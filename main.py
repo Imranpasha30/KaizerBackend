@@ -17,9 +17,51 @@ from database import engine, SessionLocal, Base, get_db
 import models
 import runner
 
-# Drop and recreate all tables (safe during early development / schema changes)
-Base.metadata.drop_all(bind=engine)
+
+def _migrate_schema():
+    """Add missing columns to existing tables — safe to run on every startup."""
+    from sqlalchemy import text, inspect
+    with engine.connect() as conn:
+        inspector = inspect(engine)
+
+        # ── jobs table columns ──────────────────────────────────────────
+        existing_jobs = {c["name"] for c in inspector.get_columns("jobs")}
+        job_additions = {
+            "frame_layout": "VARCHAR(50)",
+            "video_name":   "VARCHAR(255)",
+            "error":        "TEXT",
+        }
+        for col, dtype in job_additions.items():
+            if col not in existing_jobs:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}"))
+
+        # Migrate old 'frame' → 'frame_layout' if needed
+        if "frame" in existing_jobs and "frame_layout" in existing_jobs:
+            conn.execute(text(
+                "UPDATE jobs SET frame_layout = frame WHERE frame_layout IS NULL"
+            ))
+
+        # ── clips table columns ─────────────────────────────────────────
+        existing_clips = {c["name"] for c in inspector.get_columns("clips")}
+        clip_additions = {
+            "thumb_path":    "VARCHAR(500)",
+            "image_path":    "VARCHAR(500)",
+            "frame_type":    "VARCHAR(50)",
+            "text":          "TEXT",
+            "card_params":   "TEXT",
+            "section_pct":   "TEXT",
+            "follow_params": "TEXT",
+        }
+        for col, dtype in clip_additions.items():
+            if col not in existing_clips:
+                conn.execute(text(f"ALTER TABLE clips ADD COLUMN {col} {dtype}"))
+
+        conn.commit()
+
+
+# Create tables if they don't exist, then safely add any missing columns
 Base.metadata.create_all(bind=engine)
+_migrate_schema()
 
 BASE_DIR    = Path(__file__).parent
 MEDIA_ROOT  = BASE_DIR / "media"
