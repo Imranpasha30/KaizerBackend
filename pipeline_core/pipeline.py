@@ -91,6 +91,16 @@ import openai
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+
+def _truetype(path, size):
+    """Load font with raqm/HarfBuzz for proper Telugu conjunct shaping.
+    Falls back to basic layout if libraqm is not installed."""
+    try:
+        return ImageFont.truetype(path, size, layout_engine=ImageFont.Layout.RAQM)
+    except Exception:
+        return ImageFont.truetype(path, size)
+
+
 # ═══════════════════════════════════════════════════════════
 # PLATFORM PRESETS
 # ═══════════════════════════════════════════════════════════
@@ -706,11 +716,11 @@ def _best_font(size):
         fp = os.path.join(FONTS_DIR, fn)
         if os.path.exists(fp):
             try:
-                return ImageFont.truetype(fp, size)
+                return _truetype(fp, size)
             except Exception:
                 pass
     try:
-        return ImageFont.truetype("arial.ttf", size)
+        return _truetype("arial.ttf", size)
     except Exception:
         return ImageFont.load_default()
 
@@ -901,7 +911,7 @@ def generate_torn_paper_card(text, width, height, font_path, out_path, seed=0,
     def _load_font(sz):
         try:
             if font_path and os.path.exists(font_path):
-                return ImageFont.truetype(font_path, size=sz)
+                return _truetype(font_path, sz)
         except Exception:
             pass
         return _best_font(sz)
@@ -1466,7 +1476,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
         txt_layer = Image.new('RGBA', (w, h), (0, 0, 0, 0))
         draw_txt = ImageDraw.Draw(txt_layer)
         try:
-            fnt = ImageFont.truetype(tel_font_path, size=fnt_sz)
+            fnt = _truetype(tel_font_path, fnt_sz)
         except Exception:
             fnt = ImageFont.load_default()
         line_h = int(fnt_sz * 1.3)
@@ -1500,7 +1510,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
     ftw = w  # seed loop
     while _fnt_sz >= 14:
         try:
-            _fnt = ImageFont.truetype(_latin_font_path, size=_fnt_sz)
+            _fnt = _truetype(_latin_font_path, _fnt_sz)
         except Exception:
             _fnt = ImageFont.load_default()
         try:
@@ -1514,7 +1524,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
         _fnt_sz -= 2
     if fbar_fnt is None:
         try:
-            fbar_fnt = ImageFont.truetype(_latin_font_path, size=14)
+            fbar_fnt = _truetype(_latin_font_path, 14)
             _ftb = draw_bg.textbbox((0, 0), follow_text, font=fbar_fnt)
             ftw = _ftb[2] - _ftb[0]
         except Exception:
