@@ -3,3 +3,6 @@ nixPkgs = ["python312", "python312Packages.pip", "ffmpeg", "libraqm", "harfbuzz"
 
 [phases.install]
 cmds = ["python3 -m venv --copies /opt/venv && . /opt/venv/bin/activate && pip install -r requirements.txt"]
+
+[variables]
+LD_LIBRARY_PATH = "/nix/var/nix/profiles/default/lib"
