@@ -94,6 +94,10 @@ FRAME_LAYOUTS = {
 
 # ── Health ───────────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    return {"app": "Kaizer Pipeline API", "docs": "/docs", "health": "/api/health/"}
+
 @app.get("/api/health/")
 def health():
     return {"status": "ok"}
@@ -332,11 +336,19 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
 async def serve_file(path: str, request: Request):
     file_path = Path(path)
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found — clips are ephemeral and expire on redeploy")
 
     mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     file_size = file_path.stat().st_size
+    filename = file_path.name
     range_header = request.headers.get("range", "")
+
+    # Common headers for all responses
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    }
 
     if range_header.startswith("bytes="):
         start_str, _, end_str = range_header[6:].partition("-")
@@ -358,15 +370,15 @@ async def serve_file(path: str, request: Request):
         return StreamingResponse(
             _iter(), status_code=206, media_type=mime,
             headers={
+                **base_headers,
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
                 "Content-Length": str(length),
             },
         )
 
     return StreamingResponse(
         open(file_path, "rb"), media_type=mime,
-        headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)},
+        headers={**base_headers, "Content-Length": str(file_size)},
     )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
