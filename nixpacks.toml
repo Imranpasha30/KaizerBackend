@@ -5,7 +5,7 @@ NIXPACKS_PYTHON_VERSION = "3.12"
 nixPkgs = ["ffmpeg"]
 
 [phases.install]
-cmds = ["pip install -r requirements-deploy.txt"]
+cmds = ["python3 -m venv --copies /opt/venv && . /opt/venv/bin/activate && pip install -r requirements-deploy.txt"]
 
 [phases.build]
 cmds = ["python manage.py migrate --noinput", "python manage.py collectstatic --noinput"]
