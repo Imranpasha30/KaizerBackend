@@ -112,6 +112,17 @@ def get_platforms():
 def get_frame_layouts():
     return FRAME_LAYOUTS
 
+@app.get("/api/fonts/{filename}")
+def serve_font(filename: str):
+    from fastapi.responses import FileResponse
+    font_path = BASE_DIR / "resources" / "fonts" / filename
+    if not font_path.exists():
+        raise HTTPException(status_code=404, detail="Font not found")
+    return FileResponse(font_path, media_type="font/ttf", headers={
+        "Cache-Control": "public, max-age=86400",
+        "Access-Control-Allow-Origin": "*",
+    })
+
 @app.get("/api/frames/")          # legacy alias
 def get_frames():
     return FRAME_LAYOUTS
@@ -438,6 +449,9 @@ def _clip_dict(c):
         """Build /api/file/ URL — no exists() check; let endpoint handle 404."""
         return f"/api/file/?path={path}" if path else ""
 
+    meta = json.loads(c.meta or "{}")
+    raw_path = meta.get("raw_path", "")
+
     return {
         "id":           c.id,
         "job_id":       c.job_id,
@@ -448,6 +462,7 @@ def _clip_dict(c):
         "thumb_url":    _furl(c.thumb_path),
         "image_path":   c.image_path or "",
         "image_url":    _furl(c.image_path),
+        "raw_url":      _furl(raw_path),
         "duration":     c.duration,
         "frame_type":   c.frame_type,
         "text":         c.text,
@@ -456,7 +471,7 @@ def _clip_dict(c):
         "card_params":  json.loads(c.card_params or "{}"),
         "section_pct":  json.loads(c.section_pct or "{}"),
         "follow_params":json.loads(c.follow_params or "{}"),
-        "meta":         json.loads(c.meta or "{}"),
+        "meta":         meta,
         "video_url":    _furl(c.file_path),
     }
 
