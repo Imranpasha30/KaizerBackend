@@ -65,7 +65,7 @@ _migrate_schema()
 
 BASE_DIR    = Path(__file__).parent
 MEDIA_ROOT  = BASE_DIR / "media"
-OUTPUT_ROOT = Path(os.getenv("KAIZER_OUTPUT_ROOT", str(BASE_DIR / "output")))
+OUTPUT_ROOT = Path(os.getenv("KAIZER_OUTPUT_ROOT", "/tmp/kaizer_output"))
 MEDIA_ROOT.mkdir(exist_ok=True)
 OUTPUT_ROOT.mkdir(exist_ok=True)
 
@@ -372,18 +372,20 @@ async def serve_file(path: str, request: Request):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clip_dict(c):
-    origin = os.getenv("RAILWAY_STATIC_URL", "")
-    thumb_url = (f"/api/file/?path={c.thumb_path}" if c.thumb_path and Path(c.thumb_path).exists() else "")
-    image_url = (f"/api/file/?path={c.image_path}" if c.image_path and Path(c.image_path).exists() else "")
+    def _furl(path):
+        """Build /api/file/ URL — no exists() check; let endpoint handle 404."""
+        return f"/api/file/?path={path}" if path else ""
+
     return {
         "id":           c.id,
         "job_id":       c.job_id,
         "clip_index":   c.clip_index,
         "filename":     c.filename,
         "file_path":    c.file_path,
-        "thumb_url":    thumb_url,
-        "image_path":   c.image_path,
-        "image_url":    image_url,
+        "thumb_path":   c.thumb_path or "",
+        "thumb_url":    _furl(c.thumb_path),
+        "image_path":   c.image_path or "",
+        "image_url":    _furl(c.image_path),
         "duration":     c.duration,
         "frame_type":   c.frame_type,
         "text":         c.text,
@@ -393,7 +395,7 @@ def _clip_dict(c):
         "section_pct":  json.loads(c.section_pct or "{}"),
         "follow_params":json.loads(c.follow_params or "{}"),
         "meta":         json.loads(c.meta or "{}"),
-        "video_url":    f"/api/file/?path={c.file_path}" if c.file_path else "",
+        "video_url":    _furl(c.file_path),
     }
 
 
