@@ -20,6 +20,24 @@ Requires:
 import os, sys, json, time, re, subprocess, math, random, shutil
 from datetime import datetime
 
+
+def _find_binary(name):
+    """Find ffmpeg/ffprobe: checks PATH first, then common nix/Railway paths."""
+    import shutil as _sh
+    p = _sh.which(name)
+    if p:
+        return p
+    for prefix in ["/usr/bin", "/usr/local/bin", "/nix/var/nix/profiles/default/bin",
+                   "/run/current-system/sw/bin"]:
+        candidate = os.path.join(prefix, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return name  # fallback — will fail with a clear error
+
+
+FFMPEG_BIN  = _find_binary("ffmpeg")
+FFPROBE_BIN = _find_binary("ffprobe")
+
 # Fix Windows console encoding for Telugu/Unicode output
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -174,7 +192,7 @@ def _ascii_text(text, max_len=60):
 
 
 def get_video_info(path):
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+    cmd = [FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
            "-show_format", "-show_streams", path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -376,7 +394,7 @@ def cut_video_clips(video_path: str, clips: list, output_dir: str) -> list:
 
         out_path = os.path.join(output_dir, f"raw_clip_{i:02d}.mp4")
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-ss", str(round(start, 3)), "-t", str(round(dur, 3)),
             "-i", video_path,
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
@@ -1157,7 +1175,7 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
     if _card_drawtext:
         fc.append(f"[outv_pre]" + ','.join(_card_drawtext) + "[outv]")
 
-    cmd = (["ffmpeg", "-y"] + base + extra +
+    cmd = ([FFMPEG_BIN, "-y"] + base + extra +
            ["-filter_complex", ";".join(fc),
             "-map", "[outv]", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
@@ -1566,7 +1584,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
             f'[bgsc][vid]overlay=x={vid_mx}:y={vid_y}[outv]',
         ]
 
-    cmd = (['ffmpeg', '-y'] + base + extra +
+    cmd = ([FFMPEG_BIN, '-y'] + base + extra +
            ['-filter_complex', ';'.join(fc),
             '-map', '[outv]', '-map', '0:a?',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
@@ -1653,7 +1671,7 @@ def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_colo
             f'[bv][thumb]overlay=x={mx}:y={my}[outv]',
         ]
 
-    cmd = (['ffmpeg', '-y'] + base + extra +
+    cmd = ([FFMPEG_BIN, '-y'] + base + extra +
            ['-filter_complex', ';'.join(fc),
             '-map', '[outv]', '-map', '0:a?',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
@@ -1947,7 +1965,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         thumb_path = os.path.join(OUTPUT_DIR, f"thumb_{i+1:02d}.jpg")
         try:
             subprocess.run([
-                "ffmpeg", "-y", "-i", out_path,
+                FFMPEG_BIN, "-y", "-i", out_path,
                 "-vframes", "1", "-q:v", "2", thumb_path
             ], capture_output=True, check=True)
         except Exception:
