@@ -1,0 +1,26 @@
+# Django
+*.pyc
+__pycache__/
+db.sqlite3
+media/
+staticfiles/
+*.log
+
+# Environment
+.env
+
+# Output (generated clips — large files, gitignore)
+output/
+
+# Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp

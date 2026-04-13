@@ -1,0 +1,7 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "gunicorn kaizer_news.wsgi --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
+healthcheckPath = "/api/platforms/"
+restartPolicyType = "on_failure"
