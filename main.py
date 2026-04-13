@@ -17,6 +17,8 @@ from database import engine, SessionLocal, Base, get_db
 import models
 import runner
 
+# Drop and recreate all tables (safe during early development / schema changes)
+Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 BASE_DIR    = Path(__file__).parent
