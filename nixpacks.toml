@@ -1,0 +1,14 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.12"
+
+[phases.setup]
+nixPkgs = ["ffmpeg"]
+
+[phases.install]
+requirementsFile = "requirements-deploy.txt"
+
+[phases.build]
+cmds = ["python manage.py migrate --noinput", "python manage.py collectstatic --noinput"]
+
+[start]
+cmd = "gunicorn kaizer_news.wsgi --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
