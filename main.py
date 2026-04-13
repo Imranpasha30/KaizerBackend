@@ -290,23 +290,73 @@ async def rerender_clip(clip_id: int, request: Request, db: Session = Depends(ge
 
     db.commit()
 
-    # Try to call editor subprocess if available
-    editor_script = BASE_DIR / "pipeline_core" / "editor.py"
-    if editor_script.exists() and clip.file_path:
+    # Actually re-compose the clip using pipeline functions
+    meta = json.loads(clip.meta or "{}")
+    raw_path = meta.get("raw_path", "")
+    if raw_path and Path(raw_path).exists():
         try:
-            import subprocess, sys
-            subprocess.run(
-                [sys.executable, str(editor_script),
-                 "--clip", clip.file_path,
-                 "--params", json.dumps(edits)],
-                timeout=120,
-                capture_output=True,
-            )
-            db.refresh(clip)
-        except Exception:
-            pass
+            _recompose_clip(clip, meta, edits, db)
+        except Exception as e:
+            print(f"[rerender] compose error: {e}")
 
     return _clip_dict(clip)
+
+
+def _recompose_clip(clip, meta, edits, db):
+    """Re-compose a clip using the pipeline's compose functions with updated params."""
+    import subprocess, sys
+
+    raw_path = meta.get("raw_path", "")
+    out_path = clip.file_path
+    preset = meta.get("preset", {"width": 1080, "height": 1920})
+    frame_type = clip.frame_type or meta.get("frame_type", "follow_bar")
+    title_text = clip.text or meta.get("text", "KAIZER NEWS")
+    image_path = clip.image_path or meta.get("image_path", "")
+
+    card_params = json.loads(clip.card_params or "{}")
+    follow_params = json.loads(clip.follow_params or "{}")
+    section_pct = json.loads(clip.section_pct or "{}")
+
+    # Import pipeline compose functions
+    sys.path.insert(0, str(BASE_DIR / "pipeline_core"))
+    from pipeline import compose_clip, compose_follow_bar, compose_split_frame, FFMPEG_BIN
+
+    if frame_type == "follow_bar":
+        compose_follow_bar(
+            raw_path, out_path, preset,
+            title_text=title_text,
+            font_file=card_params.get("font_file", "Ponnala-Regular.ttf"),
+            text_color=follow_params.get("text_color", card_params.get("text_color", "#ffff00")),
+            text_size=int(card_params.get("font_size", 60)),
+            bg_color=follow_params.get("bg_color", "#1a0a2e"),
+            follow_text=follow_params.get("follow_text", "FOLLOW KAIZER NEWS TELUGU"),
+            follow_text_color=follow_params.get("follow_text_color", "#ffffff"),
+            velvet_style=follow_params.get("velvet_style"),
+        )
+    elif frame_type == "split_frame":
+        compose_split_frame(raw_path, image_path, out_path, preset)
+    else:
+        # torn_card
+        cs = card_params.get("card_style", {})
+        compose_clip(
+            raw_path, image_path, title_text, out_path, preset,
+            font_size=card_params.get("font_size", 52),
+            text_color=card_params.get("text_color", "#ffffff"),
+            font_file=card_params.get("font_file", "Ponnala-Regular.ttf"),
+            section_pct=section_pct or None,
+            card_style=cs or None,
+        )
+
+    # Regenerate thumbnail
+    thumb_path = clip.thumb_path
+    if thumb_path and out_path:
+        try:
+            subprocess.run(
+                [FFMPEG_BIN, "-y", "-i", out_path, "-vframes", "1", "-q:v", "2", thumb_path],
+                capture_output=True, check=True, timeout=30,
+            )
+        except Exception:
+            pass
 
 
 @app.post("/api/clips/{clip_id}/upload-image/")
