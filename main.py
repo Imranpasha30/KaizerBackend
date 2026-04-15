@@ -3,6 +3,7 @@ import json
 import time
 import shutil
 import mimetypes
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
@@ -310,7 +311,8 @@ async def rerender_clip(clip_id: int, request: Request, db: Session = Depends(ge
         raise HTTPException(status_code=410, detail="Source video has expired (server was redeployed) — please re-run the pipeline job to regenerate clips")
 
     try:
-        _recompose_clip(clip, meta, edits, db)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _recompose_clip, clip, meta, edits, db)
     except Exception as e:
         import traceback
         print(f"[rerender] compose error:\n{traceback.format_exc()}")
@@ -419,8 +421,8 @@ async def serve_file(path: str, request: Request):
     # Common headers for all responses
     base_headers = {
         "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Access-Control-Expose-Headers": "Content-Disposition",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Accept-Ranges",
     }
 
     if range_header.startswith("bytes="):
