@@ -304,11 +304,17 @@ async def rerender_clip(clip_id: int, request: Request, db: Session = Depends(ge
     # Actually re-compose the clip using pipeline functions
     meta = json.loads(clip.meta or "{}")
     raw_path = meta.get("raw_path", "")
-    if raw_path and Path(raw_path).exists():
-        try:
-            _recompose_clip(clip, meta, edits, db)
-        except Exception as e:
-            print(f"[rerender] compose error: {e}")
+    if not raw_path:
+        raise HTTPException(status_code=422, detail="No source video path in clip metadata — cannot rerender")
+    if not Path(raw_path).exists():
+        raise HTTPException(status_code=410, detail="Source video has expired (server was redeployed) — please re-run the pipeline job to regenerate clips")
+
+    try:
+        _recompose_clip(clip, meta, edits, db)
+    except Exception as e:
+        import traceback
+        print(f"[rerender] compose error:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Rerender failed: {e}")
 
     return _clip_dict(clip)
 
@@ -348,7 +354,13 @@ def _recompose_clip(clip, meta, edits, db):
         compose_split_frame(raw_path, image_path, out_path, preset)
     else:
         # torn_card
-        cs = card_params.get("card_style", {})
+        # card_style may be stored nested (after editor rerender) or flat in card_params
+        # (original pipeline format uses card_c0/card_c1/edge/jag/... at top level).
+        # Support both by falling back to the flat card_params keys.
+        cs = card_params.get("card_style") or {
+            k: v for k, v in card_params.items()
+            if k not in ("font_size", "font_file", "text_color")
+        }
         compose_clip(
             raw_path, image_path, title_text, out_path, preset,
             font_size=card_params.get("font_size", 52),
