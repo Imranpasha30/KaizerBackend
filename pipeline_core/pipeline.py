@@ -302,6 +302,138 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no ```):
 """
 
 
+def _fix_json_strings(text: str) -> str:
+    """Replace literal control characters inside JSON string values with escape sequences.
+    Handles: unescaped newlines, carriage returns, tabs, and stray backslashes.
+    Uses a simple state machine so it correctly skips over \\" inside strings.
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == '\\':
+                # Pass through the escape sequence unchanged
+                result.append(c)
+                i += 1
+                if i < len(text):
+                    result.append(text[i])
+                    i += 1
+                continue
+            elif c == '"':
+                in_string = False
+                result.append(c)
+            elif c == '\n':
+                result.append('\\n')
+            elif c == '\r':
+                result.append('\\r')
+            elif c == '\t':
+                result.append('\\t')
+            else:
+                result.append(c)
+        else:
+            if c == '"':
+                in_string = True
+                result.append(c)
+            else:
+                result.append(c)
+        i += 1
+    return ''.join(result)
+
+
+def _parse_gemini_json(raw_text: str) -> dict:
+    """Robust multi-strategy parser for Gemini JSON responses.
+
+    Gemini sometimes returns:
+      - Markdown code fences (```json ... ```)
+      - Trailing commas before } or ]
+      - Literal newlines / tabs inside string values (invalid JSON)
+      - Truncated responses
+
+    Each strategy is tried in order; the first that succeeds is returned.
+    As a last resort the clips array is extracted clip-by-clip so at least
+    the cut decisions are preserved even if metadata fields are garbled.
+    """
+    text = raw_text.strip()
+
+    def _try(t):
+        return json.loads(t)
+
+    # 1. Direct parse
+    try:
+        return _try(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown code fences
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+            try:
+                return _try(text)
+            except json.JSONDecodeError:
+                pass
+
+    # 3. Find outermost { ... } block
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        text = m.group(0)
+
+    # 4. Remove trailing commas before } or ]
+    fixed = re.sub(r',(\s*[}\]])', r'\1', text)
+    try:
+        return _try(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Fix literal control characters inside strings
+    fixed2 = _fix_json_strings(fixed)
+    try:
+        return _try(fixed2)
+    except json.JSONDecodeError:
+        pass
+
+    # 6. Also fix the original (unfixed-commas) text with string repair
+    fixed3 = _fix_json_strings(text)
+    fixed3 = re.sub(r',(\s*[}\]])', r'\1', fixed3)
+    try:
+        return _try(fixed3)
+    except json.JSONDecodeError:
+        pass
+
+    # 7. Last resort — extract clip objects individually so we keep cut decisions
+    clips = []
+    for clip_m in re.finditer(
+        r'\{\s*"index"\s*:.*?"importance"\s*:\s*\d+\s*\}',
+        fixed3, re.DOTALL
+    ):
+        try:
+            clips.append(json.loads(clip_m.group(0)))
+        except json.JSONDecodeError:
+            pass
+
+    if clips:
+        print(f"    [warn] Gemini JSON was malformed — recovered {len(clips)} clip(s) from partial parse")
+        return {
+            "video_type": "MIXED",
+            "language": "Telugu",
+            "total_speakers": 1,
+            "clips": clips,
+            "overall_summary": "",
+            "overall_summary_telugu": "",
+            "image_search_queries": ["Telugu news"],
+            "key_people": [],
+            "key_people_telugu": [],
+            "key_topics": [],
+            "key_locations": [],
+        }
+
+    print(f"    [error] Could not parse Gemini response. Raw (first 600 chars):\n{raw_text[:600]}")
+    raise ValueError("Could not parse Gemini JSON response — all repair strategies failed")
+
+
 def upload_video_to_gemini(video_path: str) -> object:
     """Upload video to Gemini File API and wait for processing."""
     size_mb = os.path.getsize(video_path) / (1024 * 1024)
@@ -354,23 +486,7 @@ def analyze_video_with_gemini(video_path: str, preset: dict) -> dict:
     raw_text = response.text.strip()
     print(" done")
 
-    # Parse JSON from response (handle markdown code blocks)
-    json_text = raw_text
-    if "```" in json_text:
-        m = re.search(r"```(?:json)?\s*\n?(.*?)```", json_text, re.DOTALL)
-        if m:
-            json_text = m.group(1).strip()
-
-    try:
-        result = json.loads(json_text)
-    except json.JSONDecodeError:
-        # Try to extract JSON object
-        m = re.search(r"\{.*\}", json_text, re.DOTALL)
-        if m:
-            result = json.loads(m.group(0))
-        else:
-            print(f"    Failed to parse Gemini response. Raw:\n{raw_text[:500]}")
-            raise ValueError("Could not parse Gemini JSON response")
+    result = _parse_gemini_json(raw_text)
 
     # Clean up the file from Gemini servers
     try:
