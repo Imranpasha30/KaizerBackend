@@ -13,6 +13,7 @@ openai>=1.0
 ffmpeg-python>=0.2
 
 # SEO + YouTube automation (phases 1-9)
+PyJWT>=2.8
 cryptography>=42
 google-auth>=2.29
 google-auth-oauthlib>=1.2
