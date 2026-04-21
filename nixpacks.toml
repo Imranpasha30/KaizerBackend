@@ -2,7 +2,11 @@
 nixPkgs = ["python312", "python312Packages.pip", "ffmpeg", "libraqm", "harfbuzz", "fribidi", "freetype", "fontconfig"]
 
 [phases.install]
-cmds = ["python3 -m venv --copies /opt/venv && . /opt/venv/bin/activate && pip install -r requirements.txt"]
+# Use the lean Railway-only requirements — excludes heavy ML deps
+# (torch, transformers, bitsandbytes, onnxruntime-gpu, librosa, etc.) that
+# only the local pipeline subprocess needs, not the FastAPI API.  Full
+# requirements.txt is kept for local dev.
+cmds = ["python3 -m venv --copies /opt/venv && . /opt/venv/bin/activate && pip install -r requirements-railway.txt"]
 
 [variables]
 LD_LIBRARY_PATH = "/nix/var/nix/profiles/default/lib"
