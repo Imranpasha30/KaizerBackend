@@ -17,6 +17,22 @@ load_dotenv()
 from database import engine, SessionLocal, Base, get_db
 import models
 import runner
+import auth
+
+from routers.auth import router as auth_router
+from routers.channels import router as channels_router
+from routers.seo import router as seo_router
+from routers.youtube_oauth import router as youtube_oauth_router
+from routers.youtube_upload import router as youtube_upload_router
+from routers.campaigns import router as campaigns_router
+from routers.performance import router as performance_router
+from routers.translation import router as translation_router
+from routers.trending import router as trending_router
+from routers.assets import router as assets_router
+from routers.veo import router as veo_router
+from seo.default_channels import seed_channels
+from youtube import worker as upload_worker
+from learning import scheduler as corpus_scheduler
 
 
 def _migrate_schema():
@@ -31,10 +47,38 @@ def _migrate_schema():
             "frame_layout": "VARCHAR(50)",
             "video_name":   "VARCHAR(255)",
             "error":        "TEXT",
+            "language":     "VARCHAR(10) DEFAULT 'te'",
+            "user_id":      "INTEGER",
+            "started_at":   "DATETIME",
+            "finished_at":  "DATETIME",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
                 conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}"))
+
+        # ── user_id on multi-tenant tables ──────────────────────────────
+        for tbl in ("channels", "upload_jobs", "campaigns", "competitor_channels"):
+            if inspector.has_table(tbl):
+                cols = {c["name"] for c in inspector.get_columns(tbl)}
+                if "user_id" not in cols:
+                    conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER"))
+
+        # ── users.socials (cross-promo links for SEO footer) ────────────
+        if inspector.has_table("users"):
+            ucols = {c["name"] for c in inspector.get_columns("users")}
+            if "socials" not in ucols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN socials TEXT DEFAULT '{}'"))
+
+        # ── profile_destinations — seed from existing OAuthTokens so
+        # pre-existing 1:1 profile↔destination links become rows in the
+        # new many-to-many table without the user having to re-link them.
+        if inspector.has_table("profile_destinations") and inspector.has_table("oauth_tokens"):
+            conn.execute(text("""
+                INSERT OR IGNORE INTO profile_destinations (profile_id, google_channel_id)
+                SELECT channel_id, google_channel_id
+                FROM oauth_tokens
+                WHERE google_channel_id IS NOT NULL AND google_channel_id != ''
+            """))
 
         # Migrate old 'frame' → 'frame_layout' if needed
         if "frame" in existing_jobs and "frame_layout" in existing_jobs:
@@ -52,17 +96,64 @@ def _migrate_schema():
             "card_params":   "TEXT",
             "section_pct":   "TEXT",
             "follow_params": "TEXT",
+            "seo":           "TEXT",
+            "seo_variants":  "TEXT DEFAULT '{}'",
         }
         for col, dtype in clip_additions.items():
             if col not in existing_clips:
                 conn.execute(text(f"ALTER TABLE clips ADD COLUMN {col} {dtype}"))
 
+        # ── upload_jobs table columns (new: publish_kind) ────────────────
+        if inspector.has_table("upload_jobs"):
+            existing_uploads = {c["name"] for c in inspector.get_columns("upload_jobs")}
+            upload_additions = {
+                "publish_kind": "VARCHAR(10) DEFAULT 'video'",
+            }
+            for col, dtype in upload_additions.items():
+                if col not in existing_uploads:
+                    conn.execute(text(f"ALTER TABLE upload_jobs ADD COLUMN {col} {dtype}"))
+
         conn.commit()
+
+
+def _seed_defaults():
+    """Populate new DB with default channel profiles + ensure legacy user exists,
+    and backfill any pre-auth rows with NULL user_id onto that legacy user.
+    Idempotent — safe to run on every startup.
+    """
+    from sqlalchemy import text as _text
+    from auth import ensure_legacy_user
+
+    db = SessionLocal()
+    try:
+        # Legacy user — owns all pre-existing data from the single-tenant era
+        legacy = ensure_legacy_user(db)
+
+        # Backfill — any row with NULL user_id belongs to legacy until a real
+        # user claims it.  Cheap UPDATE; noop when there's nothing to backfill.
+        for tbl in ("jobs", "channels", "upload_jobs", "campaigns", "competitor_channels"):
+            try:
+                db.execute(_text(f"UPDATE {tbl} SET user_id = :uid WHERE user_id IS NULL"),
+                           {"uid": legacy.id})
+            except Exception as e:
+                print(f"[startup] backfill {tbl} skipped: {e}")
+        db.commit()
+
+        added = seed_channels(db)
+        if added:
+            # Freshly seeded channels also belong to legacy user
+            db.execute(_text("UPDATE channels SET user_id = :uid WHERE user_id IS NULL"),
+                       {"uid": legacy.id})
+            db.commit()
+            print(f"[startup] Seeded {added} default channel(s) for legacy user")
+    finally:
+        db.close()
 
 
 # Create tables if they don't exist, then safely add any missing columns
 Base.metadata.create_all(bind=engine)
 _migrate_schema()
+_seed_defaults()
 
 BASE_DIR    = Path(__file__).parent
 MEDIA_ROOT  = BASE_DIR / "media"
@@ -78,6 +169,51 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Routers ──────────────────────────────────────────────────────────────────
+# Auth (register / login / Google sign-in / me).
+app.include_router(auth_router)
+# Phases 1–7: channels, SEO, OAuth, uploads.
+app.include_router(channels_router)
+app.include_router(seo_router)
+app.include_router(youtube_oauth_router)
+app.include_router(youtube_upload_router)
+# Billion-dollar phases A–E: campaigns, performance, translation, trending radar.
+app.include_router(campaigns_router)
+app.include_router(performance_router)
+app.include_router(translation_router)
+app.include_router(trending_router)
+app.include_router(assets_router)
+app.include_router(veo_router)
+
+
+# ── Upload worker lifecycle ──────────────────────────────────────────────────
+@app.on_event("startup")
+async def _start_upload_worker():
+    try:
+        await upload_worker.start()
+        print("[startup] upload worker running")
+    except Exception as e:
+        print(f"[startup] WARN: upload worker failed to start: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_upload_worker():
+    await upload_worker.stop()
+
+
+# ── Channel learning cron (Phase 7) ──────────────────────────────────────────
+@app.on_event("startup")
+async def _start_corpus_scheduler():
+    try:
+        corpus_scheduler.start()
+    except Exception as e:
+        print(f"[startup] WARN: corpus scheduler failed to start: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_corpus_scheduler():
+    corpus_scheduler.stop()
 
 # ── Static config ────────────────────────────────────────────────────────────
 
@@ -131,8 +267,13 @@ def get_frames():
 # ── Jobs ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/jobs/")
-def list_jobs(db: Session = Depends(get_db)):
-    jobs = db.query(models.Job).order_by(models.Job.created_at.desc()).all()
+def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+    jobs = (
+        db.query(models.Job)
+          .filter(models.Job.user_id == user.id)
+          .order_by(models.Job.created_at.desc())
+          .all()
+    )
     return [
         {
             "id": j.id,
@@ -140,6 +281,7 @@ def list_jobs(db: Session = Depends(get_db)):
             "platform": j.platform,
             "frame_layout": j.frame_layout,
             "video_name": j.video_name,
+            "language": j.language or "te",
             "created_at": j.created_at,
             "clip_count": len(j.clips),
         }
@@ -152,8 +294,14 @@ async def create_job(
     video: UploadFile = File(...),
     platform: str = Form(...),
     frame_layout: str = Form(...),
+    language: str = Form("te"),
+    use_default_image: bool = Form(False),
     db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
 ):
+    import languages as _langs
+    lang_cfg = _langs.get(language)  # falls back to default if invalid
+
     upload_dir = MEDIA_ROOT / "uploads"
     upload_dir.mkdir(exist_ok=True)
     video_path = upload_dir / video.filename
@@ -162,9 +310,11 @@ async def create_job(
         f.write(await video.read())
 
     job = models.Job(
+        user_id=user.id,
         platform=platform,
         frame_layout=frame_layout,
         video_name=video.filename,
+        language=lang_cfg.code,
         status="pending",
         log="",
         output_dir=str(OUTPUT_ROOT),
@@ -173,20 +323,145 @@ async def create_job(
     db.commit()
     db.refresh(job)
 
+    # If the user opted in, look up their default asset and pass the absolute
+    # path to the pipeline so every clip uses it instead of stock photos.
+    default_img_path = ""
+    if use_default_image:
+        asset = (
+            db.query(models.UserAsset)
+              .filter(
+                  models.UserAsset.user_id == user.id,
+                  models.UserAsset.is_default_ad == True,  # noqa: E712
+              )
+              .first()
+        )
+        if asset and asset.file_path and Path(asset.file_path).exists():
+            default_img_path = asset.file_path
+
     runner.run_pipeline(
         job_id=job.id,
         video_path=str(video_path),
         platform=platform,
         frame=frame_layout,
+        language=lang_cfg.code,
+        default_image=default_img_path,
         db_session_factory=SessionLocal,
     )
 
-    return {"id": job.id, "status": job.status}
+    return {"id": job.id, "status": job.status, "language": lang_cfg.code}
+
+
+@app.get("/api/languages/")
+def list_languages():
+    """Language picker payload for the frontend New Job form."""
+    import languages as _langs
+    return _langs.list_options()
+
+
+@app.post("/api/clips/raw-upload/")
+async def raw_upload(
+    video: UploadFile = File(...),
+    title:    str = Form(""),
+    language: str = Form("te"),
+    platform: str = Form("youtube_full"),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Upload an already-edited video directly as a publishable Clip.
+
+    Skips the whole Gemini-cut / compose pipeline. Creates a tiny Job with
+    status='done' so all existing Editor / SEO / Publish / Uploads flows
+    work against the resulting Clip unchanged.
+    """
+    import subprocess, sys
+    import languages as _langs
+    lang_cfg = _langs.get(language)
+
+    # Save the file under a predictable path so /api/file/ allowlist accepts it
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    upload_dir = BASE_DIR / "output" / "raw_uploads" / timestamp
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(video.filename or "upload.mp4").name
+    video_path = upload_dir / safe_name
+    with open(video_path, "wb") as f:
+        f.write(await video.read())
+
+    # ffprobe for duration — silently defaults to 0 if the binary is missing
+    duration = 0.0
+    try:
+        sys.path.insert(0, str(BASE_DIR / "pipeline_core"))
+        from pipeline import FFMPEG_BIN, get_video_info  # type: ignore
+        info = get_video_info(str(video_path))
+        if info:
+            duration = float(info.get("duration") or 0)
+    except Exception:
+        FFMPEG_BIN = "ffmpeg"  # Fallback — hope it's on PATH
+
+    # Auto-generate a thumbnail from the first frame
+    thumb_path = upload_dir / f"thumb_{safe_name}.jpg"
+    try:
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-i", str(video_path),
+             "-vframes", "1", "-q:v", "2", str(thumb_path)],
+            capture_output=True, check=True, timeout=30,
+        )
+    except Exception as e:
+        print(f"[raw-upload] thumb gen failed: {e}")
+        thumb_path = None  # type: ignore
+
+    # Minimal Job acting as a container for the standalone Clip
+    job = models.Job(
+        user_id=user.id,
+        platform=platform,
+        frame_layout="raw_upload",
+        video_name=safe_name,
+        language=lang_cfg.code,
+        status="done",
+        log="[raw-upload] no pipeline run — user-edited video",
+        output_dir=str(upload_dir),
+    )
+    db.add(job); db.commit(); db.refresh(job)
+
+    display_title = (title or "").strip() or Path(safe_name).stem
+
+    clip = models.Clip(
+        job_id=job.id,
+        clip_index=0,
+        filename=safe_name,
+        file_path=str(video_path),
+        thumb_path=str(thumb_path) if thumb_path and thumb_path.exists() else "",
+        image_path="",
+        duration=duration,
+        frame_type="raw_upload",
+        text=display_title,
+        sentiment="",
+        entities=json.dumps([]),
+        card_params=json.dumps({}),
+        section_pct=json.dumps({}),
+        follow_params=json.dumps({}),
+        meta=json.dumps({
+            "raw_upload": True,
+            "platform": platform,
+            "language": lang_cfg.code,
+            "original_filename": safe_name,
+        }),
+    )
+    db.add(clip); db.commit(); db.refresh(clip)
+
+    return {
+        "job_id":   job.id,
+        "clip_id":  clip.id,
+        "duration": duration,
+        "language": lang_cfg.code,
+    }
 
 
 @app.get("/api/jobs/{job_id}/")
-def get_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(models.Job).filter(models.Job.id == job_id).first()
+def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return {
@@ -195,15 +470,21 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
         "platform": job.platform,
         "frame_layout": job.frame_layout,
         "video_name": job.video_name,
+        "language": job.language or "te",
         "log": job.log,
-        "created_at": job.created_at,
+        "created_at":  job.created_at,
+        "started_at":  job.started_at.isoformat()  if job.started_at  else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "elapsed_seconds": _elapsed_seconds(job),
         "clips": [_clip_dict(c) for c in job.clips],
     }
 
 
 @app.get("/api/jobs/{job_id}/status/")
-def get_job_status(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(models.Job).filter(models.Job.id == job_id).first()
+def get_job_status(job_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     log_lines = (job.log or "").split("\n") if job.log else []
@@ -213,7 +494,101 @@ def get_job_status(job_id: int, db: Session = Depends(get_db)):
         "progress_pct": progress_pct,
         "log_lines": log_lines,
         "error": job.error or "",
+        "started_at":  job.started_at.isoformat()  if job.started_at  else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "elapsed_seconds": _elapsed_seconds(job),
     }
+
+
+def _elapsed_seconds(job: "models.Job") -> int | None:
+    """Wall-clock runtime of the pipeline.  Live-counting while running."""
+    start = job.started_at
+    if not start:
+        return None
+    from datetime import datetime, timezone
+    # SQLite strips tzinfo — treat stored naive datetimes as UTC.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    end = job.finished_at
+    if end is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end is None:
+        end = datetime.now(timezone.utc)
+    try:
+        return max(0, int((end - start).total_seconds()))
+    except Exception:
+        return None
+
+
+def _meta_path_from_log(log: str) -> Path | None:
+    """Mine the stored job log for the exact editor_meta.json path.
+
+    Handles three cases, in priority order:
+      1. `[kaizer:meta] <abs_path>`   — emitted by pipeline.py post-write
+      2. `Output: <dir>`              — legacy breadcrumb before the marker existed
+    """
+    if not log:
+        return None
+    import re
+    # Priority 1: explicit marker
+    for m in re.finditer(r"^\s*\[kaizer:meta\]\s+(.+?)\s*$", log, re.MULTILINE):
+        p = Path(m.group(1).strip())
+        if p.exists():
+            return p
+    # Priority 2: "Output: <dir>" printed by run_pipeline banner
+    for m in re.finditer(r"^\s*Output:\s+(.+?)\s*$", log, re.MULTILINE):
+        candidate = Path(m.group(1).strip()) / "editor_meta.json"
+        if not candidate.is_absolute():
+            candidate = (BASE_DIR / candidate).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+@app.post("/api/jobs/{job_id}/reimport/")
+def reimport_clips(job_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+    """Re-run clip import for a job whose pipeline already finished.
+
+    Used when `_import_clips` failed silently (e.g. the earlier cp1252 bug) or
+    when a fresh editor_meta.json has been written to disk and the DB is stale.
+    Clears any existing clip rows first so the import is idempotent.
+    """
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Drop any stale Clip rows for this job so we don't accumulate duplicates
+    db.query(models.Clip).filter(models.Clip.job_id == job_id).delete()
+    db.commit()
+
+    # Prefer the exact meta path mined from the job's log output — avoids
+    # picking up an unrelated editor_meta.json from an older run via rglob.
+    meta_override = _meta_path_from_log(job.log or "")
+
+    try:
+        runner._import_clips(job, db, meta_override=meta_override)
+    except Exception as e:
+        job.status = "failed"
+        job.error = f"Reimport failed: {e}"
+        db.commit()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db.refresh(job)
+    if not job.clips:
+        job.status = "failed"
+        job.error = "Reimport found 0 clips on disk."
+        db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail="No clips found on disk for this job. Check the output directory.",
+        )
+
+    job.status = "done"
+    job.error = ""
+    db.commit()
+    return {"imported": len(job.clips), "output_dir": job.output_dir}
 
 
 @app.post("/api/jobs/{job_id}/export/")
@@ -236,8 +611,10 @@ def export_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/jobs/{job_id}/delete/")
-def delete_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(models.Job).filter(models.Job.id == job_id).first()
+def delete_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     db.delete(job)
@@ -405,11 +782,39 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
         "image_url": f"/api/file/?path={img_path}",
     }
 
-# ── File serving (any path, with Range support) ──────────────────────────────
+# ── File serving (path-restricted, with Range support) ──────────────────────
+
+def _allowed_file_roots() -> list[Path]:
+    """Absolute paths the /api/file/ endpoint is permitted to read from."""
+    roots = [
+        BASE_DIR / "output",
+        BASE_DIR / "media",
+        MEDIA_ROOT,
+        OUTPUT_ROOT,
+    ]
+    return [r.resolve() for r in roots if r.exists() or True]
+
+
+def _is_safe_path(p: Path) -> bool:
+    """Block path traversal: requested file must resolve under an allowed root."""
+    try:
+        resolved = p.resolve()
+    except Exception:
+        return False
+    for root in _allowed_file_roots():
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
 
 @app.get("/api/file/")
 async def serve_file(path: str, request: Request):
     file_path = Path(path)
+    if not _is_safe_path(file_path):
+        raise HTTPException(status_code=403, detail="Path is not under an allowed root")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found — clips are ephemeral and expire on redeploy")
 
@@ -466,6 +871,13 @@ def _clip_dict(c):
     meta = json.loads(c.meta or "{}")
     raw_path = meta.get("raw_path", "")
 
+    seo = None
+    if c.seo:
+        try:
+            seo = json.loads(c.seo)
+        except (ValueError, TypeError):
+            seo = None
+
     return {
         "id":           c.id,
         "job_id":       c.job_id,
@@ -487,6 +899,8 @@ def _clip_dict(c):
         "follow_params":json.loads(c.follow_params or "{}"),
         "meta":         meta,
         "video_url":    _furl(c.file_path),
+        "seo":          seo,
+        "seo_variants": (lambda raw: (json.loads(raw) if raw else {}) or {})(getattr(c, "seo_variants", "") or "{}"),
     }
 
 

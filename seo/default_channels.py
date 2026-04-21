@@ -1,0 +1,194 @@
+"""Seed data for the `channels` table.
+
+Applied once on first startup. Idempotent by `name` — editing/deleting rows
+in the DB afterwards will not bring them back. Matches the 13-channel default
+set from the Chrome extension reference implementation.
+"""
+
+DEFAULT_CHANNELS = [
+    {
+        "name": "Kaizer News Telugu",
+        "handle": "@KaizerNewsTelugu",
+        "language": "te",
+        "title_formula": "English Hook (తెలుగు అనువాదం) | Kaizer News Telugu",
+        "desc_style": "hook_first",
+        "footer": (
+            "📺 Subscribe Kaizer News Telugu for real-time breaking news.\n"
+            "🔔 Hit the bell for politics, cinema & national updates.\n"
+            "#KaizerNews #TeluguNews"
+        ),
+        "fixed_tags": [
+            "kaizer news", "kaizer news telugu", "telugu news",
+            "latest news telugu", "breaking news telugu", "telugu news today",
+        ],
+        "hashtags": ["#KaizerNews", "#TeluguNews", "#LatestNews", "#BreakingNews", "#Telugu"],
+        "mandatory_hashtags": ["#KaizerNews", "#TeluguNews"],
+        "is_priority": True,
+    },
+    {
+        "name": "RTV Telugu",
+        "handle": "@RTVLIVE",
+        "language": "te",
+        "title_formula": "Viral Hook (తెలుగు హెడ్‌లైన్) | RTV",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe RTV Telugu for breaking news.\n#RTV #TeluguNews",
+        "fixed_tags": ["rtv", "rtv telugu", "rtv news", "telugu news"],
+        "hashtags": ["#RTV", "#TeluguNews", "#LatestNews"],
+        "mandatory_hashtags": ["#RTV"],
+        "is_priority": True,
+    },
+    {
+        "name": "Suman TV Live",
+        "handle": "@SumanTVLive",
+        "language": "te",
+        "title_formula": "Shocking Hook (తెలుగులో) | Suman TV Live",
+        "desc_style": "shocking_hook",
+        "footer": "📺 Subscribe Suman TV Live for viral news.\n#SumanTV #TeluguNews",
+        "fixed_tags": ["suman tv", "suman tv live", "telugu viral news", "telugu news"],
+        "hashtags": ["#SumanTV", "#TeluguNews", "#Viral"],
+        "mandatory_hashtags": ["#SumanTV"],
+        "is_priority": True,
+    },
+    {
+        "name": "TV9 Telugu",
+        "handle": "@tv9telugulive",
+        "language": "te",
+        "title_formula": "English Headline | తెలుగు Translation | TV9 Telugu",
+        "desc_style": "news_anchor",
+        "footer": "📺 Subscribe TV9 Telugu for 24x7 news.\n#TV9Telugu #TeluguNews",
+        "fixed_tags": ["tv9 telugu", "tv9 news", "telugu news 24x7", "telugu news"],
+        "hashtags": ["#TV9Telugu", "#TeluguNews", "#Breaking"],
+        "mandatory_hashtags": ["#TV9Telugu"],
+        "is_priority": True,
+    },
+    {
+        "name": "ETV Bharat Telugu",
+        "handle": "@etvbharattelugu",
+        "language": "te",
+        "title_formula": "Headline in Telugu | ETV Bharat",
+        "desc_style": "news_anchor",
+        "footer": "📺 Subscribe ETV Bharat Telugu.\n#ETVBharat #TeluguNews",
+        "fixed_tags": ["etv bharat", "etv bharat telugu", "etv telugu", "telugu news"],
+        "hashtags": ["#ETVBharat", "#TeluguNews"],
+        "mandatory_hashtags": ["#ETVBharat"],
+        "is_priority": False,
+    },
+    {
+        "name": "NTV Telugu",
+        "handle": "@NTVTeluguHD",
+        "language": "te",
+        "title_formula": "English Hook | తెలుగు | NTV Telugu",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe NTV Telugu.\n#NTVTelugu #TeluguNews",
+        "fixed_tags": ["ntv telugu", "ntv news", "ntv hd", "telugu news"],
+        "hashtags": ["#NTVTelugu", "#TeluguNews"],
+        "mandatory_hashtags": ["#NTVTelugu"],
+        "is_priority": False,
+    },
+    {
+        "name": "Mahaa News",
+        "handle": "@MahaaNews",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | Mahaa News",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe Mahaa News.\n#MahaaNews #TeluguNews",
+        "fixed_tags": ["mahaa news", "mahaa telugu", "mahaa news live", "telugu news"],
+        "hashtags": ["#MahaaNews", "#TeluguNews"],
+        "mandatory_hashtags": ["#MahaaNews"],
+        "is_priority": False,
+    },
+    {
+        "name": "HMTV Live",
+        "handle": "@HMTVLive",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | HMTV",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe HMTV Live.\n#HMTV #TeluguNews",
+        "fixed_tags": ["hmtv", "hmtv live", "hmtv telugu", "telugu news"],
+        "hashtags": ["#HMTV", "#TeluguNews"],
+        "mandatory_hashtags": ["#HMTV"],
+        "is_priority": False,
+    },
+    {
+        "name": "V6 News",
+        "handle": "@V6NewsLIVE",
+        "language": "te",
+        "title_formula": "Viral Hook (తెలుగు) | V6 News",
+        "desc_style": "shocking_hook",
+        "footer": "📺 Subscribe V6 News.\n#V6News #TeluguNews",
+        "fixed_tags": ["v6 news", "v6 telugu", "v6 news live", "telugu news"],
+        "hashtags": ["#V6News", "#TeluguNews"],
+        "mandatory_hashtags": ["#V6News"],
+        "is_priority": False,
+    },
+    {
+        "name": "Sakshi TV",
+        "handle": "@sakshitvlive",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | Sakshi TV",
+        "desc_style": "news_anchor",
+        "footer": "📺 Subscribe Sakshi TV.\n#SakshiTV #TeluguNews",
+        "fixed_tags": ["sakshi tv", "sakshi news", "sakshi tv live", "telugu news"],
+        "hashtags": ["#SakshiTV", "#TeluguNews"],
+        "mandatory_hashtags": ["#SakshiTV"],
+        "is_priority": False,
+    },
+    {
+        "name": "ABN Telugu",
+        "handle": "@abntelugutv",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | ABN Telugu",
+        "desc_style": "news_anchor",
+        "footer": "📺 Subscribe ABN Telugu.\n#ABN #TeluguNews",
+        "fixed_tags": ["abn telugu", "abn news", "abn telugu live", "telugu news"],
+        "hashtags": ["#ABN", "#TeluguNews"],
+        "mandatory_hashtags": ["#ABN"],
+        "is_priority": False,
+    },
+    {
+        "name": "10TV News",
+        "handle": "@10tvnewstelugu",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | 10TV",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe 10TV News Telugu.\n#10TV #TeluguNews",
+        "fixed_tags": ["10tv", "10tv telugu", "10tv news", "telugu news"],
+        "hashtags": ["#10TV", "#TeluguNews"],
+        "mandatory_hashtags": ["#10TV"],
+        "is_priority": False,
+    },
+    {
+        "name": "Big TV Telugu",
+        "handle": "@bigtvtelugu",
+        "language": "te",
+        "title_formula": "Headline (తెలుగు) | Big TV",
+        "desc_style": "hook_first",
+        "footer": "📺 Subscribe Big TV Telugu.\n#BigTV #TeluguNews",
+        "fixed_tags": ["big tv", "big tv telugu", "big tv news", "telugu news"],
+        "hashtags": ["#BigTV", "#TeluguNews"],
+        "mandatory_hashtags": ["#BigTV"],
+        "is_priority": False,
+    },
+]
+
+
+def seed_channels(db) -> int:
+    """Insert any DEFAULT_CHANNELS missing from the DB (keyed by name).
+
+    Returns the number of rows inserted. Idempotent — safe to call on every
+    startup. Existing channels are left untouched; user edits via the admin
+    UI will never be overwritten.
+    """
+    import models
+
+    existing_names = {row[0] for row in db.query(models.Channel.name).all()}
+    added = 0
+    for spec in DEFAULT_CHANNELS:
+        if spec["name"] in existing_names:
+            continue
+        db.add(models.Channel(**spec))
+        added += 1
+
+    if added:
+        db.commit()
+    return added

@@ -1,21 +1,52 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float
+from sqlalchemy import (
+    Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean,
+    JSON, UniqueConstraint, Index,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
+
+
+class User(Base):
+    """App-level user account — distinct from a connected YouTube account.
+
+    `password_hash` is nullable so users who sign in exclusively with Google
+    don't need to set a password.  `google_sub` is the OpenID Connect
+    subject from Google Sign-In (NOT the YouTube channel id).
+    """
+    __tablename__ = "users"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    email         = Column(String(255), unique=True, nullable=False, index=True)
+    name          = Column(String(255), default="")
+    password_hash = Column(String(255), nullable=True)   # argon2 or bcrypt
+    google_sub    = Column(String(64),  nullable=True, unique=True, index=True)
+    is_active     = Column(Boolean, default=True)
+    is_admin      = Column(Boolean, default=False)
+    # Cross-promo links used by SEO to populate "follow me" footer in descriptions.
+    # Free-form dict: {"twitter":"@...", "instagram":"...", "whatsapp_community":"...", "website":"...", ...}
+    socials       = Column(JSON, default=dict)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
     __tablename__ = "jobs"
 
     id           = Column(Integer, primary_key=True, index=True)
+    user_id      = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     status       = Column(String(20), default="pending")   # pending | running | done | failed
     platform     = Column(String(50))
     frame_layout = Column(String(50))
     video_name   = Column(String(255))
+    language     = Column(String(10), default="te")        # ISO 639-1: te|hi|ta|kn|ml|bn|mr|gu|en
     output_dir   = Column(String(500), default="")
     log          = Column(Text, default="")
     error        = Column(Text, default="")
     created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    # Wall-clock timing of the pipeline subprocess.
+    started_at   = Column(DateTime(timezone=True), nullable=True)
+    finished_at  = Column(DateTime(timezone=True), nullable=True)
 
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 
@@ -39,5 +70,316 @@ class Clip(Base):
     section_pct  = Column(Text, default="{}")    # JSON: {video, text, image}
     follow_params= Column(Text, default="{}")    # JSON: follow_text, bg_color, etc.
     meta         = Column(Text, default="{}")    # raw pipeline meta JSON
+    seo          = Column(Text, default="")      # most-recently-generated SEO (JSON str, empty until generated) — kept for back-compat + "current" display
+    seo_variants = Column(Text, default="{}")    # JSON dict {channel_id: enforced_seo_payload} — one variant per style profile
 
     job = relationship("Job", back_populates="clips")
+    upload_jobs = relationship("UploadJob", back_populates="clip", cascade="all, delete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channels — YouTube channel profiles driving SEO + upload targeting
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Channel(Base):
+    __tablename__ = "channels"
+    # Profile names are unique PER USER, not globally — two users can both
+    # have a "Kaizer News Telugu" style profile.
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_channel_user_name"),)
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    user_id            = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    name               = Column(String(255), nullable=False, index=True)
+    handle             = Column(String(100), default="")
+    language           = Column(String(10), default="te")
+    title_formula      = Column(Text, default="")
+    desc_style         = Column(String(50), default="hook_first")
+    footer             = Column(Text, default="")
+    fixed_tags         = Column(JSON, default=list)
+    hashtags           = Column(JSON, default=list)
+    mandatory_hashtags = Column(JSON, default=list)
+    is_priority        = Column(Boolean, default=False)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    oauth_token = relationship(
+        "OAuthToken", back_populates="channel", uselist=False,
+        cascade="all, delete-orphan",
+    )
+    upload_jobs = relationship(
+        "UploadJob", back_populates="channel", cascade="all, delete-orphan",
+    )
+    corpus = relationship(
+        "ChannelCorpus", back_populates="channel", uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class ProfileDestination(Base):
+    """Many-to-many: which style profiles are allowed to publish to which
+    YouTube destinations (for a given user).
+
+    `google_channel_id` identifies the real YouTube channel.  A profile is
+    publishable to a destination iff a row exists here AND some profile
+    owned by the same user has an OAuthToken matching that google_channel_id
+    (so we can actually upload).
+    """
+    __tablename__ = "profile_destinations"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "google_channel_id", name="uq_profdest"),
+    )
+
+    id                = Column(Integer, primary_key=True, index=True)
+    profile_id        = Column(Integer, ForeignKey("channels.id"), nullable=False, index=True)
+    google_channel_id = Column(String(50), nullable=False, index=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class OAuthToken(Base):
+    __tablename__ = "oauth_tokens"
+
+    id                   = Column(Integer, primary_key=True, index=True)
+    channel_id           = Column(Integer, ForeignKey("channels.id"), unique=True, nullable=False)
+    google_channel_id    = Column(String(50), default="")
+    google_channel_title = Column(String(255), default="")
+    refresh_token_enc    = Column(Text, default="")      # Fernet-encrypted base64
+    access_token_enc     = Column(Text, default="")      # Fernet-encrypted base64
+    token_expiry         = Column(DateTime(timezone=True), nullable=True)
+    scopes               = Column(Text, default="")
+    connected_at         = Column(DateTime(timezone=True), server_default=func.now())
+    last_refreshed_at    = Column(DateTime(timezone=True), nullable=True)
+
+    channel = relationship("Channel", back_populates="oauth_token")
+
+
+class OAuthState(Base):
+    """Short-lived random state tokens to validate OAuth callbacks against CSRF."""
+    __tablename__ = "oauth_states"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    state      = Column(String(64), unique=True, nullable=False, index=True)
+    channel_id = Column(Integer, ForeignKey("channels.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UploadJob(Base):
+    __tablename__ = "upload_jobs"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    clip_id        = Column(Integer, ForeignKey("clips.id"), nullable=False, index=True)
+    channel_id     = Column(Integer, ForeignKey("channels.id"), nullable=False, index=True)
+    status         = Column(String(20), default="queued", index=True)
+    # queued | uploading | processing | done | failed | cancelled
+    privacy_status = Column(String(20), default="private")  # public | unlisted | private
+    publish_kind   = Column(String(10), default="video")    # "video" | "short"
+    publish_at     = Column(DateTime(timezone=True), nullable=True)
+    title          = Column(Text, default="")
+    description    = Column(Text, default="")
+    tags           = Column(JSON, default=list)
+    category_id    = Column(String(10), default="25")   # 25 = News & Politics
+    made_for_kids  = Column(Boolean, default=False)
+    video_id       = Column(String(50), default="")     # YouTube video ID after insert
+    upload_uri     = Column(Text, default="")           # resumable session URI
+    bytes_uploaded = Column(Integer, default=0)
+    bytes_total    = Column(Integer, default=0)
+    attempts       = Column(Integer, default=0)
+    last_error     = Column(Text, default="")
+    log            = Column(Text, default="")
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    clip    = relationship("Clip", back_populates="upload_jobs")
+    channel = relationship("Channel", back_populates="upload_jobs")
+
+
+class ApiQuota(Base):
+    __tablename__ = "api_quota"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    date         = Column(String(10), nullable=False)     # YYYY-MM-DD (IST)
+    api_key_hash = Column(String(16), nullable=False)
+    units_used   = Column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("date", "api_key_hash", name="uq_api_quota_date_key"),
+        Index("ix_api_quota_date", "date"),
+    )
+
+
+class ChannelCorpus(Base):
+    __tablename__ = "channel_corpus"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    channel_id   = Column(Integer, ForeignKey("channels.id"), unique=True, nullable=False)
+    payload      = Column(JSON, default=dict)    # {top_titles, hook_patterns, emotional_triggers, power_words}
+    refreshed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    channel = relationship("Channel", back_populates="corpus")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase A — Auto-Publish Campaigns
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_campaign_user_name"),)
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    user_id            = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    name               = Column(String(255), nullable=False, index=True)
+    channel_ids        = Column(JSON, default=list)         # [int, ...] — fan out across these
+    spacing_minutes    = Column(Integer, default=120)       # gap between scheduled slots
+    privacy_status     = Column(String(20), default="private")  # public | unlisted | private
+    auto_seo           = Column(Boolean, default=True)
+    auto_translate_to  = Column(JSON, default=list)         # ["hi", "ta", "en"] — Phase D fan-out
+    daily_cap          = Column(Integer, default=0)         # 0 = unlimited
+    quiet_hours_start  = Column(Integer, default=0)         # 0-23, skip slots in this window
+    quiet_hours_end    = Column(Integer, default=0)
+    thumbnail_ab       = Column(Boolean, default=False)     # Phase C
+    active             = Column(Boolean, default=True)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class JobCampaign(Base):
+    """Link a pipeline job to a campaign — when the job finishes all its clips
+    are auto-enqueued according to the campaign's rules."""
+    __tablename__ = "job_campaigns"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    job_id      = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    status      = Column(String(20), default="pending")  # pending | seo | scheduled | done | failed
+    last_error  = Column(Text, default="")
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("job_id", "campaign_id", name="uq_job_campaign"),)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase B — Analytics feedback loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClipPerformance(Base):
+    """Periodic snapshots of live video stats. Multiple rows per upload over
+    time — we keep the history so we can plot trajectories."""
+    __tablename__ = "clip_performance"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    upload_job_id  = Column(Integer, ForeignKey("upload_jobs.id"), nullable=False, index=True)
+    clip_id        = Column(Integer, ForeignKey("clips.id"), nullable=True, index=True)
+    channel_id     = Column(Integer, ForeignKey("channels.id"), nullable=True, index=True)
+    video_id       = Column(String(50), default="", index=True)
+    views          = Column(Integer, default=0)
+    likes          = Column(Integer, default=0)
+    comments       = Column(Integer, default=0)
+    seo_score      = Column(Integer, default=0)     # captured at upload time
+    hours_since_publish = Column(Float, default=0)  # uploaded_at → sampled_at
+    sampled_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase C — Thumbnail A/B variants
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThumbnailVariant(Base):
+    __tablename__ = "thumbnail_variants"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    upload_job_id  = Column(Integer, ForeignKey("upload_jobs.id"), nullable=False, index=True)
+    variant_idx    = Column(Integer, default=0)         # 0 = primary, 1+ = alternates
+    image_path     = Column(String(500), default="")
+    hook_text      = Column(String(255), default="")
+    status         = Column(String(20), default="pending")
+    # pending | served (applied to YT) | swapped_in | swapped_out | skipped
+    served_at      = Column(DateTime(timezone=True), nullable=True)
+    swapped_at     = Column(DateTime(timezone=True), nullable=True)
+    views_at_swap  = Column(Integer, default=0)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase D — Multi-language rebroadcast (SEO-level translation v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClipTranslation(Base):
+    """Translated SEO payload for a clip in a target language. Mirrors the
+    shape of Clip.seo but in another language."""
+    __tablename__ = "clip_translations"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    clip_id     = Column(Integer, ForeignKey("clips.id"), nullable=False, index=True)
+    language    = Column(String(10), nullable=False)       # ISO 639-1
+    payload     = Column(JSON, default=dict)               # {title, description, tags, hashtags, hook}
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("clip_id", "language", name="uq_clip_lang"),)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase E — Trending-topic radar
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UserAsset(Base):
+    """Images / logos a user uploads to reuse across clips.
+
+    Marking one as `is_default_ad` makes the pipeline use that image instead
+    of fetching a fresh stock photo (Pexels) or Gemini-generated card when
+    the user enables "Use my default image" on a job.
+    """
+    __tablename__ = "user_assets"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    filename      = Column(String(255), default="")
+    file_path     = Column(String(500), nullable=False)     # absolute path on disk
+    thumb_path    = Column(String(500), default="")         # optional downscaled jpg
+    kind          = Column(String(32), default="image")     # image | logo | background
+    mime          = Column(String(64), default="image/jpeg")
+    size_bytes    = Column(Integer, default=0)
+    width         = Column(Integer, default=0)
+    height        = Column(Integer, default=0)
+    is_default_ad = Column(Boolean, default=False, index=True)
+    tags          = Column(JSON, default=list)              # ["news", "telugu", …]
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CompetitorChannel(Base):
+    """YouTube channels we monitor for topic intelligence."""
+    __tablename__ = "competitor_channels"
+    __table_args__ = (
+        UniqueConstraint("user_id", "youtube_channel_id", name="uq_competitor_user_ytid"),
+    )
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    user_id            = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    name               = Column(String(255), nullable=False)
+    handle             = Column(String(100), default="")
+    # Global uniqueness dropped — two users can both track @TV9TeluguLive
+    youtube_channel_id = Column(String(50), nullable=False, index=True)
+    language           = Column(String(10), default="te")
+    active             = Column(Boolean, default=True)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class TrendingTopic(Base):
+    __tablename__ = "trending_topics"
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    source_channel_id  = Column(Integer, ForeignKey("competitor_channels.id"), nullable=False, index=True)
+    video_id           = Column(String(50), nullable=False, index=True)
+    video_title        = Column(Text, default="")
+    video_url          = Column(Text, default="")
+    published_at       = Column(DateTime(timezone=True), nullable=True)
+    view_count         = Column(Integer, default=0)
+    topic_summary      = Column(Text, default="")
+    keywords           = Column(JSON, default=list)
+    urgency            = Column(String(20), default="normal")   # hot | normal | low
+    used_for_job_id    = Column(Integer, ForeignKey("jobs.id"), nullable=True)
+    fetched_at         = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("source_channel_id", "video_id", name="uq_competitor_video"),)

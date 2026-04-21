@@ -235,7 +235,7 @@ def run_ffmpeg(cmd):
 # STEP 1: GEMINI — Video Analysis + Cuts + Summary + Keywords
 # ═══════════════════════════════════════════════════════════
 
-GEMINI_PROMPT = """You are an expert Telugu news video editor. Watch this video carefully.
+GEMINI_PROMPT = """You are an expert {language_name} news video editor. Watch this video carefully.
 
 This video could be ANY of these types — detect which one:
   - SOLO: One person reading/reporting news alone
@@ -263,39 +263,45 @@ RULES FOR CUTTING:
 IMAGE SEARCH QUERIES — THIS IS CRITICAL:
 - Do NOT give generic keywords like "man speaking" or "podium".
 - Give SPECIFIC search queries that will find REAL news photos:
-  * Full names of people shown/mentioned (e.g. "KCR press meet Hyderabad")
-  * Specific events (e.g. "Karimnagar police firing incident 2024")
-  * Telugu search terms (e.g. "కరీంనగర్ పోలీస్ కమిషనర్")
-  * Location + event combinations (e.g. "Elgandhu firing range Karimnagar")
+  * Full names of people shown/mentioned
+  * Specific events with location + date when possible
+  * One query in native {script_name} script so local news sources surface
+  * Location + event combinations
 - Think: what would a journalist search on Google to find photos for this story?
+
+NATIVE LANGUAGE OUTPUT:
+- summary_native, overall_summary_native, key_people_native must use {script_name} script.
+- Do NOT transliterate to Latin. If the video is in {language_name}, write the native
+  fields in authentic {language_name}. If the video is in another language, still
+  provide {language_name} translations in the native fields.
 
 RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no ```):
 {{
   "video_type": "SOLO|INTERVIEW|PRESS_CONFERENCE|PANEL|MIXED",
-  "language": "Telugu|English|Mixed",
+  "language": "{language_name}|English|Mixed",
   "total_speakers": <number>,
   "clips": [
     {{
       "index": 1,
       "start": "MM:SS.ss",
       "end": "MM:SS.ss",
-      "summary": "<2-3 sentence summary of what happens in this clip — in English>",
-      "summary_telugu": "<same summary in Telugu if the video is in Telugu, else empty>",
+      "summary": "<2-3 sentence summary in English>",
+      "summary_native": "<same summary in {language_name} using {script_name} script>",
       "mood": "serious|dramatic|emotional|calm|heated|funny",
       "speakers": <number of speakers in this clip>,
       "importance": <1-10 score>
     }}
   ],
-  "overall_summary": "<5-6 sentence overall summary of the entire video — in English>",
-  "overall_summary_telugu": "<same in Telugu if applicable>",
+  "overall_summary": "<5-6 sentence overall summary in English>",
+  "overall_summary_native": "<same summary in {language_name} using {script_name} script>",
   "image_search_queries": [
     "<SPECIFIC Google search query to find a real photo of the main person/event — in English>",
     "<Second search query — different angle, e.g. location or incident photo>",
-    "<Third search query — Telugu language search for local news article images>",
+    "<Third search query — IN {language_name} ({script_name} script) for local news article images>",
     "<Fourth search query — another relevant person or topic>"
   ],
   "key_people": ["full name 1", "full name 2"],
-  "key_people_telugu": ["తెలుగు పేరు 1", "తెలుగు పేరు 2"],
+  "key_people_native": ["name1 in {script_name}", "name2 in {script_name}"],
   "key_topics": ["topic 1", "topic 2", "topic 3"],
   "key_locations": ["location 1", "location 2"]
 }}
@@ -418,14 +424,14 @@ def _parse_gemini_json(raw_text: str) -> dict:
         print(f"    [warn] Gemini JSON was malformed — recovered {len(clips)} clip(s) from partial parse")
         return {
             "video_type": "MIXED",
-            "language": "Telugu",
+            "language": "Mixed",
             "total_speakers": 1,
             "clips": clips,
             "overall_summary": "",
-            "overall_summary_telugu": "",
-            "image_search_queries": ["Telugu news"],
+            "overall_summary_native": "",
+            "image_search_queries": ["breaking news today"],
             "key_people": [],
-            "key_people_telugu": [],
+            "key_people_native": [],
             "key_topics": [],
             "key_locations": [],
         }
@@ -449,44 +455,160 @@ def upload_video_to_gemini(video_path: str) -> object:
     return vf
 
 
-def analyze_video_with_gemini(video_path: str, preset: dict) -> dict:
-    """Send video to Gemini, get cut decisions + summary + keywords."""
+def _video_cache_key(video_path: str, preset: dict) -> str:
+    """Content-hash of video (first 4MB + size + mtime) + preset params.
+
+    First 4 MB is enough to distinguish any two real videos; hashing 771 MB
+    to look up a cache entry would defeat the purpose of having a cache.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        st = os.stat(video_path)
+        h.update(f"{st.st_size}:{int(st.st_mtime)}".encode())
+        with open(video_path, "rb") as f:
+            h.update(f.read(4 * 1024 * 1024))
+    except Exception:
+        h.update(video_path.encode())
+    h.update(json.dumps({
+        "min_dur":   preset.get("min_dur"),
+        "max_dur":   preset.get("max_dur"),
+        "ideal_dur": preset.get("ideal_dur"),
+        "max_clips": MAX_CLIPS,
+    }, sort_keys=True).encode())
+    return h.hexdigest()[:16]
+
+
+def _cache_dir() -> str:
+    """Persistent cache directory — survives per-run OUTPUT_DIR timestamps."""
+    d = os.path.join(OUTPUT_ROOT, "_gemini_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te") -> dict:
+    """Send video to Gemini, get cut decisions + summary + keywords.
+
+    Cached: identical video + preset + language → same Gemini response, read from disk.
+    Override with KAIZER_CACHE_GEMINI=false to force re-run.
+    """
+    # Lazy import so test harnesses that don't set sys.path can still load.
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import languages as _langs
+    lang_cfg = _langs.get(language)
+
+    # ── Cache lookup (key includes language so te/hi outputs don't collide) ──
+    cache_enabled = os.getenv("KAIZER_CACHE_GEMINI", "true").lower() != "false"
+    cache_preset = {**preset, "_lang": lang_cfg.code} if cache_enabled else preset
+    cache_key = _video_cache_key(video_path, cache_preset) if cache_enabled else None
+    cache_path = os.path.join(_cache_dir(), f"{cache_key}.json") if cache_key else None
+
+    if cache_enabled and cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            print(f"    ✓ Using cached Gemini analysis ({cache_key}) — 0 quota burned")
+            return cached
+        except Exception as e:
+            print(f"    [cache] read failed ({e}) — re-calling Gemini")
+
     genai.configure(api_key=GEMINI_API_KEY)
 
     # Upload
     video_file = upload_video_to_gemini(video_path)
 
-    # Build prompt with platform-specific constraints
+    # Build prompt with platform-specific constraints + target language
     min_dur = preset.get("min_dur", 15)
     max_dur = preset.get("max_dur", 90) or 300
     ideal_dur = preset.get("ideal_dur", 30) or 120
     prompt = GEMINI_PROMPT.format(
         min_dur=min_dur, max_dur=max_dur,
-        ideal_dur=ideal_dur, max_clips=MAX_CLIPS
+        ideal_dur=ideal_dur, max_clips=MAX_CLIPS,
+        language_name=lang_cfg.name_english,
+        script_name=lang_cfg.script,
     )
 
-    # Call Gemini
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    print("    Asking Gemini to analyze and suggest cuts ...", end="", flush=True)
+    # Model fallback chain — first entry is primary, rest are fallbacks tried
+    # on either quota (429) OR model-not-found (404). Accuracy-first ordering,
+    # using only models currently live on v1beta. The 1.5-* family is retired.
+    #   2.0-flash       → 2.0-flash-lite → 2.5-flash-lite → 2.5-flash
+    # Override via KAIZER_GEMINI_VIDEO_MODELS="model_a,model_b,..." in .env.
+    models_raw = os.getenv(
+        "KAIZER_GEMINI_VIDEO_MODELS",
+        "gemini-2.0-flash,gemini-2.0-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash",
+    )
+    # Back-compat: if someone set the old single-model var, put it first.
+    legacy_single = os.getenv("KAIZER_GEMINI_VIDEO_MODEL", "").strip()
+    candidates = [m.strip() for m in models_raw.split(",") if m.strip()]
+    if legacy_single and legacy_single not in candidates:
+        candidates.insert(0, legacy_single)
 
-    for attempt in range(3):
+    response = None
+    last_error = None
+    for model_name in candidates:
         try:
-            response = model.generate_content(
-                [video_file, prompt],
-                request_options={"timeout": 180}
-            )
-            break
+            model = genai.GenerativeModel(model_name)
+            print(f"    Asking {model_name} to analyze and suggest cuts ...", end="", flush=True)
+            # Only retry in-place on transient server errors; 429 and 404
+            # bubble up to the outer loop so we try the next model instead.
+            for attempt in range(3):
+                try:
+                    response = model.generate_content(
+                        [video_file, prompt],
+                        request_options={"timeout": 180}
+                    )
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    is_quota = ("429" in msg) or ("ResourceExhausted" in msg) or ("quota" in msg.lower())
+                    is_missing = ("404" in msg) or ("NotFound" in msg) or ("not found for API version" in msg) or ("is not supported for generateContent" in msg)
+                    is_server = any(code in msg for code in ("500", "502", "503", "504"))
+                    if is_quota or is_missing:
+                        raise  # Try next model in chain
+                    if attempt < 2 and is_server:
+                        print(f"\n    Retry {attempt+1} (server error): {e}")
+                        time.sleep(5)
+                    else:
+                        raise
+            if response is not None:
+                break  # Got a response — stop trying fallback models
         except Exception as e:
-            if attempt < 2:
-                print(f"\n    Retry {attempt+1}: {e}")
-                time.sleep(5)
-            else:
-                raise
+            msg = str(e)
+            is_quota = ("429" in msg) or ("ResourceExhausted" in msg) or ("quota" in msg.lower())
+            is_missing = ("404" in msg) or ("NotFound" in msg) or ("not found for API version" in msg) or ("is not supported for generateContent" in msg)
+            skip = is_quota or is_missing
+            if skip and model_name != candidates[-1]:
+                reason = "quota exhausted" if is_quota else "model unavailable (404)"
+                print(f"\n    [skip] {model_name}: {reason} — falling back to next model in chain")
+                last_error = e
+                continue
+            # Non-recoverable error, or last model in chain → give up
+            if is_quota:
+                print("\n    [quota] All Gemini models exhausted for today. Options:")
+                print("      • Enable billing on your Google Cloud project (recommended)")
+                print("      • Wait for daily reset (midnight UTC)")
+                print("      • Add more models to KAIZER_GEMINI_VIDEO_MODELS")
+            elif is_missing:
+                print(f"\n    [404] All configured models are unavailable. Update KAIZER_GEMINI_VIDEO_MODELS in .env.")
+            raise
+
+    if response is None:
+        raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
     raw_text = response.text.strip()
     print(" done")
 
     result = _parse_gemini_json(raw_text)
+
+    # Persist to cache so next re-run on the same video is free
+    if cache_enabled and cache_path:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print(f"    ✓ Cached Gemini analysis at {cache_key}.json")
+        except Exception as e:
+            print(f"    [cache] write failed: {e}")
 
     # Clean up the file from Gemini servers
     try:
@@ -541,14 +663,14 @@ def cut_video_clips(video_path: str, clips: list, output_dir: str) -> list:
 # STEP 3: ChatGPT — Generate Title from Summary
 # ═══════════════════════════════════════════════════════════
 
-TITLE_PROMPT = """You are a Telugu breaking news flash writer.
-Write ONE ultra-short Telugu flash headline — ticker style, 5-8 words max.
+TITLE_PROMPT = """You are a {language_name} breaking news flash writer.
+Write ONE ultra-short {language_name} flash headline — ticker style, 5-8 words max.
 
 Rules:
-1. Telugu script ONLY.
+1. {script_name} script ONLY for the native headline. No transliteration.
 2. MAX 8 words. No full sentences — just the key fact.
 3. Include the main person/place name if mentioned.
-4. Breaking news style: "పోలీస్ కమిషనర్‌పై తీవ్ర ఆరోపణలు!" or "నిజామాబాద్‌లో భారీ అగ్నిప్రమాదం!"
+4. {style_hint}
 5. Do NOT add explanation or context — just the punchy headline.
 
 Video summary:
@@ -558,21 +680,30 @@ Key people: {people}
 Key topics: {topics}
 
 Respond with ONLY the JSON (no markdown):
-{{"title_telugu": "<Telugu headline>", "title_english": "<English translation>", "subtitle": "<1-line English subtitle for context>"}}
+{{"title_native": "<{language_name} headline in {script_name} script>", "title_english": "<English translation>", "subtitle": "<1-line English subtitle for context>"}}
 """
 
 
-def generate_title_chatgpt(summary: str, people: list, topics: list) -> dict:
-    """Call GPT-4o-mini to generate a Telugu news headline."""
+def generate_title_chatgpt(summary: str, people: list, topics: list, language: str = "te") -> dict:
+    """Call GPT-4o-mini to generate a native-language news headline.
+
+    Returns dict with title_native + title_english + subtitle. Callers that
+    still expect the old key 'title_telugu' get it back as an alias (legacy).
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import languages as _langs
+    lang_cfg = _langs.get(language)
+
     if not OPENAI_API_KEY:
         print("    No OPENAI_API_KEY — truncating summary to flash headline")
-        # Take first 6 words of summary as a minimal headline
         words = (summary or "KAIZER NEWS").split()
         short = " ".join(words[:7])
         return {
-            "title_telugu": short,
+            "title_native":  short,
+            "title_telugu":  short,  # legacy alias
             "title_english": short,
-            "subtitle": ""
+            "subtitle": "",
         }
 
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -580,10 +711,13 @@ def generate_title_chatgpt(summary: str, people: list, topics: list) -> dict:
     prompt = TITLE_PROMPT.format(
         summary=summary,
         people=", ".join(people) if people else "unknown",
-        topics=", ".join(topics) if topics else "general news"
+        topics=", ".join(topics) if topics else "general news",
+        language_name=lang_cfg.name_english,
+        script_name=lang_cfg.script,
+        style_hint=lang_cfg.title_style_hint or "Breaking news style — punchy and direct.",
     )
 
-    print("    Generating title with GPT-4o-mini ...", end="", flush=True)
+    print(f"    Generating {lang_cfg.name_english} title with GPT-4o-mini ...", end="", flush=True)
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -593,20 +727,20 @@ def generate_title_chatgpt(summary: str, people: list, topics: list) -> dict:
     raw = resp.choices[0].message.content.strip()
     print(" done")
 
-    # Parse JSON
     json_text = raw
     if "```" in json_text:
         m = re.search(r"```(?:json)?\s*\n?(.*?)```", json_text, re.DOTALL)
         if m:
             json_text = m.group(1).strip()
     try:
-        return json.loads(json_text)
+        result = json.loads(json_text)
     except json.JSONDecodeError:
-        return {
-            "title_telugu": raw[:80],
-            "title_english": raw[:80],
-            "subtitle": ""
-        }
+        result = {"title_native": raw[:80], "title_english": raw[:80], "subtitle": ""}
+
+    # Legacy alias so downstream code that still references title_telugu keeps working
+    result.setdefault("title_native", result.get("title_telugu", raw[:80]))
+    result["title_telugu"] = result.get("title_native", "")
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1924,8 +2058,15 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
     return platform, frame_layout
 
 
-def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None):
+def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None,
+                 language: str = "te"):
     """Complete API pipeline: Gemini → FFmpeg → ChatGPT → Pexels → Compose → Editor."""
+
+    # Resolve language config once at the top — used for prompts, fonts, follow-bar.
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import languages as _langs
+    lang_cfg = _langs.get(language)
 
     print("=" * 60)
     print("  KAIZER NEWS — API Pipeline")
@@ -1941,6 +2082,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         return
     print(f"  Video: {os.path.basename(video_path)}")
     print(f"  Duration: {sec_to_ts(vinfo['duration'])} | {vinfo['width']}x{vinfo['height']}")
+    print(f"  Language : {lang_cfg.name_english} ({lang_cfg.name_native}, {lang_cfg.script} script)")
 
     # ── Platform + Frame selection (platform first, then frame, with back option) ──
     platform, frame_layout = _select_platform_and_frame(platform, frame_layout)
@@ -1958,13 +2100,15 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     TOTAL = 6
 
     # ════ STEP 1: Gemini Video Analysis ════
-    print(f"\n  [1/{TOTAL}] Sending video to Gemini 2.0 Flash ...")
-    gemini_result = analyze_video_with_gemini(video_path, preset)
+    print(f"\n  [1/{TOTAL}] Sending video to Gemini (language={lang_cfg.code}) ...")
+    gemini_result = analyze_video_with_gemini(video_path, preset, language=lang_cfg.code)
 
     video_type = gemini_result.get("video_type", "SOLO")
     clips = gemini_result.get("clips", [])
     summary = gemini_result.get("overall_summary", "")
-    summary_te = gemini_result.get("overall_summary_telugu", "")
+    # Support both new (_native) and legacy (_telugu) field names on cached data
+    summary_native = (gemini_result.get("overall_summary_native")
+                      or gemini_result.get("overall_summary_telugu", ""))
     keywords = gemini_result.get("image_keywords", [])
     people = gemini_result.get("key_people", [])
     topics = gemini_result.get("key_topics", [])
@@ -1990,12 +2134,14 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     cut_video_clips(video_path, clips, OUTPUT_DIR)
 
     # ════ STEP 3: Generate Title with ChatGPT ════
-    print(f"\n  [3/{TOTAL}] Generating Telugu headline ...")
-    title_result = generate_title_chatgpt(summary, people, topics)
-    title_te = title_result.get("title_telugu", "KAIZER NEWS")
+    print(f"\n  [3/{TOTAL}] Generating {lang_cfg.name_english} headline ...")
+    title_result = generate_title_chatgpt(summary, people, topics, language=lang_cfg.code)
+    title_native = title_result.get("title_native") or title_result.get("title_telugu", "KAIZER NEWS")
     title_en = title_result.get("title_english", "")
-    print(f"    Title (TE): {title_te}")
-    print(f"    Title (EN): {title_en}")
+    # Legacy alias — several downstream code paths still read title_te
+    title_te = title_native
+    print(f"    Title ({lang_cfg.code}): {title_native}")
+    print(f"    Title (en): {title_en}")
 
     # Save title
     with open(os.path.join(OUTPUT_DIR, "title.json"), "w", encoding="utf-8") as f:
@@ -2005,17 +2151,25 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     print(f"\n  [4/{TOTAL}] Searching for news images ...")
     search_queries = gemini_result.get("image_search_queries", [])
     locations = gemini_result.get("key_locations", [])
-    images = search_news_images(
-        search_queries, people, topics + locations,
-        OUTPUT_DIR, count=len(clips) + 2
-    )
+
+    # Short-circuit: user chose "use my default image" → skip Pexels + Gemini
+    # card fallbacks entirely and reuse the uploaded asset for every clip.
+    _default_img = os.environ.get("KAIZER_DEFAULT_IMAGE", "").strip()
+    if _default_img and os.path.exists(_default_img):
+        print(f"    ✓ Using user default image: {_default_img}")
+        images = [_default_img] * (len(clips) + 2)
+    else:
+        images = search_news_images(
+            search_queries, people, topics + locations,
+            OUTPUT_DIR, count=len(clips) + 2
+        )
 
     # If no real images found, generate news cards as fallback
     if not images:
         print("    No real images found — generating news card graphics ...")
         img_dir = os.path.join(OUTPUT_DIR, "images")
         os.makedirs(img_dir, exist_ok=True)
-        fallback_terms = (search_queries or topics or ["Telugu news"])
+        fallback_terms = (search_queries or topics or lang_cfg.news_search_seed)
         for i, kw in enumerate(fallback_terms[:len(clips) + 2]):
             card_path = os.path.join(img_dir, f"card_{i+1:02d}.jpg")
             generate_news_card(kw, card_path, preset["width"],
@@ -2028,6 +2182,16 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
     # ════ STEP 5: Compose Final Clips ════
     print(f"\n  [5/{TOTAL}] Composing broadcast layout ({FRAME_LAYOUTS[frame_layout]}) ...")
+
+    # Resolve language-specific font + follow-bar text once for this job.
+    # For Telugu we keep the legacy Ponnala font (designed for Telugu news style);
+    # for every other language we use the bundled Noto Sans of that script.
+    if lang_cfg.code == "te":
+        lang_font_basename = "Ponnala-Regular.ttf"
+    else:
+        lang_font_basename = os.path.basename(lang_cfg.font_primary) or "NotoSans-Bold.ttf"
+    lang_follow_text = lang_cfg.follow_bar_text or "FOLLOW KAIZER NEWS"
+
     editor_clips = []
     for i, clip in enumerate(clips):
         raw_path = clip.get("raw_path")
@@ -2036,14 +2200,14 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
         out_path = os.path.join(OUTPUT_DIR, f"clip_{i+1:02d}.mp4")
         img = images[i] if i < len(images) else images[-1]
-        card_text = title_te or "KAIZER NEWS"
+        card_text = title_native or "KAIZER NEWS"
 
-        print(f"    Composing clip {i+1} ({frame_layout}) ...")
+        print(f"    Composing clip {i+1} ({frame_layout}, font={lang_font_basename}) ...")
 
         if frame_layout == "split_frame":
             compose_split_frame(raw_path, img, out_path, preset)
             compose_meta = {}
-            clip_card_params = {"font_file": "Ponnala-Regular.ttf"}
+            clip_card_params = {"font_file": lang_font_basename}
             clip_split_params = {"bg_color": "#1a0a2e"}
             clip_follow_params = {}
         elif frame_layout == "follow_bar":
@@ -2055,23 +2219,24 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             }
             compose_follow_bar(raw_path, out_path, preset,
                                title_text=card_text,
-                               font_file="Ponnala-Regular.ttf",
+                               font_file=lang_font_basename,
                                text_color="#ffff00",
                                bg_color="#1a0a2e",
+                               follow_text=lang_follow_text,
                                velvet_style=_default_velvet)
             compose_meta = {}
-            clip_card_params = {"font_file": "Ponnala-Regular.ttf",
+            clip_card_params = {"font_file": lang_font_basename,
                                  "font_size": 60, "text_color": "#ffff00"}
             clip_split_params = {}
             clip_follow_params = {"bg_color": "#1a0a2e", "text_color": "#ffff00",
-                                   "follow_text": "FOLLOW KAIZER NEWS TELUGU",
+                                   "follow_text": lang_follow_text,
                                    "follow_text_color": "#ffffff", "social_logos": [],
                                    "velvet_style": _default_velvet}
         else:
             compose_meta = compose_clip(
                 raw_path, img, card_text, out_path, preset,
                 font_size=52,
-                font_file="Ponnala-Regular.ttf",
+                font_file=lang_font_basename,
                 section_pct={"video": 0.4619, "text": 0.1691, "image": 0.3690},
                 card_style={"card_c0": "#c10000", "card_c1": "#800000",
                             "edge": 9, "jag": 60, "seed": 7,
@@ -2079,7 +2244,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             )
             clip_card_params = {
                 "font_size": compose_meta.get("font_size", 52),
-                "font_file": compose_meta.get("font_file", "Ponnala-Regular.ttf"),
+                "font_file": compose_meta.get("font_file", lang_font_basename),
                 "card_c0": "#c10000", "card_c1": "#800000",
                 "edge": 9, "jag": 60, "seed": 7,
                 "vsid": 35, "vcor": 72, "vwid": 74, "overlap": 20,
@@ -2103,7 +2268,9 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             "thumb_path":   os.path.abspath(thumb_path) if thumb_path else "",
             "image_path":   os.path.abspath(img),
             "text":         card_text,
-            "title_telugu": title_te,
+            "language":     lang_cfg.code,
+            "title_native": title_native,
+            "title_telugu": title_native,  # legacy alias
             "title_english": title_en,
             "start":        clip.get("start", ""),
             "end":          clip.get("end", ""),
@@ -2127,12 +2294,18 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         "video_path": os.path.abspath(video_path),
         "platform": platform,
         "frame_layout": frame_layout,
+        "language":    lang_cfg.code,
+        "language_english": lang_cfg.name_english,
+        "language_native": lang_cfg.name_native,
+        "script":      lang_cfg.script,
         "preset": preset,
         "video_type": video_type,
-        "title_telugu": title_te,
+        "title_native":  title_native,
+        "title_telugu":  title_native,  # legacy alias
         "title_english": title_en,
         "summary": summary,
-        "summary_telugu": summary_te,
+        "summary_native": summary_native,
+        "summary_telugu": summary_native,  # legacy alias
         "people": people,
         "topics": topics,
         "keywords": keywords,
@@ -2144,16 +2317,21 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(editor_meta, f, ensure_ascii=False, indent=2)
 
+    # Machine-parseable marker line for runner.py — canonical source for the
+    # post-pipeline clip-import step.  ASCII-only so it survives any encoding.
+    print(f"[kaizer:meta] {os.path.abspath(meta_path)}", flush=True)
+
     # Print summary report
     print("\n" + "=" * 60)
     print("  PIPELINE COMPLETE")
     print("=" * 60)
     print(f"  Frame layout: {FRAME_LAYOUTS[frame_layout]}")
     print(f"  Platform    : {preset['label']}")
+    print(f"  Language    : {lang_cfg.name_english} ({lang_cfg.script})")
     print(f"  Video type  : {video_type}")
     print(f"  Clips       : {len(editor_clips)}")
-    print(f"  Title (TE)  : {title_te}")
-    print(f"  Title (EN)  : {title_en}")
+    print(f"  Title ({lang_cfg.code}): {title_native}")
+    print(f"  Title (en)  : {title_en}")
     print(f"  Output      : {OUTPUT_DIR}")
     print(f"  Metadata   : {meta_path}")
 
@@ -2168,10 +2346,10 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         f"Frame      : {FRAME_LAYOUTS[frame_layout]}",
         f"Video type : {video_type}",
         f"Speakers   : {gemini_result.get('total_speakers', '?')}",
-        f"Language   : {gemini_result.get('language', '?')}",
+        f"Language   : {lang_cfg.name_english} ({lang_cfg.script}) — detected: {gemini_result.get('language', '?')}",
         "",
-        f"Title (TE) : {title_te}",
-        f"Title (EN) : {title_en}",
+        f"Title ({lang_cfg.code}) : {title_native}",
+        f"Title (en) : {title_en}",
         "",
         "CLIPS:",
     ]
@@ -2234,8 +2412,15 @@ if __name__ == "__main__":
                          help="Platform preset key")
     _parser.add_argument("--frame", default=None, choices=list(FRAME_LAYOUTS.keys()),
                          help="Frame layout key")
+    _parser.add_argument("--language", default="te",
+                         help="Language code (te|hi|ta|kn|ml|bn|mr|gu|en). Default: te")
+    _parser.add_argument("--default-image", default="",
+                         help="Absolute path to an image the user uploaded; when set, "
+                              "every clip uses THIS image instead of a fetched stock photo.")
     _args = _parser.parse_args()
     _video = _args.video
+    if _args.default_image:
+        os.environ["KAIZER_DEFAULT_IMAGE"] = _args.default_image
 
     if not _video:
         for ext in ("*.mp4", "*.MP4", "*.mkv", "*.avi"):
@@ -2257,4 +2442,5 @@ if __name__ == "__main__":
         print("Usage: python scripts/11_api_pipeline.py <video_path> [--platform X] [--frame Y]")
         sys.exit(1)
 
-    run_pipeline(os.path.abspath(_video), platform=_args.platform, frame_layout=_args.frame)
+    run_pipeline(os.path.abspath(_video), platform=_args.platform,
+                 frame_layout=_args.frame, language=_args.language)
