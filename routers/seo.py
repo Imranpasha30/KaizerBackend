@@ -1,4 +1,15 @@
-"""SEO router — per-clip SEO generation, status polling, manual edit, batch."""
+"""SEO router — per-clip GENERIC (channel-agnostic) SEO generation.
+
+Flow (post Content + Brand Overlay refactor):
+  - ONE Gemini-powered generation per clip, produces a GENERIC SEO JSON.
+  - At publish time, `seo.composer` overlays each destination's brand onto
+    the generic SEO to produce the actual uploaded title/description/tags.
+
+The old per-destination multi-variant endpoint surface is preserved (it's
+still used by the older PublishModal code paths) but now it all routes
+through the same generic generator — `channel_ids` and per-destination
+overrides are quietly ignored for generation.
+"""
 from __future__ import annotations
 
 import json
@@ -14,7 +25,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, get_db
 import models
 import auth
-from seo import enforcer, generator
+from seo import generator
 
 
 router = APIRouter(prefix="/api", tags=["seo"])
@@ -23,21 +34,18 @@ router = APIRouter(prefix="/api", tags=["seo"])
 # ─── Request schemas ──────────────────────────────────────────────────────────
 
 class GenerateSEORequest(BaseModel):
-    # Either `channel_id` (single, legacy) or `channel_ids` (multi, preferred).
-    # `channel_id(s)` are the DESTINATIONS (output branding).
-    channel_id:  Optional[int] = None
-    channel_ids: Optional[List[int]] = None
-    # Optional: learn writing STYLE from this channel instead of destination's
-    # own style.  None / same-as-destination = self-style (legacy behavior).
+    # Optional: learn writing RHYTHM from this channel's corpus + title formula.
+    # Its branding never appears in the output (sanitizer + verifier enforce).
     style_source_id: Optional[int] = None
     force: bool = False
     include_news: bool = True
+    include_trends: bool = True
+    include_yt_benchmark: bool = True
 
-
-class BulkGenerateRequest(BaseModel):
-    channel_id: int
-    force: bool = False
-    include_news: bool = True
+    # Legacy fields — accepted but ignored post-refactor (keeps older frontend
+    # builds from 422-ing while they're still deploying).
+    channel_id:  Optional[int] = None
+    channel_ids: Optional[List[int]] = None
 
 
 class UpdateSEORequest(BaseModel):
@@ -50,10 +58,8 @@ class UpdateSEORequest(BaseModel):
 
 
 # ─── In-process status tracker ────────────────────────────────────────────────
-# (This is intentionally simple. A DB-backed table would survive restarts but
-#  SEO generation completes in <30 s so ephemeral is fine.)
 
-_generation_status: dict[int, str] = {}   # clip_id -> "generating" | "done" | "error: ..."
+_generation_status: dict[int, str] = {}   # clip_id -> "idle" | "generating ..." | "done" | "error: ..."
 _generation_lock = threading.Lock()
 
 
@@ -69,16 +75,12 @@ def _get_status(clip_id: int) -> str:
 
 def _run_generate(
     clip_id: int,
-    channel_ids: list[int],
     include_news: bool,
+    include_trends: bool,
+    include_yt_benchmark: bool,
     style_source_id: Optional[int] = None,
 ) -> None:
-    """Background worker — generates SEO for each destination sequentially.
-
-    Each channel_id is a DESTINATION (branding target).  `style_source_id`,
-    if given, is the single reference channel whose style is applied across
-    every destination variant.  Per-clip variants are keyed by destination id.
-    """
+    """Background worker — 1 generic SEO per clip with retry-until-target loop."""
     db = SessionLocal()
     try:
         clip = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
@@ -93,40 +95,28 @@ def _run_generate(
                   .filter(models.Channel.id == style_source_id)
                   .first()
             )
-            # If the user picked a style that doesn't exist, continue without
-            # it rather than failing — safer UX; the variant still generates.
             if not style_source:
                 print(f"[seo] style_source {style_source_id} not found — using self-style")
 
-        import time as _time
-        errors: list[str] = []
-        ok_count = 0
-        for idx, cid in enumerate(channel_ids):
-            destination = db.query(models.Channel).filter(models.Channel.id == cid).first()
-            if not destination:
-                errors.append(f"channel {cid}: not found")
-                continue
-            _set_status(clip_id, f"generating ({ok_count + 1}/{len(channel_ids)}: {destination.name})")
-            try:
-                generator.generate_seo_for_clip(
-                    clip, destination,
-                    db=db,
-                    style_source=style_source,
-                    include_news=include_news,
-                )
-                ok_count += 1
-            except Exception as e:
-                traceback.print_exc()
-                errors.append(f"{destination.name}: {str(e)[:200]}")
-            if idx < len(channel_ids) - 1:
-                _time.sleep(2)
+        def _progress(stage: str, info) -> None:
+            label = f"{stage}"
+            if isinstance(info, str) and info:
+                label = f"{stage}: {info}"
+            elif isinstance(info, dict):
+                label = f"{stage}: " + ", ".join(f"{k}={v}" for k, v in info.items())
+            _set_status(clip_id, label)
 
-        if ok_count == 0:
-            _set_status(clip_id, f"error: {'; '.join(errors) or 'no SEO generated'}")
-        elif errors:
-            _set_status(clip_id, f"done_with_errors ({ok_count}/{len(channel_ids)}): {'; '.join(errors[:2])}")
-        else:
-            _set_status(clip_id, "done")
+        _set_status(clip_id, "generating: starting")
+        generator.generate_seo_for_clip(
+            clip,
+            db=db,
+            style_source=style_source,
+            include_news=include_news,
+            include_trends=include_trends,
+            include_yt_benchmark=include_yt_benchmark,
+            progress_cb=_progress,
+        )
+        _set_status(clip_id, "done")
     except Exception as e:
         traceback.print_exc()
         _set_status(clip_id, f"error: {str(e)[:200]}")
@@ -143,11 +133,12 @@ def generate_clip_seo(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
-    """Kick off SEO generation for one OR many channels in a background thread.
+    """Kick off GENERIC SEO generation for this clip.
 
-    - If `channel_ids` is set → fan out, producing one variant per channel.
-    - If only `channel_id` is set → single-channel path (legacy).
-    Poll `.../seo/status` for result.
+    A single background call produces one channel-agnostic SEO that will be
+    reused across every destination at publish time.  The optional
+    `style_source_id` teaches Gemini a writing voice; no branding from
+    that channel is ever emitted.
     """
     clip = (
         db.query(models.Clip)
@@ -158,32 +149,7 @@ def generate_clip_seo(
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    raw_ids: list[int] = []
-    if payload.channel_ids:
-        raw_ids.extend(payload.channel_ids)
-    if payload.channel_id is not None:
-        raw_ids.append(payload.channel_id)
-    seen: set[int] = set()
-    target_ids = [i for i in raw_ids if not (i in seen or seen.add(i))]
-    if not target_ids:
-        raise HTTPException(status_code=422, detail="At least one channel must be specified.")
-
-    # Validate all destination channels belong to this user
-    channels = (
-        db.query(models.Channel)
-          .filter(
-              models.Channel.id.in_(target_ids),
-              models.Channel.user_id == user.id,
-          )
-          .all()
-    )
-    found_ids = {c.id for c in channels}
-    missing = [i for i in target_ids if i not in found_ids]
-    if missing:
-        raise HTTPException(status_code=404, detail=f"Channel(s) not found: {missing}")
-
-    # Validate style_source (optional) also belongs to this user — can't borrow
-    # style from another user's private profile.
+    # Validate optional style source belongs to this user
     if payload.style_source_id is not None:
         src = (
             db.query(models.Channel)
@@ -199,35 +165,38 @@ def generate_clip_seo(
                 detail=f"Style-source channel {payload.style_source_id} not found",
             )
 
-    if not payload.force:
+    # Refuse to regenerate if SEO already exists AND force flag not set.
+    if not payload.force and clip.seo:
         try:
-            variants = json.loads(clip.seo_variants or "{}")
+            existing = json.loads(clip.seo)
         except (ValueError, TypeError):
-            variants = {}
-        # If every requested channel already has a variant, reject unless forced
-        already = [cid for cid in target_ids if str(cid) in variants]
-        if len(already) == len(target_ids) and already:
+            existing = {}
+        if isinstance(existing, dict) and existing.get("title"):
             raise HTTPException(
                 status_code=409,
-                detail="SEO already exists for all requested channels. Pass force=true to regenerate.",
+                detail="SEO already exists for this clip. Pass force=true to regenerate.",
             )
 
     if _get_status(clip_id).startswith("generating"):
         return {"status": "generating", "clip_id": clip_id}
 
-    _set_status(clip_id, f"generating (0/{len(target_ids)})")
+    _set_status(clip_id, "generating: queued")
     threading.Thread(
         target=_run_generate,
-        args=(clip_id, target_ids, payload.include_news, payload.style_source_id),
+        args=(
+            clip_id,
+            payload.include_news,
+            payload.include_trends,
+            payload.include_yt_benchmark,
+            payload.style_source_id,
+        ),
         daemon=True,
     ).start()
 
     return {
         "status": "generating",
         "clip_id": clip_id,
-        "channel_ids": target_ids,
         "style_source_id": payload.style_source_id,
-        "variant_count": len(target_ids),
     }
 
 
@@ -254,8 +223,8 @@ def update_clip_seo(
     payload: UpdateSEORequest,
     db: Session = Depends(get_db),
 ):
-    """Manual edit — merges user changes into the existing SEO JSON and
-    re-enforces constraints + score."""
+    """Manual edit — merge user changes into the generic SEO JSON and
+    recompute the deterministic verifier score."""
     clip = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -274,23 +243,19 @@ def update_clip_seo(
     for key, val in updates.items():
         seo[key] = val
 
-    # Re-enforce title length + hashtag shape, then recompute score
-    channel = (
-        db.query(models.Channel).filter(models.Channel.id == seo.get("channel_id")).first()
-        if seo.get("channel_id") else None
+    # Re-score with the deterministic verifier
+    from seo import verifier as _verifier
+    report = _verifier.verify(
+        seo,
+        clip_topic=(clip.text or ""),
+        trend_keywords=seo.get("trending_keywords") or [],
+        news_items=seo.get("news_context") or [],
     )
-    if channel:
-        # Only re-enforce the edited fields
-        if "title" in updates:
-            seo["title"] = enforcer._truncate_title_at_word(seo["title"], channel.name)
-        if "hashtags" in updates:
-            seo["hashtags"] = enforcer._ensure_hashtags(seo["hashtags"], channel.mandatory_hashtags or [])
-        if "keywords" in updates:
-            seo["keywords"] = enforcer._ensure_tags(seo["keywords"], channel.fixed_tags or [])
-        seo["seo_score"] = enforcer.compute_seo_score(seo, channel)
-
-    seo["edited_by_user"] = True
-    seo["edited_at"] = datetime.now(timezone.utc).isoformat()
+    seo["seo_score"]           = report["score"]
+    seo["verifier_breakdown"]  = report["breakdown"]
+    seo["verifier_reasons"]    = report["reasons"]
+    seo["edited_by_user"]      = True
+    seo["edited_at"]           = datetime.now(timezone.utc).isoformat()
 
     clip.seo = json.dumps(seo, ensure_ascii=False)
     db.commit()
@@ -309,39 +274,59 @@ def clear_clip_seo(clip_id: int, db: Session = Depends(get_db)):
     return {"clip_id": clip_id, "cleared": True}
 
 
-@router.post("/jobs/{job_id}/seo/generate-all")
-def generate_job_seo(
-    job_id: int,
-    payload: BulkGenerateRequest,
+# ─── Compose-preview for PublishModal (pure function, no side effects) ────────
+
+@router.get("/clips/{clip_id}/seo/compose-preview")
+def preview_composed_seo(
+    clip_id: int,
+    channel_id: int,
+    publish_kind: str = "video",
     db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
 ):
-    """Fan-out SEO generation over every clip in a job."""
-    job = db.query(models.Job).filter(models.Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    """Return the exact title/description/tags that would be uploaded to
+    `channel_id` for this clip — generic SEO + brand overlay from that channel.
 
-    channel = db.query(models.Channel).filter(models.Channel.id == payload.channel_id).first()
-    if not channel:
-        raise HTTPException(status_code=404, detail="Channel not found")
+    Used by PublishModal to show the user a destination-specific preview
+    BEFORE confirming publish.
+    """
+    clip = (
+        db.query(models.Clip)
+          .join(models.Job, models.Clip.job_id == models.Job.id)
+          .filter(models.Clip.id == clip_id, models.Job.user_id == user.id)
+          .first()
+    )
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    if not clip.seo:
+        raise HTTPException(status_code=409, detail="No SEO on this clip yet — generate first")
 
-    targeted = 0
-    skipped = 0
-    for clip in job.clips:
-        if clip.seo and not payload.force:
-            skipped += 1
-            continue
-        _set_status(clip.id, "generating")
-        threading.Thread(
-            target=_run_generate,
-            args=(clip.id, payload.channel_id, payload.include_news),
-            daemon=True,
-        ).start()
-        targeted += 1
+    dest = db.query(models.Channel).filter(
+        models.Channel.id == channel_id, models.Channel.user_id == user.id,
+    ).first()
+    if not dest:
+        raise HTTPException(status_code=404, detail="Destination channel not found")
+
+    try:
+        generic = json.loads(clip.seo)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=500, detail="Existing SEO is corrupt — regenerate")
+
+    from seo.composer import compose, assert_no_foreign_brand
+    composed = compose(generic, dest, publish_kind=publish_kind)
+
+    # Safety audit — lists any rival brand that leaked despite sanitizer
+    other_channels = (
+        db.query(models.Channel)
+          .filter(models.Channel.user_id == user.id, models.Channel.id != dest.id)
+          .all()
+    )
+    warnings = assert_no_foreign_brand(composed, dest, other_channels)
 
     return {
-        "job_id": job_id,
-        "targeted": targeted,
-        "skipped": skipped,
-        "total_clips": len(job.clips),
-        "channel_id": payload.channel_id,
+        "clip_id":    clip_id,
+        "channel_id": dest.id,
+        "channel_name": dest.name,
+        "composed":   composed,
+        "leak_warnings": warnings,
     }

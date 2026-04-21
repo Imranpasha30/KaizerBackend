@@ -13,7 +13,7 @@ from typing import Dict, List
 import feedparser
 
 
-_NEWS_TIMEOUT_S = 4.0
+_NEWS_TIMEOUT_S = 8.0   # bumped from 4s — cold Google News fetches can take 5-7s
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kaizer-news")
 
 # User-Agent matters: bare feedparser UA is blocked by Google News in some regions.

@@ -30,6 +30,8 @@ from routers.translation import router as translation_router
 from routers.trending import router as trending_router
 from routers.assets import router as assets_router
 from routers.veo import router as veo_router
+from routers.channel_groups import router as channel_groups_router
+from routers.billing import router as billing_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -68,6 +70,20 @@ def _migrate_schema():
             ucols = {c["name"] for c in inspector.get_columns("users")}
             if "socials" not in ucols:
                 conn.execute(text("ALTER TABLE users ADD COLUMN socials TEXT DEFAULT '{}'"))
+
+            # ── users: billing / subscription columns ────────────────────
+            user_billing_additions = {
+                "plan":                   "VARCHAR(20) DEFAULT 'free'",
+                "plan_cycle":             "VARCHAR(10) DEFAULT 'monthly'",
+                "plan_renews_at":         "TIMESTAMP NULL" if engine.dialect.name == "postgresql" else "DATETIME",
+                "stripe_customer_id":     "VARCHAR(64)",
+                "stripe_subscription_id": "VARCHAR(64)",
+                "monthly_clip_count":     "INTEGER DEFAULT 0",
+                "usage_reset_at":         "TIMESTAMP NULL" if engine.dialect.name == "postgresql" else "DATETIME",
+            }
+            for col, dtype in user_billing_additions.items():
+                if col not in ucols:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {dtype}"))
 
         # ── profile_destinations — seed from existing OAuthTokens so
         # pre-existing 1:1 profile↔destination links become rows in the
@@ -124,6 +140,25 @@ def _migrate_schema():
             for col, dtype in upload_additions.items():
                 if col not in existing_uploads:
                     conn.execute(text(f"ALTER TABLE upload_jobs ADD COLUMN {col} {dtype}"))
+
+        # ── oauth_tokens: cached YouTube-channel metadata ───────────────
+        # Populated on OAuth connect + manual refresh.  Eliminates repeated
+        # YT Data API calls for display-only fields (thumbnail, subs, etc.)
+        if inspector.has_table("oauth_tokens"):
+            existing_tokens = {c["name"] for c in inspector.get_columns("oauth_tokens")}
+            token_additions = {
+                "channel_description":   "TEXT DEFAULT ''",
+                "channel_thumbnail_url": "VARCHAR(500) DEFAULT ''",
+                "channel_custom_url":    "VARCHAR(120) DEFAULT ''",
+                "channel_country":       "VARCHAR(10) DEFAULT ''",
+                "subscriber_count":      "INTEGER DEFAULT 0",
+                "video_count":           "INTEGER DEFAULT 0",
+                "view_count":            "BIGINT DEFAULT 0",
+                "metadata_cached_at":    "TIMESTAMP NULL" if engine.dialect.name == "postgresql" else "DATETIME",
+            }
+            for col, dtype in token_additions.items():
+                if col not in existing_tokens:
+                    conn.execute(text(f"ALTER TABLE oauth_tokens ADD COLUMN {col} {dtype}"))
 
         conn.commit()
 
@@ -197,6 +232,8 @@ app.include_router(translation_router)
 app.include_router(trending_router)
 app.include_router(assets_router)
 app.include_router(veo_router)
+app.include_router(channel_groups_router)
+app.include_router(billing_router)
 
 
 # ── Upload worker lifecycle ──────────────────────────────────────────────────

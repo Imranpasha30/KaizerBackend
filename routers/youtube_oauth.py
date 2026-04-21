@@ -54,7 +54,20 @@ def list_accounts(
                 "google_channel_id":    t.google_channel_id or "",
                 "youtube_channel_title": t.google_channel_title or "Your YouTube channel",
                 "connected_at":         t.connected_at.isoformat() if t.connected_at else None,
+                # Cached YT metadata — served from DB, no API call per page load
+                "description":          t.channel_description or "",
+                "thumbnail_url":        t.channel_thumbnail_url or "",
+                "custom_url":           t.channel_custom_url or "",
+                "country":              t.channel_country or "",
+                "subscriber_count":     int(t.subscriber_count or 0),
+                "video_count":          int(t.video_count or 0),
+                "view_count":           int(t.view_count or 0),
+                "metadata_cached_at":   t.metadata_cached_at.isoformat() if t.metadata_cached_at else None,
                 "profiles":             [],
+                # Channel ID of the PRIMARY profile for this YT account — the
+                # one whose oauth_token directly holds creds.  Used by the UI
+                # to target refresh / disconnect operations.
+                "primary_profile_id":   t.channel_id,
             }
         if t.channel:
             groups[key]["profiles"].append({
@@ -70,6 +83,52 @@ def list_accounts(
         key=lambda g: g.get("connected_at") or "",
         reverse=True,
     )
+
+
+@router.post("/accounts/{channel_id}/refresh")
+def refresh_account(
+    channel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Pull fresh YouTube metadata for an OAuth-linked profile and update the
+    cached fields (thumbnail, subscriber count, description, etc.).
+
+    Costs 1 YouTube Data API unit — infinitely cheaper than refetching on
+    every page render.  Frontend calls this when the user clicks the refresh
+    icon next to their account card.
+    """
+    # Ownership check — only the profile owner can refresh
+    channel = db.query(models.Channel).filter(
+        models.Channel.id == channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not channel:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not channel.oauth_token or not channel.oauth_token.refresh_token_enc:
+        raise HTTPException(
+            status_code=409,
+            detail="Profile is not connected to YouTube — link it first.",
+        )
+
+    try:
+        token = oauth.refresh_account_metadata(db, channel_id)
+    except oauth.OAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "channel_id":           channel_id,
+        "google_channel_id":    token.google_channel_id,
+        "youtube_channel_title": token.google_channel_title,
+        "description":          token.channel_description or "",
+        "thumbnail_url":        token.channel_thumbnail_url or "",
+        "custom_url":           token.channel_custom_url or "",
+        "country":              token.channel_country or "",
+        "subscriber_count":     int(token.subscriber_count or 0),
+        "video_count":          int(token.video_count or 0),
+        "view_count":           int(token.view_count or 0),
+        "metadata_cached_at":   token.metadata_cached_at.isoformat() if token.metadata_cached_at else None,
+    }
 
 
 @router.get("/authorize")

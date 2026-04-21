@@ -131,12 +131,31 @@ def exchange_code(db, state: str, code: str) -> Tuple[models.Channel, models.OAu
             "Google account's third-party permissions and try again."
         )
 
-    # Fetch the YouTube channel identity (id + title) to associate with this row
-    yt_channel_id, yt_channel_title = _fetch_identity(creds)
+    # Fetch the FULL channel metadata (identity + description + stats +
+    # thumbnail) in ONE API call — caches everything we need for the UI so
+    # subsequent renders don't round-trip to YouTube.
+    try:
+        meta = fetch_channel_metadata(creds)
+    except OAuthError:
+        # Fall back to legacy identity-only fetch so connect still succeeds
+        yt_id, yt_title = _fetch_identity(creds)
+        meta = {"google_channel_id": yt_id, "google_channel_title": yt_title}
+
+    yt_channel_id    = meta.get("google_channel_id", "") or ""
+    yt_channel_title = meta.get("google_channel_title", "") or ""
 
     token = channel.oauth_token or models.OAuthToken(channel_id=channel.id)
     token.google_channel_id    = yt_channel_id
     token.google_channel_title = yt_channel_title
+    # Rich metadata — safe when keys are absent (fallback path above)
+    token.channel_description   = meta.get("channel_description", "") or ""
+    token.channel_thumbnail_url = meta.get("channel_thumbnail_url", "") or ""
+    token.channel_custom_url    = meta.get("channel_custom_url", "") or ""
+    token.channel_country       = meta.get("channel_country", "") or ""
+    token.subscriber_count      = int(meta.get("subscriber_count", 0) or 0)
+    token.video_count           = int(meta.get("video_count", 0) or 0)
+    token.view_count            = int(meta.get("view_count", 0) or 0)
+    token.metadata_cached_at    = datetime.now(timezone.utc)
     token.refresh_token_enc    = crypto.encrypt(creds.refresh_token)
     token.access_token_enc     = crypto.encrypt(creds.token or "")
     token.token_expiry         = creds.expiry.replace(tzinfo=timezone.utc) if creds.expiry else None
@@ -177,6 +196,95 @@ def _fetch_identity(creds: Credentials) -> Tuple[str, str]:
         return items[0].get("id", ""), snip.get("title", "")
     except Exception:
         return "", ""
+
+
+def fetch_channel_metadata(creds: Credentials) -> dict:
+    """Pull rich YouTube channel metadata with ONE API call.
+
+    Returns a dict the caller can splat onto an OAuthToken row.  All fields
+    default to empty / 0 so a partial YT response never crashes the caller.
+    Raises OAuthError on hard failures; returns best-effort on transient ones.
+    """
+    default = {
+        "google_channel_id":    "",
+        "google_channel_title": "",
+        "channel_description":  "",
+        "channel_thumbnail_url":"",
+        "channel_custom_url":   "",
+        "channel_country":      "",
+        "subscriber_count":     0,
+        "video_count":          0,
+        "view_count":           0,
+    }
+    try:
+        yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        # One API call returns identity + snippet + stats together — the
+        # quota cost is 1 unit regardless of how many `part`s we request.
+        resp = yt.channels().list(
+            part="id,snippet,statistics",
+            mine=True,
+        ).execute()
+    except Exception as e:
+        raise OAuthError(f"YouTube API call failed: {e}") from e
+
+    items = resp.get("items") or []
+    if not items:
+        return default
+
+    item = items[0]
+    snip = item.get("snippet")     or {}
+    stats = item.get("statistics") or {}
+    thumbs = snip.get("thumbnails") or {}
+    # Prefer high-res thumbnail; fall back through medium → default
+    thumb_url = (
+        (thumbs.get("high") or {}).get("url")
+        or (thumbs.get("medium") or {}).get("url")
+        or (thumbs.get("default") or {}).get("url")
+        or ""
+    )
+
+    def _int(v):
+        try:
+            return int(v or 0)
+        except (ValueError, TypeError):
+            return 0
+
+    return {
+        "google_channel_id":    item.get("id", ""),
+        "google_channel_title": snip.get("title", ""),
+        "channel_description":  snip.get("description", "") or "",
+        "channel_thumbnail_url": thumb_url,
+        "channel_custom_url":   snip.get("customUrl", "") or "",
+        "channel_country":      snip.get("country", "") or "",
+        "subscriber_count":     _int(stats.get("subscriberCount")),
+        "video_count":          _int(stats.get("videoCount")),
+        "view_count":           _int(stats.get("viewCount")),
+    }
+
+
+def refresh_account_metadata(db, channel_id: int) -> models.OAuthToken:
+    """Re-fetch live YT metadata + persist on the token row.  Used by the
+    /accounts/{id}/refresh endpoint so the user can pull the latest state
+    after renaming their channel, changing their avatar, etc.
+    """
+    creds = get_credentials(db, channel_id)  # handles token refresh too
+    meta  = fetch_channel_metadata(creds)
+
+    token = (
+        db.query(models.OAuthToken)
+          .filter(models.OAuthToken.channel_id == channel_id)
+          .first()
+    )
+    if not token:
+        raise OAuthError(f"No OAuth token for channel {channel_id}")
+
+    from datetime import datetime, timezone
+    for k, v in meta.items():
+        setattr(token, k, v)
+    token.metadata_cached_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(token)
+    return token
 
 
 # ─── Service minting (used by worker + learning) ────────────────────────────

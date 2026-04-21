@@ -87,9 +87,10 @@ pyasn1_modules==0.4.2
 # ─── Image handling (asset uploads) ──────────────────────────
 pillow==12.1.0
 
-# ─── Trending / news (RSS + corpus learning) ─────────────────
+# ─── Trending / news (RSS + corpus learning + Google Trends) ─
 feedparser==6.0.12
 sgmllib3k==1.0.0
+pytrends==4.9.2
 
 # ─── Retry logic (SEO generator) ─────────────────────────────
 tenacity==9.1.4

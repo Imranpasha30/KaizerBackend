@@ -1,216 +1,210 @@
-"""SEO prompt builders — system + user prompts for Gemini.
+"""SEO prompt builders — CHANNEL-AGNOSTIC output.
 
-Ported from the Chrome extension's `buildSystemPrompt` + `buildUserPrompt` in
-background.js. The system prompt encodes channel rules, title formula,
-mandatory hashtags, and the output contract. The user prompt pipes the clip's
-metadata + live news context into a single generate_content call.
+New architecture (Content + Brand Overlay):
+  - Gemini produces GENERIC SEO — no channel name in title, no mandatory
+    hashtags, no footer.  Just the news content optimized for discoverability.
+  - Branding (destination's name, hashtags, footer) is injected LATER at
+    publish time by `seo.composer.compose(...)`.
+
+Optional `style_source` teaches writing VOICE only — never identity.  Sanitizer
+runs post-generation to strip any brand leaks Gemini may have slipped in.
+
+Context layers fed to Gemini:
+  1. Clip facts               — what the video is actually about
+  2. Google News items        — factually grounded details
+  3. Google Trends keywords   — terms people are searching RIGHT NOW
+  4. YouTube top-5 titles     — winning title patterns for this topic this week
+  5. Style corpus             — hook/title rhythm to emulate (from style_source)
+  6. User retry feedback      — verifier failures from previous attempt(s)
 """
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import List, Dict, Any, Optional
 
 import models
 
 
+# ── System prompt (content-only) ─────────────────────────────────────────────
+
 def build_system_prompt(
-    destination: models.Channel,
+    *,
+    language: str = "te",
     style_source: Optional[models.Channel] = None,
+    target_score: int = 95,
 ) -> str:
-    """System prompt.
-
-    - `destination` — whose YouTube channel the SEO is being generated for.
-      All OUTPUT branding comes from this: title suffix, mandatory hashtags,
-      fixed tags, footer, handle.
-    - `style_source` — optional reference channel (e.g. a competitor) whose
-      writing style (title formula + desc style) Gemini should emulate.  If
-      None, the destination's own style is used.
-
-    Destination never equals style_source in intent: destination is WHO we
-    publish as, style_source is HOW we write.  The prompt makes this split
-    explicit so Gemini doesn't bleed RTV-style branding into a Kaizer video.
+    """Channel-agnostic system prompt.  Tells Gemini to produce news-topic SEO
+    with ZERO channel branding — that's added mechanically at publish time.
     """
-    name = destination.name
-    handle = destination.handle or "(no handle)"
-    footer = (destination.footer or "").strip()
-    lang = destination.language or "te"
-
-    mandatory = ", ".join(destination.mandatory_hashtags or []) or "(none)"
-    fixed = ", ".join(destination.fixed_tags or []) or "(none)"
-
-    has_footer = "yes — will be appended automatically; do NOT include subscribe/hashtag lines in description" if footer else "none"
-
-    # Style comes from style_source if provided, else destination's own.
-    style = style_source or destination
-    title_formula = (style.title_formula or f"Viral Hook ({lang}) | {name}").strip()
-    desc_style = style.desc_style or "hook_first"
-
-    # Distinct-source block — only appears when learning from a different
-    # channel, so Gemini understands "match rhythm/voice from X, publish as Y."
-    style_ref_block = ""
-    if style_source and style_source.id != destination.id:
-        src_name = style_source.name
-        src_handle = style_source.handle or "(no handle)"
-        style_ref_block = f"""
-# Writing style reference (LEARN FROM — do NOT copy branding)
-You are learning the *writing rhythm* of **{src_name}** ({src_handle}): their
-title-formula pattern, their description cadence, and their hook style.  Do
-NOT put {src_name}'s name, handle, hashtags, or footer into the output.  The
-video is being published on **{name}**, so all branding stays as {name}'s.
+    voice_block = ""
+    if style_source:
+        tf = (style_source.title_formula or "").strip()
+        ds = (style_source.desc_style or "hook_first").strip()
+        voice_block = f"""
+# Writing voice reference (LEARN FROM — do NOT mention the reference channel)
+You are studying a top-performing news channel's writing rhythm.
+- Title formula pattern: {tf or "(none — use your best judgement for native-script news)"}
+- Description style: {ds}
+Do NOT include the reference channel's name, handle, hashtags, or any
+branding in the output.  Use only its RHYTHM and WORDING STYLE.
 """
 
     return f"""\
-You are a YouTube SEO expert specializing in {lang} news content. You write viral,
-click-worthy, factually-honest titles and descriptions for the channel **{name}** ({handle}).
-{style_ref_block}
-# Destination channel (ALL branding in output MUST reflect this channel)
-- Channel name: {name}
-- Channel handle: {handle}
-- Title formula: {title_formula}
-- Description style: {desc_style}
-- Mandatory hashtags (MUST appear verbatim, as-is): {mandatory}
-- Fixed tags (MUST all be present in the keywords list): {fixed}
-- Footer: {has_footer}
-- Language target: {lang} (native-script-dominant; English hook is encouraged)
+You are an elite YouTube SEO strategist specializing in {language}-language news.
+Your job: write viral, click-worthy, factually-honest SEO metadata that will
+score ≥{target_score}/100 on our independent verifier.
 
+# Critical rule — CHANNEL-AGNOSTIC OUTPUT
+The output MUST be completely generic — it will be reused across many
+different YouTube channels.  Therefore:
+- Title MUST NOT end with " | ChannelName" or contain any channel's name.
+- Description MUST NOT mention any channel by name, URL, or @handle.
+- Description MUST NOT include subscribe lines, Follow-us blocks, or emoji
+  footer blocks — those are added per-destination by downstream systems.
+- Hashtags MUST NOT include channel-branded tags like #RTVTelugu or
+  #TV9News — only TOPIC hashtags like #NPSRetirees or #RevanthReddy.
+- Keywords MUST NOT contain channel names — only news-topic terms.
+
+Any channel name, handle, or URL that leaks in will cost score points AND
+will be mechanically stripped before publish.
+{voice_block}
 # Output contract (strict — response_schema is enforced)
-- `title`: max 100 chars INCLUDING the trailing ` | {name}` suffix. Bilingual
-  (English hook + native-script translation) OR fully native-script. MUST end
-  with ` | {name}` — never any other channel name.
-- `description`: 600–1500 chars. Plain text, no markdown. Open with the HOOK
-  sentence. 2–3 context paragraphs. Do NOT include subscribe lines, hashtag
-  lines, or emojis on their own line — the footer is appended automatically.
-  NEVER mention or brand for any channel other than **{name}**.
-- `keywords`: 28–30 SEO tags. Plain strings, no '#', no quotes. Mix English +
-  native-script. MUST include every tag from the "Fixed tags" list above,
-  verbatim (case-insensitive).  Never include tags that brand a different
-  channel's name unless topically relevant to the news story.
-- `hashtags`: 10–12 unique hashtags with '#' prefix, CamelCase only (no spaces,
-  no punctuation inside). First items MUST be the mandatory hashtags above.
-- `hook`: one strong opening sentence reused on thumbnails + social.
-- `thumbnail_text`: 2–5 short shouting words, no punctuation.
+- `title`: 50-95 characters.  Bilingual (English hook + native-script) OR
+  fully native-script.  NO "| Channel" suffix anywhere.  Include a power
+  word (Shocking, Breaking, Exclusive, Revealed, Viral, or the native-script
+  equivalent: బిగ్, షాకింగ్, బ్రేకింగ్, వైరల్, ...).  Put the key person
+  / place in the first 6 words.
+- `description`: 700-1800 characters.  Plain text, no markdown.  Line 1 is
+  the HOOK sentence, verbatim.  Then 3 context paragraphs with blank-line
+  breaks.  Cite facts from "Live Google News context" if provided.  Do NOT
+  include hashtag-only lines or subscribe lines.
+- `keywords`: exactly 28-30 unique SEO tags.  Plain lowercase strings.  No
+  '#' prefix.  Total combined length ≤500 chars (YouTube hard cap).  Must
+  include 2-3 trending keywords from "Google Trends" if provided.  Mix
+  English + native-script.
+- `hashtags`: 10-12 unique hashtags with '#' prefix, strict CamelCase.  No
+  spaces, no punctuation inside the tag.  Topic-only — NO channel brands.
+- `hook`: one strong opening sentence reused on thumbnails + social copy.
+- `thumbnail_text`: 2-5 shouting words, no punctuation.
 - `metadata.sentiment`: one of shock | breaking | political | emotional | analytical | positive
 - `metadata.category`: one of politics | cinema | sports | crime | national | state | viral | other
-- `metadata.viral_score`: hint 0–100 (the server recomputes it — don't game it)
+- `metadata.viral_score`: 0-100 (server recomputes — don't game)
 
 # Editorial rules
-1. This is news, not entertainment — never invent facts. Only restructure the
-   clip context and the Google News context provided.
-2. Use power words sparingly (Shocking, Breaking, Viral, Revealed, Exclusive,
-   and their native-script equivalents).
-3. Conversational newsroom phrasing, not literary.
-4. Prefer numbers to vague claims.
-5. Put the key person / place in the first 6 words of the title.
-6. Never repeat the exact same phrase across title, hook, and thumbnail_text.
+1. News only, never entertainment fiction — use facts from the clip context
+   and the Google News items.
+2. Power words sparingly, not every sentence.
+3. Conversational newsroom phrasing.  Native-script should feel spoken, not
+   literary.
+4. Prefer concrete numbers to vague claims.
+5. Each of title / hook / thumbnail_text should use DIFFERENT phrasing.
+6. Every keyword and hashtag must be earnable — no generic stuffing like
+   "news news news".
 """
 
+
+# ── User prompt (per-clip, with all context layers) ──────────────────────────
 
 def build_user_prompt(
     *,
     clip: models.Clip,
-    destination: models.Channel,
+    language: str = "te",
+    news_items: Optional[List[Dict[str, Any]]] = None,
+    trends: Optional[Dict[str, Any]] = None,
+    yt_top: Optional[List[Dict[str, Any]]] = None,
+    corpus: Optional[Dict[str, Any]] = None,
     style_source: Optional[models.Channel] = None,
-    news_items: Optional[list[dict]] = None,
-    corpus: Optional[dict] = None,
-    socials: Optional[dict] = None,
+    retry_feedback: Optional[List[str]] = None,
 ) -> str:
-    """Per-clip user prompt. Injects meta + live news + optional learned corpus
-    + the user's social-link map so the description ends with a cross-promo block.
-
-    `destination` provides output branding; `style_source` is the (optional)
-    channel whose corpus/style patterns we learn from.  When style_source is
-    provided and distinct from destination, the corpus label below makes that
-    explicit so Gemini doesn't misread reference titles as destination titles.
-    """
-    # Reminder for linters/IDEs — `channel` is deprecated, kept as alias below.
-    channel = destination
+    """Per-clip user prompt with all grounded research layers + retry context."""
     try:
         meta = json.loads(clip.meta or "{}")
     except (ValueError, TypeError):
         meta = {}
 
     summary_en = (meta.get("summary") or "").strip()
-    summary_te = (meta.get("summary_telugu") or "").strip()
+    summary_native = (meta.get("summary_telugu") or meta.get("summary_native") or "").strip()
     headline = (clip.text or meta.get("text") or "").strip()
-
     key_people = meta.get("key_people") or meta.get("speakers") or []
     key_topics = meta.get("key_topics") or []
     key_locations = meta.get("key_locations") or []
     sentiment = (clip.sentiment or meta.get("mood") or "").strip()
+    duration_str = f"{clip.duration:.1f}s" if clip.duration else "unknown"
 
+    # ── News block ──
     news_block = ""
     if news_items:
-        news_block = "\n# Live Google News context (ground your wording in these facts)\n"
-        for i, item in enumerate(news_items, 1):
+        news_block = "\n# Live Google News context (ground wording in THESE facts)\n"
+        for i, item in enumerate(news_items[:8], 1):
             src = item.get("source") or "Google News"
             news_block += f"{i}. {item['title']} — {src}\n"
 
+    # ── Trends block ──
+    trends_block = ""
+    if trends and (trends.get("related_queries") or trends.get("rising_queries") or trends.get("trending_now")):
+        trends_block = "\n# Google Trends — incorporate 2-3 of these into keywords AND at least 1 into title/description\n"
+        if trends.get("related_queries"):
+            trends_block += f"Related to topic: {', '.join(trends['related_queries'][:8])}\n"
+        if trends.get("rising_queries"):
+            trends_block += f"Rising queries: {', '.join(trends['rising_queries'][:6])}\n"
+        if trends.get("trending_now"):
+            trends_block += f"Trending now (regional): {', '.join(trends['trending_now'][:6])}\n"
+
+    # ── YouTube top-5 block ──
+    yt_block = ""
+    if yt_top:
+        yt_block = "\n# YouTube top-performing titles for this topic (last 7 days) — emulate the hook shape, do NOT copy verbatim\n"
+        for i, v in enumerate(yt_top[:5], 1):
+            views = v.get("views", 0)
+            yt_block += f'{i}. [{views:,} views] "{v.get("title", "")}"\n'
+
+    # ── Style corpus block (from style_source) ──
     corpus_block = ""
     if corpus and corpus.get("top_titles"):
-        if style_source and style_source.id != destination.id:
-            corpus_block = (
-                f"\n# Reference titles from **{style_source.name}** "
-                f"(LEARN the rhythm/hook shape — do NOT copy their channel name "
-                f"or branding; publish as {destination.name})\n"
-            )
-        else:
-            corpus_block = "\n# Top-performing titles on this channel (match rhythm/hook style, don't copy)\n"
-        for t in (corpus["top_titles"] or [])[:10]:
+        label = style_source.name if style_source else "reference style"
+        corpus_block = (
+            f"\n# Writing-voice corpus from {label} — emulate RHYTHM, do NOT mention them by name\n"
+        )
+        for t in (corpus["top_titles"] or [])[:8]:
             corpus_block += f"- {t}\n"
         if corpus.get("hook_patterns"):
-            corpus_block += "\nCommon hook patterns: " + ", ".join(corpus["hook_patterns"][:8]) + "\n"
+            corpus_block += "Common hooks: " + " | ".join(corpus["hook_patterns"][:6]) + "\n"
 
-    duration_str = f"{clip.duration:.1f}s" if clip.duration else "unknown"
-
-    # Cross-promo block — only emit when the user actually set some links.
-    social_block = ""
-    if socials:
-        pretty = {
-            "youtube":   "▶ YouTube",
-            "website":   "🌐 Website",
-            "twitter":   "𝕏 / Twitter",
-            "instagram": "📸 Instagram",
-            "facebook":  "📘 Facebook",
-            "whatsapp":  "📱 WhatsApp",
-            "telegram":  "✈ Telegram",
-            "linkedin":  "💼 LinkedIn",
-            "tiktok":    "🎵 TikTok",
-            "threads":   "@ Threads",
-            "email":     "✉ Email",
-        }
-        lines = []
-        for k in ("youtube", "website", "twitter", "instagram", "facebook",
-                 "whatsapp", "telegram", "linkedin", "tiktok", "threads", "email"):
-            v = (socials.get(k) or "").strip()
-            if v:
-                label = pretty.get(k, k.capitalize())
-                lines.append(f"{label}: {v}")
-        # Any other keys not in the canonical list
-        for k, v in socials.items():
-            if k in pretty:
-                continue
-            v = (v or "").strip() if isinstance(v, str) else ""
-            if v:
-                lines.append(f"{k.capitalize()}: {v}")
-        if lines:
-            social_block = (
-                "\n# User's social links — APPEND these as a '— Follow us —' section "
-                "at the END of the description, one per line, with their emoji/label exactly as shown.\n"
-                + "\n".join(lines) + "\n"
-            )
+    # ── Retry feedback (from verifier) ──
+    retry_block = ""
+    if retry_feedback:
+        retry_block = (
+            "\n# ⚠ PREVIOUS ATTEMPT SCORED BELOW TARGET — YOU MUST FIX EACH ISSUE BELOW\n"
+            "# This is your chance to recover.  Every line below is a direct order.\n"
+            "# Do NOT keep any element that violates these rules.  Regenerate fully.\n\n"
+        )
+        for i, fail in enumerate(retry_feedback[:14], 1):
+            retry_block += f"  {i}. {fail}\n"
+        retry_block += (
+            "\n# How to respond to this feedback\n"
+            "- Treat every item as a HARD constraint, not a suggestion.\n"
+            "- Do NOT paraphrase the old title/description/keywords — rewrite them.\n"
+            "- If a specific trending keyword or phrase was named, copy it VERBATIM\n"
+            "  into the title or description (exact spelling, including case if native).\n"
+            "- If a channel-suffix leak was flagged, the title must NOT end with '|'\n"
+            "  followed by anything at all.  Zero exceptions.\n"
+            "- Hit 95/100 this time — a verifier will regrade immediately.\n"
+        )
 
     return f"""\
-Generate YouTube SEO for this news clip. Follow the response_schema exactly.
+Generate YouTube SEO for this news clip.  Follow the response_schema exactly
+and produce CHANNEL-AGNOSTIC content (no channel names, no footer).
 
-# Clip
+# Clip facts
 - Current headline on-screen: {headline or '(none)'}
 - English summary: {summary_en or '(none)'}
-- Telugu summary: {summary_te or '(none)'}
+- Native-script summary: {summary_native or '(none)'}
 - Key people: {', '.join(key_people) if key_people else '(none)'}
 - Key topics: {', '.join(key_topics) if key_topics else '(none)'}
 - Key locations: {', '.join(key_locations) if key_locations else '(none)'}
 - Sentiment / mood: {sentiment or '(unspecified)'}
 - Clip duration: {duration_str}
-{news_block}{corpus_block}{social_block}
+- Target language: {language}
+{news_block}{trends_block}{yt_block}{corpus_block}{retry_block}
 Write the JSON now.
 """

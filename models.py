@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean,
+    Column, Integer, BigInteger, String, Text, DateTime, ForeignKey, Float, Boolean,
     JSON, UniqueConstraint, Index,
 )
 from sqlalchemy.orm import relationship
@@ -28,6 +28,21 @@ class User(Base):
     socials       = Column(JSON, default=dict)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     last_login_at = Column(DateTime(timezone=True), nullable=True)
+
+    # ── Billing / subscription ──────────────────────────────────────────
+    # `plan` matches keys in billing/plans.py.  New accounts default to "free".
+    # Stripe fields are populated later when the actual billing pipe is wired;
+    # kept nullable so development works without Stripe configured.
+    plan               = Column(String(20),  default="free", index=True)
+    plan_cycle         = Column(String(10),  default="monthly")   # monthly | yearly
+    plan_renews_at     = Column(DateTime(timezone=True), nullable=True)
+    # Stripe bookkeeping — set by webhooks once live.  Null on free tier.
+    stripe_customer_id     = Column(String(64), nullable=True, index=True)
+    stripe_subscription_id = Column(String(64), nullable=True, index=True)
+    # Monthly usage counter.  Reset to 0 on the first of every month by a
+    # cron (or lazily on first check after `usage_reset_at`).
+    monthly_clip_count = Column(Integer,     default=0)
+    usage_reset_at     = Column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
@@ -149,7 +164,42 @@ class OAuthToken(Base):
     connected_at         = Column(DateTime(timezone=True), server_default=func.now())
     last_refreshed_at    = Column(DateTime(timezone=True), nullable=True)
 
+    # Cached YouTube-channel metadata — populated on OAuth connect + on manual
+    # refresh.  Eliminates repeat YT Data API calls for display-only fields.
+    # Stale until the user clicks "refresh" on the Channels page.
+    channel_description  = Column(Text,        default="")
+    channel_thumbnail_url = Column(String(500), default="")
+    channel_custom_url   = Column(String(120), default="")
+    channel_country      = Column(String(10),  default="")
+    subscriber_count     = Column(Integer,     default=0)
+    video_count          = Column(Integer,     default=0)
+    view_count           = Column(BigInteger,  default=0)
+    metadata_cached_at   = Column(DateTime(timezone=True), nullable=True)
+
     channel = relationship("Channel", back_populates="oauth_token")
+
+
+class ChannelGroup(Base):
+    """User-defined group of YouTube destinations for one-click fan-out.
+
+    Stores a list of `google_channel_id`s.  At publish time the user picks
+    a group (e.g. "English", "Telugu") and every destination in the group is
+    auto-selected — no manual checking on every upload.
+
+    `is_default_all` is a virtual marker for the implicit "Global" group
+    ("publish to every connected YT account").  The UI renders it but it's
+    never persisted — this row stays user-managed only.
+    """
+    __tablename__ = "channel_groups"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_group_user_name"),)
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    user_id            = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name               = Column(String(100), nullable=False)
+    description        = Column(Text, default="")
+    google_channel_ids = Column(JSON, default=list)  # ["UC_abc...", "UC_xyz..."]
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class OAuthState(Base):

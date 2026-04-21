@@ -117,54 +117,81 @@ def _compose_metadata(
     channel: models.Channel,
     payload: PublishRequest,
 ) -> tuple[str, str, list[str]]:
-    """Resolve title/description/tags using SEO + overrides.
+    """Resolve title / description / tags for an upload to `channel`.
 
-    Prefers the per-channel SEO variant (clip.seo_variants[channel.id]) when
-    one exists so each destination can be published with its own tailored
-    title/description/hashtags.  Falls back to the legacy `clip.seo` (last
-    generated) when no channel-specific variant is stored.
+    Content + Brand Overlay model:
+      - `clip.seo` holds the GENERIC (channel-agnostic) SEO produced by the
+        generator.
+      - `seo.composer.compose(generic, channel)` overlays the destination's
+        name suffix, mandatory hashtags, fixed tags, and footer.
+      - Result is the exact metadata uploaded to YouTube for this destination.
 
-    When publish_kind == 'short', appends the literal `#Shorts` hashtag so
-    YouTube's Shorts classifier picks the clip up.  Goes on the title if it
-    fits under 100 chars, otherwise on a new line of the description.
+    Legacy `clip.seo_variants` is still read as a fallback for older clips
+    that were generated before the refactor (they stored per-channel full
+    SEO blobs instead of a single generic one).  When present, we apply the
+    variant AS-IS for that destination (no composer re-pass — it's already
+    channel-scoped from the old flow).
+
+    Shorts handling is performed inside composer.compose().
     """
-    seo = {}
-    if payload.use_seo:
-        try:
-            variants = json.loads(clip.seo_variants or "{}")
-        except (ValueError, TypeError):
-            variants = {}
-        if not isinstance(variants, dict):
-            variants = {}
+    # Manual override wins everything — user typed title/desc in PublishModal
+    if not payload.use_seo:
+        title = (payload.title or clip.text or f"Kaizer clip #{clip.id}")[:100]
+        description = payload.description or ""
+        tags = payload.tags or []
+        if payload.publish_kind == "short":
+            if "shorts" not in [t.lower() for t in tags]:
+                tags = ["shorts", *tags]
+        from youtube.uploader import sanitize_tags
+        return title, description, sanitize_tags(tags)
 
-        # Precedence (first win):
-        # 1) Per-destination map: user picked a specific variant for THIS dest
-        # 2) Global override: same variant for every dest
-        # 3) Auto: match this destination's own style profile variant
-        # 4) Legacy: whatever clip.seo contains
-        per_dest = payload.variant_by_channel or {}
-        dest_key = str(channel.id)
-        if dest_key in per_dest:
-            v_key = str(per_dest[dest_key])
-            if v_key in variants:
-                seo = variants[v_key] or {}
-        if not seo and payload.seo_variant_override is not None:
-            key = str(payload.seo_variant_override)
-            if key in variants:
-                seo = variants[key] or {}
-        if not seo and dest_key in variants:
-            seo = variants[dest_key] or {}
-        if not seo and clip.seo:
-            try:
-                seo = json.loads(clip.seo)
-            except (ValueError, TypeError):
-                seo = {}
+    # ─── Try generic SEO + brand overlay (new path) ───
+    generic: dict = {}
+    if clip.seo:
+        try:
+            g = json.loads(clip.seo)
+            if isinstance(g, dict) and g.get("title"):
+                generic = g
+        except (ValueError, TypeError):
+            pass
+
+    if generic:
+        from seo.composer import compose
+        composed = compose(generic, channel, publish_kind=payload.publish_kind)
+        title = (payload.title or composed["title"])[:100]
+        description = payload.description or composed["description"]
+        tags = payload.tags if payload.tags is not None else composed["keywords"]
+        from youtube.uploader import sanitize_tags
+        return title, description, sanitize_tags(tags)
+
+    # ─── Legacy fallback: per-channel variants from old generation runs ───
+    try:
+        variants = json.loads(clip.seo_variants or "{}")
+    except (ValueError, TypeError):
+        variants = {}
+    if not isinstance(variants, dict):
+        variants = {}
+
+    per_dest = payload.variant_by_channel or {}
+    dest_key = str(channel.id)
+    legacy_seo: dict = {}
+    if dest_key in per_dest:
+        v_key = str(per_dest[dest_key])
+        if v_key in variants:
+            legacy_seo = variants[v_key] or {}
+    if not legacy_seo and payload.seo_variant_override is not None:
+        key = str(payload.seo_variant_override)
+        if key in variants:
+            legacy_seo = variants[key] or {}
+    if not legacy_seo and dest_key in variants:
+        legacy_seo = variants[dest_key] or {}
 
     title = (payload.title
-             or seo.get("title")
+             or legacy_seo.get("title")
              or clip.text
              or f"Kaizer clip #{clip.id}")[:100]
-    description = payload.description or seo.get("description") or ""
+    description = payload.description or legacy_seo.get("description") or ""
+    tags = payload.tags if payload.tags is not None else (legacy_seo.get("keywords") or [])
 
     if payload.publish_kind == "short":
         shorts_tag = "#Shorts"
@@ -172,23 +199,11 @@ def _compose_metadata(
             candidate = f"{title} {shorts_tag}"
             if len(candidate) <= 100:
                 title = candidate
-            else:
-                # Title at or near cap — keep it clean and put the tag in the
-                # description (also a valid signal for YouTube's classifier).
-                if shorts_tag.lower() not in description.lower():
-                    description = (shorts_tag + "\n\n" + description).strip()
+            elif shorts_tag.lower() not in description.lower():
+                description = (shorts_tag + "\n\n" + description).strip()
+        if "shorts" not in [t.lower() for t in tags]:
+            tags = ["shorts", *tags]
 
-    tags = payload.tags
-    if tags is None:
-        tags = seo.get("keywords") or []
-
-    # Ensure "shorts" is in the list for Shorts uploads (sanitize_tags dedupes/caps)
-    if payload.publish_kind == "short":
-        tags = ["shorts", *tags]
-
-    # Strip YouTube-forbidden chars, leading '#', cap length — avoids the
-    # `invalidTags 400` error that used to kill uploads when SEO produced
-    # hashtag-style tokens like "#shorts" or "<breakingnews>".
     from youtube.uploader import sanitize_tags
     return title, description, sanitize_tags(tags)
 
