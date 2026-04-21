@@ -72,13 +72,25 @@ def _migrate_schema():
         # ── profile_destinations — seed from existing OAuthTokens so
         # pre-existing 1:1 profile↔destination links become rows in the
         # new many-to-many table without the user having to re-link them.
+        # Dialect-aware: SQLite uses INSERT OR IGNORE, Postgres uses
+        # ON CONFLICT DO NOTHING on the (profile_id, google_channel_id) UK.
         if inspector.has_table("profile_destinations") and inspector.has_table("oauth_tokens"):
-            conn.execute(text("""
-                INSERT OR IGNORE INTO profile_destinations (profile_id, google_channel_id)
-                SELECT channel_id, google_channel_id
-                FROM oauth_tokens
-                WHERE google_channel_id IS NOT NULL AND google_channel_id != ''
-            """))
+            dialect = engine.dialect.name
+            if dialect == "postgresql":
+                conn.execute(text("""
+                    INSERT INTO profile_destinations (profile_id, google_channel_id)
+                    SELECT channel_id, google_channel_id
+                    FROM oauth_tokens
+                    WHERE google_channel_id IS NOT NULL AND google_channel_id != ''
+                    ON CONFLICT DO NOTHING
+                """))
+            else:
+                conn.execute(text("""
+                    INSERT OR IGNORE INTO profile_destinations (profile_id, google_channel_id)
+                    SELECT channel_id, google_channel_id
+                    FROM oauth_tokens
+                    WHERE google_channel_id IS NOT NULL AND google_channel_id != ''
+                """))
 
         # Migrate old 'frame' → 'frame_layout' if needed
         if "frame" in existing_jobs and "frame_layout" in existing_jobs:

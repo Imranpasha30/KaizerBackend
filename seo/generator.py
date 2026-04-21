@@ -167,13 +167,20 @@ def _extract_topic(clip: models.Clip) -> str:
 
 def generate_seo_for_clip(
     clip: models.Clip,
-    channel: models.Channel,
+    destination: models.Channel,
     *,
     db,
+    style_source: models.Channel | None = None,
     include_news: bool = True,
     include_corpus: bool = True,
 ) -> Dict[str, Any]:
-    """End-to-end SEO generation for one clip. Persists to `clip.seo` on success."""
+    """End-to-end SEO generation for one clip. Persists to `clip.seo` on success.
+
+    `destination` drives all OUTPUT branding (title suffix, mandatory hashtags,
+    fixed tags, footer). `style_source` — if provided and different — supplies
+    the writing style patterns (title formula, desc style, corpus). When
+    style_source is None, behavior equals the legacy self-style path.
+    """
     _configure_gemini()
 
     # 1. News grounding (best-effort; never blocks the main call)
@@ -183,22 +190,24 @@ def generate_seo_for_clip(
             topic = _extract_topic(clip)
             if topic:
                 news_items = news.fetch_news_context(
-                    topic, lang=channel.language or "te",
+                    topic, lang=destination.language or "te",
                 )
         except Exception as e:
             print(f"[seo] news fetch failed (non-fatal): {e}")
 
-    # 2. Channel corpus (Phase 7 — may be absent)
+    # 2. Corpus — learn from style_source when provided, else destination's own.
+    #    This way, picking RTV as style gets us RTV's top_titles + hook_patterns
+    #    even though the publish destination is a different channel.
     corpus_payload = None
-    if include_corpus and channel.corpus is not None:
-        corpus_payload = channel.corpus.payload or None
+    if include_corpus:
+        ref = style_source or destination
+        if ref and ref.corpus is not None:
+            corpus_payload = ref.corpus.payload or None
 
     # 3. Prompts — include the publishing user's social links so Gemini can
     # embed them as a cross-promo footer in the description.
     socials: dict = {}
     try:
-        # clip → job → user.  `clip.job` is a back-ref, `job.user` may be absent
-        # in old records.  Look up defensively.
         owner_id = None
         if getattr(clip, "job", None) is not None:
             owner_id = getattr(clip.job, "user_id", None)
@@ -209,10 +218,13 @@ def generate_seo_for_clip(
     except Exception:
         socials = {}
 
-    system_prompt = prompts.build_system_prompt(channel)
+    system_prompt = prompts.build_system_prompt(destination, style_source=style_source)
     user_prompt = prompts.build_user_prompt(
-        clip=clip, channel=channel,
-        news_items=news_items, corpus=corpus_payload,
+        clip=clip,
+        destination=destination,
+        style_source=style_source,
+        news_items=news_items,
+        corpus=corpus_payload,
         socials=socials,
     )
 
@@ -220,11 +232,19 @@ def generate_seo_for_clip(
     raw = _call_gemini(system_prompt, user_prompt)
 
     # 5. Enforcement (30 tags, 100-char title, CamelCase hashtags, computed score)
-    enforced = enforcer.enforce_quality(raw, channel)
+    #    Enforcement uses the DESTINATION channel — fixed tags, mandatory
+    #    hashtags, and title suffix MUST be the destination's, never the style
+    #    source's.  Even if Gemini slipped in RTV-branded output, enforcement
+    #    will rewrite the title suffix and ensure Kaizer's mandatory tags.
+    enforced = enforcer.enforce_quality(raw, destination)
 
-    # 6. Attach bookkeeping
-    enforced["channel_id"] = channel.id
-    enforced["channel_name"] = channel.name
+    # 6. Attach bookkeeping — channel_id is the DESTINATION (what we publish
+    #    as), with style_source_id recorded separately for audit.
+    enforced["channel_id"] = destination.id
+    enforced["channel_name"] = destination.name
+    if style_source and style_source.id != destination.id:
+        enforced["style_source_id"] = style_source.id
+        enforced["style_source_name"] = style_source.name
     enforced["generated_at"] = datetime.now(timezone.utc).isoformat()
     enforced["model"] = GEMINI_MODEL
     enforced["edited_by_user"] = False
@@ -237,9 +257,8 @@ def generate_seo_for_clip(
         for n in news_items
     ]
 
-    # 7. Persist — store under this channel's key in seo_variants AND update
-    # the legacy `clip.seo` field to this generation (for back-compat callers
-    # that still read the "current" SEO).
+    # 7. Persist — keyed by DESTINATION id so Publish picks the right variant
+    #    per real YouTube channel regardless of which style was borrowed.
     enforced_json = json.dumps(enforced, ensure_ascii=False)
     clip.seo = enforced_json
     try:
@@ -248,7 +267,7 @@ def generate_seo_for_clip(
             variants = {}
     except (ValueError, TypeError):
         variants = {}
-    variants[str(channel.id)] = enforced
+    variants[str(destination.id)] = enforced
     clip.seo_variants = json.dumps(variants, ensure_ascii=False)
     db.commit()
     try:

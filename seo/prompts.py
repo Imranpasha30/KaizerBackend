@@ -13,40 +13,78 @@ from typing import Optional
 import models
 
 
-def build_system_prompt(channel: models.Channel) -> str:
-    name = channel.name
-    handle = channel.handle or "(no handle)"
-    footer = (channel.footer or "").strip()
-    title_formula = (channel.title_formula or f"Viral English Hook (తెలుగు) | {name}").strip()
-    desc_style = channel.desc_style or "hook_first"
-    lang = channel.language or "te"
+def build_system_prompt(
+    destination: models.Channel,
+    style_source: Optional[models.Channel] = None,
+) -> str:
+    """System prompt.
 
-    mandatory = ", ".join(channel.mandatory_hashtags or []) or "(none)"
-    fixed = ", ".join(channel.fixed_tags or []) or "(none)"
+    - `destination` — whose YouTube channel the SEO is being generated for.
+      All OUTPUT branding comes from this: title suffix, mandatory hashtags,
+      fixed tags, footer, handle.
+    - `style_source` — optional reference channel (e.g. a competitor) whose
+      writing style (title formula + desc style) Gemini should emulate.  If
+      None, the destination's own style is used.
+
+    Destination never equals style_source in intent: destination is WHO we
+    publish as, style_source is HOW we write.  The prompt makes this split
+    explicit so Gemini doesn't bleed RTV-style branding into a Kaizer video.
+    """
+    name = destination.name
+    handle = destination.handle or "(no handle)"
+    footer = (destination.footer or "").strip()
+    lang = destination.language or "te"
+
+    mandatory = ", ".join(destination.mandatory_hashtags or []) or "(none)"
+    fixed = ", ".join(destination.fixed_tags or []) or "(none)"
 
     has_footer = "yes — will be appended automatically; do NOT include subscribe/hashtag lines in description" if footer else "none"
 
-    return f"""\
-You are a YouTube SEO expert specializing in Telugu news content. You write viral,
-click-worthy, factually-honest titles and descriptions for the channel **{name}** ({handle}).
+    # Style comes from style_source if provided, else destination's own.
+    style = style_source or destination
+    title_formula = (style.title_formula or f"Viral Hook ({lang}) | {name}").strip()
+    desc_style = style.desc_style or "hook_first"
 
-# Channel editorial profile
+    # Distinct-source block — only appears when learning from a different
+    # channel, so Gemini understands "match rhythm/voice from X, publish as Y."
+    style_ref_block = ""
+    if style_source and style_source.id != destination.id:
+        src_name = style_source.name
+        src_handle = style_source.handle or "(no handle)"
+        style_ref_block = f"""
+# Writing style reference (LEARN FROM — do NOT copy branding)
+You are learning the *writing rhythm* of **{src_name}** ({src_handle}): their
+title-formula pattern, their description cadence, and their hook style.  Do
+NOT put {src_name}'s name, handle, hashtags, or footer into the output.  The
+video is being published on **{name}**, so all branding stays as {name}'s.
+"""
+
+    return f"""\
+You are a YouTube SEO expert specializing in {lang} news content. You write viral,
+click-worthy, factually-honest titles and descriptions for the channel **{name}** ({handle}).
+{style_ref_block}
+# Destination channel (ALL branding in output MUST reflect this channel)
+- Channel name: {name}
+- Channel handle: {handle}
 - Title formula: {title_formula}
 - Description style: {desc_style}
 - Mandatory hashtags (MUST appear verbatim, as-is): {mandatory}
 - Fixed tags (MUST all be present in the keywords list): {fixed}
 - Footer: {has_footer}
-- Language target: {lang} (Telugu-dominant; English hook is encouraged)
+- Language target: {lang} (native-script-dominant; English hook is encouraged)
 
 # Output contract (strict — response_schema is enforced)
 - `title`: max 100 chars INCLUDING the trailing ` | {name}` suffix. Bilingual
-  (English hook + తెలుగు translation) OR fully Telugu. MUST end with ` | {name}`.
+  (English hook + native-script translation) OR fully native-script. MUST end
+  with ` | {name}` — never any other channel name.
 - `description`: 600–1500 chars. Plain text, no markdown. Open with the HOOK
   sentence. 2–3 context paragraphs. Do NOT include subscribe lines, hashtag
   lines, or emojis on their own line — the footer is appended automatically.
+  NEVER mention or brand for any channel other than **{name}**.
 - `keywords`: 28–30 SEO tags. Plain strings, no '#', no quotes. Mix English +
-  Telugu. MUST include every tag from the "Fixed tags" list above, verbatim
-  (case-insensitive).
+  native-script. MUST include every tag from the "Fixed tags" list above,
+  verbatim (case-insensitive).  Never include tags that brand a different
+  channel's name unless topically relevant to the news story.
 - `hashtags`: 10–12 unique hashtags with '#' prefix, CamelCase only (no spaces,
   no punctuation inside). First items MUST be the mandatory hashtags above.
 - `hook`: one strong opening sentence reused on thumbnails + social.
@@ -59,9 +97,9 @@ click-worthy, factually-honest titles and descriptions for the channel **{name}*
 1. This is news, not entertainment — never invent facts. Only restructure the
    clip context and the Google News context provided.
 2. Use power words sparingly (Shocking, Breaking, Viral, Revealed, Exclusive,
-   బిగ్, షాకింగ్, బ్రేకింగ్, వైరల్, సంచలనం).
-3. In Telugu: conversational newsroom phrasing, not literary.
-4. Prefer numbers to vague claims ("10 కోట్లు" > "huge amount").
+   and their native-script equivalents).
+3. Conversational newsroom phrasing, not literary.
+4. Prefer numbers to vague claims.
 5. Put the key person / place in the first 6 words of the title.
 6. Never repeat the exact same phrase across title, hook, and thumbnail_text.
 """
@@ -70,14 +108,22 @@ click-worthy, factually-honest titles and descriptions for the channel **{name}*
 def build_user_prompt(
     *,
     clip: models.Clip,
-    channel: models.Channel,
+    destination: models.Channel,
+    style_source: Optional[models.Channel] = None,
     news_items: Optional[list[dict]] = None,
     corpus: Optional[dict] = None,
     socials: Optional[dict] = None,
 ) -> str:
     """Per-clip user prompt. Injects meta + live news + optional learned corpus
     + the user's social-link map so the description ends with a cross-promo block.
+
+    `destination` provides output branding; `style_source` is the (optional)
+    channel whose corpus/style patterns we learn from.  When style_source is
+    provided and distinct from destination, the corpus label below makes that
+    explicit so Gemini doesn't misread reference titles as destination titles.
     """
+    # Reminder for linters/IDEs — `channel` is deprecated, kept as alias below.
+    channel = destination
     try:
         meta = json.loads(clip.meta or "{}")
     except (ValueError, TypeError):
@@ -101,7 +147,14 @@ def build_user_prompt(
 
     corpus_block = ""
     if corpus and corpus.get("top_titles"):
-        corpus_block = "\n# Top-performing titles on this channel (match rhythm/hook style, don't copy)\n"
+        if style_source and style_source.id != destination.id:
+            corpus_block = (
+                f"\n# Reference titles from **{style_source.name}** "
+                f"(LEARN the rhythm/hook shape — do NOT copy their channel name "
+                f"or branding; publish as {destination.name})\n"
+            )
+        else:
+            corpus_block = "\n# Top-performing titles on this channel (match rhythm/hook style, don't copy)\n"
         for t in (corpus["top_titles"] or [])[:10]:
             corpus_block += f"- {t}\n"
         if corpus.get("hook_patterns"):

@@ -24,8 +24,12 @@ router = APIRouter(prefix="/api", tags=["seo"])
 
 class GenerateSEORequest(BaseModel):
     # Either `channel_id` (single, legacy) or `channel_ids` (multi, preferred).
+    # `channel_id(s)` are the DESTINATIONS (output branding).
     channel_id:  Optional[int] = None
     channel_ids: Optional[List[int]] = None
+    # Optional: learn writing STYLE from this channel instead of destination's
+    # own style.  None / same-as-destination = self-style (legacy behavior).
+    style_source_id: Optional[int] = None
     force: bool = False
     include_news: bool = True
 
@@ -63,11 +67,17 @@ def _get_status(clip_id: int) -> str:
         return _generation_status.get(clip_id, "idle")
 
 
-def _run_generate(clip_id: int, channel_ids: list[int], include_news: bool) -> None:
-    """Background worker — generates SEO for each channel sequentially.
+def _run_generate(
+    clip_id: int,
+    channel_ids: list[int],
+    include_news: bool,
+    style_source_id: Optional[int] = None,
+) -> None:
+    """Background worker — generates SEO for each destination sequentially.
 
-    Each successful channel adds a variant under clip.seo_variants[channel_id].
-    clip.seo ends up as the last successfully generated variant (for back-compat).
+    Each channel_id is a DESTINATION (branding target).  `style_source_id`,
+    if given, is the single reference channel whose style is applied across
+    every destination variant.  Per-clip variants are keyed by destination id.
     """
     db = SessionLocal()
     try:
@@ -76,25 +86,38 @@ def _run_generate(clip_id: int, channel_ids: list[int], include_news: bool) -> N
             _set_status(clip_id, "error: clip not found")
             return
 
+        style_source = None
+        if style_source_id:
+            style_source = (
+                db.query(models.Channel)
+                  .filter(models.Channel.id == style_source_id)
+                  .first()
+            )
+            # If the user picked a style that doesn't exist, continue without
+            # it rather than failing — safer UX; the variant still generates.
+            if not style_source:
+                print(f"[seo] style_source {style_source_id} not found — using self-style")
+
         import time as _time
         errors: list[str] = []
         ok_count = 0
         for idx, cid in enumerate(channel_ids):
-            channel = db.query(models.Channel).filter(models.Channel.id == cid).first()
-            if not channel:
+            destination = db.query(models.Channel).filter(models.Channel.id == cid).first()
+            if not destination:
                 errors.append(f"channel {cid}: not found")
                 continue
-            _set_status(clip_id, f"generating ({ok_count + 1}/{len(channel_ids)}: {channel.name})")
+            _set_status(clip_id, f"generating ({ok_count + 1}/{len(channel_ids)}: {destination.name})")
             try:
-                generator.generate_seo_for_clip(clip, channel, db=db, include_news=include_news)
+                generator.generate_seo_for_clip(
+                    clip, destination,
+                    db=db,
+                    style_source=style_source,
+                    include_news=include_news,
+                )
                 ok_count += 1
             except Exception as e:
                 traceback.print_exc()
-                errors.append(f"{channel.name}: {str(e)[:200]}")
-                # keep going — one channel failing shouldn't abort the whole batch
-            # Small breather between variants — safety net against bursty
-            # per-minute limits.  With paid tier this is essentially free;
-            # on free tier (10 RPM) 2s keeps us well under the limit.
+                errors.append(f"{destination.name}: {str(e)[:200]}")
             if idx < len(channel_ids) - 1:
                 _time.sleep(2)
 
@@ -145,7 +168,7 @@ def generate_clip_seo(
     if not target_ids:
         raise HTTPException(status_code=422, detail="At least one channel must be specified.")
 
-    # Validate all channels belong to this user
+    # Validate all destination channels belong to this user
     channels = (
         db.query(models.Channel)
           .filter(
@@ -158,6 +181,23 @@ def generate_clip_seo(
     missing = [i for i in target_ids if i not in found_ids]
     if missing:
         raise HTTPException(status_code=404, detail=f"Channel(s) not found: {missing}")
+
+    # Validate style_source (optional) also belongs to this user — can't borrow
+    # style from another user's private profile.
+    if payload.style_source_id is not None:
+        src = (
+            db.query(models.Channel)
+              .filter(
+                  models.Channel.id == payload.style_source_id,
+                  models.Channel.user_id == user.id,
+              )
+              .first()
+        )
+        if not src:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Style-source channel {payload.style_source_id} not found",
+            )
 
     if not payload.force:
         try:
@@ -178,7 +218,7 @@ def generate_clip_seo(
     _set_status(clip_id, f"generating (0/{len(target_ids)})")
     threading.Thread(
         target=_run_generate,
-        args=(clip_id, target_ids, payload.include_news),
+        args=(clip_id, target_ids, payload.include_news, payload.style_source_id),
         daemon=True,
     ).start()
 
@@ -186,6 +226,7 @@ def generate_clip_seo(
         "status": "generating",
         "clip_id": clip_id,
         "channel_ids": target_ids,
+        "style_source_id": payload.style_source_id,
         "variant_count": len(target_ids),
     }
 
