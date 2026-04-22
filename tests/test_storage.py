@@ -62,13 +62,16 @@ if _BACKEND_ROOT not in sys.path:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_r2_env(monkeypatch, *, public_base_url: str = "") -> None:
+def _make_r2_env(monkeypatch, *, public_base_url: str = "", key_prefix: str = "") -> None:
     """Set the minimum R2 env vars so R2Storage() can be constructed."""
     monkeypatch.setenv("R2_BUCKET", "test-bucket")
     monkeypatch.setenv("R2_ENDPOINT", "https://test.r2.cloudflarestorage.com")
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "AKID1234567890abcdef")
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "supersecretkey")
     monkeypatch.setenv("R2_PUBLIC_BASE_URL", public_base_url)
+    # Always explicit — prevents .env leak from poisoning tests that assume
+    # unprefixed keys.
+    monkeypatch.setenv("R2_KEY_PREFIX", key_prefix)
 
 
 def _make_fake_client() -> MagicMock:
@@ -640,3 +643,116 @@ def test_r2_round_trip_real_network(tmp_path):
         # Always clean up, even on assertion failures
         storage.delete(unique_key)
         assert not storage.exists(unique_key), "Key should be gone after delete"
+
+
+# ---------------------------------------------------------------------------
+# R2_KEY_PREFIX — namespace isolation inside one bucket
+# ---------------------------------------------------------------------------
+
+
+class TestR2KeyPrefix:
+    """Covers the R2_KEY_PREFIX env var that lets dev/local/prod coexist in
+    a single bucket by prefixing every object key."""
+
+    def _make_storage(self, monkeypatch, *, key_prefix: str, public_base_url: str = "") -> tuple:
+        _make_r2_env(monkeypatch, public_base_url=public_base_url, key_prefix=key_prefix)
+        fake_client = _make_fake_client()
+        from pipeline_core.storage import R2Storage
+        storage = R2Storage()
+        storage._client = fake_client
+        return storage, fake_client
+
+    def test_prefix_applied_to_upload_key(self, tmp_path, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="local/")
+        src = tmp_path / "clip.mp4"
+        src.write_bytes(b"x")
+        storage.upload(str(src), "clips/42/master.mp4", content_type="video/mp4")
+        client.upload_file.assert_called_once_with(
+            str(src),
+            "test-bucket",
+            "local/clips/42/master.mp4",
+            ExtraArgs={"ContentType": "video/mp4"},
+        )
+
+    def test_prefix_applied_to_download(self, tmp_path, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="dev/")
+        dest = tmp_path / "out.mp4"
+        storage.download("clips/7/x.mp4", str(dest))
+        client.download_file.assert_called_once_with(
+            "test-bucket", "dev/clips/7/x.mp4", str(dest),
+        )
+
+    def test_prefix_applied_to_delete(self, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="staging/")
+        storage.delete("clips/99/x.mp4")
+        client.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key="staging/clips/99/x.mp4",
+        )
+
+    def test_prefix_applied_to_exists(self, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="prod/")
+        storage.exists("foo/bar.txt")
+        client.head_object.assert_called_once_with(
+            Bucket="test-bucket", Key="prod/foo/bar.txt",
+        )
+
+    def test_prefix_applied_to_signed_url(self, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="local/")
+        storage.get_url("clips/1/x.mp4", signed=True, expires_s=60)
+        args, kwargs = client.generate_presigned_url.call_args
+        assert kwargs["Params"]["Key"] == "local/clips/1/x.mp4"
+
+    def test_prefix_applied_to_public_url(self, monkeypatch):
+        storage, _ = self._make_storage(
+            monkeypatch,
+            key_prefix="local/",
+            public_base_url="https://pub-abc.r2.dev",
+        )
+        url = storage.get_url("clips/1/x.mp4", signed=False)
+        assert url == "https://pub-abc.r2.dev/local/clips/1/x.mp4"
+
+    def test_stored_object_returns_prefixed_key(self, tmp_path, monkeypatch):
+        """StoredObject.key reflects the actual storage location (prefixed)
+        so callers can round-trip it through delete/get_url."""
+        storage, _ = self._make_storage(
+            monkeypatch,
+            key_prefix="local/",
+            public_base_url="https://pub-abc.r2.dev",
+        )
+        src = tmp_path / "clip.mp4"
+        src.write_bytes(b"x")
+        obj = storage.upload(str(src), "clips/42/master.mp4")
+        assert obj.key == "local/clips/42/master.mp4"
+        assert obj.url == "https://pub-abc.r2.dev/local/clips/42/master.mp4"
+
+    def test_prefix_is_idempotent_on_already_prefixed_key(self, monkeypatch):
+        """Passing an already-prefixed key back in must not double-prefix."""
+        storage, client = self._make_storage(monkeypatch, key_prefix="local/")
+        storage.delete("local/clips/1/x.mp4")   # already-prefixed key
+        client.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key="local/clips/1/x.mp4",  # NOT local/local/...
+        )
+
+    def test_empty_prefix_is_noop(self, tmp_path, monkeypatch):
+        storage, client = self._make_storage(monkeypatch, key_prefix="")
+        src = tmp_path / "clip.mp4"
+        src.write_bytes(b"x")
+        storage.upload(str(src), "clips/1/x.mp4", content_type="video/mp4")
+        args = client.upload_file.call_args[0]
+        assert args[2] == "clips/1/x.mp4", "Empty prefix must not modify the key"
+
+    def test_prefix_normalises_missing_trailing_slash(self, monkeypatch):
+        """R2_KEY_PREFIX=local (no slash) should behave same as local/."""
+        storage, client = self._make_storage(monkeypatch, key_prefix="local")
+        storage.delete("x.mp4")
+        client.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key="local/x.mp4",
+        )
+
+    def test_prefix_strips_leading_slash(self, monkeypatch):
+        """R2_KEY_PREFIX=/local/ → normalise to local/."""
+        storage, client = self._make_storage(monkeypatch, key_prefix="/local/")
+        storage.delete("x.mp4")
+        client.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key="local/x.mp4",
+        )

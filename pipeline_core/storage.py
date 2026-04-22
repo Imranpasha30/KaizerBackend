@@ -325,6 +325,7 @@ class R2Storage(StorageProvider):
         access_key_id: Optional[str] = None,
         secret_access_key: Optional[str] = None,
         public_base_url: Optional[str] = None,
+        key_prefix: Optional[str] = None,
     ) -> None:
         self.bucket: str = (
             bucket or os.environ.get("R2_BUCKET", "")
@@ -347,6 +348,18 @@ class R2Storage(StorageProvider):
         # Treat empty string as "not set".
         self.public_base_url: str = (raw_base or "").strip()
 
+        # Key prefix: transparent namespace inside the bucket so dev/local/
+        # prod traffic coexist without collisions. A caller passes
+        # "clips/42/x.mp4" and internally the object lives at
+        # "<prefix>clips/42/x.mp4". Returned StoredObject.key stays
+        # unprefixed — prefix is an internal detail.
+        raw_prefix = (
+            key_prefix
+            if key_prefix is not None
+            else os.environ.get("R2_KEY_PREFIX", "")
+        )
+        self.key_prefix: str = self._normalize_prefix(raw_prefix)
+
         if not self.bucket:
             raise ValueError(
                 "R2Storage: R2_BUCKET is not set. "
@@ -365,11 +378,38 @@ class R2Storage(StorageProvider):
         # Log partial key ID only — never the secret.
         partial_id = (self.access_key_id[:8] + "…") if len(self.access_key_id) > 8 else self.access_key_id
         self._r2_logger.info(
-            "R2Storage configured: bucket=%r endpoint=%r access_key_id=%s",
+            "R2Storage configured: bucket=%r endpoint=%r access_key_id=%s prefix=%r",
             self.bucket,
             self.endpoint,
             partial_id,
+            self.key_prefix,
         )
+
+    @staticmethod
+    def _normalize_prefix(raw: str) -> str:
+        """Normalise an R2 key prefix: strip leading slashes, ensure a
+        trailing slash when non-empty, collapse doubles. Empty → empty."""
+        if not raw:
+            return ""
+        s = raw.strip().replace("\\", "/").lstrip("/")
+        if not s:
+            return ""
+        # Collapse consecutive slashes
+        while "//" in s:
+            s = s.replace("//", "/")
+        if not s.endswith("/"):
+            s = s + "/"
+        return s
+
+    def _k(self, key: str) -> str:
+        """Apply key_prefix to a caller-supplied key. No-op if no prefix
+        or if the caller already included the prefix (idempotent)."""
+        if not self.key_prefix:
+            return key
+        k = key.replace("\\", "/").lstrip("/")
+        if k.startswith(self.key_prefix):
+            return k
+        return self.key_prefix + k
 
     # -- Lazy boto3 client ------------------------------------------------
 
@@ -409,40 +449,42 @@ class R2Storage(StorageProvider):
         content_type: Optional[str] = None,
     ) -> StoredObject:
         resolved_ct = content_type or _guess_content_type(local_path)
+        full_key = self._k(key)
         client = self._get_client()
         self._r2_logger.info(
             "uploading %r → bucket=%r key=%r content_type=%r",
             local_path,
             self.bucket,
-            key,
+            full_key,
             resolved_ct,
         )
         try:
             client.upload_file(
                 local_path,
                 self.bucket,
-                key,
+                full_key,
                 ExtraArgs={"ContentType": resolved_ct},
             )
         except Exception as exc:
             self._r2_logger.error(
-                "R2 upload FAILED for key=%r: %s", key, exc
+                "R2 upload FAILED for key=%r: %s", full_key, exc
             )
             raise
 
         size = os.path.getsize(local_path)
 
-        # Determine the public URL for the stored object.
+        # Determine the public URL for the stored object (URL always
+        # reflects the actual prefixed storage location).
         if self.public_base_url:
-            url = f"{self.public_base_url.rstrip('/')}/{key}"
+            url = f"{self.public_base_url.rstrip('/')}/{full_key}"
         else:
             url = self.get_url(key, signed=True)
 
         self._r2_logger.info(
-            "upload complete: key=%r size=%d url=%r", key, size, url
+            "upload complete: key=%r size=%d url=%r", full_key, size, url
         )
         return StoredObject(
-            key=key,
+            key=full_key,
             url=url,
             backend=self.name,
             size_bytes=size,
@@ -450,37 +492,40 @@ class R2Storage(StorageProvider):
         )
 
     def download(self, key: str, local_path: str) -> str:
+        full_key = self._k(key)
         client = self._get_client()
         os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
         self._r2_logger.info(
-            "downloading bucket=%r key=%r → %r", self.bucket, key, local_path
+            "downloading bucket=%r key=%r → %r", self.bucket, full_key, local_path
         )
         try:
-            client.download_file(self.bucket, key, local_path)
+            client.download_file(self.bucket, full_key, local_path)
         except Exception as exc:
             self._r2_logger.error(
-                "R2 download FAILED for key=%r: %s", key, exc
+                "R2 download FAILED for key=%r: %s", full_key, exc
             )
             raise
         return local_path
 
     def delete(self, key: str) -> None:
+        full_key = self._k(key)
         client = self._get_client()
         self._r2_logger.info(
-            "deleting bucket=%r key=%r", self.bucket, key
+            "deleting bucket=%r key=%r", self.bucket, full_key
         )
         try:
-            client.delete_object(Bucket=self.bucket, Key=key)
+            client.delete_object(Bucket=self.bucket, Key=full_key)
         except Exception as exc:
             self._r2_logger.error(
-                "R2 delete FAILED for key=%r: %s", key, exc
+                "R2 delete FAILED for key=%r: %s", full_key, exc
             )
             raise
 
     def exists(self, key: str) -> bool:
+        full_key = self._k(key)
         client = self._get_client()
         try:
-            client.head_object(Bucket=self.bucket, Key=key)
+            client.head_object(Bucket=self.bucket, Key=full_key)
             return True
         except Exception as exc:
             # botocore raises ClientError for 404 and other errors.
@@ -494,7 +539,7 @@ class R2Storage(StorageProvider):
                 pass
             # Unexpected error — log and re-raise so callers notice.
             self._r2_logger.error(
-                "R2 exists check FAILED for key=%r: %s", key, exc
+                "R2 exists check FAILED for key=%r: %s", full_key, exc
             )
             raise
 
@@ -505,28 +550,29 @@ class R2Storage(StorageProvider):
         signed: bool = True,
         expires_s: int = 3600,
     ) -> str:
+        full_key = self._k(key)
         if signed:
             client = self._get_client()
             url = client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": self.bucket, "Key": key},
+                Params={"Bucket": self.bucket, "Key": full_key},
                 ExpiresIn=expires_s,
             )
             return url
 
         if self.public_base_url:
-            return f"{self.public_base_url.rstrip('/')}/{key}"
+            return f"{self.public_base_url.rstrip('/')}/{full_key}"
 
         # No public base URL configured → fall back to signed URL for safety.
         self._r2_logger.warning(
             "get_url(signed=False) called but R2_PUBLIC_BASE_URL is not set; "
             "falling back to signed URL for key=%r",
-            key,
+            full_key,
         )
         client = self._get_client()
         return client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": self.bucket, "Key": key},
+            Params={"Bucket": self.bucket, "Key": full_key},
             ExpiresIn=expires_s,
         )
 
