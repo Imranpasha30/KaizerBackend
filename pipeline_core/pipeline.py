@@ -98,6 +98,50 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import logging as _logging
+_pipeline_logger = _logging.getLogger("kaizer.pipeline")
+
+
+def _maybe_upload_final(
+    local_path: str,
+    key: str,
+    *,
+    content_type: str = "video/mp4",
+) -> tuple:
+    """Upload *local_path* to the configured storage backend if it is not 'local'.
+
+    Returns a ``(url, key, backend)`` triple.  When the backend is local (or
+    STORAGE_BACKEND is unset / 'local') all three values are empty strings so
+    callers can detect "no upload happened" without extra logic.
+
+    This helper is intentionally simple — it does NOT delete the local file.
+    The caller (run_pipeline) owns cleanup.
+
+    Exceptions from the storage provider are logged and re-raised so the
+    pipeline fails loudly rather than silently producing a clip with no cloud
+    copy.
+    """
+    try:
+        from pipeline_core.storage import get_storage_provider
+        provider = get_storage_provider()
+        if provider.name == "local":
+            return ("", "", "")
+        # Forward-slash keys on all platforms.
+        safe_key = key.replace("\\", "/")
+        stored = provider.upload(local_path, safe_key, content_type=content_type)
+        _pipeline_logger.info(
+            "_maybe_upload_final: uploaded %r → key=%r url=%r",
+            local_path, safe_key, stored.url,
+        )
+        return (stored.url, safe_key, stored.backend)
+    except Exception as exc:
+        _pipeline_logger.error(
+            "_maybe_upload_final: upload FAILED for %r key=%r: %s",
+            local_path, key, exc,
+        )
+        raise
+
+
 # pipeline_core/ lives inside kaizer/backend/ — BASE_DIR = kaizer/backend/
 BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(BASE_DIR)
@@ -2449,28 +2493,54 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         except Exception:
             thumb_path = ""
 
+        # ── Phase 5: post-render storage upload ──────────────────────
+        # Upload the finished clip to cloud storage when STORAGE_BACKEND
+        # is not 'local'.  The local file is kept alive until the pipeline
+        # process exits (runner.py owns cleanup via the output directory).
+        # job_id is not available inside pipeline.py (subprocess context),
+        # so we use a timestamp-based directory name as the key prefix.
+        storage_url_ec  = ""
+        storage_key_ec  = ""
+        storage_bknd_ec = ""
+        try:
+            _clip_key = f"clips/{timestamp}/{i+1:02d}.mp4"
+            storage_url_ec, storage_key_ec, storage_bknd_ec = _maybe_upload_final(
+                os.path.abspath(out_path),
+                _clip_key,
+                content_type="video/mp4",
+            )
+        except Exception as _upload_err:
+            # Log but do NOT abort the pipeline — the local file is still
+            # valid and runner.py will import it successfully.  The DB row
+            # will simply have empty storage_* fields until the next upload.
+            print(f"  [storage] upload failed for clip {i+1}: {_upload_err}", flush=True)
+
         ec = {
-            "clip_path":    os.path.abspath(out_path),
-            "raw_path":     os.path.abspath(raw_path),
-            "thumb_path":   os.path.abspath(thumb_path) if thumb_path else "",
-            "image_path":   os.path.abspath(img),
-            "text":         card_text,
-            "language":     lang_cfg.code,
-            "title_native": title_native,
-            "title_telugu": title_native,  # legacy alias
-            "title_english": title_en,
-            "start":        clip.get("start", ""),
-            "end":          clip.get("end", ""),
-            "duration":     clip.get("duration_sec", 0),
-            "summary":      clip.get("summary", ""),
-            "mood":         clip.get("mood", ""),
-            "importance":   clip.get("importance", 5),
-            "video_type":   video_type,
-            "frame_type":    frame_layout,
-            "card_params":   clip_card_params,
-            "split_params":  clip_split_params,
-            "follow_params": clip_follow_params,
-            "preset":       preset,
+            "clip_path":        os.path.abspath(out_path),
+            "raw_path":         os.path.abspath(raw_path),
+            "thumb_path":       os.path.abspath(thumb_path) if thumb_path else "",
+            "image_path":       os.path.abspath(img),
+            "text":             card_text,
+            "language":         lang_cfg.code,
+            "title_native":     title_native,
+            "title_telugu":     title_native,  # legacy alias
+            "title_english":    title_en,
+            "start":            clip.get("start", ""),
+            "end":              clip.get("end", ""),
+            "duration":         clip.get("duration_sec", 0),
+            "summary":          clip.get("summary", ""),
+            "mood":             clip.get("mood", ""),
+            "importance":       clip.get("importance", 5),
+            "video_type":       video_type,
+            "frame_type":       frame_layout,
+            "card_params":      clip_card_params,
+            "split_params":     clip_split_params,
+            "follow_params":    clip_follow_params,
+            "preset":           preset,
+            # Phase 5 storage fields — empty strings when backend is local
+            "storage_url":      storage_url_ec,
+            "storage_key":      storage_key_ec,
+            "storage_backend":  storage_bknd_ec,
         }
         editor_clips.append(ec)
 

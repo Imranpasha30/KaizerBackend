@@ -15,11 +15,14 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -27,6 +30,8 @@ from sqlalchemy.orm import Session
 import models
 from database import SessionLocal
 from youtube import oauth, uploader, quota
+
+_worker_logger = logging.getLogger("kaizer.youtube.worker")
 
 
 POLL_INTERVAL = 3.0
@@ -136,6 +141,84 @@ def _append_log(job: models.UploadJob, msg: str) -> None:
     job.log = ((job.log or "") + ("\n" if job.log else "") + entry)[-8000:]
 
 
+def _ensure_local_clip(
+    job: models.UploadJob,
+    clip: models.Clip,
+) -> Tuple[str, Optional[str]]:
+    """Return (local_file_path, tmp_dir_or_None) for the clip video.
+
+    Resolution order
+    ----------------
+    1. ``clip.file_path`` exists on disk → return it directly (no tempdir).
+    2. ``clip.storage_key`` + ``clip.storage_backend`` are set → download via
+       the matching storage provider into a fresh tempdir and return that path.
+    3. Neither → raise RuntimeError with a descriptive message.
+
+    The caller is responsible for deleting *tmp_dir* (when not None) in a
+    ``finally`` block after the upload completes.
+    """
+    # ------------------------------------------------------------------
+    # 1. Local file still present?
+    # ------------------------------------------------------------------
+    local_path = (clip.file_path or "").strip()
+    if local_path and Path(local_path).is_file():
+        _worker_logger.debug(
+            "ensure_local_clip: clip %d found on disk at %r", clip.id, local_path
+        )
+        return local_path, None
+
+    # ------------------------------------------------------------------
+    # 2. Download from cloud storage
+    # ------------------------------------------------------------------
+    storage_key: str = (getattr(clip, "storage_key", "") or "").strip()
+    storage_backend: str = (getattr(clip, "storage_backend", "") or "").strip()
+
+    if storage_key and storage_backend:
+        _worker_logger.info(
+            "ensure_local_clip: clip %d not on disk — downloading from %r key=%r",
+            clip.id, storage_backend, storage_key,
+        )
+        from pipeline_core.storage import get_storage_provider
+        provider = get_storage_provider(storage_backend)
+
+        tmp_dir = tempfile.mkdtemp(prefix="kaizer_upload_")
+        filename = Path(storage_key).name or f"clip_{clip.id}.mp4"
+        tmp_path = os.path.join(tmp_dir, filename)
+
+        try:
+            provider.download(storage_key, tmp_path)
+        except Exception as dl_exc:
+            _worker_logger.error(
+                "ensure_local_clip: download failed for clip %d key=%r: %s",
+                clip.id, storage_key, dl_exc,
+            )
+            # Clean up the empty tempdir before re-raising
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Could not download clip {clip.id} from storage "
+                f"(backend={storage_backend!r}, key={storage_key!r}): {dl_exc}"
+            ) from dl_exc
+
+        _worker_logger.info(
+            "ensure_local_clip: clip %d downloaded to %r", clip.id, tmp_path
+        )
+        return tmp_path, tmp_dir
+
+    # ------------------------------------------------------------------
+    # 3. No usable source
+    # ------------------------------------------------------------------
+    raise RuntimeError(
+        f"Clip {clip.id} has no usable video source: "
+        f"file_path={clip.file_path!r} is missing on disk and "
+        f"storage_key={getattr(clip, 'storage_key', '')!r} / "
+        f"storage_backend={getattr(clip, 'storage_backend', '')!r} are not set."
+    )
+
+
 def _process(job_id: int) -> None:
     db = SessionLocal()
     try:
@@ -147,8 +230,16 @@ def _process(job_id: int) -> None:
             return
 
         clip = db.query(models.Clip).filter(models.Clip.id == job.clip_id).first()
-        if not clip or not clip.file_path:
-            _fail(db, job, "clip is missing file_path")
+        if not clip:
+            _fail(db, job, "clip row not found")
+            return
+
+        # ─── Resolve local clip path (disk or cloud download) ─────────
+        _clip_tmp_dir: Optional[str] = None
+        try:
+            resolved_clip_path, _clip_tmp_dir = _ensure_local_clip(job, clip)
+        except RuntimeError as resolve_err:
+            _fail(db, job, str(resolve_err))
             return
 
         # ─── Quota check ───────────────────────────────────────────
@@ -171,7 +262,7 @@ def _process(job_id: int) -> None:
         _append_log(job, f"starting upload (attempt {job.attempts})")
         db.commit()
 
-        def _progress(uploaded: int, total: int):
+        def _progress(uploaded: int, total: int) -> None:
             # Keep the row warm so /api/uploads polling shows movement
             job.updated_at = datetime.now(timezone.utc)
             db.commit()
@@ -180,8 +271,8 @@ def _process(job_id: int) -> None:
         # The pipeline renders a clean master so each destination can
         # get ITS OWN logo burned in just before upload.  Resolves the
         # destination channel's OAuthToken.logo_asset_id → file → ffmpeg
-        # overlay.  If anything fails, falls back to the clean master.
-        upload_path = clip.file_path
+        # overlay.  If anything fails, falls back to the resolved clip path.
+        upload_path = resolved_clip_path
         try:
             dest_channel = db.query(models.Channel).filter(
                 models.Channel.id == job.channel_id,
@@ -194,14 +285,16 @@ def _process(job_id: int) -> None:
                 if logo_asset and logo_asset.file_path and Path(logo_asset.file_path).exists():
                     _append_log(job, f"overlaying destination logo ({logo_asset.filename})…")
                     from youtube import logo_overlay
-                    upload_path = logo_overlay.overlay_logo(clip.file_path, logo_asset.file_path)
-                    if upload_path != clip.file_path:
+                    upload_path = logo_overlay.overlay_logo(
+                        resolved_clip_path, logo_asset.file_path
+                    )
+                    if upload_path != resolved_clip_path:
                         _append_log(job, "logo overlay applied")
                     else:
                         _append_log(job, "logo overlay failed — uploading clean master")
         except Exception as e:
             _append_log(job, f"logo overlay skipped: {e}")
-            upload_path = clip.file_path
+            upload_path = resolved_clip_path
 
         try:
             video_id = uploader.upload_video(creds, job, upload_path, db, progress_cb=_progress)
@@ -230,13 +323,25 @@ def _process(job_id: int) -> None:
             _retry(db, job, f"unexpected: {e}")
         finally:
             # Clean up the overlay temp file if we made one (no-op when we
-            # uploaded the clean master directly).
+            # uploaded the resolved clip path directly).
             try:
-                if upload_path != clip.file_path:
+                if upload_path != resolved_clip_path:
                     from youtube import logo_overlay
-                    logo_overlay.cleanup_overlay(upload_path, clip.file_path)
+                    logo_overlay.cleanup_overlay(upload_path, resolved_clip_path)
             except Exception:
                 pass
+            # Clean up the cloud-download tempdir (if any) regardless of
+            # whether the upload succeeded or failed.
+            if _clip_tmp_dir:
+                try:
+                    import shutil as _sh
+                    _sh.rmtree(_clip_tmp_dir, ignore_errors=True)
+                    _worker_logger.debug(
+                        "cleaned up clip tempdir %r for job %d",
+                        _clip_tmp_dir, job_id,
+                    )
+                except Exception:
+                    pass
     finally:
         db.close()
 

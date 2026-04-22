@@ -221,6 +221,10 @@ def _import_clips(job, db, meta_override: Path | None = None):
             section_pct=json.dumps(c.get("section_pct", {})),
             follow_params=json.dumps(c.get("follow_params", {})),
             meta=json.dumps(c),
+            # Phase 5 storage fields — empty strings when backend is local
+            storage_url=c.get("storage_url", ""),
+            storage_key=c.get("storage_key", ""),
+            storage_backend=c.get("storage_backend", ""),
         )
         db.add(clip)
         imported += 1

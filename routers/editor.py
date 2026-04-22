@@ -54,6 +54,7 @@ from pipeline_core.effects.style_packs import (
     list_style_packs,
 )
 from pipeline_core.editor_pro import BetaRenderResult, render_beta
+from pipeline_core.storage import get_storage_provider
 
 logger = logging.getLogger("kaizer.routers.editor")
 
@@ -141,8 +142,20 @@ def _latest_json_path(clip_id: int) -> Path:
     return BETA_RENDERS_ROOT / f"clip_{clip_id}" / "latest.json"
 
 
-def _write_latest_cache(clip_id: int, result: BetaRenderResult) -> None:
-    """Persist the render result to output/beta_renders/clip_{id}/latest.json."""
+def _write_latest_cache(
+    clip_id: int,
+    result: BetaRenderResult,
+    *,
+    storage_url: str = "",
+    storage_key: str = "",
+    storage_backend: str = "",
+) -> None:
+    """Persist the render result to output/beta_renders/clip_{id}/latest.json.
+
+    When storage_backend is 'r2', *storage_url* and *storage_key* are written
+    alongside the local paths so that the GET handler can reconstruct the
+    correct URL without re-uploading.
+    """
     cache_path = _latest_json_path(clip_id)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -153,6 +166,11 @@ def _write_latest_cache(clip_id: int, result: BetaRenderResult) -> None:
         "qa_ok": result.qa_ok,
         "warnings": result.warnings,
         "rendered_at": datetime.now(timezone.utc).isoformat(),
+        # Phase 5 storage fields — present so the GET handler knows which
+        # backend produced the URL and can return it directly.
+        "storage_url": storage_url,
+        "storage_key": storage_key,
+        "storage_backend": storage_backend,
     }
     with open(cache_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
@@ -272,9 +290,60 @@ def post_render_beta(
             detail=f"Render failed for clip {body.clip_id}: {exc}",
         )
 
+    # ── Phase 5: upload to cloud storage when STORAGE_BACKEND != 'local' ────────
+    storage_url: str = ""
+    storage_key: str = ""
+    storage_backend_name: str = ""
+    beta_url_for_response: str = _path_to_url(result.beta_path)
+
+    try:
+        provider = get_storage_provider()
+        if provider.name != "local" and result.beta_path and os.path.isfile(result.beta_path):
+            storage_key = f"beta_renders/clip_{body.clip_id}/{body.style_pack}.mp4"
+            stored = provider.upload(
+                result.beta_path,
+                storage_key,
+                content_type="video/mp4",
+            )
+            storage_url = stored.url
+            storage_backend_name = stored.backend
+            beta_url_for_response = stored.url
+            logger.info(
+                "editor: uploaded beta render clip=%d key=%r url=%r",
+                body.clip_id, storage_key, storage_url,
+            )
+            # Delete the local temp file — cloud is the source of truth now.
+            try:
+                os.remove(result.beta_path)
+            except Exception as rm_exc:
+                logger.warning(
+                    "editor: could not remove local beta file %r: %s",
+                    result.beta_path, rm_exc,
+                )
+    except Exception as upload_exc:
+        logger.error(
+            "editor: storage upload failed for clip %d: %s — returning local URL",
+            body.clip_id, upload_exc,
+        )
+        # Do NOT silently swallow when R2 is configured — re-raise so the
+        # caller knows the upload failed.  For local backend, this branch
+        # is never reached.
+        storage_backend_env = os.environ.get("STORAGE_BACKEND", "local").lower()
+        if storage_backend_env != "local":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Storage upload failed for clip {body.clip_id}: {upload_exc}",
+            )
+
     # ── Cache result to disk ──────────────────────────────────────────────────
     try:
-        _write_latest_cache(body.clip_id, result)
+        _write_latest_cache(
+            body.clip_id,
+            result,
+            storage_url=storage_url,
+            storage_key=storage_key,
+            storage_backend=storage_backend_name,
+        )
     except Exception as exc:
         logger.warning(
             "editor: could not write latest.json for clip %d: %s",
@@ -287,7 +356,7 @@ def post_render_beta(
         current_path=result.current_path,
         current_url=_path_to_url(result.current_path),
         beta_path=result.beta_path,
-        beta_url=_path_to_url(result.beta_path),
+        beta_url=beta_url_for_response,
         style_pack=result.style_pack,
         effects_applied=result.effects_applied,
         render_time_s=result.render_time_s,
@@ -324,12 +393,21 @@ def get_latest_render(clip_id: int) -> RenderBetaResponse:
     current_path = cache.get("current_path", "")
     beta_path = cache.get("beta_path", "")
 
+    # Phase 5: when the render was uploaded to cloud storage the cached
+    # storage_url supersedes the local /media/ URL.
+    cached_storage_url: str = cache.get("storage_url", "")
+    cached_storage_backend: str = cache.get("storage_backend", "")
+    if cached_storage_url and cached_storage_backend and cached_storage_backend != "local":
+        beta_url_for_response = cached_storage_url
+    else:
+        beta_url_for_response = _path_to_url(beta_path)
+
     return RenderBetaResponse(
         clip_id=clip_id,
         current_path=current_path,
         current_url=_path_to_url(current_path),
         beta_path=beta_path,
-        beta_url=_path_to_url(beta_path),
+        beta_url=beta_url_for_response,
         style_pack=cache.get("style_pack", ""),
         effects_applied=cache.get("effects_applied", []),
         render_time_s=0.0,

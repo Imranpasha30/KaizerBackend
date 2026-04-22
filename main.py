@@ -147,6 +147,28 @@ def _migrate_schema():
             if col not in existing_clips:
                 conn.execute(text(f"ALTER TABLE clips ADD COLUMN {col} {dtype}"))
 
+        # ── clips: Phase 5 storage columns ──────────────────────────────
+        clip_storage_additions = {
+            "storage_url":     "VARCHAR(500) DEFAULT ''",
+            "storage_key":     "VARCHAR(500) DEFAULT ''",
+            "storage_backend": "VARCHAR(20) DEFAULT ''",
+        }
+        for col, dtype in clip_storage_additions.items():
+            if col not in existing_clips:
+                conn.execute(text(f"ALTER TABLE clips ADD COLUMN {col} {dtype}"))
+
+        # ── user_assets: Phase 5 storage columns ────────────────────────
+        if inspector.has_table("user_assets"):
+            existing_assets = {c["name"] for c in inspector.get_columns("user_assets")}
+            asset_storage_additions = {
+                "storage_url":     "VARCHAR(500) DEFAULT ''",
+                "storage_key":     "VARCHAR(500) DEFAULT ''",
+                "storage_backend": "VARCHAR(20) DEFAULT ''",
+            }
+            for col, dtype in asset_storage_additions.items():
+                if col not in existing_assets:
+                    conn.execute(text(f"ALTER TABLE user_assets ADD COLUMN {col} {dtype}"))
+
         # ── upload_jobs table columns (new: publish_kind) ────────────────
         if inspector.has_table("upload_jobs"):
             existing_uploads = {c["name"] for c in inspector.get_columns("upload_jobs")}

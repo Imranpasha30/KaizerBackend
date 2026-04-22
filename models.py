@@ -88,6 +88,14 @@ class Clip(Base):
     seo          = Column(Text, default="")      # most-recently-generated SEO (JSON str, empty until generated) — kept for back-compat + "current" display
     seo_variants = Column(Text, default="{}")    # JSON dict {channel_id: enforced_seo_payload} — one variant per style profile
 
+    # ── Storage (Phase 5) ──────────────────────────────────────────
+    # When storage_backend='local' the URL is /media/<key>; when 'r2' the URL
+    # is a CDN/public link or a signed URL (frontend re-fetches if expired).
+    # file_path remains populated for backwards compatibility.
+    storage_url     = Column(String(500), default="")
+    storage_key     = Column(String(500), default="")
+    storage_backend = Column(String(20),  default="")
+
     job = relationship("Job", back_populates="clips")
     upload_jobs = relationship("UploadJob", back_populates="clip", cascade="all, delete")
 
@@ -410,6 +418,14 @@ class UserAsset(Base):
     # organization string the frontend groups by.
     folder_path   = Column(String(255), default="", index=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+    # ── Storage (Phase 5) ──────────────────────────────────────────
+    # When storage_backend='local' the URL is /media/<key>; when 'r2' the URL
+    # is a CDN/public link or a signed URL (frontend re-fetches if expired).
+    # file_path remains populated for backwards compatibility.
+    storage_url     = Column(String(500), default="")
+    storage_key     = Column(String(500), default="")
+    storage_backend = Column(String(20),  default="")
 
 
 class CompetitorChannel(Base):
