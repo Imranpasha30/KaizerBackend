@@ -22,19 +22,17 @@ Endpoints (to be added in Phase 4)
 
 Authentication
 --------------
-  Partner API keys, scoped per newsroom. Rate-limited at the org level.
-  HMAC request signing on POST (phase 4 decision).
-
-v1 scaffolding
---------------
-This module holds the data contracts so the UI + docs can reference
-them today.
+  Partner API keys, scoped per newsroom. SHA-256 hash stored in DB.
+  Rate-limited at the org level.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger("kaizer.pipeline.phase4.regional_api")
 
@@ -64,10 +62,45 @@ class RegionalIngestResponse:
     eta_s: Optional[int] = None
 
 
-def authenticate(api_key: str) -> PartnerCredentials:
-    raise NotImplementedError(
-        "regional_api.authenticate — Phase 4. "
-        "See docs/PHASE4_ROADMAP.md § Regional API."
+def authenticate(api_key: str, db: Optional[Session] = None) -> PartnerCredentials:
+    """Hash the api_key (SHA-256 hex), look up RegionalApiKey where
+    api_key_hash == hash AND active=True.
+
+    Raises ValueError('Invalid API key') on miss or inactive key.
+    Returns PartnerCredentials dataclass on success.
+    """
+    if not api_key:
+        raise ValueError("Invalid API key")
+
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    if db is None:
+        raise ValueError("Invalid API key")
+
+    import models  # type: ignore
+
+    row = (
+        db.query(models.RegionalApiKey)
+        .filter(
+            models.RegionalApiKey.api_key_hash == key_hash,
+            models.RegionalApiKey.active == True,  # noqa: E712
+        )
+        .first()
+    )
+
+    if row is None:
+        logger.warning("authenticate: no active key found for hash %s…", key_hash[:8])
+        raise ValueError("Invalid API key")
+
+    logger.info(
+        "authenticate: org_id=%s authenticated (label=%r)",
+        row.org_id, row.label,
+    )
+    return PartnerCredentials(
+        org_id=row.org_id,
+        api_key_hash=row.api_key_hash,
+        rate_limit_rpm=row.rate_limit_rpm or 60,
+        monthly_cap=row.monthly_cap or 1000,
     )
 
 

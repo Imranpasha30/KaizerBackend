@@ -179,6 +179,12 @@ def _migrate_schema():
                 if col not in existing_tokens:
                     conn.execute(text(f"ALTER TABLE oauth_tokens ADD COLUMN {col} {dtype}"))
 
+        # ── Phase 4 / Wave 3 new tables ─────────────────────────────────────────
+        for tbl in ("training_records", "clip_edges", "agency_teams",
+                    "agency_members", "agency_audit_log", "regional_api_keys"):
+            if not inspector.has_table(tbl):
+                Base.metadata.tables[tbl].create(conn)
+
         conn.commit()
 
 

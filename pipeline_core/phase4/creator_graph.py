@@ -20,19 +20,18 @@ Competitors treat clips as flat rows. With typed edges:
 
 Storage
 -------
-v2 can use Postgres recursive CTEs on an (edge_type, src_clip_id,
-dst_clip_id, meta JSONB) table. v3 may switch to Neo4j / Memgraph.
-
-Phase 4 scope
--------------
-  - Add `clip_edges` table migration
-  - Edge insertion hooks in render_series.chain_parts and variants.generate_variants
-  - GraphQL-style traversal API
+v2 uses Postgres / SQLite on a (edge_type, src_clip_id, dst_clip_id,
+edge_metadata JSONB) table with a unique constraint.
+v3 may switch to Neo4j / Memgraph.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger("kaizer.pipeline.phase4.creator_graph")
 
@@ -59,30 +58,158 @@ def link_clips(
     dst_clip_id: int,
     *,
     edge_type: str,
-    meta: dict | None = None,
-    db=None,
+    meta: Optional[dict] = None,
+    db: Optional[Session] = None,
 ) -> ClipEdge:
     """Record a typed edge between two clips.
 
-    Phase 4 implementation: insert into `clip_edges` table with uniqueness
-    on (edge_type, src, dst).
+    INSERTs into `clip_edges` table with uniqueness on
+    (edge_type, src_clip_id, dst_clip_id). On conflict returns the
+    existing edge without raising. When db is None, returns an in-memory
+    dataclass only (useful for testing without a DB).
     """
     if edge_type not in EDGE_TYPES:
         raise ValueError(f"Unknown edge_type: {edge_type}. Must be one of {EDGE_TYPES}")
-    logger.info(
-        "link_clips(%s -> %s, edge_type=%s): Phase 4 stub", src_clip_id, dst_clip_id, edge_type,
+
+    edge_meta = meta or {}
+
+    if db is None:
+        logger.debug(
+            "link_clips(%s -> %s, edge_type=%s): no db — in-memory only",
+            src_clip_id, dst_clip_id, edge_type,
+        )
+        return ClipEdge(
+            edge_type=edge_type,
+            src_clip_id=src_clip_id,
+            dst_clip_id=dst_clip_id,
+            meta=edge_meta,
+        )
+
+    import models  # type: ignore
+
+    # Check for existing edge first (avoids try/except on every call)
+    existing = (
+        db.query(models.ClipEdge)
+        .filter(
+            models.ClipEdge.edge_type == edge_type,
+            models.ClipEdge.src_clip_id == src_clip_id,
+            models.ClipEdge.dst_clip_id == dst_clip_id,
+        )
+        .first()
     )
-    return ClipEdge(edge_type=edge_type, src_clip_id=src_clip_id,
-                    dst_clip_id=dst_clip_id, meta=meta or {})
+    if existing is not None:
+        logger.debug(
+            "link_clips: edge already exists (id=%s)", existing.id
+        )
+        return ClipEdge(
+            edge_type=existing.edge_type,
+            src_clip_id=existing.src_clip_id,
+            dst_clip_id=existing.dst_clip_id,
+            meta=existing.edge_metadata or {},
+        )
+
+    row = models.ClipEdge(
+        edge_type=edge_type,
+        src_clip_id=src_clip_id,
+        dst_clip_id=dst_clip_id,
+        edge_metadata=edge_meta,
+    )
+    db.add(row)
+    try:
+        db.commit()
+        db.refresh(row)
+        logger.info(
+            "link_clips: inserted edge id=%s (%s -> %s, type=%s)",
+            row.id, src_clip_id, dst_clip_id, edge_type,
+        )
+    except IntegrityError:
+        db.rollback()
+        # Race condition — another process inserted concurrently; load it
+        existing = (
+            db.query(models.ClipEdge)
+            .filter(
+                models.ClipEdge.edge_type == edge_type,
+                models.ClipEdge.src_clip_id == src_clip_id,
+                models.ClipEdge.dst_clip_id == dst_clip_id,
+            )
+            .first()
+        )
+        if existing is not None:
+            return ClipEdge(
+                edge_type=existing.edge_type,
+                src_clip_id=existing.src_clip_id,
+                dst_clip_id=existing.dst_clip_id,
+                meta=existing.edge_metadata or {},
+            )
+        # Shouldn't happen, but don't crash
+        logger.error("link_clips: IntegrityError but no existing row found")
+        return ClipEdge(
+            edge_type=edge_type,
+            src_clip_id=src_clip_id,
+            dst_clip_id=dst_clip_id,
+            meta=edge_meta,
+        )
+
+    return ClipEdge(
+        edge_type=row.edge_type,
+        src_clip_id=row.src_clip_id,
+        dst_clip_id=row.dst_clip_id,
+        meta=row.edge_metadata or {},
+    )
 
 
-def traverse(clip_id: int, *, edge_type: str, direction: str = "out", db=None) -> list[int]:
+def traverse(
+    clip_id: int,
+    *,
+    edge_type: str,
+    direction: str = "out",
+    db: Optional[Session] = None,
+) -> list[int]:
     """Return clip IDs connected to `clip_id` by `edge_type`.
 
-    direction='out' → clips where src = clip_id.
-    direction='in'  → clips where dst = clip_id.
+    direction='out' → clips where src_clip_id = clip_id  (clip_id → ?)
+    direction='in'  → clips where dst_clip_id = clip_id  (? → clip_id)
+    Unknown direction raises ValueError.
+    Returns [] when db is None or no edges exist.
     """
-    raise NotImplementedError(
-        "creator_graph.traverse is a Phase 4 task. "
-        "See docs/PHASE4_ROADMAP.md § Creator Graph."
-    )
+    if direction not in ("out", "in"):
+        raise ValueError(
+            f"Unknown direction: {direction!r}. Must be 'out' or 'in'."
+        )
+
+    if db is None:
+        logger.debug(
+            "traverse(clip_id=%s, edge_type=%s, direction=%s): no db",
+            clip_id, edge_type, direction,
+        )
+        return []
+
+    import models  # type: ignore
+
+    try:
+        if direction == "out":
+            rows = (
+                db.query(models.ClipEdge.dst_clip_id)
+                .filter(
+                    models.ClipEdge.src_clip_id == clip_id,
+                    models.ClipEdge.edge_type == edge_type,
+                )
+                .all()
+            )
+            return [r[0] for r in rows]
+        else:  # direction == "in"
+            rows = (
+                db.query(models.ClipEdge.src_clip_id)
+                .filter(
+                    models.ClipEdge.dst_clip_id == clip_id,
+                    models.ClipEdge.edge_type == edge_type,
+                )
+                .all()
+            )
+            return [r[0] for r in rows]
+    except Exception as exc:
+        logger.error(
+            "traverse(clip_id=%s, edge_type=%s, direction=%s) error: %s",
+            clip_id, edge_type, direction, exc, exc_info=True,
+        )
+        return []

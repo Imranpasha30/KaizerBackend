@@ -447,3 +447,103 @@ class TrendingTopic(Base):
     fetched_at         = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("source_channel_id", "video_id", name="uq_competitor_video"),)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4 / Wave 3 — Training Flywheel, Creator Graph, Agency Mode,
+#                    Regional API
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TrainingRecord(Base):
+    """One labeled data point for the narrative scorer flywheel."""
+    __tablename__ = "training_records"
+    __table_args__ = (
+        UniqueConstraint("upload_job_id", name="uq_training_upload"),
+        Index("ix_training_niche", "niche"),
+        Index("ix_training_collected_at", "collected_at"),
+    )
+    id                 = Column(Integer, primary_key=True, index=True)
+    upload_job_id      = Column(Integer, ForeignKey("upload_jobs.id", ondelete="CASCADE"), nullable=False)
+    clip_id            = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"), nullable=False, index=True)
+    niche              = Column(String(50), default="")
+    narrative_role     = Column(String(32), default="")
+    hook_score         = Column(Float,   default=0.0)
+    completion_score   = Column(Float,   default=0.0)
+    composite_score    = Column(Float,   default=0.0)
+    views_48h          = Column(Integer, default=0)
+    retention_curve    = Column(JSON,    default=list)
+    shares_per_reach   = Column(Float,   default=0.0)
+    video_hash         = Column(String(64), default="")
+    collected_at       = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClipEdge(Base):
+    """Typed edges between Clips. Enables series/variant/trailer graph queries."""
+    __tablename__ = "clip_edges"
+    __table_args__ = (
+        UniqueConstraint("edge_type", "src_clip_id", "dst_clip_id", name="uq_clip_edge"),
+        Index("ix_clip_edge_src", "src_clip_id"),
+        Index("ix_clip_edge_dst", "dst_clip_id"),
+        Index("ix_clip_edge_type", "edge_type"),
+    )
+    id            = Column(Integer, primary_key=True, index=True)
+    edge_type     = Column(String(32), nullable=False)    # series_part_of | trailer_for | variant_of | reusable_source | narrative_beat_of
+    src_clip_id   = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"), nullable=False)
+    dst_clip_id   = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"), nullable=False)
+    edge_metadata = Column(JSON, default=dict)   # NOTE: named edge_metadata not 'meta' to avoid SQLAlchemy reserved-word clash
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgencyTeam(Base):
+    """Agency workspace — multi-account billing + RBAC."""
+    __tablename__ = "agency_teams"
+    __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_agency_owner_name"),)
+    id                 = Column(Integer, primary_key=True, index=True)
+    owner_user_id      = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name               = Column(String(255), nullable=False)
+    branding           = Column(JSON, default=dict)           # {logo_url, accent_color, domain, ...}
+    monthly_clip_cap   = Column(Integer, default=0)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AgencyMember(Base):
+    """User↔Agency membership with a role (owner/admin/creator/viewer)."""
+    __tablename__ = "agency_members"
+    __table_args__ = (UniqueConstraint("agency_id", "user_id", name="uq_agency_member"),)
+    id         = Column(Integer, primary_key=True, index=True)
+    agency_id  = Column(Integer, ForeignKey("agency_teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role       = Column(String(16), nullable=False, default="creator")   # owner | admin | creator | viewer
+    added_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgencyAuditLog(Base):
+    """Who-did-what log inside an agency (immutable, insert-only)."""
+    __tablename__ = "agency_audit_log"
+    __table_args__ = (
+        Index("ix_agency_audit_agency", "agency_id"),
+        Index("ix_agency_audit_ts", "timestamp"),
+    )
+    id              = Column(Integer, primary_key=True, index=True)
+    agency_id       = Column(Integer, ForeignKey("agency_teams.id", ondelete="CASCADE"), nullable=False)
+    actor_user_id   = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action          = Column(String(64), nullable=False)      # clip.create / billing.view / team.invite / ...
+    target_kind     = Column(String(32), default="")          # clip | user | asset | upload_job | ...
+    target_id       = Column(Integer, default=0)
+    timestamp       = Column(DateTime(timezone=True), server_default=func.now())
+    details         = Column(JSON, default=dict)
+
+
+class RegionalApiKey(Base):
+    """Partner API keys for the B2B newsroom /api/regional/* endpoints."""
+    __tablename__ = "regional_api_keys"
+    __table_args__ = (UniqueConstraint("org_id", "api_key_hash", name="uq_regional_org_key"),)
+    id              = Column(Integer, primary_key=True, index=True)
+    org_id          = Column(String(64), nullable=False, index=True)
+    api_key_hash    = Column(String(64), nullable=False, index=True)    # SHA-256 hex of the raw key
+    label           = Column(String(120), default="")
+    rate_limit_rpm  = Column(Integer, default=60)
+    monthly_cap     = Column(Integer, default=1000)
+    active          = Column(Boolean, default=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
