@@ -16,11 +16,14 @@ OUTPUT_ROOT     = Path(os.getenv("KAIZER_OUTPUT_ROOT", "/tmp/kaizer_output"))
 
 def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  db_session_factory, language: str = "te",
-                 default_image: str = ""):
+                 default_image: str = "",
+                 default_logo: str = ""):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
-    When `default_image` is a non-empty absolute path to an existing file,
-    the pipeline uses it for every clip instead of fetching stock photos.
+    - `default_image` (non-empty absolute path) → the pipeline uses this
+      image for every clip instead of fetching stock photos.
+    - `default_logo` (non-empty absolute path) → the pipeline overlays this
+      logo on every clip video.  Empty / missing = NO logo overlay.
     """
 
     def _run():
@@ -64,6 +67,10 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                 env={
                     **os.environ,
                     "KAIZER_OUTPUT_ROOT": str(OUTPUT_ROOT),
+                    # Per-job logo path resolved from channel.logo_asset —
+                    # pipeline reads this and overlays on every clip.  Empty
+                    # = no logo overlay (deliberate SaaS default).
+                    "KAIZER_DEFAULT_LOGO": default_logo or "",
                     "PYTHONUNBUFFERED": "1",
                     "PYTHONIOENCODING": "utf-8",
                 },

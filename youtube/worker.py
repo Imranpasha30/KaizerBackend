@@ -18,6 +18,7 @@ import asyncio
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import or_
@@ -175,8 +176,35 @@ def _process(job_id: int) -> None:
             job.updated_at = datetime.now(timezone.utc)
             db.commit()
 
+        # ─── Per-destination logo overlay (before upload) ────────────
+        # The pipeline renders a clean master so each destination can
+        # get ITS OWN logo burned in just before upload.  Resolves the
+        # destination channel's OAuthToken.logo_asset_id → file → ffmpeg
+        # overlay.  If anything fails, falls back to the clean master.
+        upload_path = clip.file_path
         try:
-            video_id = uploader.upload_video(creds, job, clip.file_path, db, progress_cb=_progress)
+            dest_channel = db.query(models.Channel).filter(
+                models.Channel.id == job.channel_id,
+            ).first()
+            dest_tok = dest_channel.oauth_token if dest_channel else None
+            if dest_tok and dest_tok.logo_asset_id:
+                logo_asset = db.query(models.UserAsset).filter(
+                    models.UserAsset.id == dest_tok.logo_asset_id,
+                ).first()
+                if logo_asset and logo_asset.file_path and Path(logo_asset.file_path).exists():
+                    _append_log(job, f"overlaying destination logo ({logo_asset.filename})…")
+                    from youtube import logo_overlay
+                    upload_path = logo_overlay.overlay_logo(clip.file_path, logo_asset.file_path)
+                    if upload_path != clip.file_path:
+                        _append_log(job, "logo overlay applied")
+                    else:
+                        _append_log(job, "logo overlay failed — uploading clean master")
+        except Exception as e:
+            _append_log(job, f"logo overlay skipped: {e}")
+            upload_path = clip.file_path
+
+        try:
+            video_id = uploader.upload_video(creds, job, upload_path, db, progress_cb=_progress)
             _append_log(job, f"uploaded → video_id {video_id}")
             job.status = "processing"
             db.commit()
@@ -200,6 +228,15 @@ def _process(job_id: int) -> None:
         except Exception as e:
             traceback.print_exc()
             _retry(db, job, f"unexpected: {e}")
+        finally:
+            # Clean up the overlay temp file if we made one (no-op when we
+            # uploaded the clean master directly).
+            try:
+                if upload_path != clip.file_path:
+                    from youtube import logo_overlay
+                    logo_overlay.cleanup_overlay(upload_path, clip.file_path)
+            except Exception:
+                pass
     finally:
         db.close()
 

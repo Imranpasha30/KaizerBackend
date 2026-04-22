@@ -32,6 +32,7 @@ class ChannelIn(BaseModel):
     hashtags: List[str] = Field(default_factory=list)
     mandatory_hashtags: List[str] = Field(default_factory=list)
     is_priority: bool = False
+    logo_asset_id: Optional[int] = None
 
     @field_validator("fixed_tags", "hashtags", "mandatory_hashtags")
     @classmethod
@@ -63,6 +64,9 @@ class ChannelPatch(BaseModel):
     hashtags: Optional[List[str]] = None
     mandatory_hashtags: Optional[List[str]] = None
     is_priority: Optional[bool] = None
+    # Pass `null` explicitly to clear the logo.  Pass an int to set it to a
+    # UserAsset (ownership validated server-side).
+    logo_asset_id: Optional[int] = None
 
     @field_validator("fixed_tags", "hashtags", "mandatory_hashtags")
     @classmethod
@@ -89,6 +93,25 @@ class ChannelPatch(BaseModel):
 
 def _to_dict(c: models.Channel) -> dict:
     tok = c.oauth_token
+    # Logo preview — look up the referenced asset if set.  Cheap single-query
+    # because the caller is either reading one channel or we've already
+    # loaded everything in list_channels.
+    logo_asset = None
+    if c.logo_asset_id:
+        try:
+            from sqlalchemy.orm import object_session
+            sess = object_session(c)
+            if sess is not None:
+                la = sess.query(models.UserAsset).filter(models.UserAsset.id == c.logo_asset_id).first()
+                if la:
+                    logo_asset = {
+                        "id":       la.id,
+                        "filename": la.filename,
+                        "url":      f"/api/file/?path={la.file_path}",
+                        "thumb_url": f"/api/file/?path={la.thumb_path}" if la.thumb_path else "",
+                    }
+        except Exception:
+            logo_asset = None
     return {
         "id": c.id,
         "name": c.name,
@@ -101,6 +124,8 @@ def _to_dict(c: models.Channel) -> dict:
         "hashtags": c.hashtags or [],
         "mandatory_hashtags": c.mandatory_hashtags or [],
         "is_priority": bool(c.is_priority),
+        "logo_asset_id": c.logo_asset_id,
+        "logo":          logo_asset,
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         "connected": tok is not None and bool(tok.refresh_token_enc),
@@ -207,6 +232,61 @@ def set_profile_destinations(
     return {"profile_id": ch.id, "google_channel_ids": sorted(final)}
 
 
+def _validate_logo_ownership(db: Session, user_id: int, asset_id: Optional[int]) -> None:
+    """Reject logo picks that reference assets outside the user's library."""
+    if asset_id is None:
+        return
+    a = db.query(models.UserAsset).filter(
+        models.UserAsset.id == asset_id,
+        models.UserAsset.user_id == user_id,
+    ).first()
+    if not a:
+        raise HTTPException(status_code=404, detail=f"Logo asset {asset_id} not found in your library")
+
+
+class ApplyLogoBulk(BaseModel):
+    channel_ids:   List[int]
+    logo_asset_id: Optional[int] = None   # null = clear logo on all listed channels
+
+
+@router.post("/apply-logo")
+def apply_logo_to_channels(
+    payload: ApplyLogoBulk,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Set (or clear) the same logo on many profiles at once.
+
+    Powers the "use this logo for multiple channels" dropdown on the logo
+    picker.  Only touches channels owned by the caller.  If the requested
+    logo_asset_id doesn't belong to this user it's rejected outright.
+    """
+    if not payload.channel_ids:
+        raise HTTPException(422, "channel_ids is required and must be non-empty")
+    _validate_logo_ownership(db, user.id, payload.logo_asset_id)
+
+    rows = (
+        db.query(models.Channel)
+          .filter(
+              models.Channel.id.in_(payload.channel_ids),
+              models.Channel.user_id == user.id,
+          )
+          .all()
+    )
+    found_ids = {c.id for c in rows}
+    missing = [i for i in payload.channel_ids if i not in found_ids]
+    if missing:
+        raise HTTPException(404, f"Channel(s) not found: {missing}")
+
+    for ch in rows:
+        ch.logo_asset_id = payload.logo_asset_id
+    db.commit()
+    return {
+        "updated": [c.id for c in rows],
+        "logo_asset_id": payload.logo_asset_id,
+    }
+
+
 @router.post("/", status_code=201)
 def create_channel(payload: ChannelIn, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
     existing = db.query(models.Channel).filter(
@@ -216,6 +296,7 @@ def create_channel(payload: ChannelIn, db: Session = Depends(get_db), user: mode
     if existing:
         raise HTTPException(status_code=409, detail=f"Profile with name '{payload.name}' already exists")
 
+    _validate_logo_ownership(db, user.id, payload.logo_asset_id)
     ch = models.Channel(user_id=user.id, **payload.model_dump())
     db.add(ch)
     db.commit()
@@ -251,6 +332,9 @@ def update_channel(channel_id: int, payload: ChannelPatch, db: Session = Depends
         ).first()
         if dup:
             raise HTTPException(status_code=409, detail=f"Profile with name '{updates['name']}' already exists")
+
+    if "logo_asset_id" in updates:
+        _validate_logo_ownership(db, user.id, updates["logo_asset_id"])
 
     for key, val in updates.items():
         setattr(ch, key, val)

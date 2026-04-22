@@ -5,6 +5,7 @@ import shutil
 import mimetypes
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,18 @@ def _migrate_schema():
                 cols = {c["name"] for c in inspector.get_columns(tbl)}
                 if "user_id" not in cols:
                     conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER"))
+
+        # ── channels.logo_asset_id (per-channel video overlay logo) ─────
+        if inspector.has_table("channels"):
+            cols = {c["name"] for c in inspector.get_columns("channels")}
+            if "logo_asset_id" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN logo_asset_id INTEGER"))
+
+        # ── user_assets.folder_path (virtual folders for organization) ──
+        if inspector.has_table("user_assets"):
+            cols = {c["name"] for c in inspector.get_columns("user_assets")}
+            if "folder_path" not in cols:
+                conn.execute(text("ALTER TABLE user_assets ADD COLUMN folder_path VARCHAR(255) DEFAULT ''"))
 
         # ── users.socials (cross-promo links for SEO footer) ────────────
         if inspector.has_table("users"):
@@ -155,6 +168,9 @@ def _migrate_schema():
                 "video_count":           "INTEGER DEFAULT 0",
                 "view_count":            "BIGINT DEFAULT 0",
                 "metadata_cached_at":    "TIMESTAMP NULL" if engine.dialect.name == "postgresql" else "DATETIME",
+                # Per-YT-account logo (lives here, NOT on Channel which is a
+                # style template).  NULL = no overlay on rendered videos.
+                "logo_asset_id":         "INTEGER",
             }
             for col, dtype in token_additions.items():
                 if col not in existing_tokens:
@@ -345,6 +361,9 @@ async def create_job(
     frame_layout: str = Form(...),
     language: str = Form("te"),
     use_default_image: bool = Form(False),
+    # Optional: pick which style-profile's logo to overlay.  Resolved to the
+    # UserAsset.file_path at render time.  Absent / invalid = no logo.
+    logo_channel_id: Optional[int] = Form(None),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -387,6 +406,43 @@ async def create_job(
         if asset and asset.file_path and Path(asset.file_path).exists():
             default_img_path = asset.file_path
 
+    # Per-destination logos: the pipeline now renders a CLEAN MASTER with no
+    # logo overlay.  The upload worker applies each destination's logo at
+    # publish time (youtube/logo_overlay.py) so Auto Wala videos get Auto
+    # Wala's logo, Cyber Sphere videos get Cyber Sphere's.  Set
+    # KAIZER_BAKE_LOGO_AT_RENDER=true in .env to restore the old single-logo
+    # behavior (faster renders, but same logo across all destinations).
+    _BAKE_AT_RENDER = (os.environ.get("KAIZER_BAKE_LOGO_AT_RENDER", "") or "").lower() == "true"
+    default_logo_path = ""
+
+    def _resolve_asset(asset_id):
+        if not asset_id:
+            return ""
+        a = db.query(models.UserAsset).filter(
+            models.UserAsset.id == asset_id,
+            models.UserAsset.user_id == user.id,
+        ).first()
+        if a and a.file_path and Path(a.file_path).exists():
+            return a.file_path
+        return ""
+
+    # Only bake a logo at render time when the explicit legacy flag is on.
+    # Default path: render clean master, let upload worker overlay per-
+    # destination (handled in youtube/logo_overlay.py + worker.py).
+    if _BAKE_AT_RENDER and logo_channel_id:
+        ch = (
+            db.query(models.Channel)
+              .filter(
+                  models.Channel.id == logo_channel_id,
+                  models.Channel.user_id == user.id,
+              )
+              .first()
+        )
+        tok = ch.oauth_token if ch else None
+        asset_id = (tok.logo_asset_id if tok and tok.logo_asset_id
+                    else (ch.logo_asset_id if ch else None))
+        default_logo_path = _resolve_asset(asset_id)
+
     runner.run_pipeline(
         job_id=job.id,
         video_path=str(video_path),
@@ -394,6 +450,7 @@ async def create_job(
         frame=frame_layout,
         language=lang_cfg.code,
         default_image=default_img_path,
+        default_logo=default_logo_path,
         db_session_factory=SessionLocal,
     )
 

@@ -112,6 +112,10 @@ class Channel(Base):
     footer             = Column(Text, default="")
     fixed_tags         = Column(JSON, default=list)
     hashtags           = Column(JSON, default=list)
+    # Optional overlay logo for videos rendered under this channel.  FK to
+    # a UserAsset the user picked from their Assets library.  Null = no
+    # logo (the SaaS default — users opt in via the Style Profiles page).
+    logo_asset_id      = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
     mandatory_hashtags = Column(JSON, default=list)
     is_priority        = Column(Boolean, default=False)
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
@@ -175,6 +179,12 @@ class OAuthToken(Base):
     video_count          = Column(Integer,     default=0)
     view_count           = Column(BigInteger,  default=0)
     metadata_cached_at   = Column(DateTime(timezone=True), nullable=True)
+
+    # Per-YouTube-account logo overlay.  The logo is a property of the REAL
+    # YT account (the user owns Auto Wala; "TV9 Telugu" is just a writing-
+    # style template and never gets a logo).  Resolved at render time via
+    # KAIZER_DEFAULT_LOGO env; empty = no overlay.
+    logo_asset_id        = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
 
     channel = relationship("Channel", back_populates="oauth_token")
 
@@ -395,6 +405,10 @@ class UserAsset(Base):
     height        = Column(Integer, default=0)
     is_default_ad = Column(Boolean, default=False, index=True)
     tags          = Column(JSON, default=list)              # ["news", "telugu", …]
+    # Virtual folder path — slash-separated like "logos/english/".  Empty
+    # = Assets root.  No physical folders on disk; this is purely a UI
+    # organization string the frontend groups by.
+    folder_path   = Column(String(255), default="", index=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 

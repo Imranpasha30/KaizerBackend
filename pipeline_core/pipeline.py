@@ -49,7 +49,11 @@ os.chdir(BASE_DIR)
 
 RESOURCES   = os.path.join(BASE_DIR, "resources")
 FONTS_DIR   = os.path.join(RESOURCES, "fonts")
-KAIZER_LOGO = os.path.join(BASE_DIR, "assests", "kaizer-logo.png")
+# Per-job logo: resolved by runner.py from the selected channel's logo_asset
+# and passed through KAIZER_DEFAULT_LOGO env var.  Empty / missing = NO logo
+# overlay at all (intentional — users must opt in by setting a channel logo).
+_DEFAULT_LOGO_ENV = (os.environ.get("KAIZER_DEFAULT_LOGO", "") or "").strip()
+DEFAULT_LOGO = _DEFAULT_LOGO_ENV if (_DEFAULT_LOGO_ENV and os.path.exists(_DEFAULT_LOGO_ENV)) else ""
 OUTPUT_ROOT = os.environ.get("KAIZER_OUTPUT_ROOT",
               os.path.join(BASE_DIR, "output", "api_pipeline"))
 
@@ -1309,16 +1313,14 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
     clip_dir = os.path.dirname(out_path)
     clip_name = os.path.splitext(os.path.basename(out_path))[0]
 
-    # Resolve image
+    # Resolve image — fall back to a generated text card if the stock image
+    # isn't available (no global branded-logo fallback).
     if not image_path or not os.path.exists(str(image_path)):
-        if os.path.exists(KAIZER_LOGO):
-            image_path = KAIZER_LOGO
-        else:
-            image_path = os.path.join(clip_dir, f"_card_{clip_name}.jpg")
-            generate_news_card(
-                _ascii_text(title_text or "KAIZER NEWS", 40),
-                image_path, w, IMAGE_H
-            )
+        image_path = os.path.join(clip_dir, f"_card_{clip_name}.jpg")
+        generate_news_card(
+            _ascii_text(title_text or "KAIZER NEWS", 40),
+            image_path, w, IMAGE_H,
+        )
 
     # Prep image to exact dimensions
     try:
@@ -1386,10 +1388,13 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
                 f"drawtext=fontfile='{_fnt_esc}':text='{te}':fontsize={_fnt_sz}"
                 f":fontcolor={_tc}:x=(w-text_w)/2:y={ly}")
 
-    # Logo — use custom if provided via card_style["video_logo"], else default
+    # Logo precedence: per-clip card_style override → per-job default (from
+    # channel config) → NO logo at all.  There is deliberately NO global
+    # fallback — users opt in by setting a Channel.logo in the Style Profiles
+    # page.  The previous Kaizer-branded default was a bug for a SaaS.
     _vlogo = (_cs.get("video_logo", "") or "") if _cs else ""
     logo_path = (_vlogo if (_vlogo and os.path.exists(_vlogo))
-                 else (KAIZER_LOGO if os.path.exists(KAIZER_LOGO) else None))
+                 else (DEFAULT_LOGO or None))
     LOGO_W = _e(int(w * 160 / 1080))
     LOGO_H = _e(int(h * 134 / 1920))
     LOGO_MR = int(w * 24 / 1080)
@@ -1812,7 +1817,9 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
     bg_img.save(bg_path, 'PNG')
 
     # ── Logo for video overlay ──
-    _logo = video_logo if (video_logo and os.path.exists(str(video_logo))) else (KAIZER_LOGO if os.path.exists(KAIZER_LOGO) else None)
+    # Per-clip video_logo → per-job DEFAULT_LOGO → NO overlay (no global default)
+    _logo = (video_logo if (video_logo and os.path.exists(str(video_logo)))
+             else (DEFAULT_LOGO or None))
     LOGO_W = _e(int(vid_w * 160 / 1080))
     LOGO_H = _e(int(vid_h * 134 / 1080))
     LOGO_MR = int(vid_w * 24 / 1080)
@@ -1895,7 +1902,7 @@ def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_colo
 
     # Logo overlay — use custom logo if provided, else default
     logo_path = (video_logo if (video_logo and os.path.exists(str(video_logo)))
-                 else (KAIZER_LOGO if os.path.exists(KAIZER_LOGO) else None))
+                 else (DEFAULT_LOGO or None))
     LOGO_W = _e(int(w * 160 / 1080))
     LOGO_H = _e(int(h * 134 / 1920))
     LOGO_MR = int(w * 24 / 1080)
@@ -2176,9 +2183,11 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                                _e(int(preset["height"] * 0.3690)))
             images.append(card_path)
 
-    # Pad images list
+    # Pad images list — repeat the last good image, or fall back to the
+    # per-job default logo (only if the user configured one), not a hardcoded
+    # Kaizer brand.
     while len(images) < len(clips):
-        images.append(images[-1] if images else KAIZER_LOGO)
+        images.append(images[-1] if images else (DEFAULT_LOGO or ""))
 
     # ════ STEP 5: Compose Final Clips ════
     print(f"\n  [5/{TOTAL}] Composing broadcast layout ({FRAME_LAYOUTS[frame_layout]}) ...")

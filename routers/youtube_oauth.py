@@ -46,6 +46,27 @@ def list_accounts(
           )
           .all()
     )
+    # Resolve logo asset once (if set) — the PRIMARY token for each YT
+    # account holds the logo; other tokens pointing at the same account
+    # fall back to None here (rare case — same account linked twice).
+    logo_ids = sorted({t.logo_asset_id for t in rows if t.logo_asset_id})
+    logo_map = {}
+    if logo_ids:
+        assets = (
+            db.query(models.UserAsset)
+              .filter(models.UserAsset.id.in_(logo_ids), models.UserAsset.user_id == user.id)
+              .all()
+        )
+        logo_map = {
+            a.id: {
+                "id":       a.id,
+                "filename": a.filename,
+                "url":      f"/api/file/?path={a.file_path}",
+                "thumb_url": f"/api/file/?path={a.thumb_path}" if a.thumb_path else "",
+            }
+            for a in assets
+        }
+
     groups: dict[str, dict] = {}
     for t in rows:
         key = t.google_channel_id or f"__unknown_{t.id}"
@@ -68,6 +89,9 @@ def list_accounts(
                 # one whose oauth_token directly holds creds.  Used by the UI
                 # to target refresh / disconnect operations.
                 "primary_profile_id":   t.channel_id,
+                # Overlay logo for videos rendered under this YT account
+                "logo_asset_id":        t.logo_asset_id,
+                "logo":                 logo_map.get(t.logo_asset_id) if t.logo_asset_id else None,
             }
         if t.channel:
             groups[key]["profiles"].append({
@@ -129,6 +153,51 @@ def refresh_account(
         "view_count":           int(token.view_count or 0),
         "metadata_cached_at":   token.metadata_cached_at.isoformat() if token.metadata_cached_at else None,
     }
+
+
+from pydantic import BaseModel  # noqa — placed here so the set-logo schema
+                                 # lives next to the handler for readability.
+
+
+class AccountLogoRequest(BaseModel):
+    logo_asset_id: int | None = None   # null = clear logo
+
+
+@router.post("/accounts/{channel_id}/logo")
+def set_account_logo(
+    channel_id: int,
+    payload: AccountLogoRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Set (or clear) the overlay logo on the REAL YouTube account backing
+    this style profile.  The logo is stored on OAuthToken so it belongs to
+    the YT account, not the writing-style profile.  Ownership validated.
+    """
+    ch = db.query(models.Channel).filter(
+        models.Channel.id == channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not ch:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not ch.oauth_token:
+        raise HTTPException(
+            status_code=409,
+            detail="This profile is not linked to a YouTube account. Link it first.",
+        )
+
+    # Validate logo asset ownership
+    if payload.logo_asset_id is not None:
+        asset = db.query(models.UserAsset).filter(
+            models.UserAsset.id == payload.logo_asset_id,
+            models.UserAsset.user_id == user.id,
+        ).first()
+        if not asset:
+            raise HTTPException(status_code=404, detail="Logo asset not found in your library")
+
+    ch.oauth_token.logo_asset_id = payload.logo_asset_id
+    db.commit()
+    return {"channel_id": channel_id, "logo_asset_id": payload.logo_asset_id}
 
 
 @router.get("/authorize")
