@@ -34,6 +34,7 @@ from routers.veo import router as veo_router
 from routers.channel_groups import router as channel_groups_router
 from routers.billing import router as billing_router
 from routers.job_progress import router as job_progress_router
+from routers.feedback import router as feedback_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -252,6 +253,7 @@ app.include_router(veo_router)
 app.include_router(channel_groups_router)
 app.include_router(billing_router)
 app.include_router(job_progress_router)   # Phase 2B — job progress endpoint
+app.include_router(feedback_router)       # Phase 3.5 — post-publish feedback endpoint
 
 
 # ── Upload worker lifecycle ──────────────────────────────────────────────────
