@@ -377,6 +377,47 @@ async def create_job(
     with open(video_path, "wb") as f:
         f.write(await video.read())
 
+    # ── Input validation gate (Phase 1) ──────────────────────────────────────
+    # Validate the uploaded file before creating a job row or starting the
+    # pipeline.  Hard errors (wrong codec, corrupt file, etc.) return HTTP 400
+    # immediately so the user gets actionable feedback without wasting a job
+    # slot.  Soft warnings are attached to the job's log field so they surface
+    # in the UI after the pipeline completes.
+    _validation_warnings: list[str] = []
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR / "pipeline_core"))
+        from pipeline_core.validator import validate_input as _validate_input  # type: ignore
+        _val_result = _validate_input(str(video_path))
+        if not _val_result.ok:
+            # Clean up uploaded file so it doesn't accumulate on disk
+            try:
+                video_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "errors": _val_result.errors,
+                    "warnings": _val_result.warnings,
+                },
+            )
+        _validation_warnings = _val_result.warnings
+    except HTTPException:
+        raise
+    except Exception as _ve:
+        # Validator import failure or unexpected error — log and continue so a
+        # broken validator never blocks all uploads.  The pipeline itself will
+        # fail if the file is truly bad.
+        import logging as _logging
+        _logging.getLogger("kaizer.pipeline.validator").warning(
+            "create_job: validator error (non-fatal): %s", _ve
+        )
+
+    _warning_prefix = ""
+    if _validation_warnings:
+        _warning_prefix = "[input warnings] " + "; ".join(_validation_warnings) + "\n"
+
     job = models.Job(
         user_id=user.id,
         platform=platform,
@@ -384,7 +425,7 @@ async def create_job(
         video_name=video.filename,
         language=lang_cfg.code,
         status="pending",
-        log="",
+        log=_warning_prefix,
         output_dir=str(OUTPUT_ROOT),
     )
     db.add(job)

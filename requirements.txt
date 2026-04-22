@@ -163,3 +163,6 @@ whitenoise==6.12.0
 xxhash==3.6.0
 yarl==1.22.0
 yt-dlp==2026.2.21
+pytest==8.3.4
+pytest-asyncio==0.25.2
+pytest-mock==3.14.0

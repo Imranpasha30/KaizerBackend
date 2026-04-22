@@ -38,6 +38,61 @@ def _find_binary(name):
 FFMPEG_BIN  = _find_binary("ffmpeg")
 FFPROBE_BIN = _find_binary("ffprobe")
 
+# ═══════════════════════════════════════════════════════════
+# STANDARD ENCODE ARGS
+#
+# _BASE_ENCODE_ARGS: bitrate-capped + colour-normalised + AAC 48 kHz.
+#   Used for INTERMEDIATE cuts (cut_video_clips) where loudnorm would
+#   be applied twice if included — once here, once at final compose.
+#
+# ENCODE_ARGS_SHORT_FORM: _BASE + loudnorm I=-14:TP=-1.5:LRA=11.
+#   Used at the FINAL compose step only, so audio hits the normaliser
+#   exactly once.
+# ═══════════════════════════════════════════════════════════
+_BASE_ENCODE_ARGS = [
+    "-c:v",          "libx264",
+    "-preset",       "medium",
+    "-crf",          "20",
+    "-b:v",          "8M",    "-maxrate", "10M",  "-bufsize", "16M",
+    "-pix_fmt",      "yuv420p",
+    "-color_range",  "tv",
+    "-color_primaries", "bt709",
+    "-color_trc",    "bt709",
+    "-colorspace",   "bt709",
+    "-profile:v",    "high",  "-level",   "4.1",
+    "-movflags",     "+faststart",
+    "-c:a",          "aac",
+    "-b:a",          "192k",
+    "-ar",           "48000",
+]
+
+ENCODE_ARGS_INTERMEDIATE = list(_BASE_ENCODE_ARGS)
+
+ENCODE_ARGS_SHORT_FORM = _BASE_ENCODE_ARGS + [
+    "-af",           "loudnorm=I=-14:TP=-1.5:LRA=11",
+]
+
+# ═══════════════════════════════════════════════════════════
+# PIPELINE EXCEPTIONS
+# ═══════════════════════════════════════════════════════════
+
+class PipelineQAError(RuntimeError):
+    """Raised when an output clip fails QA validation.
+
+    Attributes
+    ----------
+    qa_errors : list[str]
+        The hard-failure messages from QAResult.errors.
+    qa_warnings : list[str]
+        Any soft warnings from QAResult.warnings.
+    """
+
+    def __init__(self, qa_errors: list, qa_warnings: list | None = None):
+        self.qa_errors = qa_errors
+        self.qa_warnings = qa_warnings or []
+        msg = "Pipeline QA failed: " + "; ".join(qa_errors)
+        super().__init__(msg)
+
 # Fix Windows console encoding for Telugu/Unicode output
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -645,15 +700,13 @@ def cut_video_clips(video_path: str, clips: list, output_dir: str) -> list:
             continue
 
         out_path = os.path.join(output_dir, f"raw_clip_{i:02d}.mp4")
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-ss", str(round(start, 3)), "-t", str(round(dur, 3)),
-            "-i", video_path,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            out_path
-        ]
+        cmd = (
+            [FFMPEG_BIN, "-y",
+             "-ss", str(round(start, 3)), "-t", str(round(dur, 3)),
+             "-i", video_path]
+            + ENCODE_ARGS_INTERMEDIATE
+            + [out_path]
+        )
         print(f"    Cutting clip {i}: {sec_to_ts(start)} -> {sec_to_ts(end)} ({dur:.1f}s)")
         run_ffmpeg(cmd)
         clip["raw_path"] = out_path
@@ -1285,12 +1338,131 @@ def generate_torn_paper_card(text, width, height, font_path, out_path, seed=0,
 
 
 # ═══════════════════════════════════════════════════════════
+# POST-COMPOSE HELPERS  (duration enforcement + QA gate)
+# ═══════════════════════════════════════════════════════════
+
+# Platforms whose output must never exceed 180 s (hard platform limit).
+_SHORT_FORM_PLATFORMS = {'youtube_short', 'instagram_reel', 'tiktok'}
+_SHORT_FORM_MAX_S     = 179.5   # trim target (leave 0.5 s headroom)
+
+
+def _enforce_duration(out_path: str, platform: str) -> None:
+    """Stream-copy trim *out_path* to _SHORT_FORM_MAX_S if needed.
+
+    Only acts on short-form platforms (youtube_short, instagram_reel, tiktok).
+    Uses FFmpeg stream-copy (-c copy) — no re-encode.  The file is replaced
+    in-place via a temporary sidecar and atomic rename.
+
+    Parameters
+    ----------
+    out_path : str
+        Path to the composed output file.  Modified in place if trimmed.
+    platform : str
+        Platform key.  Trim is skipped for platforms not in _SHORT_FORM_PLATFORMS.
+    """
+    import logging as _logging
+    _log = _logging.getLogger("kaizer.pipeline.validator")
+
+    if platform not in _SHORT_FORM_PLATFORMS:
+        return
+
+    # Measure actual duration via ffprobe
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-print_format", "json",
+             "-show_format", out_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(result.stdout)
+        dur = float(info.get("format", {}).get("duration") or 0.0)
+    except Exception as exc:
+        _log.warning("_enforce_duration: could not probe %s: %s", out_path, exc)
+        return
+
+    if dur <= _SHORT_FORM_MAX_S:
+        return  # nothing to do
+
+    _log.warning(
+        "Output %s duration %.2fs exceeds %.1fs for platform %r — "
+        "stream-copy trimming to %.1fs.",
+        out_path, dur, _SHORT_FORM_MAX_S + 0.5, platform, _SHORT_FORM_MAX_S,
+    )
+
+    tmp_path = out_path + ".trim_tmp.mp4"
+    try:
+        trim_cmd = [
+            FFMPEG_BIN, "-y",
+            "-i", out_path,
+            "-t", str(_SHORT_FORM_MAX_S),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            tmp_path,
+        ]
+        subprocess.run(trim_cmd, capture_output=True, check=True, timeout=120)
+        os.replace(tmp_path, out_path)
+        _log.info("Duration trim complete: %s → %.1fs", out_path, _SHORT_FORM_MAX_S)
+    except Exception as exc:
+        _log.error("_enforce_duration trim failed for %s: %s", out_path, exc)
+        # Clean up temp file if it exists; leave original untouched.
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _run_output_qa(out_path: str, platform: str,
+                   expected_duration_s: float | None = None) -> None:
+    """Run the QA gate on a composed output file.
+
+    Imports qa.validate_output lazily to avoid circular imports at module load.
+    Raises PipelineQAError if QA hard-fails.  Warnings are logged only.
+
+    Parameters
+    ----------
+    out_path : str
+        Path to the composed output file.
+    platform : str
+        Platform key passed to validate_output().
+    expected_duration_s : float | None
+        If provided, QA checks that actual duration is within ±0.5 s.
+    """
+    import logging as _logging
+    _log = _logging.getLogger("kaizer.pipeline.qa")
+
+    try:
+        from pipeline_core.qa import validate_output  # type: ignore
+    except ImportError:
+        try:
+            from qa import validate_output  # type: ignore
+        except ImportError:
+            _log.warning(
+                "_run_output_qa: qa module not importable — QA check skipped for %s",
+                out_path,
+            )
+            return
+
+    qa_result = validate_output(
+        out_path,
+        platform=platform,
+        expected_duration_s=expected_duration_s,
+    )
+
+    if qa_result.warnings:
+        for w in qa_result.warnings:
+            _log.warning("QA warning [%s]: %s", out_path, w)
+
+    if not qa_result.ok:
+        raise PipelineQAError(qa_result.errors, qa_result.warnings)
+
+
+# ═══════════════════════════════════════════════════════════
 # COMPOSE CLIP — KAIZER_NEWS Layout (Video + Text + Image)
 # ═══════════════════════════════════════════════════════════
 
 def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
                  font_size=None, text_color=None, font_file=None, section_pct=None,
-                 word_colors=None, card_style=None):
+                 word_colors=None, card_style=None, platform: str = 'youtube_short'):
     """
     Compose final broadcast clip with KAIZER_NEWS 3-section layout:
       Top:    Video (49.5%)
@@ -1442,12 +1614,13 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
 
     cmd = ([FFMPEG_BIN, "-y"] + base + extra +
            ["-filter_complex", ";".join(fc),
-            "-map", "[outv]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", out_path])
+            "-map", "[outv]", "-map", "0:a?"]
+           + ENCODE_ARGS_SHORT_FORM
+           + ["-shortest", out_path])
 
     run_ffmpeg(cmd)
+    _enforce_duration(out_path, platform)
+    _run_output_qa(out_path, platform)
     return {
         "font_size": card_font_size,
         "font_file": os.path.basename(tel_font),
@@ -1658,7 +1831,8 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
                        follow_text_color='#ffffff',
                        social_logos=None,
                        video_logo=None,
-                       velvet_style=None):
+                       velvet_style=None,
+                       platform: str = 'youtube_short'):
     """
     Follow Bar layout (9:16):
       - Solid bg color (full frame)
@@ -1853,16 +2027,17 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
 
     cmd = ([FFMPEG_BIN, '-y'] + base + extra +
            ['-filter_complex', ';'.join(fc),
-            '-map', '[outv]', '-map', '0:a?',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-shortest', out_path])
+            '-map', '[outv]', '-map', '0:a?']
+           + ENCODE_ARGS_SHORT_FORM
+           + ['-shortest', out_path])
 
     run_ffmpeg(cmd)
+    _enforce_duration(out_path, platform)
+    _run_output_qa(out_path, platform)
     return {'bg_color': bg_color}
 
 
-def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_color='#1a0a2e', video_logo=None):
+def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_color='#1a0a2e', video_logo=None, platform: str = 'youtube_short'):
     """
     Compose split-frame broadcast clip:
       - Solid background color (full frame)
@@ -1940,12 +2115,13 @@ def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_colo
 
     cmd = ([FFMPEG_BIN, '-y'] + base + extra +
            ['-filter_complex', ';'.join(fc),
-            '-map', '[outv]', '-map', '0:a?',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-shortest', out_path])
+            '-map', '[outv]', '-map', '0:a?']
+           + ENCODE_ARGS_SHORT_FORM
+           + ['-shortest', out_path])
 
     run_ffmpeg(cmd)
+    _enforce_duration(out_path, platform)
+    _run_output_qa(out_path, platform)
     return {'bg_color': bg_color}
 
 
@@ -2214,7 +2390,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         print(f"    Composing clip {i+1} ({frame_layout}, font={lang_font_basename}) ...")
 
         if frame_layout == "split_frame":
-            compose_split_frame(raw_path, img, out_path, preset)
+            compose_split_frame(raw_path, img, out_path, preset, platform=platform)
             compose_meta = {}
             clip_card_params = {"font_file": lang_font_basename}
             clip_split_params = {"bg_color": "#1a0a2e"}
@@ -2232,7 +2408,8 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                                text_color="#ffff00",
                                bg_color="#1a0a2e",
                                follow_text=lang_follow_text,
-                               velvet_style=_default_velvet)
+                               velvet_style=_default_velvet,
+                               platform=platform)
             compose_meta = {}
             clip_card_params = {"font_file": lang_font_basename,
                                  "font_size": 60, "text_color": "#ffff00"}
@@ -2250,6 +2427,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 card_style={"card_c0": "#c10000", "card_c1": "#800000",
                             "edge": 9, "jag": 60, "seed": 7,
                             "vsid": 35, "vcor": 72, "vwid": 74, "overlap": 20},
+                platform=platform,
             )
             clip_card_params = {
                 "font_size": compose_meta.get("font_size", 52),
