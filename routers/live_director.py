@@ -303,6 +303,49 @@ def add_camera(
     )
 
 
+@router.delete("/events/{event_id}/cameras/{cam_id}")
+def delete_camera(
+    event_id: int,
+    cam_id: str,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Remove a camera from a scheduled event. Refuses while the event is live."""
+    ev = _load_event(event_id, user.id, db)
+    if ev.status == "live" or event_id in _SESSIONS:
+        raise HTTPException(409, "Cannot remove a camera from a live event. Stop the event first.")
+    cam = (
+        db.query(models.LiveCamera)
+        .filter(
+            models.LiveCamera.event_id == event_id,
+            models.LiveCamera.cam_id == cam_id,
+        )
+        .first()
+    )
+    if cam is None:
+        raise HTTPException(404, f"No camera {cam_id!r} on event {event_id}")
+    db.delete(cam)
+    db.commit()
+    return {"deleted": cam_id}
+
+
+@router.delete("/events/{event_id}")
+def delete_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Delete an entire event (cameras + director log cascade via FK).
+    Refuses while the event is live — POST /stop first.
+    """
+    ev = _load_event(event_id, user.id, db)
+    if ev.status == "live" or event_id in _SESSIONS:
+        raise HTTPException(409, "Cannot delete a live event. Stop it first.")
+    db.delete(ev)
+    db.commit()
+    return {"deleted": event_id}
+
+
 @router.post("/events/{event_id}/start")
 async def start_event(
     event_id: int,
