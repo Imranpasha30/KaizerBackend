@@ -36,6 +36,7 @@ from routers.billing import router as billing_router
 from routers.job_progress import router as job_progress_router
 from routers.feedback import router as feedback_router
 from routers.editor import router as editor_router
+from routers.live_director import router as live_director_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -289,6 +290,7 @@ app.include_router(billing_router)
 app.include_router(job_progress_router)   # Phase 2B — job progress endpoint
 app.include_router(feedback_router)       # Phase 3.5 — post-publish feedback endpoint
 app.include_router(editor_router)         # Wave 2 — editor beta endpoints
+app.include_router(live_director_router)  # Phase 6 — Autonomous Live Director
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend
