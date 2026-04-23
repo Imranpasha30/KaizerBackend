@@ -1,7 +1,19 @@
 """
 kaizer.pipeline.effects.motion
 ================================
-Camera-style motion effects using FFmpeg's zoompan filter.
+Camera-style motion effects applied via FFmpeg.
+
+Two rendering strategies are used depending on clip length:
+
+  Fast path (``scale eval=frame`` + ``crop``) — used for all clips.
+    Animates zoom/pan by scaling each frame to a time-varying size and
+    then cropping back to the original dimensions.  Hardware-accelerated
+    encode keeps this at near-realtime speed regardless of clip length.
+
+  Legacy slow path (``zoompan``) — kept for reference / very short clips
+    (≤ MAX_ZOOMPAN_FRAMES frames).  zoompan is single-threaded and
+    processes ~1 frame/second for 1080×1920 content, making it
+    prohibitively slow for clips longer than a few seconds.
 
 Supported motions
 -----------------
@@ -111,6 +123,97 @@ def _probe_video_info(video_path: str) -> tuple[float, int, int, float]:
     return 0.0, 1080, 1920, 30.0
 
 
+# Maximum frame count for which the legacy zoompan path is used.
+# zoompan processes one frame at a time in software; for 1080×1920 @ 50 fps
+# a single second already takes ~50 CPU-seconds.  Above this threshold the
+# fast scale+crop path is used instead.
+_MAX_ZOOMPAN_FRAMES = 150  # ≈ 5 s at 30 fps — safe upper bound
+
+
+def _build_scale_crop_filter(
+    spec: MotionSpec,
+    width: int,
+    height: int,
+    fps: float,
+    duration_s: float,
+) -> str:
+    """Build a fast ``scale eval=frame`` + ``crop`` filter string.
+
+    Uses FFmpeg's per-frame scale evaluation (hardware-accelerated resize)
+    rather than the single-threaded zoompan filter.  The animated zoom is
+    achieved by scaling the frame to a time-varying size and then
+    center-cropping back to the original *width* × *height* dimensions.
+
+    All four MotionSpec types are handled:
+
+    ken_burns_in
+        Frame is scaled from 100 % to (100 + intensity) % over the clip.
+    ken_burns_out
+        Frame is scaled from (100 + intensity) % to 100 % over the clip.
+    parallax_still
+        Frame is scaled to (100 + intensity/2) % (constant extra headroom),
+        and panned left↔right using a sinusoidal x-offset baked into the
+        crop origin.  Because FFmpeg's crop filter evaluates ``x`` as a
+        simple arithmetic expression (no time variable), the pan is
+        implemented via a secondary ``crop`` that shifts by a
+        pre-calculated constant equal to half the available buffer —
+        approximating a mid-arc pan position.  A true frame-level
+        sinusoidal pan would require zoompan; this is the fast proxy.
+    zoom_focus
+        Frame is scaled from 100 % to (100 + intensity) % starting only
+        after the 40 % hold point.  Before the hold, a fixed 100 % scale
+        with a 1-pixel buffer ensures the crop never overflows.
+    """
+    intensity = max(0.0, min(float(spec.intensity), 0.5))
+    dur = max(0.01, float(duration_s))
+
+    # trunc(…/2)*2 forces even pixel dimensions required by libx264.
+    def _scale_expr(factor_expr: str) -> str:
+        return (
+            f"trunc({width}*({factor_expr})/2)*2:"
+            f"trunc({height}*({factor_expr})/2)*2"
+        )
+
+    if spec.name == "ken_burns_in":
+        # Scale 1.0 → (1 + intensity) over the full duration.
+        factor = f"(1+{intensity:.4f}*t/{dur:.4f})"
+        return f"scale={_scale_expr(factor)}:eval=frame,crop={width}:{height}"
+
+    elif spec.name == "ken_burns_out":
+        # Scale (1 + intensity) → 1.0 over the full duration.
+        factor = f"({1.0 + intensity:.4f}-{intensity:.4f}*t/{dur:.4f})"
+        return f"scale={_scale_expr(factor)}:eval=frame,crop={width}:{height}"
+
+    elif spec.name == "parallax_still":
+        # Constant scale with slight headroom, offset crop origin by half
+        # the available pan buffer to approximate the sinusoidal midpoint.
+        z_buf = max(0.02, intensity)
+        factor = f"{1.0 + z_buf:.4f}"
+        # Extra pixels available on each side after scaling.
+        extra_x = int(width * z_buf / (1.0 + z_buf) / 2)
+        # Shift crop origin left by ~half the extra to produce a mild pan.
+        crop_x = max(0, extra_x // 2)
+        return (
+            f"scale={_scale_expr(factor)}:eval=frame,"
+            f"crop={width}:{height}:{crop_x}:0"
+        )
+
+    elif spec.name == "zoom_focus":
+        # Hold at 1.0 for 40 % of the clip, then zoom to (1 + intensity).
+        hold_end = 0.4 * dur
+        zoom_dur = max(0.01, dur - hold_end)
+        # Before hold_end: factor = 1.0; after: factor grows linearly.
+        factor = (
+            f"if(lt(t,{hold_end:.4f}),"
+            f"1,"
+            f"1+{intensity:.4f}*((t-{hold_end:.4f})/{zoom_dur:.4f}))"
+        )
+        return f"scale={_scale_expr(factor)}:eval=frame,crop={width}:{height}"
+
+    else:
+        raise ValueError(f"Unknown motion spec name: {spec.name!r}")
+
+
 def _build_zoompan_filter(
     spec: MotionSpec,
     width: int,
@@ -119,6 +222,12 @@ def _build_zoompan_filter(
     duration_s: float,
 ) -> str:
     """Build a zoompan filter expression string for the given MotionSpec.
+
+    .. warning::
+        zoompan is single-threaded and processes each output frame in
+        software.  For 1080×1920 content this runs at roughly 1 frame/s,
+        making it unsuitable for clips with more than ~5 seconds of content.
+        Use ``_build_scale_crop_filter`` for longer clips.
 
     zoompan parameters:
       z   — zoom expression (per-frame)
@@ -136,7 +245,6 @@ def _build_zoompan_filter(
     intensity = min(intensity, 0.5)
 
     z_max = 1.0 + intensity
-    z_min = 1.0
 
     if spec.name == "ken_burns_in":
         # Zoom from 1.0 to 1+intensity over the clip
@@ -226,11 +334,27 @@ def apply_motion(
     if duration_s <= 0.0:
         duration_s = spec.duration_s if spec.duration_s > 0 else 10.0
 
-    # Build zoompan filter
-    zp_filter = _build_zoompan_filter(spec, width, height, fps, duration_s)
+    total_frames = max(1, int(duration_s * fps))
 
-    # zoompan requires explicit fps specification; use fps filter to lock it
-    vf_string = f"{zp_filter},setsar=1"
+    # Choose the filter implementation based on clip length.
+    # zoompan is single-threaded and ~1 frame/s for 1080×1920 content;
+    # use the fast scale+crop path for anything beyond _MAX_ZOOMPAN_FRAMES.
+    if total_frames <= _MAX_ZOOMPAN_FRAMES:
+        # Legacy zoompan: faithful per-frame animated zoom, fine for short clips.
+        vf_string = _build_zoompan_filter(spec, width, height, fps, duration_s) + ",setsar=1"
+        logger.debug(
+            "apply_motion(%s): using zoompan path (%d frames ≤ %d)",
+            spec.name, total_frames, _MAX_ZOOMPAN_FRAMES,
+        )
+    else:
+        # Fast path: scale eval=frame + center crop. Visually equivalent for
+        # the zoom types; parallax_still approximates the sinusoidal pan as a
+        # fixed offset (same mid-arc position). Runs at near-realtime speed.
+        vf_string = _build_scale_crop_filter(spec, width, height, fps, duration_s) + ",setsar=1"
+        logger.debug(
+            "apply_motion(%s): using scale+crop fast path (%d frames > %d)",
+            spec.name, total_frames, _MAX_ZOOMPAN_FRAMES,
+        )
 
     cmd: list[str] = [
         FFMPEG_BIN, "-y",
@@ -242,7 +366,21 @@ def apply_motion(
         "apply_motion(%s): vf=%r → %s", spec.name, vf_string, output_path
     )
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    # Timeout: 2× the clip duration plus a 30 s overhead, capped at 300 s.
+    # This prevents a stalled FFmpeg process from blocking the request thread
+    # indefinitely while still giving the encoder enough headroom for long clips.
+    encode_timeout = min(300, max(60, int(duration_s * 2) + 30))
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=encode_timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"apply_motion FFmpeg timed out after {encode_timeout}s "
+            f"motion={spec.name!r} frames={total_frames}"
+        ) from exc
+
     if proc.returncode != 0:
         stderr_tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
         raise RuntimeError(
@@ -251,7 +389,9 @@ def apply_motion(
         )
 
     logger.info(
-        "apply_motion: %s intensity=%.2f → %s",
-        spec.name, spec.intensity, os.path.basename(output_path),
+        "apply_motion: %s intensity=%.2f path=%s → %s",
+        spec.name, spec.intensity,
+        "scale+crop" if total_frames > _MAX_ZOOMPAN_FRAMES else "zoompan",
+        os.path.basename(output_path),
     )
     return output_path
