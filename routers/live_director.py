@@ -82,6 +82,7 @@ class _LiveSession:
         self.director = None          # pipeline_core.live_director.director.Director
         self.composer = None          # pipeline_core.live_director.composer.Composer
         self.output_stack = None      # pipeline_core.live_director.output.OutputStack
+        self.relay = None             # pipeline_core.live_director.relay.RTMPRelay (Phase 7)
         self.ws_clients: set[WebSocket] = set()
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -154,6 +155,43 @@ class DirectorLogSchema(BaseModel):
     cam_id: str
     confidence: float
     reason: str
+
+
+# ── Phase 7 schemas ──────────────────────────────────────────────────────────
+
+
+class RelayDestinationSchema(BaseModel):
+    id: str
+    name: str
+    rtmp_url: str
+    enabled: bool = True
+    reconnect_max_attempts: int = 0
+
+
+class RelayStatusSchema(BaseModel):
+    destination_id: str
+    state: str
+    attempts: int
+    last_error: str = ""
+    started_at: float = 0.0
+    uptime_s: float = 0.0
+
+
+class ChromaConfigSchema(BaseModel):
+    color: str = "0x00d639"
+    similarity: float = 0.12
+    blend: float = 0.08
+    bg_asset_path: str = ""
+    bg_asset_kind: str = "auto"
+    bg_fit: str = "cover"
+    enabled: bool = True
+
+
+class BridgeConfigSchema(BaseModel):
+    asset_url: str = ""
+    silence_threshold_s: float = 3.0
+    rms_ceiling: float = 0.02
+    min_duration_s: float = 4.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -486,6 +524,345 @@ def get_log(
         )
         for r in rows
     ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 7 endpoints — RTMP relay, chroma, dead-air bridge
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def hls_playlist_path_for(event_id: int) -> str:
+    """Where the composer writes HLS — matches output.HLSSink defaults."""
+    return f"/tmp/kaizer_live/event_{event_id}/program.m3u8"
+
+
+def _relay_status_to_schema(status) -> RelayStatusSchema:
+    return RelayStatusSchema(
+        destination_id=status.destination_id,
+        state=status.state,
+        attempts=status.attempts,
+        last_error=status.last_error or "",
+        started_at=float(status.started_at or 0.0),
+        uptime_s=float(status.uptime_s or 0.0),
+    )
+
+
+# ── Relay endpoints ──────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/events/{event_id}/relay/destinations",
+    response_model=list[RelayDestinationSchema],
+)
+def list_relay_destinations(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+    dests = (ev.config_json or {}).get("relay_destinations", []) or []
+    return [RelayDestinationSchema(**d) for d in dests]
+
+
+@router.post(
+    "/events/{event_id}/relay/destinations",
+    response_model=RelayDestinationSchema,
+)
+async def add_relay_destination(
+    event_id: int,
+    body: RelayDestinationSchema,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+    cfg = dict(ev.config_json or {})
+    dests = list(cfg.get("relay_destinations", []) or [])
+    for d in dests:
+        if d.get("id") == body.id:
+            raise HTTPException(409, f"destination id {body.id!r} already exists")
+    payload = body.dict()
+    dests.append(payload)
+    cfg["relay_destinations"] = dests
+    ev.config_json = cfg
+    # SQLAlchemy needs a flag_modified hint for JSON columns sometimes; assigning
+    # a fresh dict on ev.config_json is the safer cross-dialect approach.
+    db.commit()
+
+    # If event is currently live, hot-add to the running relay (if any).
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.relay is not None:
+        try:
+            from pipeline_core.live_director.relay import RelayDestination
+            await session.relay.add_destination(RelayDestination(
+                id=body.id,
+                name=body.name,
+                rtmp_url=body.rtmp_url,
+                enabled=body.enabled,
+                reconnect_max_attempts=body.reconnect_max_attempts,
+            ))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            logger.warning(
+                "relay hot-add failed for event %s dest %s: %s",
+                event_id, body.id, exc,
+            )
+    return body
+
+
+@router.delete("/events/{event_id}/relay/destinations/{destination_id}")
+async def delete_relay_destination(
+    event_id: int,
+    destination_id: str,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+    cfg = dict(ev.config_json or {})
+    dests = list(cfg.get("relay_destinations", []) or [])
+    new_dests = [d for d in dests if d.get("id") != destination_id]
+    if len(new_dests) == len(dests):
+        raise HTTPException(404, f"destination {destination_id!r} not found")
+    cfg["relay_destinations"] = new_dests
+    ev.config_json = cfg
+    db.commit()
+
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.relay is not None:
+        try:
+            await session.relay.remove_destination(destination_id)
+        except Exception as exc:
+            logger.warning(
+                "relay hot-remove failed for event %s dest %s: %s",
+                event_id, destination_id, exc,
+            )
+    return {"deleted": destination_id}
+
+
+@router.post("/events/{event_id}/relay/start")
+async def start_relay(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+    if ev.status != "live" or event_id not in _SESSIONS:
+        raise HTTPException(409, "Event is not live")
+    session = _SESSIONS[event_id]
+    if session.relay is not None and session.relay.is_running():
+        raise HTTPException(409, "Relay is already running")
+
+    cfg = ev.config_json or {}
+    dest_rows = cfg.get("relay_destinations", []) or []
+    if not dest_rows:
+        raise HTTPException(400, "No relay destinations configured")
+
+    from pipeline_core.live_director.relay import RelayDestination, RTMPRelay
+
+    destinations = [
+        RelayDestination(
+            id=d.get("id"),
+            name=d.get("name", ""),
+            rtmp_url=d.get("rtmp_url", ""),
+            enabled=bool(d.get("enabled", True)),
+            reconnect_max_attempts=int(d.get("reconnect_max_attempts", 0) or 0),
+        )
+        for d in dest_rows
+    ]
+    source_url = ev.program_url or hls_playlist_path_for(event_id)
+    relay = RTMPRelay(source_url=source_url, destinations=destinations)
+    session.relay = relay
+    await relay.start()
+
+    statuses = relay.get_status()
+    if not isinstance(statuses, list):
+        statuses = [statuses]
+    return {
+        "status": "started",
+        "source_url": source_url,
+        "destinations": [_relay_status_to_schema(s).dict() for s in statuses],
+    }
+
+
+@router.post("/events/{event_id}/relay/stop")
+async def stop_relay(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    _load_event(event_id, user.id, db)
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.relay is not None:
+        try:
+            await session.relay.stop()
+        except Exception as exc:
+            logger.warning("relay stop failed for event %s: %s", event_id, exc)
+        session.relay = None
+    return {"status": "stopped"}
+
+
+@router.get("/events/{event_id}/relay/status")
+def get_relay_status(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    _load_event(event_id, user.id, db)
+    session = _SESSIONS.get(event_id)
+    if session is None or session.relay is None:
+        return {"is_running": False, "destinations": []}
+    statuses = session.relay.get_status()
+    if not isinstance(statuses, list):
+        statuses = [statuses]
+    return {
+        "is_running": bool(session.relay.is_running()),
+        "destinations": [_relay_status_to_schema(s).dict() for s in statuses],
+    }
+
+
+# ── Chroma endpoints ─────────────────────────────────────────────────────────
+
+
+@router.put("/events/{event_id}/cameras/{cam_id}/chroma")
+def put_chroma(
+    event_id: int,
+    cam_id: str,
+    body: ChromaConfigSchema,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+
+    from pipeline_core.live_director.chroma import ChromaConfig, validate_chroma_config
+
+    config = ChromaConfig(
+        color=body.color,
+        similarity=body.similarity,
+        blend=body.blend,
+        bg_asset_path=body.bg_asset_path,
+        bg_asset_kind=body.bg_asset_kind,
+        bg_fit=body.bg_fit,
+        enabled=body.enabled,
+    )
+    try:
+        validate_chroma_config(config)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            404, {"detail": f"bg asset not found: {config.bg_asset_path}"}
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    cfg = dict(ev.config_json or {})
+    chroma_map = dict(cfg.get("chroma_configs", {}) or {})
+    chroma_map[str(cam_id)] = {
+        "color": config.color,
+        "similarity": config.similarity,
+        "blend": config.blend,
+        "bg_asset_path": config.bg_asset_path,
+        "bg_asset_kind": config.bg_asset_kind,
+        "bg_fit": config.bg_fit,
+        "enabled": config.enabled,
+    }
+    cfg["chroma_configs"] = chroma_map
+    ev.config_json = cfg
+    db.commit()
+
+    applied_live = False
+    note = "saved to event config; takes effect on next live start"
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.composer is not None:
+        try:
+            cam_index = session.camera_ids.index(str(cam_id))
+        except ValueError:
+            cam_index = -1
+        if cam_index >= 0:
+            try:
+                session.composer.config.chroma_configs[cam_index] = config
+                applied_live = True
+                note = (
+                    "saved; runtime updated — takes effect on next layout respawn"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "chroma live-update failed for event %s cam %s: %s",
+                    event_id, cam_id, exc,
+                )
+    return {"saved": True, "applied_live": applied_live, "note": note}
+
+
+@router.delete("/events/{event_id}/cameras/{cam_id}/chroma")
+def delete_chroma(
+    event_id: int,
+    cam_id: str,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+    cfg = dict(ev.config_json or {})
+    chroma_map = dict(cfg.get("chroma_configs", {}) or {})
+    key = str(cam_id)
+    if key not in chroma_map:
+        raise HTTPException(404, f"no chroma config for cam {cam_id!r}")
+    chroma_map.pop(key, None)
+    cfg["chroma_configs"] = chroma_map
+    ev.config_json = cfg
+    db.commit()
+
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.composer is not None:
+        try:
+            cam_index = session.camera_ids.index(str(cam_id))
+        except ValueError:
+            cam_index = -1
+        if cam_index >= 0:
+            try:
+                session.composer.config.chroma_configs.pop(cam_index, None)
+            except Exception as exc:
+                logger.warning(
+                    "chroma live-remove failed for event %s cam %s: %s",
+                    event_id, cam_id, exc,
+                )
+    return {"deleted": cam_id}
+
+
+# ── Bridge endpoint ──────────────────────────────────────────────────────────
+
+
+@router.put("/events/{event_id}/bridge")
+def put_bridge(
+    event_id: int,
+    body: BridgeConfigSchema,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    ev = _load_event(event_id, user.id, db)
+
+    if body.asset_url and not os.path.exists(body.asset_url):
+        raise HTTPException(400, f"bridge asset not found: {body.asset_url}")
+
+    cfg = dict(ev.config_json or {})
+    cfg["bridge_asset_url"] = body.asset_url
+    cfg["bridge_silence_threshold_s"] = float(body.silence_threshold_s)
+    cfg["bridge_silence_rms_ceiling"] = float(body.rms_ceiling)
+    cfg["bridge_min_duration_s"] = float(body.min_duration_s)
+    ev.config_json = cfg
+    db.commit()
+
+    applied_live = False
+    session = _SESSIONS.get(event_id)
+    if session is not None and session.director is not None:
+        try:
+            session.director.config.bridge_asset_url = body.asset_url
+            session.director.config.bridge_silence_threshold_s = float(body.silence_threshold_s)
+            session.director.config.bridge_silence_rms_ceiling = float(body.rms_ceiling)
+            session.director.config.bridge_min_duration_s = float(body.min_duration_s)
+            applied_live = True
+        except Exception as exc:
+            logger.warning(
+                "bridge live-update failed for event %s: %s", event_id, exc,
+            )
+    return {"saved": True, "applied_live": applied_live}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
