@@ -563,3 +563,79 @@ class RegionalApiKey(Base):
     monthly_cap     = Column(Integer, default=1000)
     active          = Column(Boolean, default=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 6 — Autonomous Live Director
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class LiveEvent(Base):
+    """A live production event managed by the Autonomous Live Director.
+
+    ``status``     : scheduled | live | ended | failed
+    ``config_json``: per-event director config (min_shot_s, max_shot_s,
+                     reaction_threshold, speaker_vad_hold_ms, …).
+    ``rtmp_key_hash``: SHA-256 of the ingest auth key (never stored in plain text).
+    ``program_url``  : Public URL of the live program output (HLS / RTMP).
+    """
+    __tablename__ = "live_events"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name          = Column(String(255), nullable=False)
+    venue         = Column(String(255), default="")
+    starts_at     = Column(DateTime(timezone=True), server_default=func.now())
+    ends_at       = Column(DateTime(timezone=True), nullable=True)
+    status        = Column(String(20), default="scheduled", index=True)   # scheduled | live | ended | failed
+    config_json   = Column(JSON, default=dict)
+    rtmp_key_hash = Column(String(64), default="")
+    program_url   = Column(String(500), default="")
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class LiveCamera(Base):
+    """One camera feed registered for a live event.
+
+    ``cam_id``    : Short machine-readable identifier matching the RTMP path.
+    ``mic_id``    : Optional linked microphone feed ID.
+    ``role_hints``: List of tags that bias director rules.
+    ``iso_url``   : R2 URL of the ISO recording for post-event edit.
+    """
+    __tablename__ = "live_cameras"
+    __table_args__ = (UniqueConstraint("event_id", "cam_id", name="uq_live_camera"),)
+
+    id          = Column(Integer, primary_key=True, index=True)
+    event_id    = Column(Integer, ForeignKey("live_events.id", ondelete="CASCADE"), nullable=False, index=True)
+    cam_id      = Column(String(64), nullable=False)
+    label       = Column(String(255), default="")
+    mic_id      = Column(String(64), default="")
+    role_hints  = Column(JSON, default=list)
+    iso_url     = Column(String(500), default="")
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DirectorLogEntry(Base):
+    """Immutable log of every director decision during a live event.
+
+    Queryable by ``(event_id, t)`` for the control-surface log view and for
+    post-event cue-sheet generation.
+
+    ``kind``      : selection | override | camera_lost | health
+    ``cam_id``    : Camera involved (may be empty for health events).
+    ``confidence``: 0.0–1.0 score from the director rule that fired.
+    ``reason``    : Human-readable explanation string.
+    ``payload``   : Full structured payload (JSON).
+    """
+    __tablename__ = "director_log"
+    __table_args__ = (Index("ix_director_log_event_t", "event_id", "t"),)
+
+    id          = Column(Integer, primary_key=True, index=True)
+    event_id    = Column(Integer, ForeignKey("live_events.id", ondelete="CASCADE"), nullable=False)
+    t           = Column(Float, nullable=False)
+    kind        = Column(String(32), default="selection")
+    cam_id      = Column(String(64), default="")
+    confidence  = Column(Float, default=0.0)
+    reason      = Column(Text, default="")
+    payload     = Column(JSON, default=dict)

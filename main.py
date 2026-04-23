@@ -207,6 +207,11 @@ def _migrate_schema():
             if not inspector.has_table(tbl):
                 Base.metadata.tables[tbl].create(conn)
 
+        # ── Phase 6 — Autonomous Live Director tables ────────────────────────
+        for tbl in ("live_events", "live_cameras", "director_log"):
+            if not inspector.has_table(tbl):
+                Base.metadata.tables[tbl].create(conn)
+
         conn.commit()
 
 

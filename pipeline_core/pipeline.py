@@ -41,6 +41,16 @@ FFPROBE_BIN = _find_binary("ffprobe")
 # ═══════════════════════════════════════════════════════════
 # STANDARD ENCODE ARGS
 #
+# Uses hardware-accelerated H.264 encoder (NVENC / QSV / AMF) when
+# available, falls back to libx264 CPU. Switchover is driven by
+# pipeline_core.hw_accel.ACTIVE_ENCODER — probed once at import.
+# Set KAIZER_FORCE_CPU_ENCODE=1 in .env to disable GPU fallback for
+# debugging.
+#
+# Dropping libx264 to NVENC on a Windows 32 GB / RTX 5060 box reduces
+# per-render CPU to ~5 % and frees 500 MB – 1 GB of RAM per concurrent
+# ffmpeg subprocess — key after a CPU-encoder-caused OOM shutdown.
+#
 # _BASE_ENCODE_ARGS: bitrate-capped + colour-normalised + AAC 48 kHz.
 #   Used for INTERMEDIATE cuts (cut_video_clips) where loudnorm would
 #   be applied twice if included — once here, once at final compose.
@@ -49,27 +59,29 @@ FFPROBE_BIN = _find_binary("ffprobe")
 #   Used at the FINAL compose step only, so audio hits the normaliser
 #   exactly once.
 # ═══════════════════════════════════════════════════════════
-_BASE_ENCODE_ARGS = [
-    "-c:v",          "libx264",
-    "-preset",       "medium",
-    "-crf",          "20",
-    "-b:v",          "8M",    "-maxrate", "10M",  "-bufsize", "16M",
-    "-pix_fmt",      "yuv420p",
-    "-color_range",  "tv",
-    "-color_primaries", "bt709",
-    "-color_trc",    "bt709",
-    "-colorspace",   "bt709",
-    "-profile:v",    "high",  "-level",   "4.1",
-    "-movflags",     "+faststart",
-    "-c:a",          "aac",
-    "-b:a",          "192k",
-    "-ar",           "48000",
+from pipeline_core.hw_accel import h264_args as _h264_args, ACTIVE_ENCODER as _ACTIVE_ENCODER
+
+_VIDEO_ARGS = _h264_args(bitrate_kbps=8000, maxrate_kbps=10000, bufsize_kbps=16000)
+
+_COLOR_TAGS = [
+    "-color_range",      "tv",
+    "-color_primaries",  "bt709",
+    "-color_trc",        "bt709",
+    "-colorspace",       "bt709",
 ]
+
+_AUDIO_ARGS = [
+    "-c:a",  "aac",
+    "-b:a",  "192k",
+    "-ar",   "48000",
+]
+
+_BASE_ENCODE_ARGS = _VIDEO_ARGS + _COLOR_TAGS + _AUDIO_ARGS
 
 ENCODE_ARGS_INTERMEDIATE = list(_BASE_ENCODE_ARGS)
 
 ENCODE_ARGS_SHORT_FORM = _BASE_ENCODE_ARGS + [
-    "-af",           "loudnorm=I=-14:TP=-1.5:LRA=11",
+    "-af",  "loudnorm=I=-14:TP=-1.5:LRA=11",
 ]
 
 # ═══════════════════════════════════════════════════════════
