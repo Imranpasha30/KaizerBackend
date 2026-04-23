@@ -20,11 +20,25 @@ Endpoints
   GET   /api/live/events/{event_id}/log       → tail of director_log rows
   WS    /api/live/events/{event_id}/stream    → real-time decisions + thumbnails
 
+  ── Phase 9: "phone as camera" browser-to-browser test mode ───────────────
+  POST  /api/live/events/{event_id}/phone-sessions
+                                              → mint a phone ingest session
+  WS    /api/live/ws/ingest/{event_id}/{cam_id}?token=...
+                                              → phone pushes webm chunks
+  WS    /api/live/ws/monitor/{event_id}/{cam_id}
+                                              → director page receives chunks
+
 Authentication
 --------------
 All REST endpoints (except WS — browsers can't Authorization-header a WS
 upgrade in most paths) use the project's JWT pattern via `auth.current_user`.
 WebSocket upgrades accept a `?token=` query param as a fallback.
+
+Phase 9 note: the monitor WebSocket has NO authentication for now. That is
+acceptable for the LAN-only test feature (phone on same WiFi as laptop);
+in production this endpoint would need cookie-based WS auth or a short-lived
+monitor token, and the fanout dict would need to be replaced with Redis pub/sub
+to work across multiple uvicorn workers. TODO(phase-10): multi-worker fanout.
 """
 from __future__ import annotations
 
@@ -32,6 +46,8 @@ import asyncio
 import json
 import logging
 import os
+import secrets
+import time
 from dataclasses import asdict
 from typing import Optional
 
@@ -103,6 +119,22 @@ class _LiveSession:
 
 
 _SESSIONS: dict[int, _LiveSession] = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 9 — "phone as camera" browser fanout registry
+# ══════════════════════════════════════════════════════════════════════════════
+
+# (event_id, cam_id) → list of monitor WebSockets receiving live chunks.
+# Ingest socket pushes chunks; monitor sockets receive them.
+# In-process only; TODO(phase-10) replace with Redis pub/sub for multi-worker.
+_INGEST_FANOUT: dict[tuple[int, str], list[WebSocket]] = {}
+
+# token → {"event_id", "cam_id", "created_at"}. Tokens are one-shot-ish — valid
+# until the phone connects + disconnects, then revoked. 30min hard expiry.
+_PHONE_TOKENS: dict[str, dict] = {}
+
+_PHONE_TOKEN_TTL_S = 1800  # 30 minutes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -945,6 +977,206 @@ async def event_stream(websocket: WebSocket, event_id: int, token: str = Query(d
         logger.debug("ws: %s disconnected: %s", event_id, exc)
     finally:
         session.ws_clients.discard(websocket)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 9 — "phone as camera" browser test mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class PhoneSessionResponse(BaseModel):
+    cam_id: str
+    token: str
+    phone_url: str        # relative path — frontend prepends window.location.origin
+    ingest_ws_url: str    # relative ws path — phone prepends ws(s)://<host>:8000
+
+
+def _gen_unique_phone_cam_id(db: Session, event_id: int) -> str:
+    """Generate a phone_<hex6> cam_id that doesn't collide on this event."""
+    existing = {
+        row.cam_id
+        for row in db.query(models.LiveCamera.cam_id)
+        .filter(models.LiveCamera.event_id == event_id)
+        .all()
+    }
+    for _ in range(32):
+        candidate = f"phone_{secrets.token_hex(3)}"  # 6 hex chars
+        if candidate not in existing:
+            return candidate
+    # Fallback: extremely unlikely to reach here
+    return f"phone_{secrets.token_hex(6)}"
+
+
+@router.post(
+    "/events/{event_id}/phone-sessions",
+    response_model=PhoneSessionResponse,
+)
+def create_phone_session(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Mint a phone-as-camera ingest session.
+
+    Registers a new LiveCamera row (role_hints=["phone","webrtc"]) and
+    returns a one-shot token + relative URLs that the frontend wraps into
+    a QR code. The phone scans the QR, opens the PhoneCamera page, and
+    connects a WebSocket to /api/live/ws/ingest/... to push webm chunks.
+
+    Rejects if the event is already live (for this test phase we add cameras
+    only while scheduled; can be relaxed once the live session accepts hot
+    camera adds).
+    """
+    ev = _load_event(event_id, user.id, db)
+    if ev.status == "live" or event_id in _SESSIONS:
+        raise HTTPException(
+            409,
+            "Phone cameras can only be added while the event is not live. "
+            "Stop the event first, then add the phone.",
+        )
+
+    cam_id = _gen_unique_phone_cam_id(db, event_id)
+    cam = models.LiveCamera(
+        event_id=event_id,
+        cam_id=cam_id,
+        label="Phone camera",
+        mic_id="",
+        role_hints=["phone", "webrtc"],
+    )
+    db.add(cam)
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"Failed to register phone camera: {exc}")
+    db.refresh(cam)
+
+    token = secrets.token_urlsafe(24)
+    _PHONE_TOKENS[token] = {
+        "event_id": event_id,
+        "cam_id": cam_id,
+        "created_at": time.time(),
+    }
+
+    # Opportunistic sweep of expired tokens to keep the dict bounded.
+    now = time.time()
+    expired = [
+        t for t, m in _PHONE_TOKENS.items()
+        if now - m.get("created_at", 0) > _PHONE_TOKEN_TTL_S
+    ]
+    for t in expired:
+        _PHONE_TOKENS.pop(t, None)
+
+    return PhoneSessionResponse(
+        cam_id=cam_id,
+        token=token,
+        phone_url=f"/phone/{event_id}/{cam_id}?token={token}",
+        ingest_ws_url=f"/api/live/ws/ingest/{event_id}/{cam_id}?token={token}",
+    )
+
+
+@router.websocket("/ws/ingest/{event_id}/{cam_id}")
+async def ws_ingest_phone_stream(
+    websocket: WebSocket,
+    event_id: int,
+    cam_id: str,
+    token: str = Query(...),
+):
+    """Phone → backend ingest WebSocket.
+
+    The phone's MediaRecorder pushes webm chunks as binary frames; the
+    backend fans them out to every monitor WebSocket connected for the
+    same (event_id, cam_id) tuple.
+    """
+    # Validate token
+    meta = _PHONE_TOKENS.get(token)
+    if not meta or meta["event_id"] != event_id or meta["cam_id"] != cam_id:
+        await websocket.close(code=4401, reason="invalid token")
+        return
+    if time.time() - meta["created_at"] > _PHONE_TOKEN_TTL_S:
+        _PHONE_TOKENS.pop(token, None)
+        await websocket.close(code=4401, reason="token expired")
+        return
+
+    await websocket.accept()
+    key = (event_id, cam_id)
+    try:
+        while True:
+            msg = await websocket.receive()
+            # FastAPI's WebSocket.receive() returns a dict with either
+            # "bytes" or "text". It can also return a disconnect message.
+            msg_type = msg.get("type")
+            if msg_type == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if data is not None:
+                # Fan out to every monitor WS for this (event, cam).
+                # Snapshot to avoid mutation-during-iteration surprises.
+                subs = list(_INGEST_FANOUT.get(key, []))
+                dead: list[WebSocket] = []
+                for sub in subs:
+                    try:
+                        await sub.send_bytes(data)
+                    except Exception:
+                        dead.append(sub)
+                if dead:
+                    active = _INGEST_FANOUT.get(key, [])
+                    for d in dead:
+                        try:
+                            active.remove(d)
+                        except ValueError:
+                            pass
+                continue
+            text = msg.get("text")
+            if text is not None:
+                # Optional control channel — {"type": "stop"} cleanly breaks
+                # the loop; {"type": "ping"} is ignored (keep-alive).
+                try:
+                    payload = json.loads(text)
+                    if isinstance(payload, dict) and payload.get("type") == "stop":
+                        break
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("phone ingest ws disconnected: %s", exc)
+    finally:
+        # Revoke token on disconnect so it can't be reused
+        _PHONE_TOKENS.pop(token, None)
+
+
+@router.websocket("/ws/monitor/{event_id}/{cam_id}")
+async def ws_monitor_phone_stream(
+    websocket: WebSocket,
+    event_id: int,
+    cam_id: str,
+):
+    """Director page → backend monitor WebSocket.
+
+    No auth for now (LAN-only test feature). Production would require
+    cookie-based WS auth or a short-lived monitor token.
+    """
+    await websocket.accept()
+    key = (event_id, cam_id)
+    _INGEST_FANOUT.setdefault(key, []).append(websocket)
+    try:
+        while True:
+            # Monitor doesn't send anything — we just keep the socket
+            # open and wait for disconnect.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("phone monitor ws disconnected: %s", exc)
+    finally:
+        subs = _INGEST_FANOUT.get(key, [])
+        try:
+            subs.remove(websocket)
+        except ValueError:
+            pass
+        if not subs:
+            _INGEST_FANOUT.pop(key, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
