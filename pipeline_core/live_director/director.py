@@ -62,6 +62,26 @@ class DirectorConfig:
     # Scores below this mute "interesting enough to cut to you" for rotation
     min_rotation_energy: float = 0.02
 
+    # ── Phase 7: layout intelligence ────────────────────────────────────────
+    # Split-screen (artist + crowd, Q&A, joke-laugh, interaction moments)
+    enable_split_screen: bool = True
+    split_min_duration_s: float = 2.5
+    # joke-laugh: artist stops speaking then crowd reacts within this window
+    joke_laugh_window_s: float = 1.5
+    # Q&A: alternating vad_speaking between stage & crowd within this window
+    qa_alternation_window_s: float = 3.0
+    # interaction: stage cam speaking + crowd cam motion/audio simultaneously
+    interaction_min_motion: float = 0.15
+    interaction_min_audio: float = 0.1
+
+    # ── Phase 7: dead-air bridge ────────────────────────────────────────────
+    enable_bridge: bool = True
+    bridge_silence_threshold_s: float = 3.0
+    # All cams below this RMS AND no vad_speaking for threshold_s → bridge
+    bridge_silence_rms_ceiling: float = 0.02
+    bridge_asset_url: str = ""          # image or looping video path
+    bridge_min_duration_s: float = 4.0  # don't flip out of bridge too fast
+
 
 @dataclass
 class _CamState:
@@ -69,7 +89,9 @@ class _CamState:
     cam_id: str
     last_frame: Optional[SignalFrame] = None
     vad_speaking_since: Optional[float] = None   # timestamp when vad_speaking flipped True
+    vad_speaking_ended_t: Optional[float] = None # timestamp when vad flipped False (for joke-laugh)
     last_beat_phase: Optional[float] = None
+    last_reaction_t: Optional[float] = None      # when a reaction last occurred
 
 
 class Director:
@@ -107,6 +129,13 @@ class Director:
         # Bar-count state for beat rule
         self._beats_since_last_cut: int = 0
         self._running: bool = False
+
+        # Phase 7: layout state
+        self._current_layout: str = "single"
+        self._current_layout_cams: list[str] = []
+        self._layout_entered_t: float = 0.0
+        self._in_bridge: bool = False
+        self._bridge_entered_t: Optional[float] = None
 
     # ── Operator controls ────────────────────────────────────────────────────
 
@@ -197,11 +226,19 @@ class Director:
         if state.last_frame.vad_speaking:
             if state.vad_speaking_since is None:
                 state.vad_speaking_since = frame.t
+            state.vad_speaking_ended_t = None
         else:
+            # Record the moment VAD flipped off (for joke-laugh rule).
+            if state.vad_speaking_since is not None:
+                state.vad_speaking_ended_t = frame.t
             state.vad_speaking_since = None
 
         if frame.beat_phase is not None:
             state.last_beat_phase = frame.beat_phase
+
+        # Track reactions (for joke-laugh timing)
+        if frame.reaction:
+            state.last_reaction_t = frame.t
 
     # ── Internal: run the rule ladder and return a CameraSelection ─────────
 
@@ -217,6 +254,62 @@ class Director:
             return None
 
         shot_elapsed = now - self._last_cut_t if self._current_cam else float("inf")
+
+        # ── Phase 7 rules — run BEFORE ordinary cut rules ─────────────────
+        # Rule A — dead-air bridge (highest non-override)
+        if self.config.enable_bridge:
+            if self._should_enter_bridge(now):
+                return self._enter_bridge(now)
+            # If currently in bridge and the room comes alive, exit to whoever's hot
+            if self._in_bridge and self._should_exit_bridge(now):
+                exit_cam = self._next_rotation_cam() or self._any_cam()
+                if exit_cam:
+                    return self._select(
+                        exit_cam, now,
+                        reason="bridge_exit (signal resumed)",
+                        confidence=0.6,
+                        layout="single",
+                    )
+            # Stay in bridge — no emission
+            if self._in_bridge:
+                return None
+
+        # Rule B — joke-laugh: artist just stopped, crowd reacted → split(artist+crowd)
+        if self.config.enable_split_screen and shot_elapsed >= self.config.min_shot_s:
+            jl = self._detect_joke_laugh(now)
+            if jl is not None:
+                artist_cam, crowd_cam = jl
+                return self._select(
+                    artist_cam, now,
+                    reason=f"joke_laugh split (artist={artist_cam}+crowd={crowd_cam})",
+                    confidence=0.85,
+                    layout="split2_hstack",
+                    layout_cams=[artist_cam, crowd_cam],
+                )
+
+            # Rule C — interaction: stage speaking + crowd motion/audio live
+            inter = self._detect_interaction(now)
+            if inter is not None:
+                stage_cam, crowd_cam = inter
+                return self._select(
+                    stage_cam, now,
+                    reason=f"interaction split ({stage_cam}+{crowd_cam})",
+                    confidence=0.75,
+                    layout="split2_hstack",
+                    layout_cams=[stage_cam, crowd_cam],
+                )
+
+            # Rule D — Q&A: alternating speakers
+            qa = self._detect_qa(now)
+            if qa is not None:
+                a, b = qa
+                return self._select(
+                    a, now,
+                    reason=f"qa split ({a}+{b})",
+                    confidence=0.7,
+                    layout="split2_hstack",
+                    layout_cams=[a, b],
+                )
 
         # Rule 2 — critical reaction
         cam_with_reaction, reaction_score = self._find_reaction_cam()
@@ -352,27 +445,217 @@ class Director:
     # ── Emission ─────────────────────────────────────────────────────────────
 
     def _select(
-        self, cam_id: str, now: float, *, reason: str, confidence: float,
+        self, cam_id: str, now: float, *,
+        reason: str, confidence: float,
+        layout: str = "single",
+        layout_cams: Optional[list[str]] = None,
+        bridge_asset_url: str = "",
     ) -> Optional[CameraSelection]:
         if cam_id in self._blacklist:
             return None
-        if cam_id == self._current_cam:
+        # Filter any blacklisted secondaries out of layout_cams.
+        cams: list[str] = list(layout_cams) if layout_cams else [cam_id]
+        cams = [c for c in cams if c not in self._blacklist]
+        if not cams:
+            return None
+        # Decide whether this selection is actually a change vs. the current state.
+        same_cam = cam_id == self._current_cam
+        same_layout = layout == self._current_layout and cams == self._current_layout_cams
+        if same_cam and same_layout:
             return None  # stay (no emit)
         transition = "cut"
         if (
             self.config.crossfade_on_scene_change
             and self._current_cam is not None
+            and cam_id != self._current_cam
             and self._is_scene_change(self._current_cam, cam_id)
         ):
             transition = "dissolve"
         self._current_cam = cam_id
+        self._current_layout = layout
+        self._current_layout_cams = cams
         self._last_cut_t = now
+        self._layout_entered_t = now
+        # Exiting bridge state on any non-bridge emission
+        if layout != "bridge":
+            self._in_bridge = False
+            self._bridge_entered_t = None
         return CameraSelection(
             t=now, cam_id=cam_id,
             transition=transition,
             confidence=min(1.0, max(0.0, confidence)),
             reason=reason,
+            layout=layout,
+            layout_cams=cams,
+            bridge_asset_url=bridge_asset_url,
         )
+
+    # ── Phase 7: bridge + layout detectors ──────────────────────────────────
+
+    def _should_enter_bridge(self, now: float) -> bool:
+        """All cameras silent (low RMS + no VAD) for at least threshold seconds.
+        Only fires when a bridge asset is configured — without an asset there is
+        nothing to bridge to, so silent scenes keep using the current camera."""
+        if self._in_bridge:
+            return False
+        if not self.config.bridge_asset_url:
+            return False
+        threshold_t = now - self.config.bridge_silence_threshold_s
+        for state in self._cam_states.values():
+            f = state.last_frame
+            if f is None:
+                continue
+            # If any cam has VAD or non-trivial RMS more recently than threshold → not silent.
+            if state.vad_speaking_since is not None and state.vad_speaking_since >= threshold_t:
+                return False
+            if f.t >= threshold_t and f.audio_rms > self.config.bridge_silence_rms_ceiling:
+                return False
+        # Also require we have SEEN at least one frame (avoid tripping on empty state)
+        if not any(s.last_frame is not None for s in self._cam_states.values()):
+            return False
+        return True
+
+    def _should_exit_bridge(self, now: float) -> bool:
+        """Exit bridge only after bridge_min_duration_s, and when any cam has audio/VAD."""
+        if not self._in_bridge:
+            return False
+        if self._bridge_entered_t is not None:
+            if (now - self._bridge_entered_t) < self.config.bridge_min_duration_s:
+                return False
+        for state in self._cam_states.values():
+            f = state.last_frame
+            if f is None:
+                continue
+            if state.vad_speaking_since is not None:
+                return True
+            if f.audio_rms > self.config.bridge_silence_rms_ceiling * 2:
+                return True
+        return False
+
+    def _enter_bridge(self, now: float) -> Optional[CameraSelection]:
+        """Emit a CameraSelection carrying layout='bridge' + the configured asset url."""
+        # Primary cam_id still required by the dataclass; use current or first cam.
+        primary = self._current_cam or (self.camera_ids[0] if self.camera_ids else "")
+        if not primary:
+            return None
+        self._in_bridge = True
+        self._bridge_entered_t = now
+        sel = CameraSelection(
+            t=now, cam_id=primary,
+            transition="cut",
+            confidence=0.95,
+            reason="bridge (dead_air)",
+            layout="bridge",
+            layout_cams=[primary],
+            bridge_asset_url=self.config.bridge_asset_url,
+        )
+        self._current_layout = "bridge"
+        self._current_layout_cams = [primary]
+        self._last_cut_t = now
+        self._layout_entered_t = now
+        return sel
+
+    def _any_cam(self) -> Optional[str]:
+        for c in self.camera_ids:
+            if c not in self._blacklist:
+                return c
+        return None
+
+    def _detect_joke_laugh(self, now: float) -> Optional[tuple[str, str]]:
+        """Artist just stopped speaking within window AND a crowd reaction exists
+        within window → return (artist_cam, crowd_cam)."""
+        w = self.config.joke_laugh_window_s
+        artist_cam: Optional[str] = None
+        best_end_t = -1.0
+        for cid, state in self._cam_states.items():
+            if cid in self._blacklist:
+                continue
+            if state.vad_speaking_ended_t is None:
+                continue
+            if (now - state.vad_speaking_ended_t) > w:
+                continue
+            if state.vad_speaking_ended_t > best_end_t:
+                best_end_t = state.vad_speaking_ended_t
+                artist_cam = cid
+        if artist_cam is None:
+            return None
+        crowd_cam: Optional[str] = None
+        best_reaction_t = -1.0
+        for cid, state in self._cam_states.items():
+            if cid == artist_cam or cid in self._blacklist:
+                continue
+            f = state.last_frame
+            if not f or not f.reaction:
+                continue
+            if state.last_reaction_t is None:
+                continue
+            if (now - state.last_reaction_t) > w:
+                continue
+            if state.last_reaction_t > best_reaction_t:
+                best_reaction_t = state.last_reaction_t
+                crowd_cam = cid
+        if crowd_cam is None:
+            return None
+        return (artist_cam, crowd_cam)
+
+    def _detect_interaction(self, now: float) -> Optional[tuple[str, str]]:
+        """Stage cam currently speaking + a crowd cam showing motion/audio.
+        Returns (stage_cam, crowd_cam) or None."""
+        stage_cam: Optional[str] = None
+        hold_s = self.config.speaker_vad_hold_ms / 1000.0
+        for cid, state in self._cam_states.items():
+            if cid in self._blacklist:
+                continue
+            if state.vad_speaking_since is None:
+                continue
+            if (now - state.vad_speaking_since) < hold_s:
+                continue
+            f = state.last_frame
+            if f and f.face_present:
+                stage_cam = cid
+                break
+        if stage_cam is None:
+            return None
+        crowd_cam: Optional[str] = None
+        best_score = 0.0
+        for cid, state in self._cam_states.items():
+            if cid == stage_cam or cid in self._blacklist:
+                continue
+            f = state.last_frame
+            if not f:
+                continue
+            if f.motion_mag < self.config.interaction_min_motion and \
+               f.audio_rms < self.config.interaction_min_audio:
+                continue
+            score = f.motion_mag + f.audio_rms
+            if score > best_score:
+                best_score = score
+                crowd_cam = cid
+        if crowd_cam is None:
+            return None
+        return (stage_cam, crowd_cam)
+
+    def _detect_qa(self, now: float) -> Optional[tuple[str, str]]:
+        """Alternating speakers within qa_alternation_window_s — return the
+        two most-recent speaking cams."""
+        w = self.config.qa_alternation_window_s
+        speaking_cams: list[tuple[float, str]] = []
+        for cid, state in self._cam_states.items():
+            if cid in self._blacklist:
+                continue
+            if state.vad_speaking_since is not None:
+                speaking_cams.append((state.vad_speaking_since, cid))
+            elif state.vad_speaking_ended_t is not None and (now - state.vad_speaking_ended_t) < w:
+                speaking_cams.append((state.vad_speaking_ended_t, cid))
+        if len(speaking_cams) < 2:
+            return None
+        # Require both happened within the window
+        speaking_cams.sort(key=lambda x: x[0], reverse=True)
+        t1, cam1 = speaking_cams[0]
+        t2, cam2 = speaking_cams[1]
+        if (now - t2) > w:
+            return None
+        return (cam1, cam2)
 
     def _is_scene_change(self, old_cam: str, new_cam: str) -> bool:
         old_scene = self._cam_states.get(old_cam, _CamState(cam_id=old_cam))

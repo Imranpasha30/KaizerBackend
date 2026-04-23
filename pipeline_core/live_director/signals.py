@@ -76,14 +76,26 @@ class SignalFrame:
 
 @dataclass
 class CameraSelection:
-    """A director decision: which camera to put on-program at time *t*.
+    """A director decision: which camera layout to put on-program at time *t*.
 
     t           : Monotonic seconds since event start.
-    cam_id      : The selected camera's ID.
+    cam_id      : The primary selected camera's ID (main cam in multi-cam layouts).
     transition  : 'cut' (v1 only) | 'dissolve' (v2).
     confidence  : 0.0–1.0 score from the winning rule.
     reason      : Human-readable explanation, e.g.
                   ``"artist speaking + face in frame"``.
+    layout      : 'single'            — one cam fullscreen (default)
+                  'split2_hstack'     — two cams side-by-side
+                  'split2_vstack'     — two cams stacked vertically
+                  'pip'               — one cam fullscreen + second as picture-in-picture
+                  'quad'              — 4 cams in 2×2 grid
+                  'bridge'            — dead-air fallback (title card / B-roll)
+    layout_cams : Ordered cam_ids used by multi-cam layouts. cam_ids[0] is the
+                  primary; cam_ids[1…] are the secondaries. For 'single' and
+                  'bridge' this is [cam_id]. The Composer uses this list to
+                  build its per-layout filter graph.
+    bridge_asset_url : For layout='bridge' — URL or local path to the asset to
+                  show (image or looping video). Ignored for other layouts.
     """
 
     t: float
@@ -91,6 +103,9 @@ class CameraSelection:
     transition: str = "cut"
     confidence: float = 0.0
     reason: str = ""
+    layout: str = "single"
+    layout_cams: list[str] = field(default_factory=list)
+    bridge_asset_url: str = ""
 
 
 @dataclass
