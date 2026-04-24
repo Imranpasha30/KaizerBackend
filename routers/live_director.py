@@ -49,7 +49,7 @@ import os
 import secrets
 import time
 from dataclasses import asdict
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import (
     APIRouter,
