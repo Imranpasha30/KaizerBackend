@@ -450,18 +450,22 @@ class WebRTCIngestWorker:
 
         MediaRecorder on the phone emits a matroska-subset (webm). Using
         `-f matroska,webm` accepts both strict-webm and generic-matroska
-        outputs.  `-fflags +nobuffer`, `-flags low_delay`, `-probesize 32`
-        and `-analyzeduration 0` make ffmpeg start emitting frames as soon
-        as it sees the first Cluster — without these, ffmpeg can buffer
-        multi-second chunks before producing any output. That was the
-        cause of the "ring fps below 1 despite chunks arriving" error.
+        outputs.
+
+        Earlier this function set `-probesize 32 -analyzeduration 0` for
+        low-latency decoding, but those values are *too* aggressive —
+        FFmpeg can't identify the embedded codecs (vp8/vp9/opus) in 32
+        bytes of input, so it silently produces no output (no error
+        either, just nothing). 64 KB probesize + 500 ms analyzeduration
+        is a better latency/reliability balance. `-loglevel info` is
+        chatty but surfaces probe + codec decisions into stderr so the
+        debug panel can tell us exactly what FFmpeg decided.
         """
         common_input = [
-            "-hide_banner", "-loglevel", "warning",
+            "-hide_banner", "-loglevel", "info",
             "-fflags", "+nobuffer+genpts+discardcorrupt",
-            "-flags", "low_delay",
-            "-probesize", "32",
-            "-analyzeduration", "0",
+            "-probesize", "65536",
+            "-analyzeduration", "500000",
             "-f", "matroska,webm",
             "-i", "pipe:0",
         ]
