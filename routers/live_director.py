@@ -267,6 +267,27 @@ def create_event(
     return _event_to_schema(ev)
 
 
+def _reconcile_zombie_live(rows: list, db: Session) -> None:
+    """Flip any status="live" event that has no in-process session back
+    to "ended" — happens when the backend restarts mid-show. Without
+    this the UI shows a permanent LIVE badge + Go-live refuses to
+    restart the event + Delete refuses with "it's live". Idempotent.
+    """
+    changed = False
+    for ev in rows:
+        if ev.status == "live" and ev.id not in _SESSIONS:
+            logger.warning(
+                "live: reconciled zombie-live event %s → ended", ev.id,
+            )
+            ev.status = "ended"
+            changed = True
+    if changed:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+
 @router.get("/events", response_model=list[EventSchema])
 def list_events(
     db: Session = Depends(get_db),
@@ -278,6 +299,7 @@ def list_events(
         .order_by(models.LiveEvent.created_at.desc())
         .all()
     )
+    _reconcile_zombie_live(rows, db)
     return [_event_to_schema(ev) for ev in rows]
 
 
@@ -288,6 +310,7 @@ def get_event(
     user: "models.User" = Depends(auth.current_user),
 ):
     ev = _load_event(event_id, user.id, db)
+    _reconcile_zombie_live([ev], db)
     cams = (
         db.query(models.LiveCamera)
         .filter(models.LiveCamera.event_id == event_id)
@@ -373,10 +396,12 @@ def delete_event(
     user: "models.User" = Depends(auth.current_user),
 ):
     """Delete an entire event (cameras + director log cascade via FK).
-    Refuses while the event is live — POST /stop first.
+    Refuses only while an in-process session exists — if the DB status
+    is "live" but no session is running (backend restarted mid-show),
+    the event is considered a zombie and allowed to be deleted.
     """
     ev = _load_event(event_id, user.id, db)
-    if ev.status == "live" or event_id in _SESSIONS:
+    if event_id in _SESSIONS:
         raise HTTPException(409, "Cannot delete a live event. Stop it first.")
     db.delete(ev)
     db.commit()
@@ -395,10 +420,22 @@ async def start_event(
     (no ingest yet — the director is fed via WebSocket clients pushing
     SignalFrames during testing). A full-stack live run requires the
     OBS/RTMP side to be wired; see docs/PHASE6_LIVE_DIRECTOR.md §6.1.
+
+    Zombie-live recovery: if the DB says the event is live but no
+    in-process session exists (backend restarted while an event was
+    running), we treat it as a stale marker and proceed — spawning a
+    fresh session and keeping the DB row as "live". Only a real
+    in-process session blocks starting.
     """
     ev = _load_event(event_id, user.id, db)
-    if ev.status == "live" or event_id in _SESSIONS:
+    if event_id in _SESSIONS:
         raise HTTPException(409, "Event is already live")
+    if ev.status == "live":
+        logger.warning(
+            "live: event %s DB status=live but no in-process session — "
+            "treating as zombie and restarting cleanly",
+            event_id,
+        )
 
     cams = (
         db.query(models.LiveCamera)
