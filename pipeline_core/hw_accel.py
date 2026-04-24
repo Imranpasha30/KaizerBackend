@@ -115,9 +115,14 @@ def h264_args(
 ) -> list[str]:
     """Return FFmpeg video-encode args for the active H.264 encoder.
 
-    All encoders produce a yuv420p Main/High-profile Level 4.1 stream at
-    roughly constant quality ~23 (libx264 CRF scale; maps to NVENC CQ 23,
-    QSV global_quality 23, AMF qp_i 23).
+    All encoders produce a yuv420p High-profile stream at roughly
+    constant quality ~23 (libx264 CRF scale; maps to NVENC CQ 23, QSV
+    global_quality 23, AMF qp_i 23).  The H.264 level is deliberately
+    NOT pinned — modern NVENC drivers reject fixed `-level 4.1` when
+    the input SPS encodes a different level (seen on Sony XAVC 1080p
+    sources: "InitializeEncoder failed: invalid param (8): Invalid
+    Level").  FFmpeg + NVENC/QSV/AMF auto-negotiate the correct level
+    from resolution + bitrate; let them.
 
     Parameters translate across codecs so caller code is unchanged when
     switching from CPU→GPU.
@@ -134,7 +139,6 @@ def h264_args(
             "-bufsize", _fmt_rate(bufsize_kbps),
             "-pix_fmt", "yuv420p",
             "-profile:v", "high",
-            "-level", "4.1",
             "-movflags", "+faststart",
         ]
     if ACTIVE_ENCODER == "h264_qsv":
@@ -147,7 +151,6 @@ def h264_args(
             "-bufsize", _fmt_rate(bufsize_kbps),
             "-pix_fmt", "nv12",         # QSV native
             "-profile:v", "high",
-            "-level", "4.1",
             "-movflags", "+faststart",
         ]
     if ACTIVE_ENCODER == "h264_amf":
@@ -160,7 +163,6 @@ def h264_args(
             "-maxrate", f"{maxrate_kbps}k",
             "-pix_fmt", "yuv420p",
             "-profile:v", "high",
-            "-level", "4.1",
             "-movflags", "+faststart",
         ]
     # CPU fallback
@@ -173,7 +175,6 @@ def h264_args(
         "-bufsize", f"{bufsize_kbps}k",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
-        "-level", "4.1",
         "-movflags", "+faststart",
     ]
 
