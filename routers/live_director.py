@@ -102,6 +102,11 @@ class _LiveSession:
         self.ws_clients: set[WebSocket] = set()
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        # Phase 10.1 — per-camera ring buffers + webrtc workers + analyzers.
+        # Populated by /start for each phone-role camera.
+        self.rings: dict[str, "CameraRingBuffer"] = {}
+        self.webrtc_workers: dict[str, "WebRTCIngestWorker"] = {}
+        self.analyzer_tasks: dict[str, list[asyncio.Task]] = {}
 
     async def broadcast(self, payload: dict) -> None:
         """Fan-out a JSON payload to every connected WS client. Silent on
@@ -468,6 +473,76 @@ async def start_event(
         on_event=_on_event,
     )
 
+    # Phase 10.1 — for every phone-role camera, spin up:
+    #   - a CameraRingBuffer sized for analyzer resolution
+    #   - a WebRTCIngestWorker that decodes webm chunks into that ring
+    #   - the six Phase 6.2 analyzers, each polling the ring + publishing
+    #     SignalFrames into session.bus
+    # RTMP-role cameras remain on the legacy IngestWorker path (not yet
+    # wired here — adding cams later goes through phase 10.2 / composer).
+    from pipeline_core.live_director.ring_buffer import CameraRingBuffer
+    from pipeline_core.live_director.webrtc_ingest import (
+        WebRTCIngestConfig, WebRTCIngestWorker,
+    )
+    from pipeline_core.live_director.analyzers.base import AnalyzerConfig
+    from pipeline_core.live_director.analyzers.audio import AudioAnalyzer
+    from pipeline_core.live_director.analyzers.face import FaceAnalyzer
+    from pipeline_core.live_director.analyzers.motion import MotionAnalyzer
+    from pipeline_core.live_director.analyzers.scene import SceneAnalyzer
+    from pipeline_core.live_director.analyzers.reaction import ReactionAnalyzer
+    from pipeline_core.live_director.analyzers.beat import BeatAnalyzer
+
+    webrtc_cfg = WebRTCIngestConfig()
+    for cam in cams:
+        role_hints = cam.role_hints or []
+        is_phone = "phone" in role_hints
+        if not is_phone:
+            continue  # RTMP cams handled by the legacy IngestWorker path
+        ring = CameraRingBuffer(
+            cam.cam_id,
+            video_max_frames=60,         # ~4s @ 15fps analyzer rate
+            audio_max_samples=80_000,    # 5s @ 16kHz
+        )
+        session.rings[cam.cam_id] = ring
+        worker = WebRTCIngestWorker(
+            event_id=event_id,
+            cam_id=cam.cam_id,
+            ring=ring,
+            bus=session.bus,
+            config=webrtc_cfg,
+        )
+        session.webrtc_workers[cam.cam_id] = worker
+        try:
+            await worker.start()
+        except Exception as exc:
+            logger.error(
+                "live: webrtc worker failed to start for %s: %s",
+                cam.cam_id, exc,
+            )
+            continue
+        # Spawn analyzer tasks — each polls the ring + publishes SignalFrames.
+        cfg_base = AnalyzerConfig(cam_id=cam.cam_id, interval_s=0.3, enabled=True)
+        analyzers = [
+            AudioAnalyzer(cfg_base, ring, session.bus),
+            FaceAnalyzer(cfg_base, ring, session.bus),
+            MotionAnalyzer(cfg_base, ring, session.bus),
+            SceneAnalyzer(cfg_base, ring, session.bus),
+            ReactionAnalyzer(cfg_base, ring, session.bus),
+            BeatAnalyzer(cfg_base, ring, session.bus),
+        ]
+        tasks = []
+        for a in analyzers:
+            t = asyncio.create_task(
+                a.run(), name=f"analyzer-{cam.cam_id}-{a.name}",
+            )
+            tasks.append(t)
+            session._tasks.append(t)
+        session.analyzer_tasks[cam.cam_id] = tasks
+        logger.info(
+            "live: event %s cam %s webrtc worker + %d analyzers started",
+            event_id, cam.cam_id, len(analyzers),
+        )
+
     # Flip DB state
     ev.status = "live"
     db.commit()
@@ -476,7 +551,10 @@ async def start_event(
     task = asyncio.create_task(session.director.run(), name=f"director-{event_id}")
     session._tasks.append(task)
 
-    logger.info("live: event %s started with %d cameras", event_id, len(cams))
+    logger.info(
+        "live: event %s started with %d cameras (%d phone-role)",
+        event_id, len(cams), len(session.webrtc_workers),
+    )
     return {"ok": True, "event_id": event_id, "status": "live"}
 
 
@@ -491,6 +569,21 @@ async def stop_event(
     if session:
         if session.director:
             session.director.stop()
+        # Phase 10.1 — tear down every webrtc worker first so the ffmpeg
+        # subprocs release their file handles + memory before analyzer
+        # tasks get cancelled (analyzers holding numpy arrays during
+        # cancel can drop references cleanly if the ring isn't being
+        # written to concurrently).
+        for cam_id, worker in list(session.webrtc_workers.items()):
+            try:
+                await worker.stop()
+            except (asyncio.CancelledError, ValueError, RuntimeError):
+                pass
+            except Exception as exc:
+                logger.debug("webrtc worker.stop failed for %s: %s", cam_id, exc)
+        session.webrtc_workers.clear()
+        session.rings.clear()
+        session.analyzer_tasks.clear()
         for t in session._tasks:
             try:
                 t.cancel()
@@ -1110,6 +1203,22 @@ async def ws_ingest_phone_stream(
                 break
             data = msg.get("bytes")
             if data is not None:
+                # Phase 10.1 — when the event is live, also route chunks into
+                # the camera's WebRTCIngestWorker so the director receives
+                # real SignalFrames. When scheduled, only the dashboard
+                # monitor fan-out runs (preview-only mode).
+                session = _SESSIONS.get(event_id)
+                if session is not None:
+                    worker = session.webrtc_workers.get(cam_id)
+                    if worker is not None:
+                        try:
+                            await worker.push_chunk(data)
+                        except Exception as exc:
+                            logger.debug(
+                                "webrtc push_chunk failed for %s/%s: %s",
+                                event_id, cam_id, exc,
+                            )
+
                 # Fan out to every monitor WS for this (event, cam).
                 # Snapshot to avoid mutation-during-iteration surprises.
                 subs = list(_INGEST_FANOUT.get(key, []))
