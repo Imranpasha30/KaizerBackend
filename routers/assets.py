@@ -28,8 +28,13 @@ router = APIRouter(prefix="/api/assets", tags=["assets"])
 BASE_DIR  = Path(__file__).resolve().parent.parent
 ASSETS_ROOT = BASE_DIR / "output" / "user_assets"
 THUMB_MAX = 512    # longest edge for the thumbnail JPG
-ALLOWED_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-MAX_BYTES = 20 * 1024 * 1024   # 20 MB per file
+ALLOWED_MIMES = {
+    # images (clip covers, chroma backgrounds, title cards)
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    # videos (looping chroma BGs, dead-air bridge B-roll)
+    "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
+}
+MAX_BYTES = 200 * 1024 * 1024   # 200 MB per file — videos are bigger than stills
 
 
 def _normalize_folder(raw: Optional[str]) -> str:

@@ -318,6 +318,8 @@ class WebRTCIngestWorker:
     async def _spawn_and_read(self, kind: str) -> None:
         """Spawn one ffmpeg subproc and drive its output reader.
 
+        Captures stderr into a rolling buffer surfaced via stats().last_error
+        so the debug panel can see why ffmpeg is refusing to decode.
         Cleans up the subproc on any exit path.
         """
         cmd = self._build_cmd(kind)
@@ -326,18 +328,30 @@ class WebRTCIngestWorker:
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         if kind == "video":
             self._video_proc = proc
         else:
             self._audio_proc = proc
+
+        # Concurrent stderr reader so ffmpeg complaints reach the debug panel.
+        stderr_task = asyncio.create_task(
+            self._drain_stderr(proc, kind), name=f"webrtc-err-{self.cam_id}-{kind}",
+        )
+
         try:
             if kind == "video":
                 await self._read_video(proc)
             else:
                 await self._read_audio(proc)
         finally:
+            # Cancel stderr reader first so it doesn't block on a killed pipe.
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
             if proc.returncode is None:
                 try:
                     proc.kill()
@@ -348,24 +362,68 @@ class WebRTCIngestWorker:
             except Exception:
                 pass
 
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process, kind: str) -> None:
+        """Stream stderr into a rolling 2KB snippet on last_error.
+        Each non-empty line is also logged at debug level.
+        """
+        if proc.stderr is None:
+            return
+        rolling = bytearray()
+        while True:
+            try:
+                line = await proc.stderr.readline()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            if not line:
+                return
+            rolling.extend(line)
+            if len(rolling) > 2048:
+                rolling = rolling[-2048:]
+            try:
+                txt = line.decode("utf-8", errors="replace").rstrip()
+            except Exception:
+                txt = "<undecodable>"
+            if txt:
+                logger.debug("[%s/%s] ffmpeg: %s", self.cam_id, kind, txt)
+                # Always expose the most-recent line so operators can see live
+                # decode warnings even when ffmpeg isn't crashing.
+                self._stats.last_error = f"{kind}: {txt[:200]}"
+
     def _build_cmd(self, kind: str) -> list[str]:
-        """Build the ffmpeg command for one kind (video | audio)."""
+        """Build the ffmpeg command for one kind (video | audio).
+
+        MediaRecorder on the phone emits a matroska-subset (webm). Using
+        `-f matroska,webm` accepts both strict-webm and generic-matroska
+        outputs.  `-fflags +nobuffer`, `-flags low_delay`, `-probesize 32`
+        and `-analyzeduration 0` make ffmpeg start emitting frames as soon
+        as it sees the first Cluster — without these, ffmpeg can buffer
+        multi-second chunks before producing any output. That was the
+        cause of the "ring fps below 1 despite chunks arriving" error.
+        """
+        common_input = [
+            "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+nobuffer+genpts+discardcorrupt",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-f", "matroska,webm",
+            "-i", "pipe:0",
+        ]
         if kind == "video":
             return [
                 FFMPEG_BIN,
-                "-hide_banner", "-loglevel", "warning",
-                "-f", "webm", "-i", "pipe:0",
-                "-vn" if False else "-an",
+                *common_input,
+                "-an",
                 "-vf", f"fps={self.config.analyzer_fps},"
                        f"scale={self.config.analyzer_width}:{self.config.analyzer_height}",
                 "-f", "rawvideo", "-pix_fmt", "bgr24",
                 "pipe:1",
             ]
-        # audio
         return [
             FFMPEG_BIN,
-            "-hide_banner", "-loglevel", "warning",
-            "-f", "webm", "-i", "pipe:0",
+            *common_input,
             "-vn",
             "-ac", "1", "-ar", str(self.config.audio_sample_rate),
             "-f", "s16le",
