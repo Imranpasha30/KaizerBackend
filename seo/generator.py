@@ -33,6 +33,7 @@ from tenacity import (
 
 import models
 from seo import news, prompts, trends, yt_benchmark, verifier, sanitizer
+from learning.gemini_log import log_gemini_call
 
 
 GEMINI_MODEL = os.environ.get("KAIZER_SEO_MODEL", "gemini-2.5-flash")
@@ -113,7 +114,16 @@ def _configure_gemini() -> None:
     wait=wait_exponential(multiplier=1, min=2, max=8),
     retry=retry_if_exception_type(TransientSEOError),
 )
-def _try_one_model(model_name: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+def _try_one_model(
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    db=None,
+    user_id=None,
+    job_id=None,
+    clip_id=None,
+) -> Dict[str, Any]:
     try:
         model = genai.GenerativeModel(
             model_name,
@@ -126,7 +136,12 @@ def _try_one_model(model_name: str, system_prompt: str, user_prompt: str) -> Dic
                 "max_output_tokens": 4096,
             },
         )
-        resp = model.generate_content(user_prompt)
+        with log_gemini_call(
+            db=db, user_id=user_id, job_id=job_id, clip_id=clip_id,
+            model=model_name, purpose="seo",
+        ) as _gcall:
+            resp = model.generate_content(user_prompt)
+            _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:
             raise TransientSEOError("Gemini returned empty response")
@@ -148,12 +163,23 @@ def _try_one_model(model_name: str, system_prompt: str, user_prompt: str) -> Dic
         raise SEOGenerationError(msg) from e
 
 
-def _call_gemini(system_prompt: str, user_prompt: str) -> tuple[Dict[str, Any], str]:
+def _call_gemini(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    db=None,
+    user_id=None,
+    job_id=None,
+    clip_id=None,
+) -> tuple[Dict[str, Any], str]:
     chain = _SEO_MODEL_CHAIN or [GEMINI_MODEL]
     last_err: Exception | None = None
     for model_name in chain:
         try:
-            raw = _try_one_model(model_name, system_prompt, user_prompt)
+            raw = _try_one_model(
+                model_name, system_prompt, user_prompt,
+                db=db, user_id=user_id, job_id=job_id, clip_id=clip_id,
+            )
             return raw, model_name
         except QuotaSEOError as e:
             print(f"[seo] {model_name}: quota/404 — next model. {str(e)[:120]}")
@@ -301,7 +327,14 @@ def generate_seo_for_clip(
         user_prompt = _build_user(retry_feedback=retry_feedback if attempt > 1 else None)
 
         try:
-            raw, model_used = _call_gemini(system_prompt, user_prompt)
+            _job = getattr(clip, "job", None)
+            raw, model_used = _call_gemini(
+                system_prompt, user_prompt,
+                db=db,
+                user_id=getattr(_job, "user_id", None) if _job else None,
+                job_id=getattr(clip, "job_id", None),
+                clip_id=getattr(clip, "id", None),
+            )
         except SEOGenerationError as e:
             # Hard failure — if we already have a best, ship it; else propagate
             if best:

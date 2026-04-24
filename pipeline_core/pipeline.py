@@ -206,6 +206,18 @@ import openai
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+# Phase 12 — admin accounting of every Gemini call.  Import is best-effort so
+# pipeline_core.pipeline stays usable as a standalone script (no Kaizer DB).
+try:
+    from learning.gemini_log import log_gemini_call as _log_gemini_call
+except Exception:  # pragma: no cover
+    from contextlib import contextmanager as _cm
+    @_cm
+    def _log_gemini_call(*_a, **_kw):
+        class _NoOp:
+            def record(self, *a, **k): return None
+        yield _NoOp()
+
 
 def _truetype(path, size):
     """Load font with raqm/HarfBuzz for proper Telugu conjunct shaping.
@@ -669,10 +681,14 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
             # bubble up to the outer loop so we try the next model instead.
             for attempt in range(3):
                 try:
-                    response = model.generate_content(
-                        [video_file, prompt],
-                        request_options={"timeout": 180}
-                    )
+                    with _log_gemini_call(
+                        db=None, model=model_name, purpose="video-cut",
+                    ) as _gcall:
+                        response = model.generate_content(
+                            [video_file, prompt],
+                            request_options={"timeout": 180}
+                        )
+                        _gcall.record(response)
                     break
                 except Exception as e:
                     msg = str(e)

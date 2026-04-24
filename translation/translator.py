@@ -24,6 +24,7 @@ from tenacity import (
 
 import models
 from config import settings
+from learning.gemini_log import log_gemini_call
 
 
 TRANSLATE_MODEL = os.environ.get("KAIZER_TRANSLATE_MODEL", "gemini-2.5-flash")
@@ -102,7 +103,11 @@ def _translate(seo: Dict, target_lang: str) -> Dict:
                 "max_output_tokens": 4096,
             },
         )
-        resp = model.generate_content(src)
+        with log_gemini_call(
+            db=None, model=TRANSLATE_MODEL, purpose="translation",
+        ) as _gcall:
+            resp = model.generate_content(src)
+            _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:
             raise TransientTranslationError("empty response")

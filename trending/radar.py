@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 import models
 from config import settings
 from database import SessionLocal
+from learning.gemini_log import log_gemini_call
 
 
 FETCH_PER_CHANNEL = 10
@@ -110,7 +111,11 @@ def _summarize(title: str, description: str) -> Dict:
             },
         )
         body = f"Title: {title}\nDescription: {(description or '')[:500]}"
-        resp = model.generate_content(body)
+        with log_gemini_call(
+            db=None, model=TOPIC_MODEL, purpose="trending-topic",
+        ) as _gcall:
+            resp = model.generate_content(body)
+            _gcall.record(resp)
         data = json.loads((resp.text or "").strip())
         u = (data.get("urgency") or "normal").lower()
         if u not in ("hot", "normal", "low"):

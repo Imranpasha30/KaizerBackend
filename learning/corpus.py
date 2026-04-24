@@ -30,6 +30,7 @@ from tenacity import (
 import models
 from config import settings
 from youtube import oauth as yt_oauth
+from learning.gemini_log import log_gemini_call
 
 
 # ─── Config ───────────────────────────────────────────────────────────────
@@ -215,7 +216,13 @@ def _extract_patterns(channel: models.Channel,
                 "max_output_tokens": 2048,
             },
         )
-        resp = model.generate_content(user_prompt)
+        with log_gemini_call(
+            db=None,  # corpus refresh runs in background scheduler — no request-scoped session
+            user_id=getattr(channel, "user_id", None),
+            model=GEMINI_MODEL, purpose="corpus",
+        ) as _gcall:
+            resp = model.generate_content(user_prompt)
+            _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:
             raise TransientCorpusError("Gemini returned empty response")

@@ -595,6 +595,43 @@ class LiveEvent(Base):
     updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 12 — Admin panel: Gemini call accounting
+#
+# Raw prompts + responses are NOT stored on this row (privacy + DB bloat).
+# Only the metadata needed for per-user quota tracking, cost estimates and
+# the admin analytics dashboard.  In dev (SQLite) Base.metadata.create_all()
+# in main.py creates this table automatically on startup.  In prod (Postgres)
+# ops runs the DDL in docs/MIGRATIONS.md manually.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class GeminiCall(Base):
+    """One row per call to a Gemini model — summed by the admin panel for
+    cost + quota reporting."""
+    __tablename__ = "gemini_calls"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id         = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    clip_id        = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"), nullable=True, index=True)
+    model          = Column(String(64), nullable=False)         # e.g. "gemini-2.0-flash-exp"
+    purpose        = Column(String(64), default="")             # "seo" | "script" | "style-classify" | "thumbnail" | ...
+    prompt_tokens  = Column(Integer, default=0)
+    output_tokens  = Column(Integer, default=0)
+    total_tokens   = Column(Integer, default=0)
+    # Video accounting — Gemini bills video uploads per-second in addition to
+    # tokens, so both file size AND duration need to be tracked to estimate
+    # real cost per clip and price subscription tiers fairly.
+    file_bytes       = Column(Integer, default=0)                 # total bytes uploaded (all file parts)
+    video_duration_s = Column(Float,   default=0.0)               # total seconds of video uploaded
+    cost_usd       = Column(Float,   default=0.0)               # estimated from COST_PER_1K_TOKENS
+    latency_ms     = Column(Integer, default=0)
+    status         = Column(String(16), default="ok")           # ok | error | rate_limited
+    error          = Column(Text,    default="")
+    created_at     = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class LiveCamera(Base):
     """One camera feed registered for a live event.
 

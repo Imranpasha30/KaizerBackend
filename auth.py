@@ -164,3 +164,44 @@ def current_user_optional(
         return None
     u = db.query(models.User).filter(models.User.id == user_id).first()
     return u if (u and u.is_active) else None
+
+
+async def admin_required(user: "models.User" = Depends(current_user)) -> "models.User":
+    """401/403 gate for admin-only endpoints.
+
+    Denies requests from disabled accounts AND from non-admins.  Callers:
+
+        @router.get("/admin/…")
+        def ep(user: models.User = Depends(admin_required)):
+            ...
+
+    NOTE: Runs *after* `current_user`, so in environments where auth is
+    optional a legacy user is returned — that legacy user is flagged
+    `is_admin=True` by `ensure_legacy_user()`, so dev still works.
+    """
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account disabled")
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+# ─── Field-level encryption helpers ──────────────────────────────────────
+# Thin re-exports over `crypto.py`'s Fernet wrapper, kept here so admin
+# routes can mask/decrypt sensitive fields without importing crypto directly.
+# TODO(Phase-12.1): migrate OAuth access/refresh tokens stored in plaintext
+# in any legacy rows to the encrypted form; today they're already written
+# to `*_enc` columns via crypto.encrypt at write-time.
+
+def encrypt(plaintext: str) -> str:
+    """Fernet-encrypt; empty input → empty output (safe for NULLable cols)."""
+    from crypto import encrypt as _enc
+    return _enc(plaintext or "")
+
+
+def decrypt(ciphertext: str) -> str:
+    """Reverse of encrypt().  Returns "" for empty input.  Raises CryptoError
+    on malformed/tampered payloads — admin endpoints should catch and mask
+    to "****" on failure (never leak the raw ciphertext)."""
+    from crypto import decrypt as _dec
+    return _dec(ciphertext or "")

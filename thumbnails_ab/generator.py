@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 import models
 from config import settings
+from learning.gemini_log import log_gemini_call
 
 
 def _pick_hook_texts(clip: models.Clip) -> List[str]:
@@ -63,7 +64,14 @@ def _pick_hook_texts(clip: models.Clip) -> List[str]:
                 "max_output_tokens": 200,
             },
         )
-        resp = model.generate_content(f"Topic: {topic}")
+        _thumb_model = os.environ.get("KAIZER_THUMB_MODEL", "gemini-2.5-flash")
+        with log_gemini_call(
+            db=None, clip_id=getattr(clip, "id", None),
+            job_id=getattr(clip, "job_id", None),
+            model=_thumb_model, purpose="thumbnail",
+        ) as _gcall:
+            resp = model.generate_content(f"Topic: {topic}")
+            _gcall.record(resp)
         data = json.loads((resp.text or "").strip())
         vs = [(v or "").strip()[:35] for v in (data.get("variants") or []) if v]
         if len(vs) >= 2:

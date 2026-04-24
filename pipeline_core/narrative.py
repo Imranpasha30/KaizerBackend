@@ -320,11 +320,26 @@ def _call_gemini(
 
     genai.configure(api_key=api_key)
 
+    # Import accounting wrapper best-effort — narrative is also importable
+    # as a standalone script, so a missing learning.gemini_log must not
+    # break the call.
+    try:
+        from learning.gemini_log import log_gemini_call as _log_gemini_call
+    except Exception:
+        from contextlib import contextmanager as _cm
+        @_cm
+        def _log_gemini_call(*_a, **_kw):
+            class _NoOp:
+                def record(self, *a, **k): return None
+            yield _NoOp()
+
     for model_name in _GEMINI_MODELS:
         try:
             logger.info("narrative: calling Gemini model %s", model_name)
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+            with _log_gemini_call(db=None, model=model_name, purpose="narrative") as _gcall:
+                response = model.generate_content(prompt)
+                _gcall.record(response)
             raw_text = response.text or ""
 
             # Extract JSON array from the response text
