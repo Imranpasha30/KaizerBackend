@@ -694,6 +694,184 @@ def get_log(
     ]
 
 
+# ── Phase 10.1 — live debug snapshot ─────────────────────────────────────────
+
+
+@router.get("/events/{event_id}/debug")
+async def get_debug_snapshot(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Deep health snapshot of the running pipeline for one event.
+
+    Surfaces every moving part so the dashboard's DebugPanel can flag
+    issues: webrtc worker stats, ring-buffer health, analyzer task
+    status, director state, fanout subscriber counts, phone-token
+    live/pending counts. Safe to poll every 1-3 seconds.
+
+    Returns a flat JSON payload (no Pydantic model — this is a
+    debugging surface, not a stable API contract).
+    """
+    _load_event(event_id, user.id, db)
+    session = _SESSIONS.get(event_id)
+
+    decisions_count = (
+        db.query(models.DirectorLogEntry)
+        .filter(
+            models.DirectorLogEntry.event_id == event_id,
+            models.DirectorLogEntry.kind == "selection",
+        )
+        .count()
+    )
+
+    issues: list[str] = []
+
+    payload: dict = {
+        "event_id": event_id,
+        "live_in_process": session is not None,
+        "decisions_total": decisions_count,
+        "issues": issues,
+    }
+
+    if session is None:
+        payload["session"] = None
+        # Not an issue if event is scheduled — only flag if DB says live
+        return payload
+
+    # ── Director state ────────────────────────────────────────────────
+    dr = session.director
+    if dr is not None:
+        payload["director"] = {
+            "running":          bool(getattr(dr, "_running", False)),
+            "current_cam":      getattr(dr, "_current_cam", None),
+            "current_layout":   getattr(dr, "_current_layout", "single"),
+            "pin":              getattr(dr, "_pin", None),
+            "blacklist":        sorted(list(getattr(dr, "_blacklist", set()))),
+            "in_bridge":        getattr(dr, "_in_bridge", False),
+            "last_cut_t":       getattr(dr, "_last_cut_t", 0.0),
+            "camera_count":     len(getattr(dr, "camera_ids", [])),
+        }
+        if not dr._running:
+            issues.append("director_loop_not_running")
+    else:
+        payload["director"] = None
+        issues.append("director_missing")
+
+    # ── Per-camera: worker + ring + analyzer stats ────────────────────
+    cams: dict[str, dict] = {}
+    for cam_id in session.camera_ids:
+        cam_entry: dict = {"cam_id": cam_id}
+
+        worker = session.webrtc_workers.get(cam_id)
+        if worker is not None:
+            s = worker.stats()
+            cam_entry["webrtc_worker"] = s
+            if s.get("ffmpeg_restarts_video", 0) > 2:
+                issues.append(f"{cam_id}: video ffmpeg restart storm ({s['ffmpeg_restarts_video']})")
+            if s.get("ffmpeg_restarts_audio", 0) > 2:
+                issues.append(f"{cam_id}: audio ffmpeg restart storm ({s['ffmpeg_restarts_audio']})")
+            if s.get("chunks_dropped", 0) > s.get("chunks_in", 1) * 0.3:
+                issues.append(f"{cam_id}: phone pushing faster than ffmpeg consumes (dropped {s['chunks_dropped']}/{s['chunks_in']})")
+            if s.get("queue_depth", 0) >= s.get("queue_capacity", 1):
+                issues.append(f"{cam_id}: chunk queue saturated")
+            if s.get("last_error"):
+                issues.append(f"{cam_id}: {s['last_error']}")
+        else:
+            cam_entry["webrtc_worker"] = None
+
+        ring = session.rings.get(cam_id)
+        if ring is not None:
+            try:
+                rs = await ring.stats()
+                cam_entry["ring"] = rs
+                if rs.get("fps", 0) < 1.0 and worker and worker.stats().get("chunks_in", 0) > 10:
+                    issues.append(f"{cam_id}: ring fps below 1 despite chunks arriving")
+                if rs.get("dropped_frames", 0) > 20:
+                    issues.append(f"{cam_id}: {rs['dropped_frames']} frames dropped by ring (analyzers slow)")
+            except Exception as exc:
+                cam_entry["ring"] = {"error": str(exc)}
+        else:
+            cam_entry["ring"] = None
+
+        tasks = session.analyzer_tasks.get(cam_id, [])
+        alive = sum(1 for t in tasks if t and not t.done())
+        cam_entry["analyzers"] = {
+            "total":    len(tasks),
+            "alive":    alive,
+            "dead":     len(tasks) - alive,
+        }
+        if tasks and alive == 0:
+            issues.append(f"{cam_id}: all analyzer tasks are dead")
+        elif tasks and alive < len(tasks):
+            issues.append(f"{cam_id}: {len(tasks) - alive}/{len(tasks)} analyzer tasks dead")
+
+        cams[cam_id] = cam_entry
+
+    payload["cameras"] = cams
+
+    # ── Monitor / ingest fanout + phone token pool ────────────────────
+    payload["monitor_subscribers"] = {
+        f"{ev}:{cid}": len(ws_list)
+        for (ev, cid), ws_list in _INGEST_FANOUT.items()
+        if ev == event_id
+    }
+    payload["phone_tokens_active"] = sum(
+        1 for m in _PHONE_TOKENS.values()
+        if m.get("event_id") == event_id
+    )
+
+    # ── Ws decision broadcast subscribers ─────────────────────────────
+    payload["ws_clients"] = len(session.ws_clients)
+
+    # ── Pipeline tasks ────────────────────────────────────────────────
+    alive_tasks = sum(1 for t in session._tasks if t and not t.done())
+    payload["pipeline_tasks"] = {
+        "total": len(session._tasks),
+        "alive": alive_tasks,
+    }
+
+    # ── Relay (Phase 7) state ─────────────────────────────────────────
+    if session.relay is not None:
+        try:
+            statuses = session.relay.get_status()
+            if not isinstance(statuses, list):
+                statuses = [statuses]
+            payload["relay"] = [
+                {
+                    "destination_id": s.destination_id,
+                    "state":          s.state,
+                    "attempts":       s.attempts,
+                    "last_error":     s.last_error,
+                    "uptime_s":       round(s.uptime_s, 2),
+                }
+                for s in statuses
+            ]
+            for s in statuses:
+                if s.state == "failed":
+                    issues.append(f"relay {s.destination_id}: {s.last_error or 'failed'}")
+        except Exception as exc:
+            payload["relay"] = [{"error": str(exc)}]
+    else:
+        payload["relay"] = None
+
+    # Final issue count
+    if decisions_count == 0 and session.camera_ids and dr and dr._running:
+        # Only flag if at least one worker shows frames arriving
+        any_frames = any(
+            (w.stats().get("frames_decoded", 0) > 5)
+            for w in session.webrtc_workers.values()
+        )
+        if any_frames:
+            issues.append(
+                "director has seen frames but emitted no decisions yet — "
+                "check analyzer interval / min_shot_s / rule thresholds"
+            )
+
+    payload["issues_count"] = len(issues)
+    return payload
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 7 endpoints — RTMP relay, chroma, dead-air bridge
 # ══════════════════════════════════════════════════════════════════════════════
