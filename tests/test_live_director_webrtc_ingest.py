@@ -65,13 +65,16 @@ async def test_push_chunk_enqueues_when_running():
         config=WebRTCIngestConfig(max_chunk_queue=5),
     )
     # Don't actually start — we just want to verify push_chunk bumps counters.
+    # First chunk is captured as _init_chunk (EBML header preserve); chunks 2
+    # and 3 go through the normal queue.
     for i in range(3):
         await worker.push_chunk(b"x" * 100)
     s = worker.stats()
     assert s["chunks_in"] == 3
     assert s["bytes_in"] == 300
     assert s["chunks_dropped"] == 0
-    assert s["queue_depth"] == 3
+    assert s["queue_depth"] == 2          # 3 pushed minus 1 captured as init
+    assert worker._init_chunk == b"x" * 100
 
 
 @pytest.mark.asyncio
@@ -82,14 +85,15 @@ async def test_push_chunk_drops_oldest_when_queue_full():
         event_id=1, cam_id="cam1", ring=ring, bus=bus,
         config=WebRTCIngestConfig(max_chunk_queue=3),
     )
+    # 5 pushed: chunk 1 → init_chunk; chunks 2-5 → queue (capacity 3).
+    # So 4 enqueues into a 3-slot queue → 1 drop.
     for i in range(5):
         await worker.push_chunk(bytes([i]) * 10)
     s = worker.stats()
-    # 5 pushed, capacity 3 → 2 dropped
     assert s["chunks_in"] == 5
-    assert s["chunks_dropped"] == 2
-    # Queue should be at capacity, holding the newest 3 chunks
+    assert s["chunks_dropped"] == 1
     assert s["queue_depth"] == 3
+    assert worker._init_chunk == bytes([0]) * 10
 
 
 @pytest.mark.asyncio

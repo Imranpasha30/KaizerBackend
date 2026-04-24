@@ -145,6 +145,13 @@ class WebRTCIngestWorker:
         self._running: bool = False
         self._event_start_t: float = 0.0
         self._stats = WebRTCStats()
+        # The FIRST webm chunk from MediaRecorder contains the EBML header +
+        # Segment info + Tracks — required for any matroska parser to start
+        # decoding. We remember it so every (re)spawned ffmpeg proc receives
+        # it first, before the live cluster chunks. Without this, a proc
+        # spawned after the initial header has arrived sees orphan cluster
+        # bytes and crashes with "Invalid data found when processing input".
+        self._init_chunk: Optional[bytes] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -201,15 +208,39 @@ class WebRTCIngestWorker:
     async def push_chunk(self, chunk: bytes) -> None:
         """Enqueue one webm chunk. If the queue is full, DROP the oldest
         chunk and enqueue the new one — never block the phone's producer.
+
+        Special-cases the VERY FIRST chunk: MediaRecorder puts the EBML
+        header + Segment info + Tracks in it, and any ffmpeg proc that
+        doesn't see that preamble can't decode anything. We stash it as
+        `_init_chunk` and inject it directly into any already-spawned
+        proc's stdin — plus every FUTURE spawn replays it on start. This
+        is the one-liner that fixes "Error opening input files: Invalid
+        data found when processing input".
         """
         if not chunk:
             return
         self._stats.chunks_in += 1
         self._stats.bytes_in += len(chunk)
+
+        if self._init_chunk is None:
+            self._init_chunk = chunk
+            # Inject into any already-live procs (they exist if the phone
+            # connected AFTER start() returned but chunk_pump hasn't spun up yet).
+            for proc in (self._video_proc, self._audio_proc):
+                if proc and proc.stdin and not proc.stdin.is_closing():
+                    try:
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                    except Exception:
+                        pass
+            # First chunk is NOT also enqueued — writing it twice to the
+            # same stream would repeat the EBML header inside the Segment,
+            # producing a malformed matroska stream ffmpeg rejects.
+            return
+
         try:
             self._chunk_queue.put_nowait(chunk)
         except asyncio.QueueFull:
-            # Drop oldest, retry once
             try:
                 self._chunk_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -218,7 +249,6 @@ class WebRTCIngestWorker:
             try:
                 self._chunk_queue.put_nowait(chunk)
             except asyncio.QueueFull:
-                # Extremely unlikely — consumer is completely stuck
                 self._stats.chunks_dropped += 1
 
     async def stop(self) -> None:
@@ -263,10 +293,21 @@ class WebRTCIngestWorker:
     async def _chunk_pump_loop(self) -> None:
         """Read from the chunk queue and write to both ffmpeg stdins.
 
-        If a subproc's stdin is closed / broken (mid-restart), skip silently
-        — the supervisor will restart it.
+        Gate: only dequeue once BOTH procs exist. Dequeueing earlier would
+        write the chunk to whichever proc happened to be spawned first,
+        silently losing it for the other — leaving the second ffmpeg with
+        a truncated webm stream that fails to parse.
         """
         while self._running:
+            # Wait for both procs to be alive before draining — prevents
+            # the race where one supervisor spawns faster than the other
+            # and the queue pump feeds chunks to only one ffmpeg.
+            while self._running and (
+                self._video_proc is None or self._audio_proc is None
+            ):
+                await asyncio.sleep(0.02)
+            if not self._running:
+                return
             try:
                 chunk = await self._chunk_queue.get()
             except asyncio.CancelledError:
@@ -334,6 +375,19 @@ class WebRTCIngestWorker:
             self._video_proc = proc
         else:
             self._audio_proc = proc
+
+        # Replay the EBML header if we have one — every proc needs the
+        # matroska preamble before it can parse cluster chunks. First spawn
+        # + crash-restart both take this path.
+        if self._init_chunk is not None and proc.stdin and not proc.stdin.is_closing():
+            try:
+                proc.stdin.write(self._init_chunk)
+                await proc.stdin.drain()
+            except Exception as exc:
+                logger.debug(
+                    "[%s/%s] init-chunk replay failed: %s",
+                    self.cam_id, kind, exc,
+                )
 
         # Concurrent stderr reader so ffmpeg complaints reach the debug panel.
         stderr_task = asyncio.create_task(
