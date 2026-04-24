@@ -521,6 +521,9 @@ async def start_event(
     from pipeline_core.live_director.webrtc_ingest import (
         WebRTCIngestConfig, WebRTCIngestWorker,
     )
+    from pipeline_core.live_director.local_camera import (
+        LocalCameraConfig, LocalCameraWorker,
+    )
     from pipeline_core.live_director.analyzers.base import AnalyzerConfig
     from pipeline_core.live_director.analyzers.audio import AudioAnalyzer
     from pipeline_core.live_director.analyzers.face import FaceAnalyzer
@@ -533,7 +536,8 @@ async def start_event(
     for cam in cams:
         role_hints = cam.role_hints or []
         is_phone = "phone" in role_hints
-        if not is_phone:
+        is_local = "local" in role_hints
+        if not is_phone and not is_local:
             continue  # RTMP cams handled by the legacy IngestWorker path
         ring = CameraRingBuffer(
             cam.cam_id,
@@ -541,19 +545,38 @@ async def start_event(
             audio_max_samples=80_000,    # 5s @ 16kHz
         )
         session.rings[cam.cam_id] = ring
-        worker = WebRTCIngestWorker(
-            event_id=event_id,
-            cam_id=cam.cam_id,
-            ring=ring,
-            bus=session.bus,
-            config=webrtc_cfg,
-        )
+
+        if is_local:
+            # Parse source from role_hints like "source:0" or "source:rtsp://..."
+            source_str = "0"
+            for h in role_hints:
+                if isinstance(h, str) and h.startswith("source:"):
+                    source_str = h[len("source:"):]
+                    break
+            src: "int | str" = (
+                int(source_str) if source_str.lstrip("-").isdigit() else source_str
+            )
+            worker = LocalCameraWorker(
+                event_id=event_id,
+                cam_id=cam.cam_id,
+                ring=ring,
+                bus=session.bus,
+                config=LocalCameraConfig(source=src),
+            )
+        else:
+            worker = WebRTCIngestWorker(
+                event_id=event_id,
+                cam_id=cam.cam_id,
+                ring=ring,
+                bus=session.bus,
+                config=webrtc_cfg,
+            )
         session.webrtc_workers[cam.cam_id] = worker
         try:
             await worker.start()
         except Exception as exc:
             logger.error(
-                "live: webrtc worker failed to start for %s: %s",
+                "live: worker failed to start for %s: %s",
                 cam.cam_id, exc,
             )
             continue
