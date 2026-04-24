@@ -20,6 +20,19 @@ Requires:
 import os, sys, json, time, re, subprocess, math, random, shutil
 from datetime import datetime
 
+# When this module is run as a standalone script (e.g. via
+# `python pipeline_core/pipeline.py ...` from the upload worker
+# subprocess, or directly), the `pipeline_core` package's parent
+# directory (KaizerBackend/) is NOT automatically on sys.path — so
+# the `from pipeline_core.xxx import ...` lines below fail with
+# ModuleNotFoundError. Bootstrap it here so the file runs cleanly
+# both as a module (`from pipeline_core.pipeline import ...`) AND as
+# a script.
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(_HERE)   # KaizerBackend/
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
 
 def _find_binary(name):
     """Find ffmpeg/ffprobe: checks PATH first, then common nix/Railway paths."""
