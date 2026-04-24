@@ -1383,6 +1383,139 @@ def create_phone_session(
     )
 
 
+# ── Local-camera ingest (OpenCV / RTSP) — rock-solid production path ────────
+
+
+class LocalCameraRequest(BaseModel):
+    """Register a local camera for this event.
+
+    `source` is either an integer (webcam index: 0 = default, 1 = second
+    device, …) or a string URL (RTSP / HTTP MJPEG).  When the event is
+    live the LocalCameraWorker spawns immediately; otherwise it's
+    registered as a DB row and spawned the next time /start is called.
+    """
+    source: Union[int, str] = 0
+    label: str = "Laptop camera"
+
+
+class LocalCameraResponse(BaseModel):
+    cam_id: str
+    label: str
+    source: str
+    is_running: bool
+
+
+@router.post("/events/{event_id}/local-cameras", response_model=LocalCameraResponse)
+async def add_local_camera(
+    event_id: int,
+    body: LocalCameraRequest,
+    db: Session = Depends(get_db),
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Attach a locally-connected camera to the event (webcam or RTSP URL)."""
+    ev = _load_event(event_id, user.id, db)
+
+    existing = {
+        row.cam_id
+        for row in db.query(models.LiveCamera.cam_id)
+        .filter(models.LiveCamera.event_id == event_id)
+        .all()
+    }
+    for _ in range(32):
+        cand = f"local_{secrets.token_hex(3)}"
+        if cand not in existing:
+            cam_id = cand
+            break
+    else:
+        cam_id = f"local_{secrets.token_hex(6)}"
+
+    cam = models.LiveCamera(
+        event_id=event_id,
+        cam_id=cam_id,
+        label=body.label,
+        mic_id="",
+        role_hints=["local", "opencv", f"source:{body.source}"],
+    )
+    db.add(cam)
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"Failed to register local camera: {exc}")
+    db.refresh(cam)
+
+    is_running = False
+    session = _SESSIONS.get(event_id)
+    if session is not None:
+        # Event is live — spawn worker + analyzers now so the user sees
+        # frames without having to restart the event.
+        from pipeline_core.live_director.ring_buffer import CameraRingBuffer
+        from pipeline_core.live_director.local_camera import (
+            LocalCameraConfig, LocalCameraWorker,
+        )
+        from pipeline_core.live_director.analyzers.base import AnalyzerConfig
+        from pipeline_core.live_director.analyzers.audio import AudioAnalyzer
+        from pipeline_core.live_director.analyzers.face import FaceAnalyzer
+        from pipeline_core.live_director.analyzers.motion import MotionAnalyzer
+        from pipeline_core.live_director.analyzers.scene import SceneAnalyzer
+        from pipeline_core.live_director.analyzers.reaction import ReactionAnalyzer
+        from pipeline_core.live_director.analyzers.beat import BeatAnalyzer
+
+        ring = CameraRingBuffer(cam_id, video_max_frames=60, audio_max_samples=80_000)
+        session.rings[cam_id] = ring
+        session.camera_ids.append(cam_id)
+        if session.director is not None:
+            # Let the director know about the new camera so its rule helpers
+            # include it.
+            if cam_id not in session.director.camera_ids:
+                session.director.camera_ids.append(cam_id)
+            # Give the director a placeholder CamState for the new cam
+            try:
+                from pipeline_core.live_director.director import _CamState
+                session.director._cam_states.setdefault(cam_id, _CamState(cam_id=cam_id))
+            except Exception:
+                pass
+
+        worker = LocalCameraWorker(
+            event_id=event_id,
+            cam_id=cam_id,
+            ring=ring,
+            bus=session.bus,
+            config=LocalCameraConfig(source=body.source),
+        )
+        # Re-use the existing webrtc_workers dict so debug + stop paths find it.
+        session.webrtc_workers[cam_id] = worker
+        try:
+            await worker.start()
+            is_running = True
+        except Exception as exc:
+            logger.error("live: local camera worker failed to start for %s: %s", cam_id, exc)
+
+        cfg_base = AnalyzerConfig(cam_id=cam_id, interval_s=0.3, enabled=True)
+        tasks = []
+        for A in (AudioAnalyzer, FaceAnalyzer, MotionAnalyzer,
+                  SceneAnalyzer, ReactionAnalyzer, BeatAnalyzer):
+            t = asyncio.create_task(
+                A(cfg_base, ring, session.bus).run(),
+                name=f"analyzer-{cam_id}-{A.__name__}",
+            )
+            tasks.append(t)
+            session._tasks.append(t)
+        session.analyzer_tasks[cam_id] = tasks
+
+        logger.info(
+            "live: event %s local cam %s (source=%s) worker + %d analyzers started",
+            event_id, cam_id, body.source, len(tasks),
+        )
+
+    return LocalCameraResponse(
+        cam_id=cam_id,
+        label=body.label,
+        source=str(body.source),
+        is_running=is_running,
+    )
+
+
 @router.websocket("/ws/ingest/{event_id}/{cam_id}")
 async def ws_ingest_phone_stream(
     websocket: WebSocket,
@@ -1453,12 +1586,33 @@ async def ws_ingest_phone_stream(
                 continue
             text = msg.get("text")
             if text is not None:
-                # Optional control channel — {"type": "stop"} cleanly breaks
-                # the loop; {"type": "ping"} is ignored (keep-alive).
+                # Control channel. Supported messages:
+                #   {"type":"stop"}                  — close the stream
+                #   {"type":"meta","mime": "...", "width":..., "height":...,
+                #    "userAgent": "..."}             — phone reports what
+                #    MediaRecorder actually negotiated; logged loudly + stored
+                #    on the worker so the Debug panel can surface it.
                 try:
                     payload = json.loads(text)
-                    if isinstance(payload, dict) and payload.get("type") == "stop":
-                        break
+                    if isinstance(payload, dict):
+                        if payload.get("type") == "stop":
+                            break
+                        if payload.get("type") == "meta":
+                            logger.warning(
+                                "[%s/%s] phone meta: mime=%s  size=%sx%s  ua=%s",
+                                event_id, cam_id,
+                                payload.get("mime", "?"),
+                                payload.get("width", "?"),
+                                payload.get("height", "?"),
+                                (payload.get("userAgent") or "")[:80],
+                            )
+                            session = _SESSIONS.get(event_id)
+                            worker = session.webrtc_workers.get(cam_id) if session else None
+                            if worker is not None:
+                                worker._stats.last_error = (
+                                    f"phone meta: mime={payload.get('mime', '?')} "
+                                    f"size={payload.get('width', '?')}x{payload.get('height', '?')}"
+                                )
                 except Exception:
                     pass
     except WebSocketDisconnect:
