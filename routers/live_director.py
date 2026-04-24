@@ -833,7 +833,7 @@ async def get_debug_snapshot(
                 issues.append(f"{cam_id}: audio ffmpeg restart storm ({s['ffmpeg_restarts_audio']})")
             if s.get("chunks_dropped", 0) > s.get("chunks_in", 1) * 0.3:
                 issues.append(f"{cam_id}: phone pushing faster than ffmpeg consumes (dropped {s['chunks_dropped']}/{s['chunks_in']})")
-            if s.get("queue_depth", 0) >= s.get("queue_capacity", 1):
+            if s.get("queue_capacity", 0) > 0 and s.get("queue_depth", 0) >= s["queue_capacity"]:
                 issues.append(f"{cam_id}: chunk queue saturated")
             if s.get("last_error"):
                 issues.append(f"{cam_id}: {s['last_error']}")
@@ -1426,6 +1426,58 @@ class LocalCameraResponse(BaseModel):
     label: str
     source: str
     is_running: bool
+
+
+@router.get("/devices/enumerate")
+def enumerate_local_devices(
+    user: "models.User" = Depends(auth.current_user),
+):
+    """Probe OpenCV indices 0..5 on every available backend and report which
+    ones can actually open + read a frame. The UI uses this to populate a
+    dropdown of real cameras so users don't have to guess device indices.
+    Runs in-process (blocks for ~1s worst case on a cold USB bus).
+    """
+    import cv2  # lazy
+    results = []
+    # Try DSHOW first on Windows (avoids 2-3 s MSMF cold-start). Falls back
+    # to CAP_ANY if DSHOW can't open the device at all.
+    for idx in range(6):
+        opened_with = None
+        width = height = 0
+        fps = 0.0
+        ok_read = False
+        for backend_name, backend in [("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]:
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+            except Exception:
+                cap = None
+            if cap is not None and cap.isOpened():
+                try:
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        ok_read = True
+                        height, width = frame.shape[:2]
+                        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                        opened_with = backend_name
+                        cap.release()
+                        break
+                finally:
+                    try: cap.release()
+                    except Exception: pass
+        if opened_with is not None:
+            results.append({
+                "index":    idx,
+                "backend":  opened_with,
+                "width":    int(width),
+                "height":   int(height),
+                "fps":      fps,
+                "readable": ok_read,
+            })
+    return {
+        "devices":          results,
+        "device_count":     len(results),
+        "hint":             "Index 0 is usually the built-in webcam. USB capture cards (HDMI→USB) typically appear at the next index. If your Sony/capture card is not listed: check USB cable, Windows Device Manager → Cameras / Imaging Devices, and ensure the source camera has clean HDMI output enabled.",
+    }
 
 
 @router.post("/events/{event_id}/local-cameras", response_model=LocalCameraResponse)
