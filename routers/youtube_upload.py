@@ -38,6 +38,12 @@ class PublishRequest(BaseModel):
     # When set, force every destination to use THIS channel's SEO variant
     # from clip.seo_variants (overrides the per-destination auto-match).
     seo_variant_override: Optional[int] = None
+    # When set, read clip.seo / seo_variants from THIS sibling clip instead of
+    # the clip being published. Used by the bulk-publish flow so a video's
+    # 5 clips can all share the SEO generated for one of them. The clip's own
+    # SEO still wins when present — this only fires when the publishing clip
+    # has no SEO of its own. Source must belong to the same job.
+    seo_source_clip_id: Optional[int] = None
     # Per-destination override map: { "<dest_channel_id>": <variant_channel_id> }.
     # Wins over `seo_variant_override` for destinations it specifies.  Lets a
     # user publish Auto Wala with "Suman TV Live" voice AND Cyber Sphere with
@@ -250,13 +256,38 @@ def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(ge
                 detail=f"Style profile '{ch.name}' is not linked to YouTube. Open Style Profiles → Link my YT.",
             )
 
-    # Accept either a legacy clip.seo OR a per-channel variant
+    # Resolve which clip's SEO to use:
+    #   - default: this clip's own SEO
+    #   - if `seo_source_clip_id` is set AND this clip lacks its own SEO:
+    #     fall back to the source clip (must be in the same job, owned by
+    #     the same user). Lets a video's 5 clips share one SEO without
+    #     forcing the user to regenerate per clip.
+    seo_clip = clip
+    if payload.use_seo and not (clip.seo or clip.seo_variants) and payload.seo_source_clip_id:
+        donor = db.query(models.Clip).filter(
+            models.Clip.id == payload.seo_source_clip_id,
+        ).first()
+        if donor is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"seo_source_clip_id={payload.seo_source_clip_id} not found.",
+            )
+        if donor.job_id != clip.job_id:
+            raise HTTPException(
+                status_code=400,
+                detail="seo_source_clip_id must belong to the same job as the publishing clip.",
+            )
+        if donor.seo or donor.seo_variants:
+            seo_clip = donor
+
+    # Accept either a legacy clip.seo OR a per-channel variant on the
+    # resolved seo_clip (which may be the donor).
     if payload.use_seo:
         try:
-            _variants_check = json.loads(clip.seo_variants or "{}")
+            _variants_check = json.loads(seo_clip.seo_variants or "{}")
         except (ValueError, TypeError):
             _variants_check = {}
-        if not clip.seo and not (isinstance(_variants_check, dict) and _variants_check):
+        if not seo_clip.seo and not (isinstance(_variants_check, dict) and _variants_check):
             raise HTTPException(
                 status_code=409,
                 detail="Clip has no SEO metadata. Generate SEO first, or pass use_seo=false with manual title/description.",
@@ -273,7 +304,9 @@ def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(ge
     created: list[models.UploadJob] = []
     for cid in target_ids:
         channel = by_id[cid]
-        title, description, tags = _compose_metadata(clip, channel, payload)
+        # Use seo_clip (may be the donor sibling) for SEO content;
+        # everything else still uses the actual clip being uploaded.
+        title, description, tags = _compose_metadata(seo_clip, channel, payload)
         job = models.UploadJob(
             user_id=user.id,
             clip_id=clip.id,

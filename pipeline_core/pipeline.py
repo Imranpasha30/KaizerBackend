@@ -1590,7 +1590,7 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
         pass
 
     # Generate torn-paper text card
-    _ff = font_file or "Ponnala-Regular.ttf"
+    _ff = font_file or "NotoSansTelugu-Bold.ttf"
     tel_font = os.path.join(FONTS_DIR, _ff)
     if not os.path.exists(tel_font):
         tel_font = os.path.join(FONTS_DIR, "Ponnala-Regular.ttf")
@@ -1947,7 +1947,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
     bg_img = _make_velvet_bg(w, h, fbar_y, velvet_style=velvet_style)
 
     # ── Resolve Telugu font ──
-    _ff = font_file or 'Ponnala-Regular.ttf'
+    _ff = font_file or 'NotoSansTelugu-Bold.ttf'
     tel_font_path = os.path.join(FONTS_DIR, _ff)
     if not os.path.exists(tel_font_path):
         tel_font_path = os.path.join(FONTS_DIR, 'NotoSansTelugu-Bold.ttf')
@@ -2454,10 +2454,11 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     print(f"\n  [5/{TOTAL}] Composing broadcast layout ({FRAME_LAYOUTS[frame_layout]}) ...")
 
     # Resolve language-specific font + follow-bar text once for this job.
-    # For Telugu we keep the legacy Ponnala font (designed for Telugu news style);
-    # for every other language we use the bundled Noto Sans of that script.
+    # Telugu defaults to NotoSansTelugu-Bold (legible at the 80px headline
+    # size, matches the editor's default selection); every other language
+    # uses the bundled Noto Sans of its own script.
     if lang_cfg.code == "te":
-        lang_font_basename = "Ponnala-Regular.ttf"
+        lang_font_basename = "NotoSansTelugu-Bold.ttf"
     else:
         lang_font_basename = os.path.basename(lang_cfg.font_primary) or "NotoSans-Bold.ttf"
     lang_follow_text = lang_cfg.follow_bar_text or "FOLLOW KAIZER NEWS"
@@ -2506,7 +2507,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         else:
             compose_meta = compose_clip(
                 raw_path, img, card_text, out_path, preset,
-                font_size=52,
+                font_size=80,
                 font_file=lang_font_basename,
                 section_pct={"video": 0.4619, "text": 0.1691, "image": 0.3690},
                 card_style={"card_c0": "#c10000", "card_c1": "#800000",
@@ -2515,7 +2516,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 platform=platform,
             )
             clip_card_params = {
-                "font_size": compose_meta.get("font_size", 52),
+                "font_size": compose_meta.get("font_size", 80),
                 "font_file": compose_meta.get("font_file", lang_font_basename),
                 "card_c0": "#c10000", "card_c1": "#800000",
                 "edge": 9, "jag": 60, "seed": 7,

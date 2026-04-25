@@ -921,7 +921,7 @@ def _recompose_clip(clip, meta, edits, db):
         compose_follow_bar(
             raw_path, out_path, preset,
             title_text=title_text,
-            font_file=card_params.get("font_file", "Ponnala-Regular.ttf"),
+            font_file=card_params.get("font_file", "NotoSansTelugu-Bold.ttf"),
             text_color=follow_params.get("text_color", card_params.get("text_color", "#ffff00")),
             text_size=int(card_params.get("font_size", 60)),
             bg_color=follow_params.get("bg_color", "#1a0a2e"),
@@ -942,9 +942,9 @@ def _recompose_clip(clip, meta, edits, db):
         }
         compose_clip(
             raw_path, image_path, title_text, out_path, preset,
-            font_size=card_params.get("font_size", 52),
+            font_size=card_params.get("font_size", 80),
             text_color=card_params.get("text_color", "#ffffff"),
-            font_file=card_params.get("font_file", "Ponnala-Regular.ttf"),
+            font_file=card_params.get("font_file", "NotoSansTelugu-Bold.ttf"),
             section_pct=section_pct or None,
             card_style=cs or None,
         )
