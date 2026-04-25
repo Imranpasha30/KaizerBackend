@@ -179,7 +179,12 @@ class WebRTCIngestWorker:
         }
 
     async def start(self) -> None:
-        """Launch the two FFmpeg subprocesses + start the pump/reader tasks.
+        """Launch the FFmpeg subprocesses + start the pump/reader tasks.
+
+        Currently spawns ONLY the video subproc — audio is on the back burner
+        while we stabilize the video decode path. Once video frames are
+        flowing into the ring, audio can be re-enabled by uncommenting the
+        audio supervisor + adjusting the chunk-pump wait condition.
 
         Safe to call once. Idempotent subsequent calls log a warning.
         """
@@ -190,7 +195,7 @@ class WebRTCIngestWorker:
         self._event_start_t = time.monotonic()
         self._stats.started_at = self._event_start_t
         logger.info(
-            "[%s] WebRTCIngestWorker starting (event=%d, analyzer=%dx%d@%d)",
+            "[%s] WebRTCIngestWorker starting (event=%d, analyzer=%dx%d@%d) — video-only mode",
             self.cam_id, self.event_id,
             self.config.analyzer_width, self.config.analyzer_height,
             self.config.analyzer_fps,
@@ -201,9 +206,10 @@ class WebRTCIngestWorker:
         self._video_loop_task = asyncio.create_task(
             self._supervisor("video"), name=f"webrtc-video-{self.cam_id}",
         )
-        self._audio_loop_task = asyncio.create_task(
-            self._supervisor("audio"), name=f"webrtc-audio-{self.cam_id}",
-        )
+        # Audio temporarily disabled — see class docstring
+        # self._audio_loop_task = asyncio.create_task(
+        #     self._supervisor("audio"), name=f"webrtc-audio-{self.cam_id}",
+        # )
 
     async def push_chunk(self, chunk: bytes) -> None:
         """Enqueue one webm chunk. If the queue is full, DROP the oldest
@@ -299,12 +305,10 @@ class WebRTCIngestWorker:
         a truncated webm stream that fails to parse.
         """
         while self._running:
-            # Wait for both procs to be alive before draining — prevents
-            # the race where one supervisor spawns faster than the other
-            # and the queue pump feeds chunks to only one ffmpeg.
-            while self._running and (
-                self._video_proc is None or self._audio_proc is None
-            ):
+            # Wait for video proc to be alive before draining (audio is
+            # currently disabled; when re-enabled add "and self._audio_proc
+            # is None" to this gate).
+            while self._running and self._video_proc is None:
                 await asyncio.sleep(0.02)
             if not self._running:
                 return
@@ -440,9 +444,11 @@ class WebRTCIngestWorker:
             except Exception:
                 txt = "<undecodable>"
             if txt:
-                logger.debug("[%s/%s] ffmpeg: %s", self.cam_id, kind, txt)
-                # Always expose the most-recent line so operators can see live
-                # decode warnings even when ffmpeg isn't crashing.
+                # Info-level so stderr lines actually show up in uvicorn logs
+                # (debug was swallowed). We're debugging the decode path.
+                logger.info("[%s/%s] ffmpeg: %s", self.cam_id, kind, txt)
+                # Also surface the most-recent line on stats() so the Debug
+                # panel shows live decode hints even when ffmpeg isn't crashing.
                 self._stats.last_error = f"{kind}: {txt[:200]}"
 
     def _build_cmd(self, kind: str) -> list[str]:
@@ -461,12 +467,14 @@ class WebRTCIngestWorker:
         chatty but surfaces probe + codec decisions into stderr so the
         debug panel can tell us exactly what FFmpeg decided.
         """
+        # Input format hint removed — FFmpeg auto-detects matroska/webm from
+        # the first bytes; being explicit with `-f matroska,webm` (comma not
+        # supported here) silently failed. Defaults pick the right demuxer.
         common_input = [
             "-hide_banner", "-loglevel", "info",
             "-fflags", "+nobuffer+genpts+discardcorrupt",
             "-probesize", "65536",
             "-analyzeduration", "500000",
-            "-f", "matroska,webm",
             "-i", "pipe:0",
         ]
         if kind == "video":
