@@ -98,3 +98,18 @@ tenacity==9.1.4
 # ─── CLI / logging colors (uvicorn + tracebacks) ─────────────
 click==8.3.1
 colorama==0.4.6
+
+# ─── Admin panel: system resource metrics (CPU/RAM/disk) ─────
+# routers/admin.py imports psutil at module load, so missing this
+# breaks main.py at boot time and the /api/health/ check fails.
+psutil==7.2.2
+
+# ─── Cloudflare R2 (S3-compatible) — used by YouTube upload ──
+# youtube/worker.py downloads source clips from R2 via
+# pipeline_core/storage.py before pushing to YouTube. boto3 is
+# lazy-imported, so it doesn't crash startup, but every upload
+# fails without it.
+boto3==1.42.96
+botocore==1.42.96
+s3transfer==0.16.1
+jmespath==1.1.0
