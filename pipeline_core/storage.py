@@ -422,9 +422,16 @@ class R2Storage(StorageProvider):
                 try:
                     import boto3  # type: ignore[import]
                 except ImportError as exc:
+                    # Surface a small bit of context with the error so future
+                    # incidents (where boto3 is "installed" but not visible
+                    # to the running process) are diagnosable from the worker
+                    # log without a code patch.  Stripped to one line so it
+                    # fits in upload_jobs.last_error UI cells.
+                    import sys
                     raise RuntimeError(
-                        "boto3 is required for R2Storage. "
-                        "Install it with: pip install boto3"
+                        f"boto3 is required for R2Storage — install with "
+                        f"`{sys.executable} -m pip install boto3` "
+                        f"(import error: {exc})"
                     ) from exc
 
                 self._client = boto3.client(
