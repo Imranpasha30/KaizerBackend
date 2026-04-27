@@ -265,8 +265,24 @@ def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(ge
     #     fall back to the source clip (must be in the same job, owned by
     #     the same user). Lets a video's 5 clips share one SEO without
     #     forcing the user to regenerate per clip.
+    def _has_real_seo(c) -> bool:
+        """True iff *c* has either a populated `seo` JSON string OR a
+        non-empty `seo_variants` dict. The bare-truthiness check on
+        `seo_variants` is wrong because the column DEFAULTS to the
+        string '{}' (which is truthy) — every clip without variants
+        looked like it 'had SEO' under that test, so the donor lookup
+        below never fired and inheriting clips were rejected with
+        'no SEO metadata'."""
+        if c.seo:
+            return True
+        try:
+            sv = json.loads(c.seo_variants or "{}")
+            return bool(isinstance(sv, dict) and sv)
+        except (ValueError, TypeError):
+            return False
+
     seo_clip = clip
-    if payload.use_seo and not (clip.seo or clip.seo_variants) and payload.seo_source_clip_id:
+    if payload.use_seo and not _has_real_seo(clip) and payload.seo_source_clip_id:
         donor = db.query(models.Clip).filter(
             models.Clip.id == payload.seo_source_clip_id,
         ).first()
@@ -280,7 +296,7 @@ def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(ge
                 status_code=400,
                 detail="seo_source_clip_id must belong to the same job as the publishing clip.",
             )
-        if donor.seo or donor.seo_variants:
+        if _has_real_seo(donor):
             seo_clip = donor
 
     # Accept either a legacy clip.seo OR a per-channel variant on the
