@@ -61,8 +61,13 @@ def list_accounts(
             a.id: {
                 "id":       a.id,
                 "filename": a.filename,
-                "url":      f"/api/file/?path={a.file_path}",
-                "thumb_url": f"/api/file/?path={a.thumb_path}" if a.thumb_path else "",
+                # Prefer R2 — survives container restarts + cross-device.
+                "url":      a.storage_url or (f"/api/file/?path={a.file_path}" if a.file_path else ""),
+                "thumb_url": (
+                    getattr(a, "thumb_storage_url", "")
+                    or a.storage_url
+                    or (f"/api/file/?path={a.thumb_path}" if a.thumb_path else "")
+                ),
             }
             for a in assets
         }

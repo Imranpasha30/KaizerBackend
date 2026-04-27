@@ -107,8 +107,13 @@ def _to_dict(c: models.Channel) -> dict:
                     logo_asset = {
                         "id":       la.id,
                         "filename": la.filename,
-                        "url":      f"/api/file/?path={la.file_path}",
-                        "thumb_url": f"/api/file/?path={la.thumb_path}" if la.thumb_path else "",
+                        # Prefer R2 — survives container restarts + cross-device.
+                        "url":      la.storage_url or (f"/api/file/?path={la.file_path}" if la.file_path else ""),
+                        "thumb_url": (
+                            getattr(la, "thumb_storage_url", "")
+                            or la.storage_url
+                            or (f"/api/file/?path={la.thumb_path}" if la.thumb_path else "")
+                        ),
                     }
         except Exception:
             logo_asset = None

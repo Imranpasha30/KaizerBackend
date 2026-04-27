@@ -95,7 +95,10 @@ def _to_dict(job: models.UploadJob) -> dict:
         "channel_id":     job.channel_id,
         "channel_name":   channel.name if channel else None,
         "clip_filename":  clip.filename if clip else None,
-        "clip_thumb_url": f"/api/file/?path={clip.thumb_path}" if clip and clip.thumb_path else "",
+        "clip_thumb_url": (
+            (getattr(clip, "thumb_storage_url", "") if clip else "")
+            or (f"/api/file/?path={clip.thumb_path}" if clip and clip.thumb_path else "")
+        ),
         "status":         job.status,
         "privacy_status": job.privacy_status,
         "publish_kind":   job.publish_kind or "video",
