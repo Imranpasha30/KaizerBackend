@@ -68,6 +68,36 @@ def _detect_encoders() -> set[str]:
 _ENCODERS: set[str] = _detect_encoders()
 
 
+def _can_initialize(encoder: str) -> bool:
+    """Probe whether ``encoder`` can actually initialize at runtime.
+
+    ``ffmpeg -encoders`` lists every encoder *compiled into the binary*,
+    but a compiled encoder can still fail at init time when its runtime
+    deps are missing (e.g. ``h264_nvenc`` is in nixpacks ffmpeg but
+    Railway containers have no CUDA driver, so ``libcuda.so.1`` can't
+    load — see "Cannot load libcuda.so.1" in past prod logs).
+
+    Run a 1-frame encode of a synthetic black frame to ``/dev/null``
+    (``NUL`` on Windows). Cheap on success (<200 ms when the GPU works);
+    fails fast on miss (<1 s). Returns True iff ffmpeg exits 0.
+    """
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    devnull = "NUL" if os.name == "nt" else "/dev/null"
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+                "-c:v", encoder, "-frames:v", "1",
+                "-f", "null", devnull,
+            ],
+            capture_output=True, timeout=8,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 def _fmt_rate(kbps: int) -> str:
     """Format a bitrate in kbps as the compact FFmpeg form: '8000' kbps → '8M'.
 
@@ -81,9 +111,16 @@ def _fmt_rate(kbps: int) -> str:
 
 
 def _pick_h264_encoder() -> str:
-    """Return the best-available H.264 encoder name. Cached via ACTIVE_ENCODER."""
+    """Return the best-available H.264 encoder name. Cached via ACTIVE_ENCODER.
+
+    Two-stage check per candidate: must be present in ``ffmpeg -encoders``
+    AND must pass a 1-frame init probe. The init probe is what catches
+    the "compiled in but driver missing" case on GPU-less Linux hosts
+    (Railway, generic Docker) where h264_nvenc is in the binary but
+    libcuda.so.1 is unavailable.
+    """
     for cand in ("h264_nvenc", "h264_qsv", "h264_amf"):
-        if cand in _ENCODERS:
+        if cand in _ENCODERS and _can_initialize(cand):
             return cand
     return "libx264"
 
