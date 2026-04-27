@@ -47,7 +47,7 @@ def _public_user(u: models.User) -> dict:
         "email":  u.email,
         "name":   u.name or u.email.split("@")[0],
         "google": bool(u.google_sub),
-        "admin":  bool(u.is_admin),
+        "is_admin": bool(u.is_admin),
         "socials": raw_socials if isinstance(raw_socials, dict) else {},
         "created_at":    u.created_at.isoformat() if u.created_at else None,
         "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
