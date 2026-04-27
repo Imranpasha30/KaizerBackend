@@ -485,7 +485,18 @@ class R2Storage(StorageProvider):
         if self.public_base_url:
             url = f"{self.public_base_url.rstrip('/')}/{full_key}"
         else:
+            # Signed URLs expire (1 hour TTL by default). Storing them in
+            # the DB is a footgun: every clip image goes 403 after an
+            # hour. Loud warning here so any environment that silently
+            # drops R2_PUBLIC_BASE_URL is caught at upload time.
             url = self.get_url(key, signed=True)
+            self._r2_logger.warning(
+                "R2_PUBLIC_BASE_URL is not set — uploaded %r with a "
+                "TIME-LIMITED SIGNED URL. Set R2_PUBLIC_BASE_URL to your "
+                "Cloudflare R2 public domain (e.g. https://pub-XXXX.r2.dev) "
+                "or images will return AccessDenied after the URL expires.",
+                full_key,
+            )
 
         self._r2_logger.info(
             "upload complete: key=%r size=%d url=%r", full_key, size, url

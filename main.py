@@ -507,6 +507,7 @@ async def create_job(
 
     # If the user opted in, look up their default asset and pass the absolute
     # path to the pipeline so every clip uses it instead of stock photos.
+    # Surface what happened in job.log so silent fallbacks are visible.
     default_img_path = ""
     if use_default_image:
         asset = (
@@ -517,7 +518,25 @@ async def create_job(
               )
               .first()
         )
-        default_img_path = _materialize_asset_locally(asset) if asset else ""
+        if asset is None:
+            job.log = (job.log or "") + (
+                "[default-image] Use default image was on but no asset is "
+                "marked as default — using stock photos.\n"
+            )
+        else:
+            default_img_path = _materialize_asset_locally(asset)
+            if default_img_path:
+                job.log = (job.log or "") + (
+                    f"[default-image] Using {asset.filename!r} (id={asset.id}) "
+                    f"for every clip.\n"
+                )
+            else:
+                job.log = (job.log or "") + (
+                    f"[default-image] Failed to materialise asset {asset.id} "
+                    f"({asset.filename!r}) — neither local file nor R2 copy "
+                    f"could be opened. Falling back to stock photos.\n"
+                )
+        db.commit()
 
     # Per-destination logos: the pipeline now renders a CLEAN MASTER with no
     # logo overlay.  The upload worker applies each destination's logo at
@@ -861,9 +880,26 @@ def export_job(job_id: int, db: Session = Depends(get_db)):
 
     count = 0
     for clip in job.clips:
+        # Prefer local file (fast); fall back to R2 download for clips
+        # whose local copy was wiped by a Railway redeploy.
+        src_path = ""
         if clip.file_path and Path(clip.file_path).exists():
-            dest = export_dir / Path(clip.file_path).name
-            shutil.copy2(clip.file_path, dest)
+            src_path = clip.file_path
+        elif clip.storage_key and clip.storage_backend:
+            try:
+                import tempfile as _tf
+                from pipeline_core.storage import get_storage_provider
+                provider = get_storage_provider(clip.storage_backend)
+                tmp_dir = _tf.mkdtemp(prefix="kaizer_export_")
+                src_path = str(Path(tmp_dir) / (Path(clip.storage_key).name or f"clip_{clip.id}.mp4"))
+                provider.download(clip.storage_key, src_path)
+            except Exception as _exc:
+                print(f"[export] R2 fetch failed for clip {clip.id}: {_exc}")
+                src_path = ""
+
+        if src_path and Path(src_path).exists():
+            dest = export_dir / (clip.filename or Path(src_path).name)
+            shutil.copy2(src_path, dest)
             count += 1
 
     return {"count": count, "export_dir": str(export_dir)}

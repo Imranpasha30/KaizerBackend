@@ -163,7 +163,11 @@ def _maybe_upload_final(
     """
     try:
         from pipeline_core.storage import get_storage_provider
-        provider = get_storage_provider()
+        # Force "r2" so clip videos always end up in R2 regardless of
+        # STORAGE_BACKEND env var. The runner + asset uploads already do
+        # this; matching the behaviour here keeps the storage discipline
+        # consistent across the codebase.
+        provider = get_storage_provider("r2")
         if provider.name == "local":
             return ("", "", "")
         # Forward-slash keys on all platforms.
