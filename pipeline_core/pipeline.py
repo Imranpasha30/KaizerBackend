@@ -94,12 +94,22 @@ _BASE_ENCODE_ARGS = _VIDEO_ARGS + _COLOR_TAGS + _AUDIO_ARGS
 ENCODE_ARGS_INTERMEDIATE = list(_BASE_ENCODE_ARGS)
 
 ENCODE_ARGS_SHORT_FORM = _BASE_ENCODE_ARGS + [
-    # loudnorm in single-pass mode drifts ~1 dB from its TP target. The
-    # AAC encoder + sample-rate conversion downstream can also lift true
-    # peaks. Chain alimiter as a hard ceiling so the QA gate's -0.5 dBTP
-    # error threshold is never breached. limit=0.85 ≈ -1.4 dBTP, leaving
-    # ~0.9 dB margin under the QA error line.
-    "-af",  "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.85:level=disabled",
+    # Three-layer audio defence so the QA -0.5 dBTP gate is never even
+    # close to being touched on real-world inputs:
+    #   1. volume=-3dB  — pre-attenuate; never trust upstream peak claims.
+    #   2. loudnorm     — TP target -2 dBTP (was -1.5; widened margin).
+    #   3. alimiter     — brick-wall at 0.708 lin ≈ -3 dBTP, with explicit
+    #                     level_in/level_out so behaviour is reproducible
+    #                     across ffmpeg builds (the "level=disabled" form
+    #                     was being silently ignored on Railway's nixpacks
+    #                     ffmpeg, letting peaks reach +1.5 dBTP in prod).
+    # Net result: post-mix peaks land near -3 dBTP. -14 LUFS integrated
+    # loudness is unchanged because loudnorm self-calibrates.
+    "-af", (
+        "volume=-3dB,"
+        "loudnorm=I=-14:TP=-2:LRA=11,"
+        "alimiter=level_in=1:level_out=1:limit=0.708:attack=5:release=50"
+    ),
 ]
 
 # ═══════════════════════════════════════════════════════════
