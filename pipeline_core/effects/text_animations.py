@@ -543,7 +543,8 @@ def apply_text_animation(
             "-c:a", "copy",
         ] + [a for a in ENCODE_ARGS_SHORT_FORM
              if a not in ("-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-                          "-af", "loudnorm=I=-14:TP=-1.5:LRA=11")] + [
+                          "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+                          "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.85:level=disabled")] + [
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "20",

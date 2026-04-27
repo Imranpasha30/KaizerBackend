@@ -94,7 +94,12 @@ _BASE_ENCODE_ARGS = _VIDEO_ARGS + _COLOR_TAGS + _AUDIO_ARGS
 ENCODE_ARGS_INTERMEDIATE = list(_BASE_ENCODE_ARGS)
 
 ENCODE_ARGS_SHORT_FORM = _BASE_ENCODE_ARGS + [
-    "-af",  "loudnorm=I=-14:TP=-1.5:LRA=11",
+    # loudnorm in single-pass mode drifts ~1 dB from its TP target. The
+    # AAC encoder + sample-rate conversion downstream can also lift true
+    # peaks. Chain alimiter as a hard ceiling so the QA gate's -0.5 dBTP
+    # error threshold is never breached. limit=0.85 ≈ -1.4 dBTP, leaving
+    # ~0.9 dB margin under the QA error line.
+    "-af",  "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.85:level=disabled",
 ]
 
 # ═══════════════════════════════════════════════════════════
