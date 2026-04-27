@@ -194,6 +194,32 @@ def _import_clips(job, db, meta_override: Path | None = None):
     raw = meta_path.read_text(encoding="utf-8")
     data = json.loads(raw)
 
+    # Lazy R2 import — pipeline-emitted images get mirrored to R2 so they
+    # survive container restarts AND don't break when the user opens the
+    # clip from a different machine. Each image lands at a clip-specific
+    # key (clips/{job_id}/{clip_index}/<filename>) so the mapping is
+    # permanent — even if the user later changes their default ad asset
+    # or deletes the source file, the clip's image_storage_url still
+    # resolves to the exact image used at render time.
+    try:
+        from pipeline_core.storage import get_storage_provider
+        _r2 = get_storage_provider("r2")
+    except Exception as exc:
+        print(f"[runner] R2 provider unavailable, images will only live "
+              f"on local disk: {exc}")
+        _r2 = None
+
+    def _r2_upload(local_path: str, key: str, ct: str) -> str:
+        """Upload to R2 with permanent clip-specific key. Returns URL or
+        empty string on failure / no R2 / no file."""
+        if not _r2 or not local_path or not Path(local_path).exists():
+            return ""
+        try:
+            return _r2.upload(local_path, key, content_type=ct).url
+        except Exception as exc:
+            print(f"[runner] R2 upload failed for {local_path!r}: {exc}")
+            return ""
+
     clips_data = data.get("clips", [])
     imported = 0
     skipped  = 0
@@ -205,13 +231,35 @@ def _import_clips(job, db, meta_override: Path | None = None):
             print(f"[runner] skipping clip {i}: file missing ({clip_path!r})")
             skipped += 1
             continue
+
+        thumb_path = c.get("thumb_path", "") or ""
+        image_path = c.get("image_path", "") or ""
+
+        # Pipeline already populates storage_* for the video clip. We add
+        # mirrors for the thumbnail + the editorial image so all three
+        # bytes-on-disk artefacts of this clip live in R2.
+        thumb_storage_url = _r2_upload(
+            thumb_path,
+            f"clips/{job.id}/{i:02d}/{Path(thumb_path).name}" if thumb_path else "",
+            "image/jpeg",
+        )
+        image_storage_url = ""
+        if image_path:
+            ext = Path(image_path).suffix.lower()
+            ct = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
+            image_storage_url = _r2_upload(
+                image_path,
+                f"clips/{job.id}/{i:02d}/{Path(image_path).name}",
+                ct,
+            )
+
         clip = Clip(
             job_id=job.id,
             clip_index=i,
             filename=Path(clip_path).name,
             file_path=clip_path,
-            thumb_path=c.get("thumb_path", ""),
-            image_path=c.get("image_path", ""),
+            thumb_path=thumb_path,
+            image_path=image_path,
             duration=float(c.get("duration", 0)),
             frame_type=c.get("frame_type", ""),
             text=c.get("text", ""),
@@ -225,6 +273,11 @@ def _import_clips(job, db, meta_override: Path | None = None):
             storage_url=c.get("storage_url", ""),
             storage_key=c.get("storage_key", ""),
             storage_backend=c.get("storage_backend", ""),
+            # Image mirrors — permanent clip-specific R2 keys so the
+            # mapping survives default-asset rotation and container
+            # rebuilds.
+            thumb_storage_url=thumb_storage_url,
+            image_storage_url=image_storage_url,
         )
         db.add(clip)
         imported += 1
