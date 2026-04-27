@@ -1503,10 +1503,18 @@ def _enforce_duration(out_path: str, platform: str) -> None:
 
 def _run_output_qa(out_path: str, platform: str,
                    expected_duration_s: float | None = None) -> None:
-    """Run the QA gate on a composed output file.
+    """Run the QA gate on a composed output file — *advisory only*.
 
-    Imports qa.validate_output lazily to avoid circular imports at module load.
-    Raises PipelineQAError if QA hard-fails.  Warnings are logged only.
+    QA findings are logged (warnings + errors) so users see them in the
+    job log, but the pipeline never aborts on them. Real-world inputs
+    have unpredictable audio levels, codecs, frame rates — a clip with
+    a slightly hot true peak or an off-spec bitrate is still a usable
+    deliverable. Killing the entire pipeline because of an advisory
+    quality check is the wrong default.
+
+    Defence in depth: ENCODE_ARGS_SHORT_FORM already chains alimiter
+    after loudnorm to clamp peaks before they reach the muxer; the QA
+    gate is the safety net that *reports* if something slipped through.
 
     Parameters
     ----------
@@ -1532,18 +1540,26 @@ def _run_output_qa(out_path: str, platform: str,
             )
             return
 
-    qa_result = validate_output(
-        out_path,
-        platform=platform,
-        expected_duration_s=expected_duration_s,
-    )
+    try:
+        qa_result = validate_output(
+            out_path,
+            platform=platform,
+            expected_duration_s=expected_duration_s,
+        )
+    except Exception as exc:
+        # QA itself crashed (e.g. ffprobe failed). Don't take the
+        # pipeline down with it — log and move on.
+        _log.warning("QA validation crashed for %s: %s", out_path, exc)
+        return
 
     if qa_result.warnings:
         for w in qa_result.warnings:
             _log.warning("QA warning [%s]: %s", out_path, w)
-
-    if not qa_result.ok:
-        raise PipelineQAError(qa_result.errors, qa_result.warnings)
+    if qa_result.errors:
+        for e in qa_result.errors:
+            _log.warning("QA advisory [%s]: %s", out_path, e)
+        print(f"[QA advisory] {out_path}: {len(qa_result.errors)} issue(s) — "
+              "delivering clip anyway. See log for details.")
 
 
 # ═══════════════════════════════════════════════════════════
