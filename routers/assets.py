@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 import auth
 import models
 from database import get_db
+from pipeline_core.storage import get_storage_provider
 
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -57,6 +58,18 @@ def _normalize_folder(raw: Optional[str]) -> str:
 
 
 def _to_dict(a: models.UserAsset) -> dict:
+    # Prefer the R2 URL when populated; fall back to /api/file/ for any
+    # legacy row that hasn't been backfilled yet (those still resolve from
+    # local disk if the file is on this host).
+    primary_url = a.storage_url or (
+        f"/api/file/?path={a.file_path}" if a.file_path else ""
+    )
+    thumb_url = (
+        a.thumb_storage_url
+        or a.storage_url
+        or (f"/api/file/?path={a.thumb_path}" if a.thumb_path
+            else (f"/api/file/?path={a.file_path}" if a.file_path else ""))
+    )
     return {
         "id":             a.id,
         "filename":       a.filename,
@@ -69,8 +82,9 @@ def _to_dict(a: models.UserAsset) -> dict:
         "tags":           list(a.tags or []),
         "folder_path":    a.folder_path or "",
         "created_at":     a.created_at.isoformat() if a.created_at else None,
-        "url":            f"/api/file/?path={a.file_path}",
-        "thumb_url":      f"/api/file/?path={a.thumb_path}" if a.thumb_path else f"/api/file/?path={a.file_path}",
+        "url":            primary_url,
+        "thumb_url":      thumb_url,
+        "storage_backend": a.storage_backend or "local",
     }
 
 
@@ -160,6 +174,31 @@ async def upload_asset(
 
     thumb_path, w, h = _thumb_for(out_path)
 
+    # Upload to R2 — local file stays on disk as a transient cache (the
+    # thumbnailer + Pillow ops need a real path). R2 is the source of
+    # truth; storage_url is what the frontend actually renders.
+    storage_backend = ""
+    storage_key = ""
+    storage_url = ""
+    thumb_storage_url = ""
+    try:
+        storage = get_storage_provider("r2")
+        rel_dir = f"user_assets/{user.id}/"
+        obj = storage.upload(str(out_path), rel_dir + out_path.name, content_type=mime)
+        storage_backend = "r2"
+        storage_key = obj.key
+        storage_url = obj.url
+        if thumb_path:
+            thumb_obj = storage.upload(
+                thumb_path, rel_dir + Path(thumb_path).name, content_type="image/jpeg",
+            )
+            thumb_storage_url = thumb_obj.url
+    except Exception as exc:
+        # R2 upload failed — keep going with local-disk-only mode so the
+        # endpoint still returns a working asset row. The frontend's
+        # _to_dict() falls back to /api/file/ when storage_url is empty.
+        print(f"[assets] R2 upload failed for {out_path.name}: {exc}")
+
     # If this upload is marked default → demote any previous default
     if is_default_ad:
         db.query(models.UserAsset).filter(
@@ -180,6 +219,10 @@ async def upload_asset(
         is_default_ad=bool(is_default_ad),
         tags=tag_list,
         folder_path=_normalize_folder(folder_path),
+        storage_backend=storage_backend,
+        storage_key=storage_key,
+        storage_url=storage_url,
+        thumb_storage_url=thumb_storage_url,
     )
     db.add(row); db.commit(); db.refresh(row)
     return _to_dict(row)

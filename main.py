@@ -610,6 +610,22 @@ async def raw_upload(
         print(f"[raw-upload] thumb gen failed: {e}")
         thumb_path = None  # type: ignore
 
+    # Mirror the freshly-generated thumbnail to R2 so it survives container
+    # restarts. Failures don't block — _clip_dict falls back to /api/file/.
+    thumb_storage_url = ""
+    if thumb_path and thumb_path.exists():
+        try:
+            from pipeline_core.storage import get_storage_provider
+            storage = get_storage_provider("r2")
+            obj = storage.upload(
+                str(thumb_path),
+                f"raw_uploads/{user.id}/{thumb_path.name}",
+                content_type="image/jpeg",
+            )
+            thumb_storage_url = obj.url
+        except Exception as exc:
+            print(f"[raw-upload] R2 thumb upload failed: {exc}")
+
     # Minimal Job acting as a container for the standalone Clip
     job = models.Job(
         user_id=user.id,
@@ -632,6 +648,7 @@ async def raw_upload(
         file_path=str(video_path),
         thumb_path=str(thumb_path) if thumb_path and thumb_path.exists() else "",
         image_path="",
+        thumb_storage_url=thumb_storage_url,
         duration=duration,
         frame_type="raw_upload",
         text=display_title,
@@ -975,11 +992,28 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
         f.write(await image.read())
 
     clip.image_path = str(img_path)
+
+    # Mirror to R2 — local file stays as transient cache. Failures don't
+    # break the upload; the row falls back to /api/file/ via _clip_dict.
+    image_storage_url = ""
+    try:
+        from pipeline_core.storage import get_storage_provider
+        storage = get_storage_provider("r2")
+        obj = storage.upload(
+            str(img_path),
+            f"clips/{clip_id}/{img_path.name}",
+            content_type=(image.content_type or "image/jpeg"),
+        )
+        image_storage_url = obj.url
+        clip.image_storage_url = image_storage_url
+    except Exception as exc:
+        print(f"[clip-image] R2 upload failed for clip {clip_id}: {exc}")
+
     db.commit()
 
     return {
         "image_path": str(img_path),
-        "image_url": f"/api/file/?path={img_path}",
+        "image_url": image_storage_url or f"/api/file/?path={img_path}",
     }
 
 # ── File serving (path-restricted, with Range support) ──────────────────────
@@ -1078,6 +1112,19 @@ def _clip_dict(c):
         except (ValueError, TypeError):
             seo = None
 
+    # Prefer R2 URLs when populated; fall back to /api/file/ for legacy rows
+    # so old uploads still render until the migration script runs.
+    thumb_resolved = (
+        getattr(c, "thumb_storage_url", "") or _furl(c.thumb_path)
+    )
+    image_resolved = (
+        getattr(c, "image_storage_url", "") or _furl(c.image_path)
+    )
+    video_resolved = (
+        (c.storage_url if (c.storage_backend or "") == "r2" else "")
+        or _furl(c.file_path)
+    )
+
     return {
         "id":           c.id,
         "job_id":       c.job_id,
@@ -1085,9 +1132,9 @@ def _clip_dict(c):
         "filename":     c.filename,
         "file_path":    c.file_path,
         "thumb_path":   c.thumb_path or "",
-        "thumb_url":    _furl(c.thumb_path),
+        "thumb_url":    thumb_resolved,
         "image_path":   c.image_path or "",
-        "image_url":    _furl(c.image_path),
+        "image_url":    image_resolved,
         "raw_url":      _furl(raw_path),
         "duration":     c.duration,
         "frame_type":   c.frame_type,
@@ -1098,7 +1145,7 @@ def _clip_dict(c):
         "section_pct":  json.loads(c.section_pct or "{}"),
         "follow_params":json.loads(c.follow_params or "{}"),
         "meta":         meta,
-        "video_url":    _furl(c.file_path),
+        "video_url":    video_resolved,
         "seo":          seo,
         "seo_variants": (lambda raw: (json.loads(raw) if raw else {}) or {})(getattr(c, "seo_variants", "") or "{}"),
     }

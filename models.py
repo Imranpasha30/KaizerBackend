@@ -95,6 +95,10 @@ class Clip(Base):
     storage_url     = Column(String(500), default="")
     storage_key     = Column(String(500), default="")
     storage_backend = Column(String(20),  default="")
+    # Separate R2 URLs for the thumbnail and editorial image. storage_url
+    # is reserved for the rendered video; these mirror it for the JPGs.
+    thumb_storage_url = Column(String(500), default="")
+    image_storage_url = Column(String(500), default="")
 
     job = relationship("Job", back_populates="clips")
     upload_jobs = relationship("UploadJob", back_populates="clip", cascade="all, delete")
@@ -423,9 +427,12 @@ class UserAsset(Base):
     # When storage_backend='local' the URL is /media/<key>; when 'r2' the URL
     # is a CDN/public link or a signed URL (frontend re-fetches if expired).
     # file_path remains populated for backwards compatibility.
-    storage_url     = Column(String(500), default="")
-    storage_key     = Column(String(500), default="")
-    storage_backend = Column(String(20),  default="")
+    storage_url       = Column(String(500), default="")
+    storage_key       = Column(String(500), default="")
+    storage_backend   = Column(String(20),  default="")
+    # Optional: separate R2 URL for the generated thumbnail. If empty,
+    # _to_dict falls back to storage_url so legacy rows still render.
+    thumb_storage_url = Column(String(500), default="")
 
 
 class CompetitorChannel(Base):
