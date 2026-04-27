@@ -434,6 +434,22 @@ async def create_job(
     with open(video_path, "wb") as f:
         f.write(await video.read())
 
+    # Mirror the source video to R2 right after the local write. The
+    # pipeline subprocess still reads from the local copy (faster than
+    # a download round-trip), but R2 is the source of truth — if the
+    # container restarts mid-render, retry can pull the source back.
+    # Predictable key so retry/recovery doesn't need a DB lookup.
+    _src_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    try:
+        from pipeline_core.storage import get_storage_provider
+        get_storage_provider("r2").upload(
+            str(video_path),
+            f"sources/{user.id}/{_src_timestamp}_{video.filename}",
+            content_type=(video.content_type or "video/mp4"),
+        )
+    except Exception as _src_exc:
+        print(f"[create_job] source video R2 mirror failed (non-fatal): {_src_exc}")
+
     # ── Input validation gate (Phase 1) ──────────────────────────────────────
     # Validate the uploaded file before creating a job row or starting the
     # pipeline.  Hard errors (wrong codec, corrupt file, etc.) return HTTP 400
@@ -588,6 +604,26 @@ async def raw_upload(
     with open(video_path, "wb") as f:
         f.write(await video.read())
 
+    # Mirror the source video to R2 — local copy is ephemeral on
+    # Railway, so the Clip row's video URL must point at R2 for
+    # cross-device viewing + retry-after-redeploy.
+    video_storage_url = ""
+    video_storage_key = ""
+    video_storage_backend = ""
+    try:
+        from pipeline_core.storage import get_storage_provider
+        _r2 = get_storage_provider("r2")
+        video_storage_key = f"raw_uploads/{user.id}/{timestamp}/{safe_name}"
+        _obj = _r2.upload(
+            str(video_path),
+            video_storage_key,
+            content_type=(video.content_type or "video/mp4"),
+        )
+        video_storage_url = _obj.url
+        video_storage_backend = "r2"
+    except Exception as _src_exc:
+        print(f"[raw-upload] R2 mirror failed (non-fatal): {_src_exc}")
+
     # ffprobe for duration — silently defaults to 0 if the binary is missing
     duration = 0.0
     try:
@@ -650,6 +686,11 @@ async def raw_upload(
         thumb_path=str(thumb_path) if thumb_path and thumb_path.exists() else "",
         image_path="",
         thumb_storage_url=thumb_storage_url,
+        # Phase 5 storage fields — populated by the R2 mirror above so
+        # _clip_dict.video_url returns the R2 URL on production.
+        storage_url=video_storage_url,
+        storage_key=video_storage_key,
+        storage_backend=video_storage_backend,
         duration=duration,
         frame_type="raw_upload",
         text=display_title,
