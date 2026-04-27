@@ -282,11 +282,17 @@ def _process(job_id: int) -> None:
                 logo_asset = db.query(models.UserAsset).filter(
                     models.UserAsset.id == dest_tok.logo_asset_id,
                 ).first()
-                if logo_asset and logo_asset.file_path and Path(logo_asset.file_path).exists():
+                # Resolve via shared helper — handles R2 download when the
+                # logo isn't on this container's disk (Railway redeploy,
+                # asset uploaded from a different host, etc.). Returns ""
+                # when the asset has no bytes anywhere.
+                from asset_resolver import materialize_asset_locally
+                logo_local = materialize_asset_locally(logo_asset)
+                if logo_local:
                     _append_log(job, f"overlaying destination logo ({logo_asset.filename})…")
                     from youtube import logo_overlay
                     upload_path = logo_overlay.overlay_logo(
-                        resolved_clip_path, logo_asset.file_path
+                        resolved_clip_path, logo_local
                     )
                     if upload_path != resolved_clip_path:
                         _append_log(job, "logo overlay applied")

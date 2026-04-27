@@ -347,6 +347,10 @@ FRAME_LAYOUTS = {
     "minimal":    "Minimal — Clean single-section layout",
 }
 
+
+from asset_resolver import materialize_asset_locally as _materialize_asset_locally
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -497,8 +501,7 @@ async def create_job(
               )
               .first()
         )
-        if asset and asset.file_path and Path(asset.file_path).exists():
-            default_img_path = asset.file_path
+        default_img_path = _materialize_asset_locally(asset) if asset else ""
 
     # Per-destination logos: the pipeline now renders a CLEAN MASTER with no
     # logo overlay.  The upload worker applies each destination's logo at
@@ -516,9 +519,7 @@ async def create_job(
             models.UserAsset.id == asset_id,
             models.UserAsset.user_id == user.id,
         ).first()
-        if a and a.file_path and Path(a.file_path).exists():
-            return a.file_path
-        return ""
+        return _materialize_asset_locally(a) if a else ""
 
     # Only bake a logo at render time when the explicit legacy flag is on.
     # Default path: render clean master, let upload worker overlay per-
@@ -1070,15 +1071,13 @@ async def download_with_logo(
             models.UserAsset.id == tok.logo_asset_id,
             models.UserAsset.user_id == user.id,
         ).first()
-        if la and la.file_path and _Path(la.file_path).exists():
-            logo_path = la.file_path
+        logo_path = _materialize_asset_locally(la)
     if not logo_path and getattr(channel, "logo_asset_id", None):
         la = db.query(models.UserAsset).filter(
             models.UserAsset.id == channel.logo_asset_id,
             models.UserAsset.user_id == user.id,
         ).first()
-        if la and la.file_path and _Path(la.file_path).exists():
-            logo_path = la.file_path
+        logo_path = _materialize_asset_locally(la)
 
     # Get clip on local disk — download from R2 if not already there.
     cleanup_dirs: list[str] = []
