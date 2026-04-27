@@ -7,7 +7,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -1015,6 +1015,122 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
         "image_path": str(img_path),
         "image_url": image_storage_url or f"/api/file/?path={img_path}",
     }
+
+# ── Branded download (clip + channel logo overlay) ──────────────────────────
+
+@app.post("/api/clips/{clip_id}/download-with-logo/")
+async def download_with_logo(
+    clip_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Render clip with the requested channel's logo overlaid and stream
+    the result as a file download.
+
+    Body: {"channel_id": int}.
+
+    Reuses youtube/logo_overlay.overlay_logo() — same machinery the upload
+    worker uses, so the burned-in look matches what publishing produces.
+    Falls back to the unbranded clip if the channel has no logo configured.
+    Cleans up temp files after the response is fully streamed.
+    """
+    from fastapi.responses import FileResponse
+    from fastapi import BackgroundTasks
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    channel_id = int((payload or {}).get("channel_id") or 0)
+    if not channel_id:
+        raise HTTPException(422, "channel_id is required")
+
+    clip = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
+    if not clip:
+        raise HTTPException(404, "Clip not found")
+
+    # Authorisation: the clip's job must belong to the requesting user.
+    job = db.query(models.Job).filter(models.Job.id == clip.job_id).first()
+    if not job or job.user_id != user.id:
+        raise HTTPException(404, "Clip not found")
+
+    # Resolve channel + logo (Channel has its own logo_asset_id; OAuthToken
+    # has another. Worker prefers OAuthToken first; we mirror that.)
+    channel = db.query(models.Channel).filter(
+        models.Channel.id == channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not channel:
+        raise HTTPException(404, "Channel not found")
+
+    logo_path = ""
+    tok = getattr(channel, "oauth_token", None)
+    if tok and getattr(tok, "logo_asset_id", None):
+        la = db.query(models.UserAsset).filter(
+            models.UserAsset.id == tok.logo_asset_id,
+            models.UserAsset.user_id == user.id,
+        ).first()
+        if la and la.file_path and _Path(la.file_path).exists():
+            logo_path = la.file_path
+    if not logo_path and getattr(channel, "logo_asset_id", None):
+        la = db.query(models.UserAsset).filter(
+            models.UserAsset.id == channel.logo_asset_id,
+            models.UserAsset.user_id == user.id,
+        ).first()
+        if la and la.file_path and _Path(la.file_path).exists():
+            logo_path = la.file_path
+
+    # Get clip on local disk — download from R2 if not already there.
+    cleanup_dirs: list[str] = []
+    clip_local = clip.file_path or ""
+    if not (clip_local and _Path(clip_local).exists()):
+        if not (clip.storage_key and clip.storage_backend):
+            raise HTTPException(404, "Clip video file not available")
+        try:
+            from pipeline_core.storage import get_storage_provider
+            provider = get_storage_provider(clip.storage_backend)
+            tmp_dir = _tempfile.mkdtemp(prefix="kaizer_dl_")
+            tmp_path = str(_Path(tmp_dir) / (_Path(clip.storage_key).name or f"clip_{clip.id}.mp4"))
+            provider.download(clip.storage_key, tmp_path)
+            clip_local = tmp_path
+            cleanup_dirs.append(tmp_dir)
+        except Exception as exc:
+            raise HTTPException(500, f"Failed to fetch clip from storage: {exc}")
+
+    # Apply logo overlay (no-op when logo_path is empty).
+    branded_path = clip_local
+    if logo_path:
+        try:
+            from youtube import logo_overlay
+            branded_path = logo_overlay.overlay_logo(clip_local, logo_path)
+            if branded_path and branded_path != clip_local:
+                cleanup_dirs.append(str(_Path(branded_path).parent))
+        except Exception as exc:
+            # Overlay failure → fall back to the clean master so the user
+            # still gets a usable file.
+            print(f"[download-with-logo] overlay failed for clip {clip_id}: {exc}")
+            branded_path = clip_local
+
+    # Build a friendly filename: <channel_slug>_<clip_filename>
+    safe_ch = "".join(
+        c for c in (channel.name or f"ch{channel.id}")
+        if c.isalnum() or c in "-_"
+    ) or f"ch{channel.id}"
+    clip_basename = clip.filename or f"clip_{clip.id}.mp4"
+    download_name = f"{safe_ch}_{clip_basename}"
+
+    # Schedule cleanup after the response has been fully sent.
+    bg = BackgroundTasks()
+    for d in cleanup_dirs:
+        bg.add_task(_shutil.rmtree, d, ignore_errors=True)
+
+    return FileResponse(
+        branded_path,
+        media_type="video/mp4",
+        filename=download_name,
+        background=bg,
+    )
+
 
 # ── File serving (path-restricted, with Range support) ──────────────────────
 
