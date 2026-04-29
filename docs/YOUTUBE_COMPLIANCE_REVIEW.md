@@ -34,7 +34,7 @@ its owner.
 | **Business model** | B2B SaaS — paid plans for creators (Free / Pro). |
 | **Primary user persona** | Independent YouTube creators and small newsroom teams who publish long-form content and want to repurpose it as Shorts without manual editing. |
 | **Public URL (sign-up)** | `https://kaizerfrontned-production.up.railway.app` |
-| **Custom domain** | `https://ozonewash.in`  (frontend) |
+| **Custom domain** | `https://kaizerfrontned-production.up.railway.app`  (frontend) |
 | **Backend API base** | `https://kaizerbackend-production.up.railway.app/api` |
 | **Privacy policy URL** | `https://<your-domain>/privacy`  *(fill in)* |
 | **Terms of service URL** | `https://<your-domain>/terms`  *(fill in)* |

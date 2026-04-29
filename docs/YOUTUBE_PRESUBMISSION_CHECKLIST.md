@@ -22,7 +22,7 @@ Go to https://console.cloud.google.com → select your project →
 - [ ] **Application logo** is uploaded — at least 120×120 PNG, square.
       Use your brand mark; this is the logo every creator sees on
       Google's consent screen.
-- [ ] **Application home page** = `https://ozonewash.in` (or whatever
+- [ ] **Application home page** = `https://kaizerfrontned-production.up.railway.app` (or whatever
       the current production frontend URL is).
 - [ ] **Application privacy policy link** = a URL that **actually
       loads** when you paste it in incognito. *(See Step 2.)*
@@ -30,7 +30,7 @@ Go to https://console.cloud.google.com → select your project →
       loads** in incognito. *(See Step 2.)*
 - [ ] **Authorised domains** lists every domain that appears in any
       redirect URI:
-      - `ozonewash.in`
+      - `kaizerfrontned-production.up.railway.app`
       - `up.railway.app`  *(needed because your backend redirect URI
         is on the railway subdomain)*
 - [ ] **Publishing status = "In production"**, NOT "Testing".
@@ -51,9 +51,9 @@ This is the **#1 silent killer**. Reviewers paste the URLs from your
 Cloud Console listing and walk away the moment one returns 404.
 
 - [ ] Privacy policy is published at a stable URL (e.g.
-      `https://ozonewash.in/privacy`).
+      `https://kaizerfrontned-production.up.railway.app/privacy`).
 - [ ] Terms of service is published at a stable URL (e.g.
-      `https://ozonewash.in/terms`).
+      `https://kaizerfrontned-production.up.railway.app/terms`).
 - [ ] Both URLs return HTTP 200 in **incognito** (not just to logged-in
       users).
 - [ ] Privacy policy explicitly mentions:
@@ -77,7 +77,7 @@ review it, edit in the YouTube-specific clauses above, and publish.
 ## Step 3 — Domain verification  *(15 min)*
 
 - [ ] In **Google Search Console** (search.google.com/search-console)
-      verify ownership of `ozonewash.in` (DNS TXT record method is
+      verify ownership of `kaizerfrontned-production.up.railway.app` (DNS TXT record method is
       the most reliable).
 - [ ] Verify ownership of any other domain that appears in your
       OAuth consent screen's "Authorised domains".
