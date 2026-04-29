@@ -33,8 +33,8 @@ its owner.
 | **Project / API client name** | Kaizer News |
 | **Business model** | B2B SaaS — paid plans for creators (Free / Pro). |
 | **Primary user persona** | Independent YouTube creators and small newsroom teams who publish long-form content and want to repurpose it as Shorts without manual editing. |
-| **Public URL (sign-up)** | `https://kaizerfrontned-production.up.railway.app` |
-| **Custom domain** | `https://kaizerfrontned-production.up.railway.app`  (frontend) |
+| **Public URL (sign-up)** | `https://kaizerx.com` |
+| **Custom domain** | `https://kaizerx.com`  (frontend) |
 | **Backend API base** | `https://kaizerbackend-production.up.railway.app/api` |
 | **Privacy policy URL** | `https://<your-domain>/privacy`  *(fill in)* |
 | **Terms of service URL** | `https://<your-domain>/terms`  *(fill in)* |
@@ -374,7 +374,7 @@ The reviewer wants to see how Kaizer News uploads + manages videos on
 
 | Time | Action | What to say |
 |---|---|---|
-| 0:00 | Open `https://kaizerfrontned-production.up.railway.app/login` | "I'm logging in as our organization admin." |
+| 0:00 | Open `https://kaizerx.com/login` | "I'm logging in as our organization admin." |
 | 0:10 | Log in with admin email | "We use a standard email-password login. Sessions are stateless JWTs." |
 | 0:25 | Click **Style Profiles** in nav | "These are our publishing presets — each one wraps a YouTube channel we operate." |
 | 0:35 | Show the connected list with channel titles + logos | "You can see we already have three channels connected: Auto Wala, Cyber Sphere, Kaizer Upload. The OAuth status badge is green." |
@@ -392,7 +392,7 @@ The reviewer specifically wants to see the OAuth 2.0 consent screen.
 
 | Time | Action | What to say |
 |---|---|---|
-| 0:00 | Open `https://kaizerfrontned-production.up.railway.app/register` in an incognito window | "I'm signing up as a brand-new public user, simulating a creator coming to Kaizer News for the first time." |
+| 0:00 | Open `https://kaizerx.com/register` in an incognito window | "I'm signing up as a brand-new public user, simulating a creator coming to Kaizer News for the first time." |
 | 0:10 | Register with a fresh test Google account email + password | "After registration the user lands on an empty dashboard." |
 | 0:30 | Click **Style Profiles** → **+ New Profile**, pick a name like "My YouTube" | "First the user creates a publishing profile — this is the row that will hold their OAuth credentials." |
 | 0:55 | Click **Link my YouTube** on the new profile | "Clicking this kicks off the OAuth 2.0 web-server flow. We hit `accounts.google.com/o/oauth2/auth` with `access_type=offline`, `prompt=consent`, `include_granted_scopes=true`, and a CSRF state token." |
