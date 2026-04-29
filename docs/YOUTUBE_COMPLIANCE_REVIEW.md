@@ -10,38 +10,67 @@
 
 ## 1. Application overview
 
+### What Kaizer News is
+
+**Kaizer News is a SaaS automation platform for YouTube creators.**
+Any creator can sign up at our public URL, connect their own YouTube
+channel via Google's standard OAuth 2.0 consent flow, and use our
+tools to automate their long-form-to-shorts publishing workflow.
+
+The product takes a long-form video the creator uploads, runs it
+through our AI pipeline (segment selection, vertical 9:16 reframing,
+bilingual captions, AI-generated SEO metadata, optional logo overlay),
+and lets the creator publish each generated clip to their own YouTube
+channel(s). Every API call is made on the creator's behalf, with the
+creator's explicit OAuth grant — there is no scenario in which Kaizer
+News uploads to a channel that has not been individually authorised by
+its owner.
+
+### Identity
+
 | Item | Value |
 |---|---|
 | **Project / API client name** | Kaizer News |
-| **Public URL** | `https://kaizerfrontned-production.up.railway.app` |
+| **Business model** | B2B SaaS — paid plans for creators (Free / Pro). |
+| **Primary user persona** | Independent YouTube creators and small newsroom teams who publish long-form content and want to repurpose it as Shorts without manual editing. |
+| **Public URL (sign-up)** | `https://kaizerfrontned-production.up.railway.app` |
 | **Custom domain** | `https://ozonewash.in`  (frontend) |
 | **Backend API base** | `https://kaizerbackend-production.up.railway.app/api` |
 | **Privacy policy URL** | `https://<your-domain>/privacy`  *(fill in)* |
 | **Terms of service URL** | `https://<your-domain>/terms`  *(fill in)* |
 | **OAuth client type** | Web application (confidential client) |
 | **Hosting** | Railway (US-West-2) |
-| **What it does** | Helps news creators publish long-form videos as platform-native short clips. The user uploads a long video, our pipeline cuts it into 9:16 vertical clips with bilingual captions, generates SEO metadata, and uploads each clip to the user's connected YouTube channel(s). |
 
-### Who uses it
+### Who uses the platform
 
-Two distinct user populations, served by **the same OAuth flow**:
+Kaizer News serves **two populations of YouTube creators**, both going
+through **the same self-serve sign-up + OAuth flow**:
 
-1. **Our organization's own YouTube channels** — the channels we operate
-   ourselves to publish news content. We are the channel owner and the
-   API consumer in this case.
-2. **Public users (creators)** — third-party news creators who sign up
-   for Kaizer News, connect their own YouTube channels, and upload
-   their own content. Each user's OAuth grant is scoped to *their own*
-   channel(s); we never touch a user's channel without their consent.
+1. **Public creators (the SaaS user base)** — the primary audience.
+   Anyone with a YouTube channel can register a Kaizer News account at
+   our public URL, link their channel via Google's OAuth consent screen,
+   and start using the automation. Each creator pays per their plan,
+   manages their own clips, and grants OAuth scoped to their own
+   channel(s) only. **This is the use case the YouTube quota is
+   primarily for.**
+2. **The organization that built the platform** — we also use the same
+   product on our own news channels (listed below) for internal content.
+   We sign in as a regular user, go through the same OAuth consent, and
+   are subject to the same quota / scope / data-handling rules. There
+   is no privileged shortcut.
 
-**The same UI, the same OAuth client, the same code path** handle both.
-There is no privileged shortcut for our own channels — we go through
-the same `accounts.google.com/o/oauth2/auth` consent screen every user
-sees.
+> **Important for the reviewer:** there is **no scenario** in which our
+> API client uploads to a YouTube channel without the channel-owning
+> user clicking "Allow" on Google's consent screen for that specific
+> channel. Each `oauth_tokens` row in our database corresponds 1:1 to a
+> user's individual OAuth grant.
 
-### Channel list (organization-owned)
+### Channel list (organization-owned, used as part of internal usage)
 
-> **Action required: fill in the YouTube channel URLs you publish to.**
+> **Action required: fill in the YouTube channel URLs you publish to
+> from the organization account.** These are the channels we operate
+> ourselves; public creators connect their own channels via the same
+> sign-up flow demonstrated in Video 2 of the screen-cast.
 
 | # | Channel name | YouTube URL | Channel ID (UC...) |
 |---|---|---|---|
@@ -49,9 +78,9 @@ sees.
 | 2 | Cyber Sphere | `https://www.youtube.com/@cybersphere`  *(replace)* | `UC...` |
 | 3 | Kaizer Upload | `https://www.youtube.com/@kaizerupload`  *(replace)* | `UC...` |
 
-*Add more rows as needed.* These are visible in our **Style Profiles**
-page and in our **YouTube Destinations** panel after a user clicks
-"Connect YouTube".
+*Add more rows as needed.* These are visible in the same **Style
+Profiles** UI that public creators use to manage their own channels —
+the experience is identical.
 
 ---
 
