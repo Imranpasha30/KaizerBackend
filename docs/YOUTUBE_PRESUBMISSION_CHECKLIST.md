@@ -40,7 +40,7 @@ Then **APIs & Services → Credentials → click your OAuth Web Client**:
 
 - [ ] **Authorised redirect URIs** includes exactly the URI your
       backend uses:
-      `https://kaizerbackend-production.up.railway.app/api/youtube/auth/callback`
+      `https://kaizerbackend-production.up.railway.app/api/youtube/oauth/callback`
 - [ ] **Authorised JavaScript origins** includes the frontend URL(s).
 
 ---

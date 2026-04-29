@@ -122,7 +122,7 @@ The user-visible journey is implemented in
    ```
    https://accounts.google.com/o/oauth2/auth
      ?client_id=<our-web-client>
-     &redirect_uri=https://kaizerbackend-production.up.railway.app/api/youtube/auth/callback
+     &redirect_uri=https://kaizerbackend-production.up.railway.app/api/youtube/oauth/callback
      &response_type=code
      &scope=youtube.upload%20youtube.readonly%20youtube
      &access_type=offline
@@ -139,7 +139,7 @@ The user-visible journey is implemented in
 5. **User clicks "Allow"** (or "Deny" — we handle both).
 6. **Google redirects back** to our callback URL with `code` and
    `state` query params.
-7. The backend at `GET /api/youtube/auth/callback`:
+7. The backend at `GET /api/youtube/oauth/callback`:
    1. Validates the `state` matches what we issued (CSRF protection) —
       see [`oauth.py:104-110`](../youtube/oauth.py#L104).
    2. Exchanges the code for `access_token` + `refresh_token` via
@@ -398,7 +398,7 @@ The reviewer specifically wants to see the OAuth 2.0 consent screen.
 | 0:55 | Click **Link my YouTube** on the new profile | "Clicking this kicks off the OAuth 2.0 web-server flow. We hit `accounts.google.com/o/oauth2/auth` with `access_type=offline`, `prompt=consent`, `include_granted_scopes=true`, and a CSRF state token." |
 | 1:10 | **Google's consent screen loads** — DO NOT skip past this; pause for ~3 seconds | "This is Google's consent screen. Notice the application name 'Kaizer News' and the three permission lines — uploading, reading, and managing the user's YouTube videos. These map exactly to the three scopes we requested." |
 | 1:25 | Pick a YouTube channel, click **Allow** | "The user picks the channel they want to connect — this can be any channel they own — and grants consent." |
-| 1:45 | Show the redirect back to our app, the success state | "Google redirects back to our `/api/youtube/auth/callback` endpoint. The backend validates the state, exchanges the code for tokens, captures the channel's ID + title via `channels.list?mine=true`, and encrypts the refresh token before storing it. The user sees their connected channel name in our UI." |
+| 1:45 | Show the redirect back to our app, the success state | "Google redirects back to our `/api/youtube/oauth/callback` endpoint. The backend validates the state, exchanges the code for tokens, captures the channel's ID + title via `channels.list?mine=true`, and encrypts the refresh token before storing it. The user sees their connected channel name in our UI." |
 | 2:10 | Upload a sample video as this new user | "The new user uploads a video. Same pipeline as before — clips, captions, SEO." |
 | 2:55 | Publish a clip to their newly-connected channel | "And now the user publishes. We mint a fresh access token from the encrypted refresh token, call `videos.insert` resumably, and follow up with `thumbnails.set`." |
 | 3:35 | Show the result on YouTube | "The clip is live on the user's channel, branded with their logo, with all our generated metadata." |
