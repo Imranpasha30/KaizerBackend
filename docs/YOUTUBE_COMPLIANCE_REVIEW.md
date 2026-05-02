@@ -73,18 +73,14 @@ through **the same self-serve sign-up + OAuth flow**:
 
 ### Channel list (organization-owned)
 
-> **Action required for senior submitter: fill in the three channel
-> URLs and UC channel IDs before sending.** These are the channels the
-> organization publishes to. Public creators connect their own channels
-> via the same sign-up flow demonstrated in Video 2.
+These are the YouTube channels the organization publishes content to
+through Kaizer News. Public creators connect their own channels via
+the same sign-up flow demonstrated in Video 2.
 
-| # | Channel name | YouTube URL | Channel ID (UC...) |
-|---|---|---|---|
-| 1 | Auto Wala | `<TODO: https://www.youtube.com/@…>` | `<TODO: UC...>` |
-| 2 | Cyber Sphere | `<TODO: https://www.youtube.com/@…>` | `<TODO: UC...>` |
-| 3 | Kaizer Upload | `<TODO: https://www.youtube.com/@…>` | `<TODO: UC...>` |
-
-*Add more rows as needed.*
+| # | Channel name | YouTube URL | Subscribers | Total videos |
+|---|---|---|---|---|
+| 1 | Kaizer News Andhra | `https://www.youtube.com/@KaizerNewsAndhra` | 327k | 2.1k |
+| 2 | Auto Wala | `https://www.youtube.com/@kaizerautowala45` | 1 | 10 |
 
 ---
 

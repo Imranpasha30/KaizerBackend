@@ -28,9 +28,10 @@ recordings, and a link to our full compliance write-up.
    Terms of service:           https://kaizerx.com/terms
 
 — Organization-owned YouTube channels (videos are uploaded to these)
-   1. Auto Wala       — <FILL: https://www.youtube.com/@…>  — UC<FILL>
-   2. Cyber Sphere    — <FILL: https://www.youtube.com/@…>  — UC<FILL>
-   3. Kaizer Upload   — <FILL: https://www.youtube.com/@…>  — UC<FILL>
+   1. Kaizer News Andhra — https://www.youtube.com/@KaizerNewsAndhra
+      (327k subscribers, 2.1k videos, joined 3 Jan 2025)
+   2. Auto Wala          — https://www.youtube.com/@kaizerautowala45
+      (1 subscriber, 10 videos, joined 7 Mar 2024)
 
 — Screen-cast recordings (Google Drive, anyone-with-the-link viewing)
 
@@ -136,16 +137,14 @@ contact: devsharkify@gmail.com
 
 ---
 
-## Before sending — fill these 3 placeholders
+## Before sending — fill these 2 placeholders
 
-The body above contains exactly three things the senior must fill in
-before sending:
+The body above contains exactly two things the senior must fill in
+before sending (channel URLs are already populated):
 
-1. **Channel URLs + UC IDs** in the channel-list section (3 rows). Get
-   the UC IDs by opening each channel on YouTube → About → Share
-   channel → Copy channel ID. Format: `UCxxxxxxxx...`.
-2. **The senior's name + role** at the bottom (`<Senior submitter — fill in name and role here>`).
-3. Confirm the contact email (`devsharkify@gmail.com`) is the one the
+1. **The senior's name + role** at the bottom
+   (`<Senior submitter — fill in name and role here>`).
+2. Confirm the contact email (`devsharkify@gmail.com`) is the one the
    reviewer should use, or replace with a different one.
 
 ---
@@ -169,7 +168,6 @@ client ID) is inline in the email body.
 
 ## Send checklist for senior
 
-- [ ] All 3 channel URL + UC ID placeholders replaced with real values.
 - [ ] Senior's name + role filled in at the bottom.
 - [ ] PDF of `YOUTUBE_COMPLIANCE_REVIEW.md` attached to the email.
 - [ ] Both Google Drive video links **tested in incognito** before
