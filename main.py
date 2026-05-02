@@ -623,9 +623,10 @@ async def raw_upload(
     with open(video_path, "wb") as f:
         f.write(await video.read())
 
-    # Mirror the source video to R2 — local copy is ephemeral on
-    # Railway, so the Clip row's video URL must point at R2 for
-    # cross-device viewing + retry-after-redeploy.
+    # Mirror the source video to R2. We need the local file briefly for
+    # the ffprobe-duration + ffmpeg-thumbnail steps below, so we keep
+    # video_path on disk through THIS request — but we delete it at the
+    # end before returning. R2 is then the source of truth.
     video_storage_url = ""
     video_storage_key = ""
     video_storage_backend = ""
@@ -726,6 +727,24 @@ async def raw_upload(
         }),
     )
     db.add(clip); db.commit(); db.refresh(clip)
+
+    # Both video + thumb are now in R2. Wipe the local copies — Railway's
+    # ephemeral disk fills up otherwise (we hit "Container exceeding
+    # maximum ephemeral storage"). asset_resolver.materialize_asset_locally
+    # pulls bytes from R2 on demand for downstream operations that need
+    # a real path (publish-time logo overlay, etc.).
+    if video_storage_url:
+        try:
+            video_path.unlink(missing_ok=True)
+            if thumb_path and Path(thumb_path).exists():
+                Path(thumb_path).unlink(missing_ok=True)
+            # Drop the now-empty timestamped directory
+            try:
+                upload_dir.rmdir()
+            except OSError:
+                pass
+        except Exception as cleanup_exc:
+            print(f"[raw-upload] cleanup warning: {cleanup_exc}")
 
     return {
         "job_id":   job.id,
@@ -1071,8 +1090,9 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
 
     clip.image_path = str(img_path)
 
-    # Mirror to R2 — local file stays as transient cache. Failures don't
-    # break the upload; the row falls back to /api/file/ via _clip_dict.
+    # Upload to R2, then DELETE the local copy. Railway's ephemeral disk
+    # has a small cap; without aggressive cleanup the container crashes
+    # ("Container is exceeding maximum ephemeral storage").
     image_storage_url = ""
     try:
         from pipeline_core.storage import get_storage_provider
@@ -1084,6 +1104,13 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
         )
         image_storage_url = obj.url
         clip.image_storage_url = image_storage_url
+        # R2 has the bytes — drop the local copy. _clip_dict serves
+        # storage_url; if anything still wants the bytes locally, the
+        # asset_resolver downloads from R2 on demand.
+        try:
+            img_path.unlink(missing_ok=True)
+        except Exception as cleanup_exc:
+            print(f"[clip-image] cleanup warning: {cleanup_exc}")
     except Exception as exc:
         print(f"[clip-image] R2 upload failed for clip {clip_id}: {exc}")
 

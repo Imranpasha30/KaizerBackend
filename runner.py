@@ -145,6 +145,39 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                 db3.commit()
             db3.close()
         finally:
+            # ─── Aggressive cleanup ─────────────────────────────────────
+            # Railway's container has a small ephemeral disk cap. Without
+            # this the disk fills up after a handful of jobs and the
+            # container crashes ("Container is exceeding maximum
+            # ephemeral storage"). All bytes worth keeping are in R2 by
+            # this point — the source video at sources/{user}/...,
+            # rendered clips + thumbs + images at clips/{job}/{idx}/...
+            # Anything still on local disk is now dead weight.
+            try:
+                import shutil as _shutil
+                # 1. Source video that create_job dropped in MEDIA_ROOT/uploads/
+                if video_path and os.path.exists(video_path):
+                    try:
+                        os.remove(video_path)
+                    except OSError as _e:
+                        print(f"[runner] cleanup: failed to remove source {video_path!r}: {_e}")
+                # 2. Pipeline output dir for this run (job.output_dir set by _import_clips)
+                try:
+                    db_clean = db_session_factory()
+                    j_clean = db_clean.query(Job).filter(Job.id == job_id).first()
+                    out_dir = j_clean.output_dir if j_clean else ""
+                    db_clean.close()
+                    if out_dir and os.path.isdir(out_dir):
+                        # Don't delete OUTPUT_ROOT itself, only the per-job subfolder
+                        if os.path.abspath(out_dir) != os.path.abspath(str(OUTPUT_ROOT)):
+                            _shutil.rmtree(out_dir, ignore_errors=True)
+                            print(f"[runner] cleanup: dropped pipeline output {out_dir!r}")
+                except Exception as _e:
+                    print(f"[runner] cleanup: output_dir removal warning: {_e}")
+            except Exception as _cleanup_e:
+                # Cleanup failures are never fatal — container will get
+                # wiped on next redeploy worst case.
+                print(f"[runner] cleanup warning: {_cleanup_e}")
             db.close()
 
     threading.Thread(target=_run, daemon=True).start()

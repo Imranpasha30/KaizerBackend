@@ -174,9 +174,12 @@ async def upload_asset(
 
     thumb_path, w, h = _thumb_for(out_path)
 
-    # Upload to R2 — local file stays on disk as a transient cache (the
-    # thumbnailer + Pillow ops need a real path). R2 is the source of
-    # truth; storage_url is what the frontend actually renders.
+    # Upload to R2, then DELETE the local copies. Railway's ephemeral
+    # disk has a small cap; without aggressive cleanup the container
+    # crashes with "Container is exceeding maximum ephemeral storage".
+    # We only need the local file long enough for Pillow to read it for
+    # the thumbnail; once R2 has both the original and the thumb, we
+    # don't need anything on disk.
     storage_backend = ""
     storage_key = ""
     storage_url = ""
@@ -193,6 +196,16 @@ async def upload_asset(
                 thumb_path, rel_dir + Path(thumb_path).name, content_type="image/jpeg",
             )
             thumb_storage_url = thumb_obj.url
+
+        # Cleanup: R2 has the bytes, drop the local copies. The frontend
+        # serves from storage_url; if the local file is gone, callers
+        # that need the bytes pull from R2 via materialize_asset_locally.
+        try:
+            out_path.unlink(missing_ok=True)
+            if thumb_path and Path(thumb_path).exists():
+                Path(thumb_path).unlink(missing_ok=True)
+        except Exception as cleanup_exc:
+            print(f"[assets] post-upload cleanup warning: {cleanup_exc}")
     except Exception as exc:
         # R2 upload failed — keep going with local-disk-only mode so the
         # endpoint still returns a working asset row. The frontend's
