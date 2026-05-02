@@ -1022,11 +1022,17 @@ def _search_pexels(query: str, count: int = 3) -> list:
 
 
 def search_news_images(search_queries: list, people: list, topics: list,
-                       output_dir: str, count: int = 5) -> list:
+                       output_dir: str, count: int = 5,
+                       language: str = "en") -> list:
     """
     Multi-source news image search.
-    Priority: Google CSE → DuckDuckGo → Pexels → Generated cards.
+    Priority: OpenAI (gpt-image-1) → Google CSE → DuckDuckGo → Pexels → Generated cards.
     Uses specific search queries from Gemini (real people, events, locations).
+
+    The ``language`` parameter is used by the OpenAI generator to pick a
+    geographic location hint (Telugu → Andhra/Telangana, Hindi → North
+    India, etc.) so the visual reads as local news. Falls back to
+    "India" for unknown / missing languages.
     """
     images_dir = os.path.join(output_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
@@ -1049,6 +1055,41 @@ def search_news_images(search_queries: list, people: list, topics: list,
 
     if not queries:
         queries = ["Telugu news today"]
+
+    # ── OpenAI image generation pass (preferred when enabled) ────────
+    # Tries gpt-image-1 first for each requested image. Each call that
+    # succeeds fills one slot; failures fall through silently to the
+    # web-search loop below for that slot. Per-image fallback (not
+    # all-or-nothing) means refusals on real-public-figure prompts
+    # don't sink the whole batch.
+    try:
+        from pipeline_core.openai_images import generate_news_image, is_enabled
+        if is_enabled():
+            print(f"    Trying OpenAI gpt-image-1 for up to {count} images ...")
+            for qi, query in enumerate(queries):
+                if len(downloaded) >= count:
+                    break
+                idx = len(downloaded) + 1
+                out_path = os.path.join(images_dir, f"news_{idx:02d}.jpg")
+                generated = generate_news_image(
+                    query=query,
+                    entities=people,
+                    topics=topics,
+                    language=language,
+                    out_path=out_path,
+                )
+                if generated:
+                    downloaded.append(generated)
+            if downloaded:
+                print(f"    OpenAI filled {len(downloaded)}/{count} slots")
+            if len(downloaded) >= count:
+                print(f"    Total: {len(downloaded)} news images downloaded")
+                return downloaded
+    except Exception as _oai_exc:
+        # Module-level failure (import error, unexpected exception):
+        # log + fall through to the web-search loop. Pipeline never
+        # blocks on this path.
+        print(f"    OpenAI image generation skipped ({_oai_exc})")
 
     print(f"    Searching for real news images ({len(queries)} queries) ...")
 
@@ -2464,7 +2505,8 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     else:
         images = search_news_images(
             search_queries, people, topics + locations,
-            OUTPUT_DIR, count=len(clips) + 2
+            OUTPUT_DIR, count=len(clips) + 2,
+            language=lang_cfg.code,
         )
 
     # If no real images found, generate news cards as fallback
