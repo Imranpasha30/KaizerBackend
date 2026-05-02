@@ -6,6 +6,18 @@ Flow:
 """
 from __future__ import annotations
 
+# Relax requests-oauthlib's strict scope check BEFORE google-auth-oauthlib
+# imports it. Google's consent screen auto-injects identity scopes
+# (openid, userinfo.email, userinfo.profile) when the user signs in
+# with their Google account — even though we never requested them.
+# The default strict comparison then raises:
+#   "Token exchange failed: Scope has changed from … to …"
+# Setting this env var tells oauthlib it's OK if the token endpoint
+# returns MORE scopes than were requested. See
+# https://requests-oauthlib.readthedocs.io/en/latest/oauth2_workflow.html
+import os
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Tuple
