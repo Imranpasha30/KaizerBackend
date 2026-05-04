@@ -2317,9 +2317,14 @@ def _prompt_choice(prompt_lines, options, default="1"):
 
 def _select_platform_and_frame(platform=None, frame_layout=None):
     """
-    Interactive selection: Platform first → Frame layout → Confirm.
-    User can go back from any step or change selections at confirmation.
-    Returns (platform_key, frame_layout_key).
+    Interactive selection: Platform first → Frame layout (Shorts only) → Confirm.
+
+    ``youtube_full`` is the 16:9 long-form bulletin path — frame layouts
+    are 9:16 Shorts-only graphics, so we skip that step entirely and
+    return a sentinel frame value (callers that need a frame for Shorts
+    paths never see ``youtube_full``).
+
+    Returns ``(platform_key, frame_layout_key)``.
     """
     platform_opts = {
         k: f"{v['label']}  ({v['width']}x{v['height']})"
@@ -2327,7 +2332,16 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
     }
     frame_opts = FRAME_LAYOUTS
 
-    # If both already provided (CLI args), skip interaction
+    # If platform is set to long-form, the frame is meaningless — pin it
+    # to the first Shorts layout key as a harmless placeholder; the
+    # bulletin branch ignores frame_layout entirely.
+    def _is_long_form(p: str | None) -> bool:
+        return (p or "").lower() == "youtube_full"
+
+    # If platform is already long-form (CLI), short-circuit. If both
+    # are provided for a Shorts platform, skip interaction.
+    if _is_long_form(platform):
+        return platform, frame_layout or next(iter(frame_opts.keys()))
     if platform and frame_layout:
         return platform, frame_layout
 
@@ -2351,7 +2365,30 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
             except (ValueError, EOFError, KeyboardInterrupt):
                 platform = p_keys[0]
 
-        # ── STEP 2: Frame layout ──────────────────────────────
+        # ── Long-form platforms skip the frame step entirely ──
+        if _is_long_form(platform):
+            preset = PLATFORM_PRESETS[platform]
+            print()
+            print("  ┌─────────────────────────────────────────┐")
+            print("  │   Long-form selected — Confirm          │")
+            print("  └─────────────────────────────────────────┘")
+            print(f"    Platform   : {preset['label']}  "
+                  f"({preset['width']}x{preset['height']})")
+            print(f"    Layout     : long-form bulletin (TV9 broadcast layout)")
+            print(f"    Frame mode : skipped (Shorts-only)")
+            print()
+            print("    1. ✓ Confirm — start bulletin pipeline")
+            print("    2. ← Change platform")
+            try:
+                raw = input("  Choice [1]: ").strip() or "1"
+                if raw == "2":
+                    platform = None
+                    continue
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+            return platform, next(iter(frame_opts.keys()))
+
+        # ── STEP 2: Frame layout (Shorts only) ────────────────
         if not frame_layout:
             print()
             print("  ┌─────────────────────────────────────────┐")
@@ -2438,9 +2475,20 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     # ── Platform + Frame selection (platform first, then frame, with back option) ──
     platform, frame_layout = _select_platform_and_frame(platform, frame_layout)
 
+    # Long-form (16:9) implies the bulletin pipeline. The 9:16 frame
+    # compose paths only know how to draw Shorts layouts and would
+    # produce broken output on a 1920×1080 canvas. Auto-route here so
+    # selecting "YouTube Full" never silently runs Shorts compose.
+    if (platform or "").lower() == "youtube_full" and not (render_mode or ""):
+        render_mode = "bulletin"
+        print("  [auto] platform=youtube_full → render_mode=bulletin")
+
     preset = PLATFORM_PRESETS[platform]
     print(f"\n  Platform : {preset['label']} ({preset['width']}x{preset['height']})")
-    print(f"  Frame    : {FRAME_LAYOUTS[frame_layout]}")
+    if (render_mode or "").lower() == "bulletin":
+        print(f"  Mode     : long-form bulletin (TV9 broadcast layout)")
+    else:
+        print(f"  Frame    : {FRAME_LAYOUTS[frame_layout]}")
 
     # ── Output directory ──────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
