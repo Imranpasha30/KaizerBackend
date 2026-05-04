@@ -65,6 +65,12 @@ PyJWT==2.12.1
 email-validator==2.3.0
 dnspython==2.8.0
 
+# ─── OpenAI (image generation for the per-clip news image) ───
+# Without this, pipeline.py:_ensure_package() runs `pip install openai`
+# at runtime on every container start, writing ~50-100 MB to the
+# ephemeral disk and eventually triggering Railway's storage cap.
+openai==2.30.0
+
 # ─── Google stack (Gemini SEO + YouTube Data + OAuth) ────────
 google-generativeai==0.8.6
 google-ai-generativelanguage==0.6.15
