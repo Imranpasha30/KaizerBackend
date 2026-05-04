@@ -2484,17 +2484,223 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     print(f"\n  [2/{TOTAL}] Cutting video with FFmpeg ...")
     cut_video_clips(video_path, clips, OUTPUT_DIR)
 
-    # ════ Bulletin short-circuit (Phase 1 long-form) ════
-    # If the user asked for the long-form bulletin output, skip per-clip
-    # composition entirely and stitch the raw slices we just produced.
-    # Phases 2–4 will add TV9 graphics, carousels, and PiP on top of this.
+    # ════ Bulletin pipeline (long-form Phases 1–4) ════
+    # Long-form path: every story gets the TV9 broadcast layout (Phase 2),
+    # an OpenAI-generated image carousel as the sidebar + full-screen
+    # photo gallery between stories (Phase 3), and an optional PiP inset
+    # for stories Gemini flags as having a secondary subject (Phase 4).
+    # Each layer can be disabled via env var so we can roll back to a
+    # bare Phase-1 stitch on demand.
     if (render_mode or "").lower() == "bulletin":
-        print(f"\n  [bulletin] Stitching {len(clips)} stories into one MP4 ...")
-        from pipeline_core.bulletin_stitcher import stitch_bulletin, BulletinStitchError
-        story_paths = [c.get("raw_path") for c in clips if c.get("raw_path")]
         bulletin_dir = os.path.join(OUTPUT_DIR, "bulletin")
         os.makedirs(bulletin_dir, exist_ok=True)
         bulletin_out = os.path.join(bulletin_dir, "bulletin.mp4")
+
+        def _flag(name: str, default: str = "1") -> bool:
+            return os.environ.get(name, default).strip().lower() not in ("0", "false", "no")
+
+        use_overlay   = _flag("KAIZER_LONGFORM_OVERLAY", "1")
+        use_sidebar   = _flag("KAIZER_CAROUSEL_SIDEBAR", "1")
+        use_takeovers = _flag("KAIZER_CAROUSEL_TAKEOVERS", "1")
+        use_pip       = _flag("KAIZER_LONGFORM_PIP", "0")
+        # CLI flags override env (set by argparse).
+        if globals().get("_BULLETIN_FLAG_OVERRIDES"):
+            for k, v in _BULLETIN_FLAG_OVERRIDES.items():
+                if k == "overlay":   use_overlay = v
+                if k == "sidebar":   use_sidebar = v
+                if k == "takeovers": use_takeovers = v
+                if k == "pip":       use_pip = v
+
+        story_paths: list[str] = []          # final segment list to stitch
+
+        if not use_overlay:
+            # Phase 1 fallback — bare slices, no graphics.
+            print("  [bulletin] overlay disabled — using bare slices (Phase 1).")
+            story_paths = [c.get("raw_path") for c in clips if c.get("raw_path")]
+        else:
+            # ── Phase 2 imports ──
+            from pipeline_core.longform_compose import (
+                StoryMeta, render_ticker, render_channel_bug,
+                make_sidebar_placeholder, compose_bulletin_story,
+                compose_pip_story, pick_pip_source,
+            )
+            # ── Phase 3 imports ──
+            from pipeline_core.image_carousel import (
+                build_sidebar_carousel, build_fullscreen_takeover, CarouselError,
+            )
+
+            # Local Gemini metadata (mirrors the Shorts path that runs after
+            # this branch — kept here because we return early).
+            locations = gemini_result.get("key_locations", [])
+            global_kw = gemini_result.get("image_search_queries", [])
+
+            # ── 1) Per-story image generation (OpenAI-first via search_news_images).
+            #    Each story writes into its own subdir so calls don't clobber
+            #    each other.
+            print(f"\n  [bulletin] Generating images per story (count=6) ...")
+            story_images: list[list[str]] = []
+            for i, c in enumerate(clips):
+                per_story_dir = os.path.join(bulletin_dir, f"story_{i:02d}_assets")
+                os.makedirs(per_story_dir, exist_ok=True)
+                story_summary = (c.get("summary") or "").strip()
+                # Build clip-specific query: prefer per-clip summary, fall back
+                # to global search queries so OpenAI/Pexels has a real subject.
+                queries = []
+                if story_summary:
+                    queries.append(story_summary[:80])
+                queries += global_kw[:2]
+                try:
+                    imgs = search_news_images(
+                        queries, people, topics + locations,
+                        per_story_dir, count=6,
+                        language=lang_cfg.code,
+                    )
+                except Exception as exc:
+                    print(f"    [bulletin][warn] story_{i:02d} image fetch: {exc}")
+                    imgs = []
+                story_images.append(imgs or [])
+                print(f"    story_{i:02d}: {len(imgs)} image(s)")
+
+            # ── 2) Render the ticker once (shared across every story).
+            all_headlines = [
+                (c.get("summary") or "").strip()[:90]
+                for c in clips if (c.get("summary") or "").strip()
+            ]
+            ticker_path = os.path.join(bulletin_dir, "_ticker.png")
+            try:
+                render_ticker(
+                    all_headlines or ["KAIZER NEWS"],
+                    lang_cfg.code, lang_cfg.font_primary,
+                    ticker_path,
+                )
+            except Exception as exc:
+                print(f"    [bulletin][warn] ticker render failed: {exc}")
+                ticker_path = ""
+
+            # ── 3) Render channel bug once.
+            bug_path = os.path.join(bulletin_dir, "_bug.png")
+            try:
+                render_channel_bug("KAIZER NEWS", DEFAULT_LOGO or None, bug_path)
+            except Exception as exc:
+                print(f"    [bulletin][warn] channel bug render failed: {exc}")
+                bug_path = None
+
+            # ── 4) Per-story compose + (optional) takeover between stories.
+            for i, c in enumerate(clips):
+                raw_path = c.get("raw_path")
+                if not raw_path or not os.path.isfile(raw_path):
+                    print(f"    [bulletin][warn] story_{i:02d}: missing raw clip, skipping")
+                    continue
+
+                story_dur_s = float(c.get("duration_sec") or 60.0)
+                imgs = story_images[i] if i < len(story_images) else []
+
+                # Sidebar: carousel video when we have ≥2 images and feature on.
+                sidebar_path: str | None = None
+                sidebar_is_video = False
+                if use_sidebar and len(imgs) >= 2:
+                    sidebar_video = os.path.join(bulletin_dir, f"_sidebar_{i:02d}.mp4")
+                    try:
+                        build_sidebar_carousel(
+                            imgs[:5], story_dur_s, sidebar_video,
+                            work_dir=os.path.join(bulletin_dir, f"_sidebar_work_{i:02d}"),
+                        )
+                        sidebar_path = sidebar_video
+                        sidebar_is_video = True
+                    except Exception as exc:
+                        print(f"    [bulletin][warn] sidebar carousel story_{i:02d}: {exc}")
+                        sidebar_path = None
+                if sidebar_path is None:
+                    sidebar_static = os.path.join(bulletin_dir, f"_sidebar_{i:02d}.png")
+                    try:
+                        make_sidebar_placeholder(
+                            imgs[0] if imgs else None, sidebar_static,
+                        )
+                        sidebar_path = sidebar_static
+                    except Exception as exc:
+                        print(f"    [bulletin][warn] sidebar placeholder story_{i:02d}: {exc}")
+                        sidebar_path = None
+
+                # Lower-third meta from clip data
+                importance = int(c.get("importance") or 5)
+                kicker = "BREAKING" if importance >= 8 else "NEWS"
+                story_meta = StoryMeta(
+                    title=(c.get("summary") or "KAIZER NEWS").strip()[:120],
+                    kicker=kicker,
+                    language=lang_cfg.code,
+                    story_index=i,
+                    total_stories=len(clips),
+                    importance=importance,
+                )
+
+                composed_path = os.path.join(bulletin_dir, f"composed_story_{i:02d}.mp4")
+                composed_ok = False
+                try:
+                    if use_pip:
+                        pip_src = pick_pip_source(clips, i)
+                    else:
+                        pip_src = None
+
+                    if pip_src and sidebar_path and ticker_path:
+                        pip_clip, pip_start, pip_dur = pip_src
+                        compose_pip_story(
+                            raw_path, story_meta, composed_path,
+                            pip_clip_path=pip_clip,
+                            pip_start_s=pip_start,
+                            pip_duration_s=pip_dur,
+                            sidebar_path=sidebar_path,
+                            ticker_path=ticker_path,
+                            channel_bug_path=bug_path,
+                            font_path=lang_cfg.font_primary,
+                            sidebar_is_video=sidebar_is_video,
+                            work_dir=bulletin_dir,
+                        )
+                        composed_ok = True
+                    elif sidebar_path and ticker_path:
+                        compose_bulletin_story(
+                            raw_path, story_meta, composed_path,
+                            sidebar_path=sidebar_path,
+                            ticker_path=ticker_path,
+                            channel_bug_path=bug_path,
+                            font_path=lang_cfg.font_primary,
+                            sidebar_is_video=sidebar_is_video,
+                            work_dir=bulletin_dir,
+                        )
+                        composed_ok = True
+                except Exception as exc:
+                    print(f"    [bulletin][warn] compose story_{i:02d}: {exc}")
+
+                if composed_ok and os.path.isfile(composed_path):
+                    story_paths.append(composed_path)
+                    print(f"    [bulletin] composed_story_{i:02d}.mp4 "
+                          f"({kicker}, {story_dur_s:.0f}s)")
+                else:
+                    # Fall back to raw slice so the story still ships.
+                    story_paths.append(raw_path)
+                    print(f"    [bulletin] story_{i:02d} fell back to raw slice")
+
+                # Phase 3 — full-screen takeover between stories.
+                # Skip after first/last + when carousel is off + need ≥2 images.
+                last_idx = len(clips) - 1
+                if (use_takeovers and i < last_idx and i > 0 and len(imgs) >= 2):
+                    takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
+                    takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
+                    try:
+                        build_fullscreen_takeover(
+                            imgs[:4], takeover_dur, takeover_path,
+                            work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
+                        )
+                        story_paths.append(takeover_path)
+                        print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
+                    except Exception as exc:
+                        print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+
+        # ── Stitch the assembled segment list into the final bulletin ──
+        if not story_paths:
+            print("  [bulletin] FAILED: no segments produced")
+            return
+        print(f"\n  [bulletin] Stitching {len(story_paths)} segments ...")
+        from pipeline_core.bulletin_stitcher import stitch_bulletin, BulletinStitchError
         try:
             result = stitch_bulletin(
                 story_paths,
@@ -2507,12 +2713,11 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         for w in result.warnings:
             print(f"    [bulletin][warn] {w}")
         print(
-            f"  [bulletin] Done: {result.stories_rendered} stories, "
+            f"  [bulletin] Done: {result.stories_rendered} segments, "
             f"{result.stories_skipped} skipped, "
             f"total={result.total_duration_s/60:.1f} min"
         )
         print(f"  [bulletin] Output: {bulletin_out}")
-        # Mirror to R2 if configured. Errors already logged inside the helper.
         try:
             url, key, backend = _maybe_upload_final(
                 bulletin_out,
@@ -2842,6 +3047,16 @@ if __name__ == "__main__":
                               "Gemini-extracted stories into one 1-2hr MP4 for "
                               "YouTube Full. Omit for the default per-clip "
                               "Shorts pipeline.")
+    # Bulletin-only feature toggles (silently ignored for Shorts):
+    _parser.add_argument("--no-broadcast-overlay", action="store_true",
+                         help="bulletin: skip TV9 graphics; emit bare slice stitch.")
+    _parser.add_argument("--no-carousel-sidebar", action="store_true",
+                         help="bulletin: skip Ken-Burns image carousel sidebar.")
+    _parser.add_argument("--no-carousel-takeovers", action="store_true",
+                         help="bulletin: skip full-screen image takeovers between stories.")
+    _parser.add_argument("--pip", action="store_true",
+                         help="bulletin: enable picture-in-picture inset on stories "
+                              "where Gemini provides a usable secondary subject.")
     _parser.add_argument("--language", default="te",
                          help="Language code (te|hi|ta|kn|ml|bn|mr|gu|en). Default: te")
     _parser.add_argument("--default-image", default="",
@@ -2871,6 +3086,15 @@ if __name__ == "__main__":
     if not _video:
         print("Usage: python scripts/11_api_pipeline.py <video_path> [--platform X] [--frame Y]")
         sys.exit(1)
+
+    # Bulletin feature toggles — flow into the bulletin branch of run_pipeline
+    # via a module-level dict (only honoured when --render-mode bulletin).
+    _BULLETIN_FLAG_OVERRIDES = {
+        "overlay":   not _args.no_broadcast_overlay,
+        "sidebar":   not _args.no_carousel_sidebar,
+        "takeovers": not _args.no_carousel_takeovers,
+        "pip":       bool(_args.pip),
+    }
 
     run_pipeline(os.path.abspath(_video), platform=_args.platform,
                  frame_layout=_args.frame, language=_args.language,
