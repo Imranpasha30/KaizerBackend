@@ -154,6 +154,23 @@ RENDER_MODE_CONFIGS: dict[str, RenderModeConfig] = {
         completion_weight=0.3,
         qa_platform="youtube_short",
     ),
+    # bulletin = the long-form 1–2 hr stitched output for YouTube Full.
+    # Per-story values (target/min/max) describe each individual story
+    # that the bulletin is composed of; the bulletin total is governed
+    # by ``bulletin_stitcher.DEFAULT_TARGET_TOTAL_MIN`` etc. CTAs are
+    # disabled per-story because the bulletin has its own outro CTA in
+    # a later phase.
+    "bulletin": RenderModeConfig(
+        target_dur_s=90,
+        min_dur_s=30,
+        max_dur_s=240,
+        cta_style="none",
+        cta_text_default="",
+        importance_weight=0.5,
+        hook_weight=0.2,
+        completion_weight=0.3,
+        qa_platform="youtube_full",
+    ),
 }
 
 

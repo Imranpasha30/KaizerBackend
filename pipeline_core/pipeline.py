@@ -2403,8 +2403,15 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
 
 
 def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None,
-                 language: str = "te"):
-    """Complete API pipeline: Gemini → FFmpeg → ChatGPT → Pexels → Compose → Editor."""
+                 language: str = "te", render_mode: str = None):
+    """Complete API pipeline: Gemini → FFmpeg → ChatGPT → Pexels → Compose → Editor.
+
+    When ``render_mode == "bulletin"``, the per-clip composition path is
+    short-circuited: after Gemini analysis + FFmpeg slicing, the raw story
+    slices are concatenated into a single 1–2 hour bulletin MP4 (no per-clip
+    layout, no images, no titles — those land in Phases 2–4 of the long-form
+    plan). All Shorts modes ignore this flag.
+    """
 
     # Resolve language config once at the top — used for prompts, fonts, follow-bar.
     import sys as _sys
@@ -2476,6 +2483,47 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     # ════ STEP 2: Cut Video with FFmpeg ════
     print(f"\n  [2/{TOTAL}] Cutting video with FFmpeg ...")
     cut_video_clips(video_path, clips, OUTPUT_DIR)
+
+    # ════ Bulletin short-circuit (Phase 1 long-form) ════
+    # If the user asked for the long-form bulletin output, skip per-clip
+    # composition entirely and stitch the raw slices we just produced.
+    # Phases 2–4 will add TV9 graphics, carousels, and PiP on top of this.
+    if (render_mode or "").lower() == "bulletin":
+        print(f"\n  [bulletin] Stitching {len(clips)} stories into one MP4 ...")
+        from pipeline_core.bulletin_stitcher import stitch_bulletin, BulletinStitchError
+        story_paths = [c.get("raw_path") for c in clips if c.get("raw_path")]
+        bulletin_dir = os.path.join(OUTPUT_DIR, "bulletin")
+        os.makedirs(bulletin_dir, exist_ok=True)
+        bulletin_out = os.path.join(bulletin_dir, "bulletin.mp4")
+        try:
+            result = stitch_bulletin(
+                story_paths,
+                bulletin_out,
+                work_dir=bulletin_dir,
+            )
+        except BulletinStitchError as exc:
+            print(f"  [bulletin] FAILED: {exc}")
+            return
+        for w in result.warnings:
+            print(f"    [bulletin][warn] {w}")
+        print(
+            f"  [bulletin] Done: {result.stories_rendered} stories, "
+            f"{result.stories_skipped} skipped, "
+            f"total={result.total_duration_s/60:.1f} min"
+        )
+        print(f"  [bulletin] Output: {bulletin_out}")
+        # Mirror to R2 if configured. Errors already logged inside the helper.
+        try:
+            url, key, backend = _maybe_upload_final(
+                bulletin_out,
+                key=f"bulletin/{timestamp}/bulletin.mp4",
+                content_type="video/mp4",
+            )
+            if url:
+                print(f"  [bulletin] Uploaded → {url}")
+        except Exception as exc:
+            print(f"  [bulletin] R2 upload skipped: {exc}")
+        return
 
     # ════ STEP 3: Generate Title with ChatGPT ════
     print(f"\n  [3/{TOTAL}] Generating {lang_cfg.name_english} headline ...")
@@ -2788,6 +2836,12 @@ if __name__ == "__main__":
                          help="Platform preset key")
     _parser.add_argument("--frame", default=None, choices=list(FRAME_LAYOUTS.keys()),
                          help="Frame layout key")
+    _parser.add_argument("--render-mode", default=None,
+                         choices=["bulletin"],
+                         help="Long-form render mode. 'bulletin' stitches all "
+                              "Gemini-extracted stories into one 1-2hr MP4 for "
+                              "YouTube Full. Omit for the default per-clip "
+                              "Shorts pipeline.")
     _parser.add_argument("--language", default="te",
                          help="Language code (te|hi|ta|kn|ml|bn|mr|gu|en). Default: te")
     _parser.add_argument("--default-image", default="",
@@ -2819,4 +2873,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     run_pipeline(os.path.abspath(_video), platform=_args.platform,
-                 frame_layout=_args.frame, language=_args.language)
+                 frame_layout=_args.frame, language=_args.language,
+                 render_mode=_args.render_mode)
