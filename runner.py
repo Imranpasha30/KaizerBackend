@@ -13,6 +13,16 @@ PIPELINE_SCRIPT = BASE_DIR / "pipeline_core" / "pipeline.py"
 # Use /tmp so clips survive the session but don't fill the deploy image
 OUTPUT_ROOT     = Path(os.getenv("KAIZER_OUTPUT_ROOT", "/tmp/kaizer_output"))
 
+# ─── Encoder concurrency cap ─────────────────────────────────────────
+# How many pipeline subprocesses may run at once. Tuned for one
+# mid-range NVIDIA GPU (1–2 NVENC engines): more than 2 simultaneous
+# NVENC encodes thrash the encoder block and total throughput drops.
+# On a CPU-only deploy (Railway / containers without CUDA) the OS
+# scheduler shares CPU fairly, so set KAIZER_PIPELINE_CONCURRENCY=999
+# (or any high number) to behave like before.
+_PIPELINE_CONCURRENCY = max(1, int(os.getenv("KAIZER_PIPELINE_CONCURRENCY", "2")))
+_PIPELINE_SEMAPHORE = threading.BoundedSemaphore(_PIPELINE_CONCURRENCY)
+
 
 def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  db_session_factory, language: str = "te",
@@ -180,7 +190,31 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                 print(f"[runner] cleanup warning: {_cleanup_e}")
             db.close()
 
-    threading.Thread(target=_run, daemon=True).start()
+    def _run_throttled():
+        """Wrap _run so concurrent pipeline jobs respect the encoder cap.
+
+        Without this every uploaded job would race straight into NVENC,
+        thrash the GPU's 1–2 encoder engines, and slow each other down.
+        We mark the row 'queued' first so the frontend shows the wait
+        state, then block on the semaphore until a slot frees up, then
+        run the actual pipeline subprocess via _run.
+        """
+        try:
+            db_pre = db_session_factory()
+            from models import Job as _Job
+            j_pre = db_pre.query(_Job).filter(_Job.id == job_id).first()
+            if j_pre and j_pre.status not in ("running", "done", "failed"):
+                j_pre.status = "queued"
+                db_pre.commit()
+            db_pre.close()
+        except Exception as _e:
+            # Status update is best-effort; don't block the run on it.
+            print(f"[runner] queued-status update skipped: {_e}")
+
+        with _PIPELINE_SEMAPHORE:
+            _run()
+
+    threading.Thread(target=_run_throttled, daemon=True).start()
 
 
 def _import_clips(job, db, meta_override: Path | None = None):
