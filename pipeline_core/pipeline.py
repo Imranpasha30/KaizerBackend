@@ -2856,6 +2856,9 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             f"total={result.total_duration_s/60:.1f} min"
         )
         print(f"  [bulletin] Output: {bulletin_out}")
+        bulletin_storage_url = ""
+        bulletin_storage_key = ""
+        bulletin_storage_backend = ""
         try:
             url, key, backend = _maybe_upload_final(
                 bulletin_out,
@@ -2864,8 +2867,60 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             )
             if url:
                 print(f"  [bulletin] Uploaded → {url}")
+                bulletin_storage_url = url
+                bulletin_storage_key = key
+                bulletin_storage_backend = backend
         except Exception as exc:
             print(f"  [bulletin] R2 upload skipped: {exc}")
+
+        # ── Emit editor_meta.json so runner._import_clips creates ONE
+        # Clip row pointing at bulletin.mp4 (NOT the per-story
+        # composed_story_NN.mp4 intermediates, which would otherwise
+        # show up as separate Shorts cards in the web UI). The runner
+        # reads the [kaizer:meta] marker line below to locate this
+        # file unambiguously.
+        try:
+            meta_path = os.path.join(OUTPUT_DIR, "editor_meta.json")
+            # Build a one-entry "clips" list that points at the single
+            # stitched bulletin output. Total duration comes from the
+            # stitcher's probe (canonical), with a fallback to the sum
+            # of per-story durations for robustness.
+            total_dur_s = float(getattr(result, "total_duration_s", 0.0) or 0.0)
+            if total_dur_s <= 0.0:
+                total_dur_s = sum(float(c.get("duration_sec") or 0.0) for c in clips)
+            bulletin_text = (gemini_result.get("overall_summary_native")
+                             or gemini_result.get("overall_summary_telugu")
+                             or gemini_result.get("overall_summary")
+                             or "Long-form bulletin")
+            bulletin_meta_clip = {
+                "clip_path":      os.path.abspath(bulletin_out),
+                "thumb_path":     "",
+                "image_path":     "",
+                "duration":       total_dur_s,
+                "frame_type":     "bulletin",
+                "text":           bulletin_text[:500],
+                "sentiment":      "",
+                "entities":       people or [],
+                "card_params":    {},
+                "section_pct":    {},
+                "follow_params":  {},
+                "storage_url":    bulletin_storage_url,
+                "storage_key":    bulletin_storage_key,
+                "storage_backend": bulletin_storage_backend,
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "render_mode":  "bulletin",
+                    "platform":     platform,
+                    "language":     lang_cfg.code,
+                    "stories":      result.stories_rendered,
+                    "skipped":      result.stories_skipped,
+                    "duration_s":   total_dur_s,
+                    "clips":        [bulletin_meta_clip],
+                }, f, ensure_ascii=False, indent=2)
+            print(f"[kaizer:meta] {meta_path}")
+        except Exception as exc:
+            print(f"  [bulletin][warn] editor_meta.json write failed: {exc}")
         return
 
     # ════ STEP 3: Generate Title with ChatGPT ════
