@@ -804,6 +804,16 @@ def cut_video_clips(video_path: str, clips: list, output_dir: str) -> list:
             continue
 
         out_path = os.path.join(output_dir, f"raw_clip_{i:02d}.mp4")
+        # Idempotency: if a previous run already produced this slice,
+        # reuse it. Lets --resume-dir skip the cut step entirely on
+        # retry. We require >100KB to filter out empty / corrupted
+        # files left behind by a half-run that crashed.
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 100_000:
+            print(f"    Clip {i}: cached at {os.path.basename(out_path)} (skipping cut)")
+            clip["raw_path"] = out_path
+            clip["duration_sec"] = round(dur, 2)
+            cut_paths.append(out_path)
+            continue
         cmd = (
             [FFMPEG_BIN, "-y",
              "-ss", str(round(start, 3)), "-t", str(round(dur, 3)),
@@ -2440,7 +2450,8 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
 
 
 def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None,
-                 language: str = "te", render_mode: str = None):
+                 language: str = "te", render_mode: str = None,
+                 resume_dir: str = None):
     """Complete API pipeline: Gemini → FFmpeg → ChatGPT → Pexels → Compose → Editor.
 
     When ``render_mode == "bulletin"``, the per-clip composition path is
@@ -2491,8 +2502,21 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         print(f"  Frame    : {FRAME_LAYOUTS[frame_layout]}")
 
     # ── Output directory ──────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, platform, timestamp)
+    # Resume mode: when --resume-dir is set we re-enter the same dir
+    # an earlier run created. All idempotency checks downstream
+    # (cut_video_clips, image gen, sidebar carousel, compose,
+    # takeover, stitch) read existing artifacts and skip steps that
+    # already finished — saving GPU time and OpenAI cost on retries.
+    _resume_dir = (resume_dir or "").strip()
+    if _resume_dir and os.path.isdir(_resume_dir):
+        OUTPUT_DIR = os.path.abspath(_resume_dir)
+        # Recover the timestamp from the dir name so R2 keys stay
+        # consistent across the resumed and original runs.
+        timestamp = os.path.basename(OUTPUT_DIR.rstrip(r"\/"))
+        print(f"  [resume] Re-entering existing output dir: {OUTPUT_DIR}")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        OUTPUT_DIR = os.path.join(OUTPUT_ROOT, platform, timestamp)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"  Output: {OUTPUT_DIR}")
 
@@ -2590,6 +2614,23 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             for i, c in enumerate(clips):
                 per_story_dir = os.path.join(bulletin_dir, f"story_{i:02d}_assets")
                 os.makedirs(per_story_dir, exist_ok=True)
+                # ── Resume: reuse cached images if a previous run already
+                # paid the OpenAI bill. We require ≥4 images of >5 KB each
+                # to consider the cache valid (the carousel needs at least
+                # 4 to look reasonable).
+                images_cache_dir = os.path.join(per_story_dir, "images")
+                cached = sorted([
+                    os.path.join(images_cache_dir, f)
+                    for f in (os.listdir(images_cache_dir)
+                              if os.path.isdir(images_cache_dir) else [])
+                    if f.lower().startswith("news_") and f.lower().endswith((".jpg", ".png"))
+                ])
+                cached = [p for p in cached if os.path.getsize(p) > 5000]
+                if len(cached) >= 4:
+                    story_images.append(cached[:6])
+                    print(f"    story_{i:02d}: {len(cached)} cached image(s) (skipping OpenAI)")
+                    continue
+
                 story_summary = (c.get("summary") or "").strip()
                 # Build clip-specific query: prefer per-clip summary, fall back
                 # to global search queries so OpenAI/Pexels has a real subject.
@@ -2615,23 +2656,29 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 for c in clips if (c.get("summary") or "").strip()
             ]
             ticker_path = os.path.join(bulletin_dir, "_ticker.png")
-            try:
-                render_ticker(
-                    all_headlines or ["KAIZER NEWS"],
-                    lang_cfg.code, lang_cfg.font_primary,
-                    ticker_path,
-                )
-            except Exception as exc:
-                print(f"    [bulletin][warn] ticker render failed: {exc}")
-                ticker_path = ""
+            if os.path.exists(ticker_path) and os.path.getsize(ticker_path) > 1000:
+                print(f"    [bulletin] ticker cached (skipping)")
+            else:
+                try:
+                    render_ticker(
+                        all_headlines or ["KAIZER NEWS"],
+                        lang_cfg.code, lang_cfg.font_primary,
+                        ticker_path,
+                    )
+                except Exception as exc:
+                    print(f"    [bulletin][warn] ticker render failed: {exc}")
+                    ticker_path = ""
 
             # ── 3) Render channel bug once.
             bug_path = os.path.join(bulletin_dir, "_bug.png")
-            try:
-                render_channel_bug("KAIZER NEWS", DEFAULT_LOGO or None, bug_path)
-            except Exception as exc:
-                print(f"    [bulletin][warn] channel bug render failed: {exc}")
-                bug_path = None
+            if os.path.exists(bug_path) and os.path.getsize(bug_path) > 500:
+                print(f"    [bulletin] channel bug cached (skipping)")
+            else:
+                try:
+                    render_channel_bug("KAIZER NEWS", DEFAULT_LOGO or None, bug_path)
+                except Exception as exc:
+                    print(f"    [bulletin][warn] channel bug render failed: {exc}")
+                    bug_path = None
 
             # ── 4) Per-story compose + (optional) takeover between stories.
             for i, c in enumerate(clips):
@@ -2648,16 +2695,25 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 sidebar_is_video = False
                 if use_sidebar and len(imgs) >= 2:
                     sidebar_video = os.path.join(bulletin_dir, f"_sidebar_{i:02d}.mp4")
-                    try:
-                        build_sidebar_carousel(
-                            imgs[:5], story_dur_s, sidebar_video,
-                            work_dir=os.path.join(bulletin_dir, f"_sidebar_work_{i:02d}"),
-                        )
+                    # Idempotency: skip rebuild if a previous run produced
+                    # this carousel. >100 KB filters out empty / corrupt
+                    # leftovers from a half-run.
+                    if (os.path.exists(sidebar_video)
+                        and os.path.getsize(sidebar_video) > 100_000):
+                        print(f"    [bulletin] sidebar story_{i:02d} cached (skipping)")
                         sidebar_path = sidebar_video
                         sidebar_is_video = True
-                    except Exception as exc:
-                        print(f"    [bulletin][warn] sidebar carousel story_{i:02d}: {exc}")
-                        sidebar_path = None
+                    else:
+                        try:
+                            build_sidebar_carousel(
+                                imgs[:5], story_dur_s, sidebar_video,
+                                work_dir=os.path.join(bulletin_dir, f"_sidebar_work_{i:02d}"),
+                            )
+                            sidebar_path = sidebar_video
+                            sidebar_is_video = True
+                        except Exception as exc:
+                            print(f"    [bulletin][warn] sidebar carousel story_{i:02d}: {exc}")
+                            sidebar_path = None
                 if sidebar_path is None:
                     sidebar_static = os.path.join(bulletin_dir, f"_sidebar_{i:02d}.png")
                     try:
@@ -2683,6 +2739,35 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
                 composed_path = os.path.join(bulletin_dir, f"composed_story_{i:02d}.mp4")
                 composed_ok = False
+                # Idempotency: if a previous run already produced this
+                # composed story (e.g. the failure happened later in the
+                # pipeline), skip the expensive FFmpeg compose call.
+                if (os.path.exists(composed_path)
+                    and os.path.getsize(composed_path) > 100_000):
+                    print(f"    [bulletin] composed_story_{i:02d}.mp4 cached (skipping compose)")
+                    composed_ok = True
+                    story_paths.append(composed_path)
+                    # Also still emit takeover after a cached compose.
+                    last_idx = len(clips) - 1
+                    if (use_takeovers and i < last_idx and i > 0 and len(imgs) >= 2):
+                        takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
+                        takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
+                        if (os.path.exists(takeover_path)
+                            and os.path.getsize(takeover_path) > 100_000):
+                            print(f"    [bulletin] takeover_{i:02d}.mp4 cached (skipping)")
+                            story_paths.append(takeover_path)
+                        else:
+                            try:
+                                build_fullscreen_takeover(
+                                    imgs[:4], takeover_dur, takeover_path,
+                                    work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
+                                )
+                                story_paths.append(takeover_path)
+                                print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
+                            except Exception as exc:
+                                print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+                    continue
+
                 try:
                     if use_pip:
                         pip_src = pick_pip_source(clips, i)
@@ -2733,15 +2818,20 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 if (use_takeovers and i < last_idx and i > 0 and len(imgs) >= 2):
                     takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
                     takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
-                    try:
-                        build_fullscreen_takeover(
-                            imgs[:4], takeover_dur, takeover_path,
-                            work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
-                        )
+                    if (os.path.exists(takeover_path)
+                        and os.path.getsize(takeover_path) > 100_000):
+                        print(f"    [bulletin] takeover_{i:02d}.mp4 cached (skipping)")
                         story_paths.append(takeover_path)
-                        print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
-                    except Exception as exc:
-                        print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+                    else:
+                        try:
+                            build_fullscreen_takeover(
+                                imgs[:4], takeover_dur, takeover_path,
+                                work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
+                            )
+                            story_paths.append(takeover_path)
+                            print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
+                        except Exception as exc:
+                            print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
 
         # ── Stitch the assembled segment list into the final bulletin ──
         if not story_paths:
@@ -3095,6 +3185,14 @@ if __name__ == "__main__":
                               "Gemini-extracted stories into one 1-2hr MP4 for "
                               "YouTube Full. Omit for the default per-clip "
                               "Shorts pipeline.")
+    _parser.add_argument("--resume-dir", default=None,
+                         help="Re-enter an existing OUTPUT_DIR instead of "
+                              "creating a new timestamped one. Useful when a "
+                              "previous run failed late (e.g. final stitch) — "
+                              "already-cut slices, OpenAI images, sidebar "
+                              "carousels, composed stories, and takeovers are "
+                              "reused, saving cost + time. Path can be "
+                              "relative or absolute.")
     # Bulletin-only feature toggles (silently ignored for Shorts):
     _parser.add_argument("--no-broadcast-overlay", action="store_true",
                          help="bulletin: skip TV9 graphics; emit bare slice stitch.")
@@ -3146,4 +3244,5 @@ if __name__ == "__main__":
 
     run_pipeline(os.path.abspath(_video), platform=_args.platform,
                  frame_layout=_args.frame, language=_args.language,
-                 render_mode=_args.render_mode)
+                 render_mode=_args.render_mode,
+                 resume_dir=_args.resume_dir)

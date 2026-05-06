@@ -119,12 +119,16 @@ def _validate_inputs(
 
 
 def _write_concat_list(paths: list[str], list_path: str) -> None:
-    """Write the concat-demuxer manifest. Paths are forward-slashed and
-    single-quoted so spaces / Windows paths survive the parser."""
+    """Write the concat-demuxer manifest. Paths are absolute, forward-
+    slashed, and single-quoted so spaces / Windows paths survive the
+    parser. Absolute is critical: FFmpeg resolves *relative* paths in
+    the manifest against the manifest's parent directory, which causes
+    "manifest_dir / relative_path" doubling when the relative path
+    already starts with the same prefix."""
     with open(list_path, "w", encoding="utf-8") as fh:
         for p in paths:
-            safe = p.replace("\\", "/").replace("'", r"'\''")
-            fh.write(f"file '{safe}'\n")
+            abs_p = os.path.abspath(p).replace("\\", "/").replace("'", r"'\''")
+            fh.write(f"file '{abs_p}'\n")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
