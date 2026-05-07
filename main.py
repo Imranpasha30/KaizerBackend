@@ -40,6 +40,7 @@ from routers.live_director import router as live_director_router
 from routers.admin import router as admin_router
 from routers.work_monitor import router as work_monitor_router
 from routers.postiz import router as postiz_router
+from routers.yt_lookup import router as yt_lookup_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -319,6 +320,7 @@ app.include_router(live_director_router)  # Phase 6 — Autonomous Live Director
 app.include_router(admin_router)           # Phase 12 — admin panel REST surface
 app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
 app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
+app.include_router(yt_lookup_router)        # YouTube channel lookup for Style References (auth'd)
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend
