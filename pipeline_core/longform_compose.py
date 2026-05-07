@@ -159,41 +159,123 @@ def render_lower_third(
     meta: StoryMeta,
     font_path: Optional[str],
     out_path: str,
-) -> str:
-    """Render a single static lower-third PNG (full-width 1920×140)."""
+) -> tuple[str, int]:
+    """Render a lower-third PNG at the NATURAL content width.
+
+    Returns ``(path, width_px)``. The caller uses ``width_px`` to decide
+    static-overlay vs scrolling-marquee in the FFmpeg compose chain.
+    Width can exceed the canvas width (1920) for long Telugu / Hindi
+    headlines — the compose step then scrolls the PNG horizontally so
+    nothing gets truncated with an ellipsis.
+    """
     face, family = _font_data_uri(font_path)
     kicker = _html.escape((meta.kicker or "NEWS")[:14])
-    headline = _html.escape((meta.title or "").strip()[:120])
+    headline = _html.escape((meta.title or "").strip()[:200])
+
+    # We render onto an oversized canvas (up to 6000px wide) and let
+    # the headline reach its natural width — no nowrap truncation, no
+    # max-width. Inline-block + a wrapper rule ensures DOM measurement
+    # picks up the real content width via scrollWidth.
+    canvas_w = 6000
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 {face}
 *{{margin:0;padding:0;box-sizing:border-box;}}
-html,body{{width:{_W}px;height:{_LT_H}px;background:transparent;font-family:{family};}}
-.bar{{position:absolute;left:0;right:0;top:20px;bottom:0;
+html,body{{width:{canvas_w}px;height:{_LT_H}px;background:transparent;
+  font-family:{family};overflow:hidden;}}
+.measurer{{display:inline-flex;align-items:center;height:{_LT_H}px;
+  padding:38px 28px 20px 28px;}}
+.bar-bg{{position:absolute;left:0;top:20px;bottom:0;
   background:linear-gradient(180deg,#e02538 0%,#c01524 75%,#7a0a14 100%);
   box-shadow:0 -4px 14px rgba(0,0,0,0.35);
   border-top:3px solid #ffd640;}}
-.row{{position:absolute;left:0;right:0;top:38px;height:{_LT_H-58}px;
-  display:flex;align-items:center;padding:0 28px;}}
 .kicker{{background:#ffffff;color:#c01524;font-weight:900;
   font-size:30px;letter-spacing:1.5px;padding:8px 20px;
   border-radius:4px;margin-right:24px;text-transform:uppercase;
-  text-shadow:none;}}
+  position:relative;z-index:2;flex-shrink:0;}}
 .headline{{color:#ffffff;font-weight:800;font-size:48px;
   text-shadow:2px 2px 0 rgba(0,0,0,0.45);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  max-width:{_W-360}px;line-height:1.05;}}
+  white-space:nowrap;line-height:1.05;position:relative;z-index:2;
+  flex-shrink:0;padding-right:48px;}}
 </style></head><body>
-<div class="bar"></div>
-<div class="row">
+<div class="measurer" id="m">
   <div class="kicker">{kicker}</div>
   <div class="headline">{headline}</div>
 </div>
-<script>document.fonts.ready.then(function(){{window._done=true;}});</script>
+<script>
+window.addEventListener('load', function(){{
+  function measure(){{
+    var m = document.getElementById('m');
+    var w = Math.max({_W}, Math.ceil(m.scrollWidth));
+    // Insert the bar-bg behind the content at the measured width
+    var bg = document.createElement('div');
+    bg.className = 'bar-bg';
+    bg.style.width = w + 'px';
+    document.body.insertBefore(bg, m);
+    document.body.style.width = w + 'px';
+    window._measured_width = w;
+    window._done = true;
+  }}
+  if (document.fonts && document.fonts.ready) {{
+    document.fonts.ready.then(measure);
+  }} else {{
+    setTimeout(measure, 200);
+  }}
+}});
+</script>
 </body></html>"""
-    if _try_playwright_html_to_png(html, out_path, _W, _LT_H):
-        return out_path
-    # Fall through to PIL
-    return _pil_fallback_lower_third(meta, font_path, out_path)
+
+    # Try Playwright with DOM measurement
+    measured_width = _try_playwright_render_measured(html, out_path,
+                                                     canvas_w, _LT_H)
+    if measured_width is not None:
+        return out_path, measured_width
+
+    # PIL fallback — fixed width, may truncate but never crashes.
+    _pil_fallback_lower_third(meta, font_path, out_path)
+    return out_path, _W
+
+
+def _try_playwright_render_measured(
+    html: str,
+    out_path: str,
+    canvas_w: int,
+    height: int,
+    timeout_ms: int = 8000,
+) -> Optional[int]:
+    """Render HTML, read window._measured_width, screenshot just that
+    rectangle. Returns the width on success, None on any failure so
+    the caller falls through to PIL.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": canvas_w, "height": height})
+            page.set_content(html)
+            try:
+                page.wait_for_function("window._done === true", timeout=timeout_ms)
+            except Exception:
+                pass
+            try:
+                width = int(page.evaluate("window._measured_width || 0"))
+            except Exception:
+                width = 0
+            if width <= 0:
+                width = canvas_w
+            # Cap at canvas_w; resize viewport so screenshot is exactly the
+            # natural content width.
+            width = max(_W, min(width, canvas_w))
+            page.set_viewport_size({"width": width, "height": height})
+            page.screenshot(path=out_path, omit_background=True,
+                            clip={"x": 0, "y": 0, "width": width, "height": height})
+            browser.close()
+        return width
+    except Exception as exc:
+        logger.warning("longform_compose: measured render failed: %s", exc)
+        return None
 
 
 def render_ticker(
@@ -378,11 +460,13 @@ def compose_bulletin_story(
     """
     ffmpeg_bin = _resolve_ffmpeg_bin(ffmpeg_bin)
 
-    # Render the per-story lower-third
+    # Render the per-story lower-third at its NATURAL width — long
+    # Telugu / Hindi headlines come back wider than 1920px, in which
+    # case we marquee-scroll them instead of truncating with "...".
     work_dir = work_dir or os.path.dirname(os.path.abspath(out_path))
     os.makedirs(work_dir, exist_ok=True)
     lt_path = os.path.join(work_dir, f"_lt_{story_meta.story_index:02d}.png")
-    render_lower_third(story_meta, font_path, lt_path)
+    _, lt_w = render_lower_third(story_meta, font_path, lt_path)
 
     # Build the FFmpeg command
     cmd: list[str] = [ffmpeg_bin, "-y", "-i", story_clip_path]
@@ -404,6 +488,20 @@ def compose_bulletin_story(
     lt_y = height - lt_h - _TICKER_H        # lower-third sits above the ticker
     ticker_y = height - _TICKER_H
 
+    # Lower-third X expression — branches on whether the rendered
+    # lower-third PNG fits in the canvas width. If yes: simple
+    # slide-in then locked at x=0. If no: slide-in, hold so the user
+    # can read the start, then scroll left at 60 px/s until the end
+    # is visible (x = W-w, which is negative when w > W).
+    if lt_w > width:
+        lt_x_expr = (
+            f"if(lt(t\\,0.4)\\,-w+w*t/0.4\\,"
+            f"if(lt(t\\,2.0)\\,0\\,"
+            f"max(W-w\\,-((t-2.0)*60))))"
+        )
+    else:
+        lt_x_expr = "if(lt(t\\,0.4)\\,-w+w*t/0.4\\,0)"
+
     fc_lines = [
         f"[0:v]scale={main_w}:{main_h}:force_original_aspect_ratio=increase,"
         f"crop={main_w}:{main_h},setsar=1[main_v]",
@@ -412,7 +510,7 @@ def compose_bulletin_story(
         f"[main_v][side_v]hstack=inputs=2[top_row]",
         f"[top_row]pad={width}:{height}:30:0:black[stage_bg]",
         f"[stage_bg][2:v]overlay="
-        f"x='if(lt(t,0.4),-w+w*t/0.4,0)':"
+        f"x='{lt_x_expr}':"
         f"y={lt_y}:format=auto[stage_lt]",
         f"[stage_lt][3:v]overlay="
         f"x='W-mod(t*{ticker_speed_px_s:.1f}\\,w+W)':"
@@ -528,7 +626,7 @@ def compose_pip_story(
     os.makedirs(work_dir, exist_ok=True)
 
     lt_path = os.path.join(work_dir, f"_lt_{story_meta.story_index:02d}.png")
-    render_lower_third(story_meta, font_path, lt_path)
+    _, lt_w = render_lower_third(story_meta, font_path, lt_path)
 
     cmd: list[str] = [ffmpeg_bin, "-y", "-i", story_clip_path]
     # PiP source — clip the requested window so we only re-encode what's needed
@@ -556,6 +654,18 @@ def compose_pip_story(
     lt_y = height - lt_h - _TICKER_H
     ticker_y = height - _TICKER_H
 
+    # Same marquee/static branch as compose_bulletin_story above —
+    # see the explanation there. Long Telugu / Hindi headlines come
+    # back wider than the canvas; we scroll instead of truncating.
+    if lt_w > width:
+        lt_x_expr = (
+            f"if(lt(t\\,0.4)\\,-w+w*t/0.4\\,"
+            f"if(lt(t\\,2.0)\\,0\\,"
+            f"max(W-w\\,-((t-2.0)*60))))"
+        )
+    else:
+        lt_x_expr = "if(lt(t\\,0.4)\\,-w+w*t/0.4\\,0)"
+
     fc_lines = [
         f"[0:v]scale={main_w}:{main_h}:force_original_aspect_ratio=increase,"
         f"crop={main_w}:{main_h},setsar=1[main_v]",
@@ -569,7 +679,7 @@ def compose_pip_story(
         f"[main_with_pip][side_v]hstack=inputs=2[top_row]",
         f"[top_row]pad={width}:{height}:30:0:black[stage_bg]",
         f"[stage_bg][3:v]overlay="
-        f"x='if(lt(t,0.4),-w+w*t/0.4,0)':"
+        f"x='{lt_x_expr}':"
         f"y={lt_y}:format=auto[stage_lt]",
         f"[stage_lt][4:v]overlay="
         f"x='W-mod(t*{ticker_speed_px_s:.1f}\\,w+W)':"
