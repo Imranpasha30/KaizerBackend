@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 import auth
 import models
-from db import get_db
+from database import get_db
 from youtube import quota
 
 logger = logging.getLogger("kaizer.routers.yt_lookup")
