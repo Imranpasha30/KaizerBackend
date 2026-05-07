@@ -242,6 +242,17 @@ def _process(job_id: int) -> None:
             _fail(db, job, str(resolve_err))
             return
 
+        # ─── Provider routing (admin-controlled, system-wide) ─────
+        # Default = 'postiz': uploads go through the Postiz integration
+        # for that destination's YouTube channel. Native Kaizer code
+        # path (quota/auth/uploader below) only runs when admin has
+        # flipped the toggle to 'kaizer' in Admin → Settings.
+        from system_settings import get_upload_provider
+        provider = get_upload_provider(db)
+        if provider == "postiz":
+            _process_via_postiz(db, job, clip, resolved_clip_path)
+            return
+
         # ─── Quota check ───────────────────────────────────────────
         if not quota.reserve(db, quota.COST_VIDEO_INSERT):
             _append_log(job, "quota exhausted — parking until tomorrow")
@@ -350,6 +361,111 @@ def _process(job_id: int) -> None:
                     pass
     finally:
         db.close()
+
+
+def _process_via_postiz(
+    db: Session,
+    job: models.UploadJob,
+    clip: models.Clip,
+    resolved_clip_path: str,
+) -> None:
+    """Upload pathway when admin has set upload_provider='postiz'.
+
+    Skips Kaizer's own quota + OAuth token + videos.insert dance —
+    posts to Postiz, which holds its own per-platform OAuth grants
+    and runs against its own Google Cloud project's quota.
+
+    Channel-mapping rule: the destination Kaizer Channel's
+    OAuthToken.google_channel_id is matched against Postiz
+    integrations[i].identifier (Postiz exposes the YouTube channel
+    id there for provider='youtube' rows). If no match is found,
+    fail loud — the user has to connect that specific YT channel
+    inside Postiz first.
+    """
+    from clients import postiz as postiz_client
+    if not postiz_client.is_enabled():
+        _fail(db, job,
+              "upload_provider=postiz but POSTIZ_API_KEY is not set in env")
+        return
+
+    # 1) Resolve the destination + its YouTube channel id.
+    dest_channel = db.query(models.Channel).filter(
+        models.Channel.id == job.channel_id,
+    ).first()
+    if not dest_channel or not dest_channel.oauth_token:
+        _fail(db, job, "destination profile not linked to YouTube")
+        return
+    target_yt_id = (dest_channel.oauth_token.google_channel_id or "").strip()
+    if not target_yt_id:
+        _fail(db, job, "destination has no YouTube channel id (re-OAuth)")
+        return
+
+    # 2) Pull Postiz integrations and find the matching YT one.
+    try:
+        integrations = postiz_client.list_integrations()
+    except postiz_client.PostizError as e:
+        _retry(db, job, f"Postiz unreachable: {e}")
+        return
+
+    yt_integrations = [i for i in integrations
+                       if (i.get("provider") or "").lower() == "youtube"]
+    match = next(
+        (i for i in yt_integrations
+         if (i.get("identifier") or "").strip() == target_yt_id),
+        None,
+    )
+    # Fallback: if Postiz didn't expose identifier, take the SOLO YT
+    # integration when only one is connected — the common case for
+    # someone just getting started.
+    if not match and len(yt_integrations) == 1:
+        match = yt_integrations[0]
+
+    if not match:
+        _fail(
+            db, job,
+            f"No Postiz YouTube integration matches channel "
+            f"{dest_channel.name!r} (yt_id={target_yt_id}). "
+            f"Connect it in Postiz → Channels → YouTube.",
+        )
+        return
+
+    # 3) Choose a public URL Postiz can fetch the bytes from.
+    #    Prefer R2 (already mirrored at clip-render time); fall back
+    #    to /api/file path which is reachable from the same host
+    #    (only works for self-hosted Postiz on the same network).
+    media_url = (clip.storage_url or "").strip()
+    if not media_url:
+        _fail(
+            db, job,
+            "Clip has no public storage_url for Postiz to fetch. "
+            "Re-render to push to R2 before publishing via Postiz.",
+        )
+        return
+
+    # 4) Compose the post + dispatch.
+    job.attempts = (job.attempts or 0) + 1
+    _append_log(job, f"postiz: posting to integration {match.get('id','?')} "
+                       f"({match.get('name','?')})")
+    db.commit()
+    try:
+        result = postiz_client.schedule_post(
+            integration_ids=[match["id"]],
+            text=(job.title or "") + (("\n\n" + job.description) if job.description else ""),
+            media_url=media_url,
+            schedule_at_iso=(job.publish_at.isoformat()
+                              if getattr(job, "publish_at", None) else None),
+            type_="scheduled" if getattr(job, "publish_at", None) else "now",
+        )
+    except postiz_client.PostizAuthError as e:
+        _fail(db, job, f"Postiz auth: {e}")
+        return
+    except postiz_client.PostizError as e:
+        _retry(db, job, f"Postiz error: {e}")
+        return
+
+    job.status = "done"
+    _append_log(job, f"postiz: scheduled OK ({result})")
+    db.commit()
 
 
 def _retry(db: Session, job: models.UploadJob, err: str) -> None:

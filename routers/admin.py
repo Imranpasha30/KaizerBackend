@@ -900,3 +900,69 @@ def _mask_oauth(row: dict) -> dict:
         if k in _MASK_FIELDS:
             safe[k] = _mask()
     return safe
+
+
+# ─── System settings (admin-only key/value config) ───────────────────────────
+import system_settings as _ss
+
+
+@router.get("/settings")
+def list_settings(
+    db: Session = Depends(get_db),
+    _u: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Return every known setting + its current value (or default)."""
+    return {
+        "upload_provider": {
+            "value":   _ss.get_upload_provider(db),
+            "default": _ss.UPLOAD_PROVIDER_DEFAULT,
+            "options": sorted(_ss.UPLOAD_PROVIDER_VALID),
+            "description": (
+                "Which path /api/clips/{id}/publish takes. 'postiz' "
+                "routes uploads through the self/cloud-hosted Postiz "
+                "instance (covers YouTube + 14 other platforms). "
+                "'kaizer' uses our native YouTube OAuth path "
+                "(YouTube only). Default is postiz until our app's "
+                "verification is complete; admin can flip per-need."
+            ),
+        },
+    }
+
+
+@router.put("/settings/{key}")
+def update_setting(
+    key: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    _u: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Update one system setting. Body: ``{"value": "<new>"}``."""
+    new_val = (payload or {}).get("value", "")
+    if not isinstance(new_val, str):
+        raise HTTPException(status_code=400, detail="value must be a string")
+
+    if key == _ss.UPLOAD_PROVIDER:
+        if new_val.strip().lower() not in _ss.UPLOAD_PROVIDER_VALID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"upload_provider must be one of {sorted(_ss.UPLOAD_PROVIDER_VALID)}",
+            )
+        new_val = new_val.strip().lower()
+    else:
+        raise HTTPException(status_code=404,
+                            detail=f"Unknown setting: {key}")
+
+    _ss.set_system_setting(db, key, new_val)
+    db.commit()
+    return {"key": key, "value": new_val}
+
+
+# Public endpoint — every authenticated user can READ the active
+# upload provider (so the publish modal can show "Uploading via X" to
+# everyone). Writes still require admin.
+@router.get("/settings/upload-provider/public")
+def get_upload_provider_public(
+    db: Session = Depends(get_db),
+    _u: models.User = Depends(auth.current_user),
+) -> dict:
+    return {"upload_provider": _ss.get_upload_provider(db)}

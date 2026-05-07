@@ -693,3 +693,23 @@ class DirectorLogEntry(Base):
     confidence  = Column(Float, default=0.0)
     reason      = Column(Text, default="")
     payload     = Column(JSON, default=dict)
+
+
+class SystemSetting(Base):
+    """Singleton-style system-wide config persisted in DB.
+
+    Used for admin-controlled toggles that apply to ALL users — e.g.
+    `upload_provider` ('postiz' vs 'kaizer'), feature flags, etc. Each
+    row is one key/value pair so we can add new settings without
+    migrations: just call `set_system_setting(db, key, value)`.
+    Read-side helper `get_system_setting(db, key, default)` is in
+    routers/admin.py (or wherever it lives) — never read directly so
+    the default is consistent.
+    """
+    __tablename__ = "system_settings"
+
+    key        = Column(String(64), primary_key=True)
+    value      = Column(String(512), nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True),
+                        server_default=func.now(),
+                        onupdate=func.now())
