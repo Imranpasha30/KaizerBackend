@@ -437,6 +437,15 @@ def compose_bulletin_story(
         "-preset", "medium",
         "-crf", "20",
         "-pix_fmt", "yuv420p",
+        # Force a constant 30 fps output and resync audio. Without
+        # these flags the looped PNG inputs (lower-third / ticker /
+        # bug) and the carousel video can drift the output to a
+        # variable frame rate, which the audio packet stream then
+        # falls behind on — visible as growing lip-sync drift over
+        # the length of the story.
+        "-r", "30",
+        "-fps_mode", "cfr",
+        "-async", "1",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest",
         "-movflags", "+faststart",
@@ -582,6 +591,10 @@ def compose_pip_story(
         "-map", "0:a?",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-pix_fmt", "yuv420p",
+        # See compose_bulletin_story above — same lip-sync fix.
+        "-r", "30",
+        "-fps_mode", "cfr",
+        "-async", "1",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest",
         "-movflags", "+faststart",

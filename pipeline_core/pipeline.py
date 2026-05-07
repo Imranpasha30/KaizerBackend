@@ -2687,9 +2687,22 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                     print(log_line)
 
             # ── 2) Render the ticker once (shared across every story).
+            # Pick native-script summary for non-English so the ticker
+            # reads in the language the user picked (Telugu, Hindi, …).
+            # Gemini already returns summary_native per clip alongside
+            # the English summary.
+            def _clip_text(c):
+                if (lang_cfg.code or "en").lower() != "en":
+                    native = (c.get("summary_native")
+                              or c.get("summary_telugu")
+                              or "").strip()
+                    if native:
+                        return native[:120]
+                return (c.get("summary") or "").strip()[:120]
+
             all_headlines = [
-                (c.get("summary") or "").strip()[:90]
-                for c in clips if (c.get("summary") or "").strip()
+                _clip_text(c)
+                for c in clips if _clip_text(c)
             ]
             ticker_path = os.path.join(bulletin_dir, "_ticker.png")
             if os.path.exists(ticker_path) and os.path.getsize(ticker_path) > 1000:
@@ -2761,11 +2774,13 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                         print(f"    [bulletin][warn] sidebar placeholder story_{i:02d}: {exc}")
                         sidebar_path = None
 
-                # Lower-third meta from clip data
+                # Lower-third meta from clip data — _clip_text picks
+                # summary_native (Telugu/Hindi/…) when language is not
+                # English, so the broadcast strap reads in-script.
                 importance = int(c.get("importance") or 5)
                 kicker = "BREAKING" if importance >= 8 else "NEWS"
                 story_meta = StoryMeta(
-                    title=(c.get("summary") or "KAIZER NEWS").strip()[:120],
+                    title=(_clip_text(c) or "KAIZER NEWS")[:200],
                     kicker=kicker,
                     language=lang_cfg.code,
                     story_index=i,

@@ -72,10 +72,39 @@ def list_accounts(
             for a in assets
         }
 
+    # Pre-load ProfileDestination rows for every profile this user owns —
+    # used to surface "sibling" Brand Accounts under each primary in the
+    # multi-channel picker. One query, no N+1.
+    user_profile_ids = sorted({t.channel_id for t in rows if t.channel_id})
+    pd_by_profile: dict[int, list] = {}
+    if user_profile_ids:
+        pd_rows = (
+            db.query(models.ProfileDestination)
+              .filter(models.ProfileDestination.profile_id.in_(user_profile_ids))
+              .all()
+        )
+        for pd in pd_rows:
+            pd_by_profile.setdefault(pd.profile_id, []).append(pd)
+
     groups: dict[str, dict] = {}
     for t in rows:
         key = t.google_channel_id or f"__unknown_{t.id}"
         if key not in groups:
+            # All Brand Accounts under this primary's Google login —
+            # populated by exchange_code at OAuth time. The picker UI
+            # uses this to show toggleable secondary destinations.
+            available = []
+            for pd in pd_by_profile.get(t.channel_id, []):
+                available.append({
+                    "google_channel_id": pd.google_channel_id,
+                    "title":             pd.channel_title or "",
+                    "thumbnail_url":     pd.channel_thumbnail_url or "",
+                    "custom_url":        pd.channel_custom_url or "",
+                    "subscriber_count":  int(pd.subscriber_count or 0),
+                    "video_count":       int(pd.video_count or 0),
+                    "enabled":           bool(getattr(pd, "enabled", True)),
+                    "is_primary":        (pd.google_channel_id == t.google_channel_id),
+                })
             groups[key] = {
                 "google_channel_id":    t.google_channel_id or "",
                 "youtube_channel_title": t.google_channel_title or "Your YouTube channel",
@@ -97,6 +126,10 @@ def list_accounts(
                 # Overlay logo for videos rendered under this YT account
                 "logo_asset_id":        t.logo_asset_id,
                 "logo":                 logo_map.get(t.logo_asset_id) if t.logo_asset_id else None,
+                # Sibling Brand Accounts the user can toggle on/off as
+                # publish destinations. Includes the primary itself with
+                # is_primary=true so the UI can render it locked-on.
+                "available_destinations": available,
             }
         if t.channel:
             groups[key]["profiles"].append({

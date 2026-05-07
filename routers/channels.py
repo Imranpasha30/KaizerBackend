@@ -144,6 +144,25 @@ def _to_dict(c: models.Channel) -> dict:
             for pd in (c.__dict__.get("_allowed_dests_cache")  # set by bulk loader
                        or [])
         }) if "_allowed_dests_cache" in c.__dict__ else None,
+        # Rich metadata — one entry per ProfileDestination, with cached
+        # YouTube channel-name / avatar / sub-count populated at OAuth
+        # time. The frontend uses this to render the multi-channel
+        # picker without re-calling channels.list.
+        "destinations": [
+            {
+                "google_channel_id":     pd.google_channel_id,
+                "title":                 pd.channel_title or "",
+                "thumbnail_url":         pd.channel_thumbnail_url or "",
+                "custom_url":            pd.channel_custom_url or "",
+                "subscriber_count":      int(pd.subscriber_count or 0),
+                "video_count":           int(pd.video_count or 0),
+                "enabled":               bool(getattr(pd, "enabled", True)),
+                "is_primary":            (tok is not None
+                                          and pd.google_channel_id
+                                          and tok.google_channel_id == pd.google_channel_id),
+            }
+            for pd in (c.__dict__.get("_allowed_dests_cache") or [])
+        ] if "_allowed_dests_cache" in c.__dict__ else None,
     }
 
 
@@ -227,14 +246,71 @@ def set_profile_destinations(
     if ch.oauth_token and ch.oauth_token.google_channel_id:
         final.add(ch.oauth_token.google_channel_id)
 
-    # Wipe existing links + rewrite
+    # Preserve cached metadata: snapshot existing rows (with their
+    # cached title / thumbnail / sub-count populated at OAuth time)
+    # before wipe, so re-created rows keep their pretty UI fields.
+    existing_meta = {
+        pd.google_channel_id: pd
+        for pd in db.query(models.ProfileDestination).filter(
+            models.ProfileDestination.profile_id == ch.id
+        ).all()
+    }
+
     db.query(models.ProfileDestination).filter(
         models.ProfileDestination.profile_id == ch.id
     ).delete()
     for gid in final:
-        db.add(models.ProfileDestination(profile_id=ch.id, google_channel_id=gid))
+        prev = existing_meta.get(gid)
+        db.add(models.ProfileDestination(
+            profile_id=ch.id,
+            google_channel_id=gid,
+            channel_title=(prev.channel_title if prev else "") or "",
+            channel_thumbnail_url=(prev.channel_thumbnail_url if prev else "") or "",
+            channel_custom_url=(prev.channel_custom_url if prev else "") or "",
+            subscriber_count=int(prev.subscriber_count if prev else 0),
+            video_count=int(prev.video_count if prev else 0),
+            enabled=bool(prev.enabled if prev is not None else True),
+        ))
     db.commit()
     return {"profile_id": ch.id, "google_channel_ids": sorted(final)}
+
+
+@router.patch("/{channel_id}/destinations/{google_channel_id}")
+def toggle_destination(
+    channel_id: int,
+    google_channel_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Toggle a single ProfileDestination on or off.
+
+    Body: ``{ "enabled": true | false }``. Returns the updated row.
+    Used by the multi-channel picker UI to enable / disable individual
+    Brand Accounts without rewriting the full destinations list.
+    """
+    ch = db.query(models.Channel).filter(
+        models.Channel.id == channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not ch:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    pd = db.query(models.ProfileDestination).filter(
+        models.ProfileDestination.profile_id == ch.id,
+        models.ProfileDestination.google_channel_id == google_channel_id,
+    ).first()
+    if not pd:
+        raise HTTPException(status_code=404, detail="Destination not found")
+
+    desired = bool((payload or {}).get("enabled", True))
+    pd.enabled = desired
+    db.commit()
+    return {
+        "profile_id": ch.id,
+        "google_channel_id": google_channel_id,
+        "enabled": desired,
+    }
 
 
 def _validate_logo_ownership(db: Session, user_id: int, asset_id: Optional[int]) -> None:

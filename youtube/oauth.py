@@ -143,16 +143,31 @@ def exchange_code(db, state: str, code: str) -> Tuple[models.Channel, models.OAu
             "Google account's third-party permissions and try again."
         )
 
-    # Fetch the FULL channel metadata (identity + description + stats +
-    # thumbnail) in ONE API call — caches everything we need for the UI so
-    # subsequent renders don't round-trip to YouTube.
+    # Fetch metadata for EVERY YouTube channel this Google identity
+    # owns (personal + every Brand Account). The first one becomes the
+    # primary OAuthToken anchor for backwards compatibility, and each
+    # additional one is auto-registered as a ProfileDestination so the
+    # user can publish to all of them via a single sign-in.
+    all_channels: list[dict] = []
     try:
-        meta = fetch_channel_metadata(creds)
+        all_channels = fetch_all_channel_metadata(creds)
     except OAuthError:
         # Fall back to legacy identity-only fetch so connect still succeeds
         yt_id, yt_title = _fetch_identity(creds)
-        meta = {"google_channel_id": yt_id, "google_channel_title": yt_title}
+        if yt_id:
+            all_channels = [{"google_channel_id": yt_id,
+                             "google_channel_title": yt_title}]
 
+    if not all_channels:
+        # Even the legacy fallback came back empty — surface a real error
+        # instead of silently writing a token row with no channel.
+        raise OAuthError(
+            "Google did not return any YouTube channels for this account. "
+            "If you signed in with a Google identity that has no YouTube "
+            "channel yet, create one at youtube.com first."
+        )
+
+    meta = all_channels[0]
     yt_channel_id    = meta.get("google_channel_id", "") or ""
     yt_channel_title = meta.get("google_channel_title", "") or ""
 
@@ -177,16 +192,40 @@ def exchange_code(db, state: str, code: str) -> Tuple[models.Channel, models.OAu
     if not token.id:
         db.add(token)
 
-    # Auto-create the many-to-many link so the profile can publish to this
-    # destination out of the box.  Idempotent via unique(profile_id, gci).
-    if yt_channel_id:
-        already = db.query(models.ProfileDestination).filter(
+    # Auto-create a ProfileDestination row for EVERY YouTube channel
+    # this Google identity owns — not just the primary. That way, the
+    # user only signs in once with the email and gets all their Brand
+    # Accounts wired up as available publish destinations. Idempotent
+    # via unique(profile_id, google_channel_id). Cached metadata
+    # (title / thumbnail / sub-count) is populated here so the picker
+    # UI doesn't need to round-trip to YouTube on every render.
+    for ch_meta in all_channels:
+        gci = ch_meta.get("google_channel_id", "") or ""
+        if not gci:
+            continue
+        existing = db.query(models.ProfileDestination).filter(
             models.ProfileDestination.profile_id == channel.id,
-            models.ProfileDestination.google_channel_id == yt_channel_id,
+            models.ProfileDestination.google_channel_id == gci,
         ).first()
-        if not already:
+        if existing:
+            # Refresh cached metadata in case the user renamed a Brand
+            # Account or changed their avatar since the last connect.
+            existing.channel_title = ch_meta.get("google_channel_title", "") or ""
+            existing.channel_thumbnail_url = ch_meta.get("channel_thumbnail_url", "") or ""
+            existing.channel_custom_url = ch_meta.get("channel_custom_url", "") or ""
+            existing.subscriber_count = int(ch_meta.get("subscriber_count", 0) or 0)
+            existing.video_count = int(ch_meta.get("video_count", 0) or 0)
+        else:
             db.add(models.ProfileDestination(
-                profile_id=channel.id, google_channel_id=yt_channel_id,
+                profile_id=channel.id,
+                google_channel_id=gci,
+                channel_title=ch_meta.get("google_channel_title", "") or "",
+                channel_thumbnail_url=ch_meta.get("channel_thumbnail_url", "") or "",
+                channel_custom_url=ch_meta.get("channel_custom_url", "") or "",
+                subscriber_count=int(ch_meta.get("subscriber_count", 0) or 0),
+                video_count=int(ch_meta.get("video_count", 0) or 0),
+                # Default to enabled — the user can toggle in the picker.
+                enabled=True,
             ))
 
     # Remove the consumed state so it cannot be replayed
@@ -210,12 +249,71 @@ def _fetch_identity(creds: Credentials) -> Tuple[str, str]:
         return "", ""
 
 
+def fetch_all_channel_metadata(creds: Credentials) -> list[dict]:
+    """Return EVERY YouTube channel the authenticated identity owns.
+
+    Google's ``channels.list?mine=true`` returns the user's personal
+    channel AND every Brand Account they manage. Today the rest of
+    the OAuth flow only persists the first item; this helper returns
+    them all so callers can build a multi-channel picker.
+
+    Output: a list of dicts with the same shape ``fetch_channel_metadata``
+    returns. Empty list if the API call fails or there are no channels.
+    """
+    try:
+        yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        resp = yt.channels().list(
+            part="id,snippet,statistics",
+            mine=True,
+            maxResults=50,
+        ).execute()
+    except Exception as e:
+        raise OAuthError(f"YouTube API call failed: {e}") from e
+
+    items = resp.get("items") or []
+    out: list[dict] = []
+
+    def _int(v):
+        try:
+            return int(v or 0)
+        except (ValueError, TypeError):
+            return 0
+
+    for item in items:
+        snip = item.get("snippet") or {}
+        stats = item.get("statistics") or {}
+        thumbs = snip.get("thumbnails") or {}
+        thumb_url = (
+            (thumbs.get("high") or {}).get("url")
+            or (thumbs.get("medium") or {}).get("url")
+            or (thumbs.get("default") or {}).get("url")
+            or ""
+        )
+        out.append({
+            "google_channel_id":     item.get("id", ""),
+            "google_channel_title":  snip.get("title", ""),
+            "channel_description":   snip.get("description", "") or "",
+            "channel_thumbnail_url": thumb_url,
+            "channel_custom_url":    snip.get("customUrl", "") or "",
+            "channel_country":       snip.get("country", "") or "",
+            "subscriber_count":      _int(stats.get("subscriberCount")),
+            "video_count":           _int(stats.get("videoCount")),
+            "view_count":            _int(stats.get("viewCount")),
+        })
+    return out
+
+
 def fetch_channel_metadata(creds: Credentials) -> dict:
     """Pull rich YouTube channel metadata with ONE API call.
 
     Returns a dict the caller can splat onto an OAuthToken row.  All fields
     default to empty / 0 so a partial YT response never crashes the caller.
     Raises OAuthError on hard failures; returns best-effort on transient ones.
+
+    Note: this is the legacy single-channel fetcher kept for callers that
+    only need the primary channel. New code should prefer
+    :func:`fetch_all_channel_metadata` which returns the full Brand Account
+    list so multi-channel picker UIs can populate.
     """
     default = {
         "google_channel_id":    "",

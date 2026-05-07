@@ -38,6 +38,7 @@ from routers.feedback import router as feedback_router
 from routers.editor import router as editor_router
 from routers.live_director import router as live_director_router
 from routers.admin import router as admin_router
+from routers.work_monitor import router as work_monitor_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -102,6 +103,28 @@ def _migrate_schema():
             for col, dtype in user_billing_additions.items():
                 if col not in ucols:
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {dtype}"))
+
+        # ── profile_destinations: cached YouTube metadata for the
+        # multi-channel picker (lets the UI show channel-title /
+        # avatar / sub-count for every Brand Account without re-calling
+        # channels.list on every render).
+        if inspector.has_table("profile_destinations"):
+            pdcols = {c["name"] for c in inspector.get_columns("profile_destinations")}
+            pd_additions = {
+                "channel_title":         "VARCHAR(255) DEFAULT ''",
+                "channel_thumbnail_url": "VARCHAR(500) DEFAULT ''",
+                "channel_custom_url":    "VARCHAR(100) DEFAULT ''",
+                "subscriber_count":      "INTEGER DEFAULT 0",
+                "video_count":           "INTEGER DEFAULT 0",
+                "enabled":               ("BOOLEAN DEFAULT TRUE NOT NULL"
+                                          if engine.dialect.name == "postgresql"
+                                          else "BOOLEAN DEFAULT 1 NOT NULL"),
+            }
+            for col, dtype in pd_additions.items():
+                if col not in pdcols:
+                    conn.execute(text(
+                        f"ALTER TABLE profile_destinations ADD COLUMN {col} {dtype}"
+                    ))
 
         # ── profile_destinations — seed from existing OAuthTokens so
         # pre-existing 1:1 profile↔destination links become rows in the
@@ -293,6 +316,7 @@ app.include_router(feedback_router)       # Phase 3.5 — post-publish feedback 
 app.include_router(editor_router)         # Wave 2 — editor beta endpoints
 app.include_router(live_director_router)  # Phase 6 — Autonomous Live Director
 app.include_router(admin_router)           # Phase 12 — admin panel REST surface
+app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend

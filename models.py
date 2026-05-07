@@ -164,6 +164,16 @@ class ProfileDestination(Base):
     profile_id        = Column(Integer, ForeignKey("channels.id"), nullable=False, index=True)
     google_channel_id = Column(String(50), nullable=False, index=True)
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    # ── Cached YouTube metadata (multi-channel picker UI) ─────────────────
+    # Populated at OAuth callback time for every Brand Account on the
+    # signed-in Google identity. Lets the frontend show channel name +
+    # avatar without re-calling channels.list per render.
+    channel_title         = Column(String(255), default="")
+    channel_thumbnail_url = Column(String(500), default="")
+    channel_custom_url    = Column(String(100), default="")
+    subscriber_count      = Column(Integer, default=0)
+    video_count           = Column(Integer, default=0)
+    enabled               = Column(Boolean, default=True, nullable=False)
 
 
 class OAuthToken(Base):
