@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KAIZER · J.A.R.V.I.S. CONSOLE</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --hud-cyan:    #5cf6ff;
+    --hud-cyan-dim:#1a8a96;
+    --hud-amber:   #ffb84d;
+    --hud-red:     #ff3859;
+    --hud-grn:     #4ade80;
+    --hud-purple:  #b58bff;
+    --hud-bg:      #03060d;
+    --hud-bg2:     #060c18;
+    --hud-glass:   rgba(8, 24, 38, 0.55);
+    --hud-line:    rgba(92, 246, 255, 0.18);
+    --hud-line-2:  rgba(92, 246, 255, 0.45);
+    --hud-glow-cy: 0 0 12px rgba(92,246,255,.55), 0 0 28px rgba(92,246,255,.18);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{
+    background:var(--hud-bg);color:var(--hud-cyan);
+    font:13px/1.5 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+    height:100vh;width:100vw;overflow:hidden;
+    /* radial vignette */
+    background-image:
+      radial-gradient(ellipse 80% 60% at 50% 30%, rgba(92,246,255,0.04) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 80% at 50% 110%, rgba(92,246,255,0.03) 0%, transparent 60%);
+    background-color: var(--hud-bg);
+  }
+
+  /* ── Animated grid background ────────────────────────────── */
+  body::before {
+    content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+    background-image:
+      linear-gradient(var(--hud-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--hud-line) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, #000 30%, transparent 80%);
+    animation: grid-drift 60s linear infinite;
+    opacity:.5;
+  }
+  @keyframes grid-drift {
+    0% { background-position: 0 0; }
+    100% { background-position: 60px 60px; }
+  }
+
+  /* ── Scan-line overlay ───────────────────────────────────── */
+  body::after {
+    content:'';position:fixed;inset:0;pointer-events:none;z-index:1;
+    background: linear-gradient(180deg, transparent 0%, rgba(92,246,255,0.04) 50%, transparent 100%);
+    background-size: 100% 8px;
+    animation: scan 4s linear infinite;
+    mix-blend-mode:screen;
+  }
+  @keyframes scan {
+    0%   { background-position: 0 0; }
+    100% { background-position: 0 100vh; }
+  }
+
+  /* ── Header ──────────────────────────────────────────────── */
+  header{
+    position:relative;z-index:10;
+    height:64px;padding:0 24px;
+    display:flex;align-items:center;gap:18px;
+    background: var(--hud-glass);
+    border-bottom: 1px solid var(--hud-line-2);
+    backdrop-filter: blur(14px);
+    text-shadow: var(--hud-glow-cy);
+  }
+  header::after{
+    content:'';position:absolute;left:0;right:0;bottom:-1px;height:1px;
+    background: linear-gradient(90deg, transparent, var(--hud-cyan), transparent);
+    opacity:.6;animation: header-sweep 6s linear infinite;
+  }
+  @keyframes header-sweep {
+    0%   { transform: translateX(-30%); opacity: 0; }
+    50%  { opacity: 1; }
+    100% { transform: translateX(30%); opacity: 0; }
+  }
+  .logo{
+    font-family:'Orbitron', sans-serif;
+    font-weight:900;letter-spacing:6px;font-size:18px;
+    color:var(--hud-cyan);
+  }
+  .logo .dim{color:var(--hud-cyan-dim);letter-spacing:2px;font-size:11px;display:block;margin-top:-2px}
+  .badge{
+    font-family:'Orbitron';font-weight:600;font-size:10px;letter-spacing:3px;
+    padding:4px 12px;border:1px solid var(--hud-line-2);border-radius:2px;
+    color:var(--hud-cyan);background:rgba(92,246,255,.05);
+  }
+  #status{
+    margin-left:auto;display:flex;align-items:center;gap:10px;
+    font-family:'Orbitron';font-size:10px;letter-spacing:2px;
+  }
+  /* arc-reactor pulse */
+  .reactor{
+    width:32px;height:32px;border-radius:50%;
+    background:radial-gradient(circle, var(--hud-cyan) 0%, transparent 70%);
+    position:relative;animation: reactor-pulse 2s ease-in-out infinite;
+  }
+  .reactor.bad{background:radial-gradient(circle, var(--hud-red) 0%, transparent 70%);animation-duration:.7s}
+  .reactor::before, .reactor::after {
+    content:'';position:absolute;inset:0;border-radius:50%;
+    border:1px solid currentColor;
+  }
+  .reactor::before { animation: ring-grow 2s ease-out infinite; }
+  .reactor::after  { animation: ring-grow 2s ease-out infinite .7s; }
+  @keyframes reactor-pulse {
+    0%,100% { box-shadow: 0 0 14px var(--hud-cyan), inset 0 0 8px rgba(255,255,255,.2); }
+    50%     { box-shadow: 0 0 28px var(--hud-cyan), inset 0 0 14px rgba(255,255,255,.4); }
+  }
+  @keyframes ring-grow {
+    0%   { transform: scale(.6); opacity: 1; }
+    100% { transform: scale(1.8); opacity: 0; }
+  }
+
+  /* ── Main grid ───────────────────────────────────────────── */
+  main{
+    position:relative;z-index:5;
+    display:grid;grid-template-columns: 1fr 380px;gap:14px;
+    padding:14px;height:calc(100vh - 64px);
+  }
+  section{
+    background: var(--hud-glass);
+    border:1px solid var(--hud-line-2);
+    border-radius:2px;
+    backdrop-filter: blur(10px);
+    display:flex;flex-direction:column;overflow:hidden;
+    position:relative;
+  }
+  section::before {
+    content:'';position:absolute;top:0;left:0;width:14px;height:14px;
+    border-top:2px solid var(--hud-cyan);border-left:2px solid var(--hud-cyan);
+  }
+  section::after {
+    content:'';position:absolute;bottom:0;right:0;width:14px;height:14px;
+    border-bottom:2px solid var(--hud-cyan);border-right:2px solid var(--hud-cyan);
+  }
+  section h2{
+    font-family:'Orbitron';font-size:11px;letter-spacing:4px;font-weight:600;
+    color:var(--hud-cyan-dim);
+    padding:12px 16px;border-bottom:1px solid var(--hud-line);
+    display:flex;align-items:center;justify-content:space-between;
+    text-shadow: 0 0 10px rgba(92,246,255,.25);
+  }
+  section h2 .live-dot{
+    width:7px;height:7px;border-radius:50%;background:var(--hud-grn);
+    box-shadow:0 0 8px var(--hud-grn);animation:blink 1.4s ease-in-out infinite;
+  }
+  @keyframes blink {
+    0%,100% { opacity:1 } 50% { opacity:.25 }
+  }
+
+  /* ── Activity equalizer ──────────────────────────────────── */
+  .equalizer{
+    display:flex;align-items:flex-end;gap:2px;height:14px;margin-left:10px;
+  }
+  .equalizer span{
+    width:3px;background:var(--hud-cyan);border-radius:1px;
+    animation:eq 1.2s ease-in-out infinite;
+    box-shadow:0 0 4px var(--hud-cyan);
+  }
+  .equalizer span:nth-child(1){animation-delay:0s;height:30%}
+  .equalizer span:nth-child(2){animation-delay:.15s;height:60%}
+  .equalizer span:nth-child(3){animation-delay:.3s;height:100%}
+  .equalizer span:nth-child(4){animation-delay:.45s;height:60%}
+  .equalizer span:nth-child(5){animation-delay:.6s;height:30%}
+  @keyframes eq {
+    0%,100% { transform: scaleY(.4) }
+    50%     { transform: scaleY(1.2) }
+  }
+
+  /* ── Event stream ────────────────────────────────────────── */
+  #events{
+    flex:1;overflow-y:auto;padding:8px 10px;
+    scroll-behavior:smooth;
+  }
+  .ev{
+    margin:6px 0;padding:9px 12px 9px 14px;
+    background:rgba(8,24,38,.55);
+    border-left:2px solid var(--hud-cyan-dim);
+    position:relative;
+    transform-origin:left;
+    animation: ev-arrive .42s cubic-bezier(.2,.8,.2,1.2);
+  }
+  .ev::before{
+    content:'';position:absolute;left:-2px;top:0;bottom:0;width:2px;
+    background:var(--hud-cyan);box-shadow:0 0 8px var(--hud-cyan);
+    transform:scaleY(0);transform-origin:top;
+    animation: ev-line .5s ease-out;
+  }
+  @keyframes ev-arrive {
+    0% { transform: translateX(-12px) scale(.96); opacity: 0; }
+    100% { transform: translateX(0) scale(1); opacity: 1; }
+  }
+  @keyframes ev-line {
+    0% { transform: scaleY(0); }
+    100% { transform: scaleY(1); }
+  }
+  .ev.l-success{border-left-color:var(--hud-grn)}
+  .ev.l-warn{border-left-color:var(--hud-amber)}
+  .ev.l-error{border-left-color:var(--hud-red); background: rgba(255,56,89,.06)}
+  .ev.k-commit{border-left-color:var(--hud-amber)}
+  .ev.k-task_start{border-left-color:var(--hud-cyan)}
+  .ev.k-task_done{border-left-color:var(--hud-grn)}
+  .ev.k-note{border-left-color:var(--hud-purple)}
+  .ev.k-agent{border-left-color:var(--hud-purple); background:rgba(181,139,255,.04)}
+
+  .ev .meta{
+    display:flex;gap:10px;align-items:center;
+    font-size:10px;color:var(--hud-cyan-dim);
+    margin-bottom:4px;font-family:'Orbitron';letter-spacing:1px;
+  }
+  .ev .ttl{
+    font-weight:600;color:#dcf7ff;font-size:13px;
+    font-family: 'JetBrains Mono';
+  }
+  .ev .body{
+    color:#9bdaeb;white-space:pre-wrap;word-break:break-word;
+    font-size:12px;margin-top:6px;line-height:1.55;opacity:.95;
+  }
+  .ev .tag{color:var(--hud-purple)}
+  .ev .ts{color:var(--hud-cyan-dim)}
+  .ev .kind{color:#577089;text-transform:uppercase;font-size:9px}
+
+  /* ── Right column ────────────────────────────────────────── */
+  .col-right{display:flex;flex-direction:column;gap:14px;min-height:0}
+  .col-right > section:first-child{flex:0 0 auto}
+  .col-right > section:last-child{flex:1;min-height:0}
+
+  /* Stats */
+  #stats{padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{
+    background: rgba(8,24,38,.5);
+    border:1px solid var(--hud-line);padding:10px 12px;
+    position:relative;
+  }
+  .stat::after{
+    content:'';position:absolute;top:6px;right:6px;width:6px;height:6px;
+    border-top:1px solid var(--hud-cyan-dim);border-right:1px solid var(--hud-cyan-dim);
+  }
+  .stat .label{
+    font-family:'Orbitron';font-size:9px;letter-spacing:2px;
+    color:var(--hud-cyan-dim);
+  }
+  .stat .value{
+    font-family:'Orbitron';font-weight:800;font-size:24px;
+    color:#dcf7ff;margin-top:4px;text-shadow: 0 0 8px rgba(92,246,255,.4);
+  }
+  .stat .delta{font-size:10px;color:var(--hud-cyan-dim);margin-top:2px}
+
+  /* Notes */
+  #notes-text{
+    flex:1;min-height:0;
+    background: rgba(0,0,0,.35);
+    color:#dcf7ff;border:1px solid var(--hud-line);
+    padding:14px;margin:14px;
+    resize:none;outline:none;
+    font:13px 'JetBrains Mono', ui-monospace, monospace;
+  }
+  #notes-text:focus{border-color:var(--hud-cyan);box-shadow:0 0 0 2px rgba(92,246,255,.1)}
+  #notes-bar{
+    padding:10px 14px;border-top:1px solid var(--hud-line);
+    display:flex;gap:10px;align-items:center;
+    font-size:10px;color:var(--hud-cyan-dim);
+    font-family:'Orbitron';letter-spacing:1px;
+  }
+  #save-btn{
+    background:transparent;
+    color:var(--hud-cyan);border:1px solid var(--hud-cyan);
+    padding:6px 16px;font-family:'Orbitron';font-weight:600;
+    letter-spacing:2px;font-size:10px;cursor:pointer;
+    text-transform:uppercase;transition: all .2s;
+    margin-left:auto;
+  }
+  #save-btn:hover{
+    background: rgba(92,246,255,.1);
+    box-shadow: 0 0 14px rgba(92,246,255,.4);
+  }
+  #save-btn:disabled{opacity:.4;cursor:wait}
+
+  /* Filter bar */
+  #filter{padding:8px 10px 0 10px;display:flex;gap:6px;flex-wrap:wrap}
+  #filter button{
+    background:transparent;color:var(--hud-cyan-dim);
+    border:1px solid var(--hud-line);padding:5px 12px;
+    font-family:'Orbitron';font-weight:500;font-size:9px;letter-spacing:2px;
+    cursor:pointer;text-transform:uppercase;transition: all .15s;
+  }
+  #filter button:hover{color:var(--hud-cyan);border-color:var(--hud-cyan-dim)}
+  #filter button.on{
+    background: rgba(92,246,255,.12);
+    color:var(--hud-cyan);border-color:var(--hud-cyan);
+    box-shadow: inset 0 0 14px rgba(92,246,255,.15);
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background: transparent}
+  ::-webkit-scrollbar-thumb{
+    background: var(--hud-cyan-dim);border-radius:3px;
+  }
+  ::-webkit-scrollbar-thumb:hover{background: var(--hud-cyan)}
+
+  /* Crosshair flourish in corners */
+  .crosshair{
+    position:fixed;width:30px;height:30px;pointer-events:none;z-index:50;
+    color:var(--hud-cyan);opacity:.45;
+  }
+  .crosshair::before, .crosshair::after{
+    content:'';position:absolute;background:currentColor;
+  }
+  .crosshair::before{top:50%;left:0;right:0;height:1px;transform:translateY(-50%)}
+  .crosshair::after{left:50%;top:0;bottom:0;width:1px;transform:translateX(-50%)}
+  .crosshair.tl{top:8px;left:8px} .crosshair.tr{top:8px;right:8px}
+  .crosshair.bl{bottom:8px;left:8px} .crosshair.br{bottom:8px;right:8px}
+</style>
+</head>
+<body>
+<span class="crosshair tl"></span><span class="crosshair tr"></span>
+<span class="crosshair bl"></span><span class="crosshair br"></span>
+
+<header>
+  <div class="logo">KAIZER<span class="dim">J.A.R.V.I.S. CONSOLE · v1.0</span></div>
+  <span class="badge">▮▮▮ LIVE FEED</span>
+  <div class="equalizer"><span></span><span></span><span></span><span></span><span></span></div>
+  <span id="status">
+    <span id="conn-txt">[STAND BY]</span>
+    <span class="reactor" id="reactor"></span>
+  </span>
+</header>
+
+<main>
+  <section>
+    <h2>
+      <span>EVENT STREAM <span style="opacity:.5">// AGENT TELEMETRY</span></span>
+      <span class="live-dot" title="Live"></span>
+    </h2>
+    <div id="filter">
+      <button data-f="all" class="on">ALL</button>
+      <button data-f="task_start">TASKS</button>
+      <button data-f="task_done">COMPLETE</button>
+      <button data-f="commit">COMMITS</button>
+      <button data-f="error">ERRORS</button>
+      <button data-f="agent">AGENTS</button>
+      <button data-f="note">NOTES</button>
+    </div>
+    <div id="events"></div>
+  </section>
+
+  <div class="col-right">
+    <section>
+      <h2>SYSTEM STATUS</h2>
+      <div id="stats">
+        <div class="stat"><div class="label">EVENTS</div><div class="value" id="s-events">0</div></div>
+        <div class="stat"><div class="label">COMMITS</div><div class="value" id="s-commits">0</div></div>
+        <div class="stat"><div class="label">ERRORS</div><div class="value" id="s-errors">0</div></div>
+        <div class="stat"><div class="label">LAST</div><div class="value" id="s-last" style="font-size:14px">—</div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>OPERATOR LOG <span style="opacity:.5">// NOTES</span></h2>
+      <textarea id="notes-text" placeholder="// type any issue / request — auto-syncs every 5 sec
+// Cmd/Ctrl+S to flush snapshot
+// Claude reads this on every cycle"></textarea>
+      <div id="notes-bar">
+        <span>AUTO-SYNC ENABLED</span>
+        <button id="save-btn">FLUSH</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const evDiv = document.getElementById('events');
+const sEvents = document.getElementById('s-events');
+const sErrors = document.getElementById('s-errors');
+const sCommits = document.getElementById('s-commits');
+const sLast = document.getElementById('s-last');
+const reactor = document.getElementById('reactor');
+const connTxt = document.getElementById('conn-txt');
+let curFilter = 'all';
+let evCount = 0, errCount = 0, commitCount = 0;
+
+function fmtTs(iso){ if(!iso) return ''; const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit', hour12:false}); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function render(evt){
+  if (evt.kind === 'ping') return;
+  evCount++; sEvents.textContent = evCount;
+  if (evt.level === 'error' || evt.kind === 'error') { errCount++; sErrors.textContent = errCount; }
+  if (evt.kind === 'commit') { commitCount++; sCommits.textContent = commitCount; }
+  sLast.textContent = fmtTs(evt.ts);
+  if (curFilter !== 'all' && evt.kind !== curFilter) return;
+
+  const div = document.createElement('div');
+  div.className = `ev k-${evt.kind || 'log'} l-${evt.level || 'info'}`;
+  div.innerHTML = `
+    <div class="meta">
+      <span class="ts">${fmtTs(evt.ts)}</span>
+      ${evt.tag ? `<span class="tag">[${escapeHtml(evt.tag)}]</span>` : ''}
+      <span class="kind">${(evt.kind||'log').replace('_','·')}</span>
+    </div>
+    ${evt.title ? `<div class="ttl">${escapeHtml(evt.title)}</div>` : ''}
+    ${evt.body ? `<div class="body">${escapeHtml(evt.body)}</div>` : ''}
+  `;
+  evDiv.prepend(div);
+  while (evDiv.childElementCount > 500) evDiv.lastChild.remove();
+}
+
+// ── WebSocket with auto-reconnect ──
+let ws = null;
+function setReactor(state){
+  if (state === 'live')   { reactor.className = 'reactor';     connTxt.textContent = '[ONLINE]'; }
+  if (state === 'down')   { reactor.className = 'reactor bad'; connTxt.textContent = '[RECONNECT]'; }
+}
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/work-log`);
+  ws.onopen    = () => setReactor('live');
+  ws.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch(_){} };
+  ws.onclose   = () => { setReactor('down'); setTimeout(connect, 2000); };
+  ws.onerror   = () => { try { ws.close(); } catch(_){} };
+}
+connect();
+
+// ── Filter ──
+document.querySelectorAll('#filter button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('#filter button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    curFilter = b.dataset.f;
+    evDiv.innerHTML = '';
+    fetch('/api/work-log/recent?limit=200').then(r => r.json()).then(arr => arr.forEach(render));
+  };
+});
+
+// ── Notes auto-save ──
+const notes = document.getElementById('notes-text');
+const saveBtn = document.getElementById('save-btn');
+let lastSent = '';
+async function saveNotes(force=false){
+  const txt = notes.value;
+  if (!force && txt === lastSent) return;
+  if (!txt.trim()) return;
+  saveBtn.disabled = true;
+  try {
+    await fetch('/api/work-log/note', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text: txt})
+    });
+    lastSent = txt;
+  } finally { saveBtn.disabled = false; }
+}
+setInterval(saveNotes, 5000);
+saveBtn.onclick = () => saveNotes(true);
+notes.addEventListener('keydown', ev => {
+  if ((ev.ctrlKey||ev.metaKey) && ev.key === 's') { ev.preventDefault(); saveNotes(true); }
+});
+
+// ── Initial replay ──
+fetch('/api/work-log/recent?limit=200').then(r => r.json()).then(arr => arr.forEach(render));
+</script>
+</body>
+</html>

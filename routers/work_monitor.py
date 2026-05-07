@@ -171,7 +171,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Kaizer — Work Monitor</title>
+<title>KAIZER · J.A.R.V.I.S. CONSOLE</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root {
@@ -393,6 +393,17 @@ fetch('/api/work-log/recent?limit=200').then(r => r.json()).then(arr => arr.forE
 </html>"""
 
 
+_DASHBOARD_FILE = Path(__file__).parent / "work_monitor_dashboard.html"
+
+
 @router.get("/admin/work-monitor", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
+    """Serve the J.A.R.V.I.S.-style HUD dashboard.
+
+    HTML lives in a sibling file so we can iterate the look without
+    touching Python and re-deploying. Falls back to the embedded
+    string if the file is missing (defensive — should never happen).
+    """
+    if _DASHBOARD_FILE.exists():
+        return HTMLResponse(_DASHBOARD_FILE.read_text(encoding="utf-8"))
     return HTMLResponse(_DASHBOARD_HTML)

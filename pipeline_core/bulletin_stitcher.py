@@ -262,8 +262,15 @@ def stitch_bulletin(
             "-f", "concat", "-safe", "0",
             "-i", list_path,
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-pix_fmt", "yuv420p",
+            # Lock to 30 fps CFR + audio resync — otherwise codec
+            # drift between source clips can reintroduce the lip-sync
+            # drift that the per-story compose step was specifically
+            # written to avoid (mirror flags in longform_compose.py).
+            "-r", "30",
+            "-fps_mode", "cfr",
+            "-async", "1",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-movflags", "+faststart",
             output_path,
         ]
