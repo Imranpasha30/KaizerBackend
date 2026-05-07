@@ -221,6 +221,23 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 # ═══════════════════════════════════════════════════════════
 # INSTALL / IMPORT DEPENDENCIES
 # ═══════════════════════════════════════════════════════════
+# Silence the noisy `google.generativeai` deprecation warning so it
+# doesn't spam the work-monitor + Railway logs on every pipeline
+# subprocess. Migration to `google.genai` is tracked as a follow-up;
+# the warning fires at import time (line 232 below).
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"google\.generativeai|.*pipeline_core\.pipeline|.*learning\.corpus",
+)
+_warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*google\.generativeai.*",
+)
+
+
 def _ensure_package(pkg, pip_name=None):
     try:
         __import__(pkg)

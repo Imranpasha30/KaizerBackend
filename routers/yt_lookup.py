@@ -44,8 +44,20 @@ _RE_HANDLE     = re.compile(r"^@?[A-Za-z0-9_.-]{3,30}$")
 
 
 def _yt_api_key() -> str:
-    key = os.environ.get("YOUTUBE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
-    return key.strip()
+    """Resolve the YouTube Data API key from env.
+
+    Order of preference (first non-empty wins):
+      1. YOUTUBE_DATA_API_KEY — the canonical name; matches the env
+         block the user manages alongside YOUTUBE_CLIENT_ID etc.
+      2. YOUTUBE_API_KEY — legacy / alternate name we used early on.
+      3. GOOGLE_API_KEY — last-ditch fallback so a single Google API
+         key set for Custom Search etc. just works without a copy.
+    """
+    for var in ("YOUTUBE_DATA_API_KEY", "YOUTUBE_API_KEY", "GOOGLE_API_KEY"):
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 def _classify(q: str) -> tuple[str, str]:
@@ -221,7 +233,7 @@ def lookup(
     if not key:
         raise HTTPException(
             status_code=503,
-            detail="YOUTUBE_API_KEY (or GOOGLE_API_KEY) not set on the server.",
+            detail="YOUTUBE_DATA_API_KEY (or YOUTUBE_API_KEY / GOOGLE_API_KEY) not set on the server.",
         )
 
     # Reserve quota before the call. channels.list = 1 unit;
@@ -263,7 +275,7 @@ def search(
     if not key:
         raise HTTPException(
             status_code=503,
-            detail="YOUTUBE_API_KEY (or GOOGLE_API_KEY) not set on the server.",
+            detail="YOUTUBE_DATA_API_KEY (or YOUTUBE_API_KEY / GOOGLE_API_KEY) not set on the server.",
         )
     # search.list = 100 units, channels.list = 1 unit per id.
     cost = 100 + limit

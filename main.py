@@ -13,7 +13,23 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
-load_dotenv()
+# Silence google.generativeai's "package end-of-life" FutureWarning.
+# It fires at import time inside several modules (corpus.py, pipeline.py,
+# narrative.py, …) and pollutes both the uvicorn console and the
+# work-monitor stream. Migration to google.genai is tracked as a
+# follow-up; until then the warning is informational only.
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*google\.generativeai.*",
+)
+
+# override=True so a `.env` edit + uvicorn restart actually replaces
+# any stale value already present in the parent shell's environment.
+# Without override, load_dotenv silently keeps the OS-level value when
+# both exist, which led to "key still empty" surprises during dev.
+load_dotenv(override=True)
 
 from database import engine, SessionLocal, Base, get_db
 import models
