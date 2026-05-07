@@ -1,0 +1,94 @@
+# Postiz self-host for cross-platform scheduling.
+#
+# Postiz is the open-source social-media scheduler we proxy through
+# for Twitter / Instagram / LinkedIn / Threads / TikTok / Discord /
+# Bluesky / Mastodon. Kaizer keeps owning the YouTube path; Postiz
+# handles every other platform via its built-in OAuth + adapters.
+#
+# Bring it up with:
+#   docker compose -f docker-compose.postiz.yml up -d
+#
+# Then open http://localhost:5000 to log in, connect platforms, and
+# generate the Bearer token Kaizer's backend uses (set as
+# POSTIZ_API_KEY in .env).
+#
+# License: Postiz core is AGPLv3. We're a CLIENT calling the API,
+# not redistributing modified code, so AGPL obligations don't apply
+# to Kaizer. See https://github.com/gitroomhq/postiz-app for the
+# full license + source.
+#
+# Networking note: Postiz binds to host 0.0.0.0 inside the container.
+# We expose 5000 on the host so Kaizer's backend can reach it via
+# http://host.docker.internal:5000 (when Kaizer also runs in Docker)
+# or http://localhost:5000 (when Kaizer runs on the host).
+
+services:
+  postiz:
+    image: ghcr.io/gitroomhq/postiz-app:latest
+    container_name: kaizer-postiz
+    restart: unless-stopped
+    environment:
+      # Required: where Postiz thinks it's reachable from. Browsers
+      # follow this for OAuth redirects, so it must match what users
+      # type in their address bar.
+      MAIN_URL: ${POSTIZ_MAIN_URL:-http://localhost:5000}
+      FRONTEND_URL: ${POSTIZ_MAIN_URL:-http://localhost:5000}
+      NEXT_PUBLIC_BACKEND_URL: ${POSTIZ_MAIN_URL:-http://localhost:5000}/api
+      # Database — Postiz needs Postgres. Compose creates one below.
+      DATABASE_URL: postgresql://postiz:postiz_local_password@postiz-db:5432/postiz
+      # Redis for queue + rate-limiting
+      REDIS_URL: redis://postiz-redis:6379
+      # JWT signing — generate a real one with `openssl rand -hex 32`
+      JWT_SECRET: ${POSTIZ_JWT_SECRET:-change-me-in-production-please-please-please-please}
+      # Storage for uploaded video / image assets — Postiz writes to
+      # /uploads inside the container; we bind-mount that to a host
+      # path below so the data survives restarts.
+      STORAGE_PROVIDER: local
+      UPLOAD_DIRECTORY: /uploads
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: /uploads
+      # Disable email signups — admin only via env-seeded user.
+      DISABLE_REGISTRATION: "false"   # flip to "true" once your account is created
+    ports:
+      - "5000:5000"
+    volumes:
+      - postiz_uploads:/uploads
+      - postiz_config:/config
+    depends_on:
+      postiz-db:
+        condition: service_healthy
+      postiz-redis:
+        condition: service_healthy
+
+  postiz-db:
+    image: postgres:16-alpine
+    container_name: kaizer-postiz-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postiz
+      POSTGRES_PASSWORD: postiz_local_password
+      POSTGRES_DB: postiz
+    volumes:
+      - postiz_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postiz -d postiz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postiz-redis:
+    image: redis:7-alpine
+    container_name: kaizer-postiz-redis
+    restart: unless-stopped
+    volumes:
+      - postiz_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postiz_uploads:
+  postiz_config:
+  postiz_pgdata:
+  postiz_redis:
