@@ -370,7 +370,9 @@ def test_nonexistent_video_returns_empty_with_warning(mocker):
 def test_gemini_call_uses_structured_prompt(mocker, valid_short_mp4):
     """When a Gemini key is provided the prompt must mention narrative roles.
 
-    We patch google.generativeai so no real network call is made.
+    We patch google.genai so no real network call is made. Mirrors the
+    new SDK shape: client = genai.Client(...); resp =
+    client.models.generate_content(model=..., contents=...).
     """
     # Mock ASR + shot detect to keep it fast
     _mock_asr(mocker)
@@ -379,21 +381,22 @@ def test_gemini_call_uses_structured_prompt(mocker, valid_short_mp4):
     # Capture the prompt sent to Gemini
     captured_prompts: list[str] = []
 
-    def _fake_generate_content(prompt, **kwargs):
-        captured_prompts.append(str(prompt))
+    def _fake_generate_content(model=None, contents=None, **kwargs):
+        captured_prompts.append(str(contents))
         mock_response = MagicMock()
         mock_response.text = (
             '{"clips": [], "roles": [], "importance": []}'
         )
         return mock_response
 
-    mock_model_instance = MagicMock()
-    mock_model_instance.generate_content.side_effect = _fake_generate_content
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = _fake_generate_content
 
     mock_genai = MagicMock()
-    mock_genai.GenerativeModel.return_value = mock_model_instance
+    mock_genai.Client.return_value = mock_client
 
-    mocker.patch.dict("sys.modules", {"google.generativeai": mock_genai})
+    mocker.patch.dict("sys.modules", {"google.genai": mock_genai,
+                                       "google": MagicMock(genai=mock_genai)})
 
     # Reload the narrative module so it picks up the patched import
     if narrative_mod is not None:

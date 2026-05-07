@@ -72,8 +72,9 @@ dnspython==2.8.0
 openai==2.30.0
 
 # ─── Google stack (Gemini SEO + YouTube Data + OAuth) ────────
-google-generativeai==0.8.6
-google-ai-generativelanguage==0.6.15
+# Migrated from google-generativeai (deprecated) → google-genai.
+# Pinned to >=1.0.0 to lock in the stable client.models / client.files API.
+google-genai>=1.0.0
 google-api-core==2.30.0
 google-api-python-client==2.193.0
 google-auth==2.49.1

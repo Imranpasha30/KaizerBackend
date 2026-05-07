@@ -26,7 +26,8 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from tenacity import (
     retry, stop_after_attempt, wait_exponential, retry_if_exception_type,
 )
@@ -99,11 +100,23 @@ class QuotaSEOError(SEOGenerationError):
     """Quota / 404 — caller should try the next model in the chain."""
 
 
-def _configure_gemini() -> None:
+def _gemini_client() -> "genai.Client":
+    """Return a fresh google.genai client. Replaces the legacy
+    `_configure_gemini()` (which used module-level `genai.configure(...)`
+    in the deprecated SDK)."""
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key:
         raise SEOGenerationError("GEMINI_API_KEY is not set")
-    genai.configure(api_key=key)
+    return genai.Client(api_key=key)
+
+
+# Backwards-compatibility alias for any caller that imports the old
+# name. `_configure_gemini()` no longer mutates global state — the
+# returned client is the one to use. Existing call sites that do
+# `_configure_gemini(); model = genai.GenerativeModel(...)` need to
+# be updated to `client = _gemini_client(); client.models.generate_content(...)`.
+def _configure_gemini() -> "genai.Client":
+    return _gemini_client()
 
 
 # ── Single-model attempt + model-chain fallback ──────────────────────────────
@@ -125,22 +138,24 @@ def _try_one_model(
     clip_id=None,
 ) -> Dict[str, Any]:
     try:
-        model = genai.GenerativeModel(
-            model_name,
+        client = _gemini_client()
+        cfg = genai_types.GenerateContentConfig(
             system_instruction=system_prompt,
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": _RESPONSE_SCHEMA,
-                "temperature": 0.9,
-                "top_p": 0.95,
-                "max_output_tokens": 4096,
-            },
+            response_mime_type="application/json",
+            response_schema=_RESPONSE_SCHEMA,
+            temperature=0.9,
+            top_p=0.95,
+            max_output_tokens=4096,
         )
         with log_gemini_call(
             db=db, user_id=user_id, job_id=job_id, clip_id=clip_id,
             model=model_name, purpose="seo",
         ) as _gcall:
-            resp = model.generate_content(user_prompt)
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=cfg,
+            )
             _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:

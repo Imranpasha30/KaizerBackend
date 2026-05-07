@@ -313,12 +313,12 @@ def _call_gemini(
     (network, quota, bad key, JSON parse error).
     """
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # type: ignore
     except ImportError:
-        logger.warning("narrative: google-generativeai not installed; Gemini skipped")
+        logger.warning("narrative: google-genai not installed; Gemini skipped")
         return None
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
     # Import accounting wrapper best-effort — narrative is also importable
     # as a standalone script, so a missing learning.gemini_log must not
@@ -336,9 +336,11 @@ def _call_gemini(
     for model_name in _GEMINI_MODELS:
         try:
             logger.info("narrative: calling Gemini model %s", model_name)
-            model = genai.GenerativeModel(model_name)
             with _log_gemini_call(db=None, model=model_name, purpose="narrative") as _gcall:
-                response = model.generate_content(prompt)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
                 _gcall.record(response)
             raw_text = response.text or ""
 

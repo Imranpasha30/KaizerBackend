@@ -19,7 +19,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
@@ -201,27 +202,28 @@ def _extract_patterns(channel: models.Channel,
                       top_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not settings.gemini_api_key:
         raise CorpusError("GEMINI_API_KEY is not set")
-    genai.configure(api_key=settings.gemini_api_key)
+    client = genai.Client(api_key=settings.gemini_api_key)
 
     user_prompt = _build_pattern_prompt(channel, top_rows)
 
     try:
-        model = genai.GenerativeModel(
-            GEMINI_MODEL,
+        cfg = genai_types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": _PATTERN_SCHEMA,
-                "temperature": 0.4,
-                "max_output_tokens": 2048,
-            },
+            response_mime_type="application/json",
+            response_schema=_PATTERN_SCHEMA,
+            temperature=0.4,
+            max_output_tokens=2048,
         )
         with log_gemini_call(
             db=None,  # corpus refresh runs in background scheduler — no request-scoped session
             user_id=getattr(channel, "user_id", None),
             model=GEMINI_MODEL, purpose="corpus",
         ) as _gcall:
-            resp = model.generate_content(user_prompt)
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_prompt,
+                config=cfg,
+            )
             _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:

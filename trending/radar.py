@@ -12,7 +12,8 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
@@ -95,26 +96,27 @@ def _summarize(title: str, description: str) -> Dict:
     if not settings.gemini_api_key:
         return {"summary": title[:200], "keywords": [], "urgency": "normal"}
     try:
-        genai.configure(api_key=settings.gemini_api_key)
-        model = genai.GenerativeModel(
-            TOPIC_MODEL,
+        client = genai.Client(api_key=settings.gemini_api_key)
+        cfg = genai_types.GenerateContentConfig(
             system_instruction=(
                 "Classify this Telugu news video into a terse topic summary and 3-6 "
                 "keywords. Urgency: 'hot' if it's breaking/political-crisis, 'low' if "
                 "filler/entertainment, 'normal' otherwise. Return STRICT JSON."
             ),
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": _TOPIC_SCHEMA,
-                "temperature": 0.3,
-                "max_output_tokens": 512,
-            },
+            response_mime_type="application/json",
+            response_schema=_TOPIC_SCHEMA,
+            temperature=0.3,
+            max_output_tokens=512,
         )
         body = f"Title: {title}\nDescription: {(description or '')[:500]}"
         with log_gemini_call(
             db=None, model=TOPIC_MODEL, purpose="trending-topic",
         ) as _gcall:
-            resp = model.generate_content(body)
+            resp = client.models.generate_content(
+                model=TOPIC_MODEL,
+                contents=body,
+                config=cfg,
+            )
             _gcall.record(resp)
         data = json.loads((resp.text or "").strip())
         u = (data.get("urgency") or "normal").lower()

@@ -221,22 +221,6 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 # ═══════════════════════════════════════════════════════════
 # INSTALL / IMPORT DEPENDENCIES
 # ═══════════════════════════════════════════════════════════
-# Silence the noisy `google.generativeai` deprecation warning so it
-# doesn't spam the work-monitor + Railway logs on every pipeline
-# subprocess. Migration to `google.genai` is tracked as a follow-up;
-# the warning fires at import time (line 232 below).
-import warnings as _warnings
-_warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    module=r"google\.generativeai|.*pipeline_core\.pipeline|.*learning\.corpus",
-)
-_warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message=r".*google\.generativeai.*",
-)
-
 
 def _ensure_package(pkg, pip_name=None):
     try:
@@ -245,12 +229,13 @@ def _ensure_package(pkg, pip_name=None):
         print(f"  Installing {pip_name or pkg} ...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name or pkg])
 
-_ensure_package("google.generativeai", "google-generativeai")
+_ensure_package("google.genai", "google-genai")
 _ensure_package("openai", "openai")
 _ensure_package("requests")
 _ensure_package("PIL", "Pillow")
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 import openai
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -616,16 +601,36 @@ def _parse_gemini_json(raw_text: str) -> dict:
     raise ValueError("Could not parse Gemini JSON response — all repair strategies failed")
 
 
+def _gemini_client() -> "genai.Client":
+    """Construct a google.genai client from the configured API key.
+
+    Replaces the deprecated `genai.configure(api_key=...)` module-level
+    state from google-generativeai. Each call returns a fresh Client —
+    cheap (just stores the API key + a requests session under the hood).
+    """
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
 def upload_video_to_gemini(video_path: str) -> object:
-    """Upload video to Gemini File API and wait for processing."""
+    """Upload video to Gemini File API and wait for processing.
+
+    Migrated to google.genai. Same polling contract — `state.name`
+    transitions from PROCESSING → ACTIVE / FAILED. The client.files
+    namespace replaces the old top-level `genai.upload_file` /
+    `genai.get_file` helpers.
+    """
+    client = _gemini_client()
     size_mb = os.path.getsize(video_path) / (1024 * 1024)
     print(f"    Uploading video ({size_mb:.1f} MB) to Gemini ...", end="", flush=True)
-    vf = genai.upload_file(path=video_path, mime_type="video/mp4")
-    while vf.state.name == "PROCESSING":
+    vf = client.files.upload(
+        file=video_path,
+        config=genai_types.UploadFileConfig(mime_type="video/mp4"),
+    )
+    while getattr(vf.state, "name", str(vf.state)) == "PROCESSING":
         time.sleep(4)
-        vf = genai.get_file(vf.name)
+        vf = client.files.get(name=vf.name)
         print(".", end="", flush=True)
-    if vf.state.name == "FAILED":
+    if getattr(vf.state, "name", str(vf.state)) == "FAILED":
         raise RuntimeError("Gemini upload failed")
     print(f" done")
     return vf
@@ -689,7 +694,7 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
         except Exception as e:
             print(f"    [cache] read failed ({e}) — re-calling Gemini")
 
-    genai.configure(api_key=GEMINI_API_KEY)
+    client = _gemini_client()
 
     # Upload
     video_file = upload_video_to_gemini(video_path)
@@ -724,7 +729,6 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
     last_error = None
     for model_name in candidates:
         try:
-            model = genai.GenerativeModel(model_name)
             print(f"    Asking {model_name} to analyze and suggest cuts ...", end="", flush=True)
             # Only retry in-place on transient server errors; 429 and 404
             # bubble up to the outer loop so we try the next model instead.
@@ -733,9 +737,15 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
                     with _log_gemini_call(
                         db=None, model=model_name, purpose="video-cut",
                     ) as _gcall:
-                        response = model.generate_content(
-                            [video_file, prompt],
-                            request_options={"timeout": 180}
+                        # google-genai: client.models.generate_content takes
+                        # the model name as a kwarg + the multipart contents
+                        # (video file ref + text prompt). Old SDK's
+                        # request_options={"timeout": 180} has no direct
+                        # equivalent — google-genai uses internal HTTP
+                        # timeouts; we rely on those defaults.
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=[video_file, prompt],
                         )
                         _gcall.record(response)
                     break
@@ -792,7 +802,7 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
 
     # Clean up the file from Gemini servers
     try:
-        genai.delete_file(video_file.name)
+        client.files.delete(name=video_file.name)
     except Exception:
         pass
 

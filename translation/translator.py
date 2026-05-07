@@ -16,7 +16,8 @@ import os
 from datetime import datetime, timezone
 from typing import Dict
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from sqlalchemy.orm import Session
 from tenacity import (
     retry, stop_after_attempt, wait_exponential, retry_if_exception_type,
@@ -72,7 +73,7 @@ _SCHEMA = {
 def _translate(seo: Dict, target_lang: str) -> Dict:
     if not settings.gemini_api_key:
         raise TranslationError("GEMINI_API_KEY not set")
-    genai.configure(api_key=settings.gemini_api_key)
+    client = genai.Client(api_key=settings.gemini_api_key)
     lang_name = _LANG_NAMES.get(target_lang, target_lang.upper())
 
     title = (seo.get("title") or "").strip()
@@ -87,8 +88,7 @@ def _translate(seo: Dict, target_lang: str) -> Dict:
     )
 
     try:
-        model = genai.GenerativeModel(
-            TRANSLATE_MODEL,
+        cfg = genai_types.GenerateContentConfig(
             system_instruction=(
                 f"You are a professional YouTube localizer. Translate the given SEO JSON "
                 f"from its source language into {lang_name}. Preserve proper nouns, brand "
@@ -96,17 +96,19 @@ def _translate(seo: Dict, target_lang: str) -> Dict:
                 f"Keep keyword count similar. Title must stay under 100 characters after "
                 f"translation. Return STRICT JSON matching the schema."
             ),
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": _SCHEMA,
-                "temperature": 0.4,
-                "max_output_tokens": 4096,
-            },
+            response_mime_type="application/json",
+            response_schema=_SCHEMA,
+            temperature=0.4,
+            max_output_tokens=4096,
         )
         with log_gemini_call(
             db=None, model=TRANSLATE_MODEL, purpose="translation",
         ) as _gcall:
-            resp = model.generate_content(src)
+            resp = client.models.generate_content(
+                model=TRANSLATE_MODEL,
+                contents=src,
+                config=cfg,
+            )
             _gcall.record(resp)
         text = (resp.text or "").strip()
         if not text:

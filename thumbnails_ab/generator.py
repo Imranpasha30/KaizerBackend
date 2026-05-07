@@ -12,7 +12,8 @@ import json
 import os
 from typing import List
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from sqlalchemy.orm import Session
 
 import models
@@ -29,7 +30,7 @@ def _pick_hook_texts(clip: models.Clip) -> List[str]:
     if not settings.gemini_api_key:
         return default
     try:
-        genai.configure(api_key=settings.gemini_api_key)
+        client = genai.Client(api_key=settings.gemini_api_key)
         seo = {}
         if clip.seo:
             try: seo = json.loads(clip.seo)
@@ -37,8 +38,8 @@ def _pick_hook_texts(clip: models.Clip) -> List[str]:
         topic = (seo.get("title") or clip.text or "").strip()[:200]
         if not topic:
             return default
-        model = genai.GenerativeModel(
-            os.environ.get("KAIZER_THUMB_MODEL", "gemini-2.5-flash"),
+        _thumb_model = os.environ.get("KAIZER_THUMB_MODEL", "gemini-2.5-flash")
+        cfg = genai_types.GenerateContentConfig(
             system_instruction=(
                 "You write ultra-short YouTube thumbnail overlays for Telugu news. "
                 "Return STRICT JSON: {\"variants\":[\"…\", \"…\"]}. "
@@ -46,31 +47,32 @@ def _pick_hook_texts(clip: models.Clip) -> List[str]:
                 "Variant 0 is urgent/dramatic. Variant 1 is curiosity/controversy. "
                 "No emojis. No quotes. No punctuation at end."
             ),
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": {
-                    "type": "object",
-                    "required": ["variants"],
-                    "properties": {
-                        "variants": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "minItems": 2,
-                            "maxItems": 2,
-                        },
+            response_mime_type="application/json",
+            response_schema={
+                "type": "object",
+                "required": ["variants"],
+                "properties": {
+                    "variants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 2,
                     },
                 },
-                "temperature": 1.1,
-                "max_output_tokens": 200,
             },
+            temperature=1.1,
+            max_output_tokens=200,
         )
-        _thumb_model = os.environ.get("KAIZER_THUMB_MODEL", "gemini-2.5-flash")
         with log_gemini_call(
             db=None, clip_id=getattr(clip, "id", None),
             job_id=getattr(clip, "job_id", None),
             model=_thumb_model, purpose="thumbnail",
         ) as _gcall:
-            resp = model.generate_content(f"Topic: {topic}")
+            resp = client.models.generate_content(
+                model=_thumb_model,
+                contents=f"Topic: {topic}",
+                config=cfg,
+            )
             _gcall.record(resp)
         data = json.loads((resp.text or "").strip())
         vs = [(v or "").strip()[:35] for v in (data.get("variants") or []) if v]
