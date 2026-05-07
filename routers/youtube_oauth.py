@@ -295,9 +295,27 @@ def callback(
 
 
 @router.delete("/{channel_id}")
-def disconnect(channel_id: int, db: Session = Depends(get_db)):
-    channel = db.query(models.Channel).filter(models.Channel.id == channel_id).first()
+def disconnect(
+    channel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Disconnect a YouTube OAuth token from a channel profile.
+
+    Auth: caller MUST own the channel — otherwise we'd let any
+    authenticated user revoke another user's YouTube connection by
+    guessing channel IDs. This was a real cross-tenant bug; the
+    ownership filter below is the fix.
+    """
+    channel = (
+        db.query(models.Channel)
+          .filter(models.Channel.id == channel_id,
+                  models.Channel.user_id == user.id)
+          .first()
+    )
     if not channel:
+        # Don't leak whether the channel exists for other users —
+        # 404 for both "missing" and "not yours" cases.
         raise HTTPException(status_code=404, detail="Channel not found")
     try:
         oauth.revoke(db, channel_id)
