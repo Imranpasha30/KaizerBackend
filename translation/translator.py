@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 from google import genai
 from google.genai import types as genai_types
@@ -87,6 +87,24 @@ def _translate(seo: Dict, target_lang: str) -> Dict:
         ensure_ascii=False,
     )
 
+    # Redis cache lookup — translation is deterministic (temp=0.4 is
+    # tight enough that re-runs converge), so identical SEO + target
+    # language ≈ identical output. At enterprise scale most clips get
+    # translated to the same handful of languages, so this hits hard.
+    _gc = None
+    cache_hash: Optional[str] = None
+    try:
+        import gemini_cache as _gc_mod
+        _gc = _gc_mod
+        cache_hash = _gc.make_key(TRANSLATE_MODEL, target_lang, src)
+        cached = _gc.cache_get("translation", cache_hash)
+        if cached is not None:
+            return cached
+    except Exception:
+        # Cache is best-effort.
+        cache_hash = None
+        _gc = None
+
     try:
         cfg = genai_types.GenerateContentConfig(
             system_instruction=(
@@ -113,7 +131,13 @@ def _translate(seo: Dict, target_lang: str) -> Dict:
         text = (resp.text or "").strip()
         if not text:
             raise TransientTranslationError("empty response")
-        return json.loads(text)
+        result = json.loads(text)
+        if _gc is not None and cache_hash:
+            try:
+                _gc.cache_set("translation", cache_hash, result)
+            except Exception:
+                pass
+        return result
     except json.JSONDecodeError as e:
         raise TransientTranslationError(f"JSON decode: {e}") from e
     except (TransientTranslationError, TranslationError):
@@ -186,5 +210,14 @@ def ensure_translation(db: Session, clip_id: int, lang: str, target_channel_id: 
         category_id="25",
     )
     db.add(up); db.commit(); db.refresh(up)
+    # Signal the upload worker via Redis. Translation fan-out is batch
+    # work (one source clip → N language variants), so the lo lane
+    # protects live uploads from getting stuck behind a translation burst.
+    try:
+        from redis_queue import enqueue_upload_job, is_enabled as _redis_on, priority_for_user
+        if _redis_on():
+            enqueue_upload_job(up.id, priority=priority_for_user(None, batch=True))
+    except Exception as exc:
+        print(f"[translator] redis enqueue failed for upload {up.id}: {exc}")
     return {"clip_id": clip_id, "language": lang,
             "upload_job_id": up.id, "created": True, "payload": payload}

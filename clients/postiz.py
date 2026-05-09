@@ -8,7 +8,12 @@ we only ever talk to its public REST API. The contract:
                Postiz UI → Settings → API Keys.
   - Endpoints we use:
       GET  /public/v1/integrations  → list connected platforms
+      POST /public/v1/upload        → upload media, returns {id, path, ...}
       POST /public/v1/posts         → schedule a multi-platform post
+
+Media flow: Postiz post bodies reference media by INTERNAL ID, not
+URL — so videos/images must be uploaded via /public/v1/upload first
+to mint an id, then attached to the post via ``image: [{id: ...}]``.
 
 Why a thin client (no postiz SDK):
   - Postiz doesn't ship a Python SDK; pip install would be a fork.
@@ -66,9 +71,14 @@ def _headers() -> dict:
             "POSTIZ_API_KEY not set — generate one at "
             "<postiz>/Settings → API Keys and add it to .env."
         )
+    # Postiz Cloud's public API expects the raw token in the
+    # `Authorization` header (no `Bearer ` prefix). Sending it with
+    # the prefix returns 401 "Invalid API key" — verified empirically
+    # against /public/v1/integrations 2026-05-07. Other auth schemes
+    # (X-API-Key, apikey, etc.) return 401 "No API Key found".
     return {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
+        "Authorization": key,
+        "Content-Type":  "application/json",
     }
 
 
@@ -105,20 +115,69 @@ def list_integrations() -> list[dict]:
     except requests.RequestException as exc:
         raise PostizError(f"Postiz unreachable at {url}: {exc}") from exc
     data = _handle(resp, "list_integrations")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "integrations" in data:
-        return data["integrations"]
-    return []
+    raw = data if isinstance(data, list) else (
+        data.get("integrations", []) if isinstance(data, dict) else []
+    )
+    # Normalise — Postiz Cloud's response uses ``identifier`` for the
+    # platform name (e.g. "youtube"), and never exposes the YouTube
+    # channel id directly. We expose a ``provider`` alias so callers
+    # can filter by platform without caring about the wire-format
+    # quirks. ``profile`` holds the @handle (with a Postiz-side
+    # random suffix like ``-y5p``).
+    out: list[dict] = []
+    for i in raw:
+        item = dict(i)
+        item.setdefault("provider", item.get("identifier", ""))
+        out.append(item)
+    return out
+
+
+def upload_file(local_path: str, mime_type: Optional[str] = None) -> dict:
+    """Upload a local media file to Postiz, return the metadata dict.
+
+    Postiz post bodies attach media by INTERNAL id, not URL — every
+    image/video must first be POSTed here to mint an id. The returned
+    dict has at minimum ``id`` (UUID), ``name`` (Postiz-renamed),
+    ``path`` (public CDN URL on uploads.postiz.com).
+
+    Verified shape against api.postiz.com 2026-05-07:
+        {"id":"…","name":"…","originalName":null,
+         "path":"https://uploads.postiz.com/…",
+         "thumbnail":null,"alt":null}
+    """
+    import mimetypes, os as _os
+    if not _os.path.isfile(local_path):
+        raise PostizError(f"upload_file: {local_path!r} does not exist")
+    if not mime_type:
+        mime_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+    url = f"{_base_url()}/public/v1/upload"
+    # _headers() forces Content-Type: application/json which breaks
+    # multipart — strip it and pass only the auth header.
+    auth_only = {"Authorization": _headers()["Authorization"]}
+    fname = _os.path.basename(local_path)
+    try:
+        with open(local_path, "rb") as fh:
+            resp = requests.post(
+                url,
+                headers=auth_only,
+                files={"file": (fname, fh, mime_type)},
+                timeout=300,  # video bytes can be large
+            )
+    except requests.RequestException as exc:
+        raise PostizError(f"Postiz upload unreachable at {url}: {exc}") from exc
+    return _handle(resp, "upload_file")
 
 
 def schedule_post(
     *,
     integration_ids: list[str],
     text: str,
-    media_url: Optional[str] = None,
+    media_id: Optional[str] = None,
+    media_path: Optional[str] = None,
     schedule_at_iso: Optional[str] = None,
     type_: str = "draft",
+    yt_title: Optional[str] = None,
+    yt_privacy: str = "public",
 ) -> dict:
     """Schedule a post across N integrations.
 
@@ -129,36 +188,75 @@ def schedule_post(
     text : str
         Caption / body. Postiz auto-truncates per platform (Twitter
         280, etc.) if you turn that on in its UI.
-    media_url : str | None
-        Public URL Postiz can fetch the video / image from. We pass
-        the R2 URL Kaizer already produced.
+    media_id : str | None
+        Postiz file id from upload_file(). Required for posts with media.
+    media_path : str | None
+        Postiz CDN URL from upload_file()['path']. Sent alongside id —
+        Postiz validation requires both fields on each image entry.
     schedule_at_iso : str | None
         ISO-8601 datetime (UTC). None = post immediately ("now").
     type_ : str
         "draft" | "scheduled" | "now". Postiz's `type` field — we let
         the caller decide.
+    yt_title : str | None
+        YouTube video title (≤100 chars). Required when targeting a
+        YouTube integration; Postiz validates this server-side as
+        ``posts.0.settings.title``. We auto-truncate from ``text`` if
+        the caller doesn't pass one explicitly.
+    yt_privacy : str
+        YouTube privacy: 'public' | 'private' | 'unlisted'. Required
+        per Postiz validation as ``posts.0.settings.type``.
 
     Raises PostizError on failure.
     """
     if not integration_ids:
         raise PostizError("schedule_post called with empty integration list")
 
+    # Default the YT title from the first line of the post body if the
+    # caller didn't provide one. Postiz hard-caps at 100 chars.
+    if not yt_title:
+        first_line = (text or "").splitlines()[0] if text else ""
+        yt_title = first_line[:100] or "Untitled"
+    yt_title = yt_title[:100]
+
+    from datetime import datetime, timezone
     posts = []
     for iid in integration_ids:
-        entry = {
+        entry: dict[str, Any] = {
             "integration": {"id": iid},
             "value": [{"content": text or ""}],
+            # Required by Postiz when the integration is YouTube.
+            # Harmless on other platforms — Postiz ignores unknown
+            # settings keys per provider, but always validates that
+            # title/type exist when YouTube is in the post.
+            "settings": {
+                "title": yt_title,
+                "type":  yt_privacy,
+            },
         }
-        if media_url:
-            entry["value"][0]["image"] = [{"path": media_url}]
+        if media_id:
+            # Postiz validates that every image entry has BOTH ``id``
+            # (its internal file id) and ``path`` (the CDN URL). The
+            # path comes from the same upload_file() response.
+            img: dict[str, Any] = {"id": media_id}
+            if media_path:
+                img["path"] = media_path
+            entry["value"][0]["image"] = [img]
         posts.append(entry)
 
+    # Postiz Cloud's /public/v1/posts validation requires these top-
+    # level fields even when scheduling "now" — without them it 400s
+    # with "shortLink/date/tags should not be null or undefined".
+    # date defaults to NOW so the "post immediately" semantic still
+    # works without requiring callers to compute the timestamp.
+    iso_now = datetime.now(timezone.utc).isoformat()
     body: dict[str, Any] = {
-        "type": type_,
-        "posts": posts,
+        "type":      type_,
+        "date":      schedule_at_iso or iso_now,
+        "shortLink": False,
+        "tags":      [],
+        "posts":     posts,
     }
-    if schedule_at_iso:
-        body["date"] = schedule_at_iso
 
     url = f"{_base_url()}/public/v1/posts"
     try:

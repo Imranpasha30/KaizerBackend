@@ -91,8 +91,15 @@ def list_campaigns(db: Session = Depends(get_db), user: models.User = Depends(au
     return [_to_dict(c) for c in rows]
 
 
+from rate_limit import rate_limited as _rate_limited
+
 @router.post("/", status_code=201)
-def create_campaign(payload: CampaignIn, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+def create_campaign(
+    payload: CampaignIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+    _rl=Depends(_rate_limited("create")),
+):
     if db.query(models.Campaign).filter(
         models.Campaign.name == payload.name,
         models.Campaign.user_id == user.id,

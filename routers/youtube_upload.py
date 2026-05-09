@@ -219,8 +219,16 @@ def _compose_metadata(
 
 # ─── Endpoints ────────────────────────────────────────────────────────────
 
+from rate_limit import rate_limited as _rate_limited
+
 @router.post("/clips/{clip_id}/publish")
-def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+def publish_clip(
+    clip_id: int,
+    payload: PublishRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+    _rl=Depends(_rate_limited("create")),
+):
     """Publish a clip to one or more YouTube destinations in one call.
 
     Accepts either the legacy `channel_id` (single) or the newer `channel_ids`
@@ -346,6 +354,30 @@ def publish_clip(clip_id: int, payload: PublishRequest, db: Session = Depends(ge
     for j in created:
         db.refresh(j)
 
+    # Signal the upload worker via Redis Streams. Done AFTER commit so
+    # the message can never reference a row that wasn't persisted.
+    # Failure is non-fatal: if Redis is down, the legacy DB-poll path
+    # in `youtube/worker.py` will still pick the row up (degraded
+    # mode, single-host only).
+    #
+    # Priority lane is derived from the user's plan — pro/agency tenants
+    # land on the ``hi`` stream so they jump ahead of free-tier batch
+    # work. ``priority_for_user`` is the single source of truth for
+    # this mapping (see redis_queue._PRIO_BY_PLAN).
+    try:
+        from redis_queue import enqueue_upload_job, is_enabled as _redis_on, priority_for_user
+        if _redis_on():
+            prio = priority_for_user(user)
+            for j in created:
+                try:
+                    enqueue_upload_job(j.id, priority=prio)
+                except Exception as exc:
+                    # Log but don't fail the API call — the row exists
+                    # and the DB-poll fallback will catch it.
+                    print(f"[uploads] redis enqueue failed for job {j.id}: {exc}")
+    except Exception as exc:
+        print(f"[uploads] redis_queue import failed (skipping enqueue): {exc}")
+
     # Single-target → legacy shape; fan-out → list under `jobs`
     if len(created) == 1:
         return _to_dict(created[0])
@@ -415,6 +447,17 @@ def retry_upload(upload_id: int, db: Session = Depends(get_db), user: models.Use
     row.last_error = ""
     # Keep upload_uri + bytes_uploaded so we resume where we left off
     db.commit()
+    # Re-signal the worker via Redis. If Redis is unavailable, the
+    # DB-poll fallback will still see status='queued' on its next
+    # cycle (slower, but works). Retry returns the job to the lane
+    # matching the user's CURRENT plan — if they upgraded since the
+    # original failure, they get the upgrade on the retry.
+    try:
+        from redis_queue import enqueue_upload_job, is_enabled as _redis_on, priority_for_user
+        if _redis_on():
+            enqueue_upload_job(row.id, priority=priority_for_user(user))
+    except Exception as exc:
+        print(f"[uploads/retry] redis enqueue failed for job {row.id}: {exc}")
     return _to_dict(row)
 
 

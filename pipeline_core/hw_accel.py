@@ -163,7 +163,37 @@ def h264_args(
 
     Parameters translate across codecs so caller code is unchanged when
     switching from CPU→GPU.
+
+    Production speedup knobs (env-overridable, runtime-checked so
+    callers don't need to re-import):
+
+      KAIZER_FFMPEG_PRESET   — libx264 preset override
+                               (ultrafast|superfast|veryfast|faster|fast|medium|…)
+                               Default: ``medium``. Drop to ``fast`` or
+                               ``veryfast`` on Railway/CPU hosts for
+                               1.5–3× speed at ~5–10% file size cost —
+                               ideal for Shorts where time-to-publish
+                               beats absolute compression efficiency.
+
+      KAIZER_FFMPEG_CRF      — quality target. Default 20 (visually
+                               lossless for our content). Bump to 23
+                               for another 30% size reduction with
+                               imperceptible quality loss on Shorts.
+
+      KAIZER_FFMPEG_THREADS  — explicit thread count (0 = use all cores,
+                               libx264 default). Set to half the CPU
+                               count when running multiple parallel
+                               compose tasks per job so they don't
+                               fight over the same cores.
     """
+    # Env-overridable knobs. Re-read on every call so a deploy can
+    # tune without restarting individual subprocesses (the FastAPI
+    # process itself does need a restart, but child renders pick up
+    # immediately on the next call).
+    cpu_preset = (os.environ.get("KAIZER_FFMPEG_PRESET", "").strip().lower()
+                  or cpu_preset)
+    crf_str = os.environ.get("KAIZER_FFMPEG_CRF", "").strip() or "20"
+    threads = os.environ.get("KAIZER_FFMPEG_THREADS", "").strip() or ""
     if ACTIVE_ENCODER == "h264_nvenc":
         return [
             "-c:v", "h264_nvenc",
@@ -203,10 +233,10 @@ def h264_args(
             "-movflags", "+faststart",
         ]
     # CPU fallback
-    return [
+    args = [
         "-c:v", "libx264",
         "-preset", cpu_preset,
-        "-crf", "20",
+        "-crf", crf_str,
         "-b:v", f"{bitrate_kbps}k",
         "-maxrate", f"{maxrate_kbps}k",
         "-bufsize", f"{bufsize_kbps}k",
@@ -214,6 +244,11 @@ def h264_args(
         "-profile:v", "high",
         "-movflags", "+faststart",
     ]
+    if threads:
+        # Inserted after -c:v so it scopes to the video encoder thread
+        # pool (libx264 reads -threads from the global option block).
+        args += ["-threads", threads]
+    return args
 
 
 def hw_decode_args() -> list[str]:

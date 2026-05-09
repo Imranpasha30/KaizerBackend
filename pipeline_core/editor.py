@@ -42,6 +42,7 @@ try:
     _pipeline = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pipeline)
     _compose_clip          = _pipeline.compose_clip
+    _compose_clip_clean    = getattr(_pipeline, "compose_clip_clean_card", None)
     _compose_split_frame   = _pipeline.compose_split_frame
     _compose_follow_bar    = _pipeline.compose_follow_bar
     _gen_torn_card         = _pipeline.generate_torn_paper_card
@@ -81,6 +82,35 @@ def rerender_clip(clip, edits):
         _compose_split_frame(raw_path, img_path, new_clip, preset,
                              bg_color=bg_color, video_logo=video_logo or None)
         clip["split_params"] = split_params or {}
+        if edits.get("image_path"):
+            clip["image_path"] = edits["image_path"]
+
+    elif frame_type == "clean_card" and _compose_clip_clean is not None:
+        text = edits.get("text", clip.get("text", "KAIZER NEWS"))
+        cp_in = clip.get("card_params", {}) or {}
+        word_colors = edits.get("word_colors") or cp_in.get("word_colors")
+        _compose_clip_clean(
+            raw_path, img_path, text, new_clip, preset,
+            font_size=edits.get("font_size"),
+            text_color=edits.get("text_color"),
+            font_file=edits.get("font_file") or cp_in.get("font_file") or "NotoSansTelugu-Bold.ttf",
+            word_colors=word_colors,
+            bg_color=edits.get("bg_color")            or cp_in.get("bg_color", "#c10000"),
+            image_border_px=int(edits.get("image_border_px", cp_in.get("image_border_px", 14))),
+            image_border_color=edits.get("image_border_color") or cp_in.get("image_border_color", "#ffffff"),
+        )
+        clip["text"] = text
+        cp = clip.setdefault("card_params", {})
+        cp.update({
+            "font_size":          edits.get("font_size",          cp.get("font_size", 80)),
+            "font_file":          edits.get("font_file",          cp.get("font_file", "NotoSansTelugu-Bold.ttf")),
+            "text_color":         edits.get("text_color",         cp.get("text_color", "#ffffff")),
+            "bg_color":           edits.get("bg_color",           cp.get("bg_color", "#c10000")),
+            "image_border_px":    edits.get("image_border_px",    cp.get("image_border_px", 14)),
+            "image_border_color": edits.get("image_border_color", cp.get("image_border_color", "#ffffff")),
+        })
+        if word_colors is not None:
+            cp["word_colors"] = word_colors
         if edits.get("image_path"):
             clip["image_path"] = edits["image_path"]
 

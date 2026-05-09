@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -81,7 +81,23 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
 
 
 @router.post("/login")
-def login(payload: LoginIn, db: Session = Depends(get_db)):
+def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
+    # Per-IP brute-force guard. We rate-limit BEFORE checking creds so
+    # an attacker can't probe valid emails by timing 401s, and so a
+    # password-spray scaled across thousands of accounts still trips
+    # the same per-IP bucket.
+    from rate_limit import check_ip_rate as _check_ip_rate
+    xff = request.headers.get("x-forwarded-for", "")
+    ip  = (xff.split(",")[0].strip() if xff else
+           (request.client.host if request.client else "unknown"))
+    allowed, retry_after, _remaining = _check_ip_rate(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many login attempts. Retry in {int(retry_after)}s.",
+            headers={"Retry-After": str(max(1, int(retry_after)))},
+        )
+
     email = payload.email.lower().strip()
     u = db.query(models.User).filter(models.User.email == email).first()
     if not u or not u.password_hash or not _auth.verify_password(payload.password, u.password_hash):

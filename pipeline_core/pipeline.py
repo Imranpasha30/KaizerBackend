@@ -680,16 +680,49 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
     lang_cfg = _langs.get(language)
 
     # ── Cache lookup (key includes language so te/hi outputs don't collide) ──
+    # Two-tier cache: Redis first (cross-pod, enterprise scale), then
+    # the legacy on-disk JSON cache (per-pod warm cache for cold-start
+    # cost). A Redis miss + disk hit lifts the entry into Redis on the
+    # way through so future pods benefit. A Redis hit doesn't bother
+    # touching disk.
     cache_enabled = os.getenv("KAIZER_CACHE_GEMINI", "true").lower() != "false"
     cache_preset = {**preset, "_lang": lang_cfg.code} if cache_enabled else preset
     cache_key = _video_cache_key(video_path, cache_preset) if cache_enabled else None
     cache_path = os.path.join(_cache_dir(), f"{cache_key}.json") if cache_key else None
 
+    # Redis tier — content-hash via the shared gemini_cache module so
+    # the key matches across all worker pods.
+    redis_key: Optional[str] = None
+    if cache_enabled and cache_key:
+        try:
+            import sys as _sys2
+            _sys2.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+            import gemini_cache as _gc
+            redis_key = _gc.make_key(
+                _gc.hash_file_prefix(video_path),
+                cache_preset,
+            )
+            cached = _gc.cache_get("video", redis_key)
+            if cached is not None:
+                print(f"    ✓ Gemini analysis served from Redis cache ({redis_key[:12]}…) — 0 quota burned")
+                return cached
+        except Exception as exc:
+            # Redis cache is best-effort; fall through to disk + live call.
+            print(f"    [cache:redis] lookup failed ({exc}) — falling back to disk")
+            redis_key = None
+
     if cache_enabled and cache_path and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            print(f"    ✓ Using cached Gemini analysis ({cache_key}) — 0 quota burned")
+            print(f"    ✓ Gemini analysis served from disk cache ({cache_key}) — 0 quota burned")
+            # Lift into Redis so the next pod gets a faster hit.
+            if redis_key:
+                try:
+                    import gemini_cache as _gc
+                    _gc.cache_set("video", redis_key, cached)
+                except Exception:
+                    pass
             return cached
         except Exception as e:
             print(f"    [cache] read failed ({e}) — re-calling Gemini")
@@ -791,14 +824,23 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
 
     result = _parse_gemini_json(raw_text)
 
-    # Persist to cache so next re-run on the same video is free
+    # Persist to BOTH cache tiers so re-runs are free across all pods.
+    # Disk write first (process-local fastest path), then Redis (shared).
+    # Either side failing is non-fatal — the result is already in hand.
     if cache_enabled and cache_path:
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
-            print(f"    ✓ Cached Gemini analysis at {cache_key}.json")
+            print(f"    ✓ Cached Gemini analysis at {cache_key}.json (disk)")
         except Exception as e:
-            print(f"    [cache] write failed: {e}")
+            print(f"    [cache:disk] write failed: {e}")
+    if cache_enabled and redis_key:
+        try:
+            import gemini_cache as _gc
+            _gc.cache_set("video", redis_key, result)
+            print(f"    ✓ Cached Gemini analysis in Redis ({redis_key[:12]}…)")
+        except Exception as e:
+            print(f"    [cache:redis] write failed: {e}")
 
     # Clean up the file from Gemini servers
     try:
@@ -1828,6 +1870,251 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
 
 
 # ═══════════════════════════════════════════════════════════
+# COMPOSE CLIP — CLEAN CARD Layout (no torn edge, framed image)
+# Video on top half, solid colour band below holding the headline
+# (top of band) and a centred white-bordered image (bottom of band).
+# ═══════════════════════════════════════════════════════════
+
+def compose_clip_clean_card(
+    raw_clip_path, image_path, title_text, out_path, preset,
+    font_size=None, text_color=None, font_file=None,
+    word_colors=None,
+    bg_color="#c10000",
+    video_pct=0.50,
+    headline_pct=0.18,
+    image_h_pct=0.30,
+    image_w_pct=0.80,
+    image_border_px=14,
+    image_border_color="#ffffff",
+    platform: str = 'youtube_short',
+):
+    """
+    Clean-card layout — same 3-block structure as torn_card but with
+    straight edges and a polaroid-style frame around the bottom image.
+
+      ┌────────────────────────────────┐
+      │           VIDEO  (top)         │  video_pct (default 50%)
+      │                                │
+      ├────────────────────────────────┤
+      │   HEADLINE TEXT (white +       │  headline_pct of band
+      │   yellow-highlighted words)    │
+      │                                │
+      │     ┌──────────────────┐       │
+      │     │  FRAMED IMAGE     │      │  image fills image_w_pct,
+      │     │  (white border)   │      │  height = image_h_pct
+      │     └──────────────────┘       │
+      └────────────────────────────────┘
+            (solid bg_color band)
+
+    Border on the image is drawn in PIL before overlay so FFmpeg only
+    sees a single rectangular RGB asset — keeps the filtergraph short
+    and the QA pass simple.
+    """
+    w, h = preset["width"], preset["height"]
+
+    VIDEO_H   = _e(int(h * float(video_pct)))
+    HEADLINE_H = _e(int(h * float(headline_pct)))
+    IMAGE_H   = _e(int(h * float(image_h_pct)))
+    IMAGE_W   = _e(int(w * float(image_w_pct)))
+
+    clip_dir = os.path.dirname(out_path)
+    clip_name = os.path.splitext(os.path.basename(out_path))[0]
+
+    # ── Solid background band (full frame, the video pads on top) ──
+    r, g, b = _hex_to_rgb(bg_color)
+    bg_img = Image.new("RGB", (w, h), (r, g, b))
+    bg_path = os.path.join(clip_dir, f"_clean_bg_{clip_name}.png")
+    bg_img.save(bg_path, "PNG")
+
+    # ── Framed image (centred, with white polaroid border) ───────
+    # Falls back to a generated text card when the news image isn't
+    # available — same fallback path compose_clip uses.
+    if not image_path or not os.path.exists(str(image_path)):
+        _gen_card = os.path.join(clip_dir, f"_clean_card_{clip_name}.jpg")
+        generate_news_card(
+            _ascii_text(title_text or "KAIZER NEWS", 40),
+            _gen_card, IMAGE_W, IMAGE_H,
+        )
+        image_path = _gen_card
+
+    bord = max(0, int(image_border_px))
+    inner_w = max(8, IMAGE_W - 2 * bord)
+    inner_h = max(8, IMAGE_H - 2 * bord)
+    bcr, bcg, bcb = _hex_to_rgb(image_border_color)
+    framed = Image.new("RGB", (IMAGE_W, IMAGE_H), (bcr, bcg, bcb))
+    try:
+        inner = Image.open(image_path).convert("RGB").resize(
+            (inner_w, inner_h), Image.LANCZOS,
+        )
+        framed.paste(inner, (bord, bord))
+    except Exception:
+        # Image load failed — leave the white plate so FFmpeg still
+        # has a valid input. Caller sees an obviously-wrong frame
+        # and can replace the image in the editor.
+        pass
+    framed_path = os.path.join(clip_dir, f"_clean_img_{clip_name}.jpg")
+    framed.save(framed_path, "JPEG", quality=95)
+
+    # ── Headline PNG via Playwright (HarfBuzz Telugu shaping) ────
+    _ff = font_file or "NotoSansTelugu-Bold.ttf"
+    tel_font = os.path.join(FONTS_DIR, _ff)
+    for _fb in ("NotoSansTelugu-Bold.ttf", "Roboto-Bold.ttf"):
+        if not os.path.exists(tel_font):
+            tel_font = os.path.join(FONTS_DIR, _fb)
+    headline_path = os.path.join(clip_dir, f"_clean_hl_{clip_name}.png")
+    HEADLINE_MARGIN = max(40, w // 24)
+    text_area_w = w - 2 * HEADLINE_MARGIN
+    # Auto-size: aim for 2 lines max — pick the largest size that fits
+    # in (text_area_w, HEADLINE_H) without overflow. compose_clip uses
+    # a similar shrink-loop via PIL.textbbox; we reuse it here.
+    words = str(title_text or "KAIZER NEWS").split()
+
+    def _fit_size():
+        from PIL import ImageDraw as _ID, Image as _IM
+        probe = _IM.new("RGB", (8, 8))
+        d = _ID.Draw(probe)
+        for fs in range(min(120, HEADLINE_H), 24, -2):
+            try:
+                fnt = _truetype(tel_font, fs) if (tel_font and os.path.exists(tel_font)) else _best_font(fs)
+            except Exception:
+                fnt = _best_font(fs)
+            wrapped, line = [], []
+            for w_ in words:
+                test = " ".join(line + [w_])
+                bb = d.textbbox((0, 0), test, font=fnt)
+                if (bb[2] - bb[0]) > text_area_w and line:
+                    wrapped.append(" ".join(line)); line = [w_]
+                else:
+                    line.append(w_)
+            if line:
+                wrapped.append(" ".join(line))
+            asc, desc = fnt.getmetrics() if hasattr(fnt, "getmetrics") else (fs, fs // 4)
+            if (asc + desc + 8) * len(wrapped) <= HEADLINE_H - 8:
+                return fs, wrapped
+        return 28, [str(title_text or "")]
+
+    fs_used, wrapped_lines = (int(font_size), None) if font_size else _fit_size()
+    if wrapped_lines is None:
+        # Caller pinned font_size — re-wrap at that size.
+        from PIL import ImageDraw as _ID2, Image as _IM2
+        probe2 = _IM2.new("RGB", (8, 8))
+        d2 = _ID2.Draw(probe2)
+        try:
+            fnt2 = _truetype(tel_font, fs_used) if (tel_font and os.path.exists(tel_font)) else _best_font(fs_used)
+        except Exception:
+            fnt2 = _best_font(fs_used)
+        wrapped_lines = []
+        line = []
+        for w_ in words:
+            test = " ".join(line + [w_])
+            bb = d2.textbbox((0, 0), test, font=fnt2)
+            if (bb[2] - bb[0]) > text_area_w and line:
+                wrapped_lines.append(" ".join(line)); line = [w_]
+            else:
+                line.append(w_)
+        if line:
+            wrapped_lines.append(" ".join(line))
+
+    _tc_hex = text_color if (text_color and str(text_color).startswith("#")) else "#ffffff"
+    _pw_ok = _playwright_render_title(
+        wrapped_lines, _tc_hex, fs_used, tel_font,
+        text_area_w, HEADLINE_H, headline_path,
+        word_colors=(word_colors or None),
+    )
+    if not (_pw_ok and os.path.exists(headline_path)):
+        # PIL fallback — render the text onto a transparent PNG.
+        from PIL import ImageDraw as _IDF, Image as _IMF
+        hl = _IMF.new("RGBA", (text_area_w, HEADLINE_H), (0, 0, 0, 0))
+        d3 = _IDF.Draw(hl)
+        try:
+            fnt3 = _truetype(tel_font, fs_used) if (tel_font and os.path.exists(tel_font)) else _best_font(fs_used)
+        except Exception:
+            fnt3 = _best_font(fs_used)
+        asc, desc = fnt3.getmetrics() if hasattr(fnt3, "getmetrics") else (fs_used, fs_used // 4)
+        line_h = asc + desc + 8
+        cy = max(0, (HEADLINE_H - line_h * len(wrapped_lines)) // 2)
+        try:
+            tr, tg, tb = _hex_to_rgb(_tc_hex); fill = (tr, tg, tb, 255)
+        except Exception:
+            fill = (255, 255, 255, 255)
+        for ln in wrapped_lines:
+            bb = d3.textbbox((0, 0), ln, font=fnt3)
+            lx = (text_area_w - (bb[2] - bb[0])) // 2
+            d3.text((lx + 2, cy + 2), ln, fill=(0, 0, 0, 180), font=fnt3)
+            d3.text((lx, cy), ln, fill=fill, font=fnt3)
+            cy += line_h
+        hl.save(headline_path, "PNG")
+
+    # ── Geometry ────────────────────────────────────────────────
+    band_y       = VIDEO_H
+    headline_y   = band_y + max(0, int((h - band_y - HEADLINE_H - IMAGE_H) * 0.35))
+    image_x      = (w - IMAGE_W) // 2
+    image_y      = headline_y + HEADLINE_H + max(0, int((h - headline_y - HEADLINE_H - IMAGE_H) * 0.5))
+    # Clamp so nothing leaks past the bottom edge
+    image_y      = min(image_y, h - IMAGE_H - 16)
+
+    # Logo precedence — same rule as compose_clip
+    _vlogo = ""  # caller can extend this via card_style later if needed
+    logo_path = (DEFAULT_LOGO or None)
+    LOGO_W = _e(int(w * 160 / 1080))
+    LOGO_H = _e(int(h * 134 / 1920))
+    LOGO_MR = int(w * 24 / 1080)
+    LOGO_MT = int(h * 25 / 1920)
+
+    def ii(*paths):
+        args = []
+        for p in paths:
+            args += ["-loop", "1", "-framerate", "30", "-i", p]
+        return args
+
+    base = ["-i", raw_clip_path]
+
+    if logo_path and os.path.exists(str(logo_path)):
+        extra = ii(bg_path, framed_path, headline_path, logo_path)
+        fc = [
+            f"{_sc(0, w, VIDEO_H)}[vid]",
+            f"[1:v]scale={w}:{h},setsar=1[bg]",
+            f"[bg][vid]overlay=x=0:y=0[bv]",
+            f"[2:v]scale={IMAGE_W}:{IMAGE_H},setsar=1[img]",
+            f"[bv][img]overlay=x={image_x}:y={image_y}[bvi]",
+            f"[3:v]scale={text_area_w}:{HEADLINE_H},setsar=1[hl]",
+            f"[bvi][hl]overlay=x={HEADLINE_MARGIN}:y={headline_y}[bgh]",
+            f"[4:v]scale={LOGO_W}:{LOGO_H}:force_original_aspect_ratio=decrease,"
+            f"pad={LOGO_W}:{LOGO_H}:(ow-iw)/2:(oh-ih)/2:color=black@0[logo]",
+            f"[bgh][logo]overlay=x={w - LOGO_W - LOGO_MR}:y={LOGO_MT}[outv]",
+        ]
+    else:
+        extra = ii(bg_path, framed_path, headline_path)
+        fc = [
+            f"{_sc(0, w, VIDEO_H)}[vid]",
+            f"[1:v]scale={w}:{h},setsar=1[bg]",
+            f"[bg][vid]overlay=x=0:y=0[bv]",
+            f"[2:v]scale={IMAGE_W}:{IMAGE_H},setsar=1[img]",
+            f"[bv][img]overlay=x={image_x}:y={image_y}[bvi]",
+            f"[3:v]scale={text_area_w}:{HEADLINE_H},setsar=1[hl]",
+            f"[bvi][hl]overlay=x={HEADLINE_MARGIN}:y={headline_y}[outv]",
+        ]
+
+    cmd = ([FFMPEG_BIN, "-y"] + base + extra +
+           ["-filter_complex", ";".join(fc),
+            "-map", "[outv]", "-map", "0:a?"]
+           + ENCODE_ARGS_SHORT_FORM
+           + ["-shortest", out_path])
+
+    run_ffmpeg(cmd)
+    _enforce_duration(out_path, platform)
+    _run_output_qa(out_path, platform)
+    return {
+        "font_size":  fs_used,
+        "font_file":  os.path.basename(tel_font),
+        "bg_color":   bg_color,
+        "image_path": image_path,
+        "framed_image_path": framed_path,
+        "headline_path":   headline_path,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # COMPOSE CLIP — SPLIT FRAME Layout (Thumbnail top + Video bottom)
 # ═══════════════════════════════════════════════════════════
 
@@ -2329,6 +2616,7 @@ def compose_split_frame(raw_clip_path, thumbnail_path, out_path, preset, bg_colo
 
 FRAME_LAYOUTS = {
     "torn_card":    "Torn Card   (Video + Red headline card + Image)",
+    "clean_card":   "Clean Card  (Video + Headline + Framed image, no torn edge)",
     "split_frame":  "Split Frame (Thumbnail + Video on colored background)",
     "follow_bar":   "Follow Bar  (Text top + Square video + Social follow bar)",
 }
@@ -3064,11 +3352,23 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         lang_font_basename = os.path.basename(lang_cfg.font_primary) or "NotoSans-Bold.ttf"
     lang_follow_text = lang_cfg.follow_bar_text or "FOLLOW KAIZER NEWS"
 
-    editor_clips = []
-    for i, clip in enumerate(clips):
+    # ── Per-clip compose worker ─────────────────────────────────────
+    # Each iteration is fully independent — different out_path, thumb,
+    # storage key, and the FFmpeg subprocesses don't share any in-
+    # process state. Safe to fan out across a ThreadPoolExecutor when
+    # KAIZER_COMPOSE_CONCURRENCY > 1.
+    #
+    # Concurrency tradeoff: each FFmpeg subprocess uses all CPU cores
+    # by default. Two simultaneous renders thus contend for the same
+    # cores. The win is that the per-clip Python setup work
+    # (Playwright HTML→PNG render of the card, PIL image prep,
+    # storage upload) overlaps with another clip's FFmpeg run. Best
+    # results on a 4-core box: concurrency=2, with
+    # KAIZER_FFMPEG_THREADS=2 so each render gets half the cores.
+    def _compose_one(i: int, clip: dict) -> Optional[dict]:
         raw_path = clip.get("raw_path")
         if not raw_path or not os.path.exists(raw_path):
-            continue
+            return None
 
         out_path = os.path.join(OUTPUT_DIR, f"clip_{i+1:02d}.mp4")
         img = images[i] if i < len(images) else images[-1]
@@ -3081,6 +3381,29 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             compose_meta = {}
             clip_card_params = {"font_file": lang_font_basename}
             clip_split_params = {"bg_color": "#1a0a2e"}
+            clip_follow_params = {}
+        elif frame_layout == "clean_card":
+            compose_meta = compose_clip_clean_card(
+                raw_path, img, card_text, out_path, preset,
+                font_size=80,
+                font_file=lang_font_basename,
+                bg_color="#c10000",
+                video_pct=0.50,
+                headline_pct=0.18,
+                image_h_pct=0.30,
+                image_w_pct=0.80,
+                image_border_px=14,
+                image_border_color="#ffffff",
+                platform=platform,
+            )
+            clip_card_params = {
+                "font_size": compose_meta.get("font_size", 80),
+                "font_file": compose_meta.get("font_file", lang_font_basename),
+                "bg_color":  "#c10000",
+                "image_border_px":   14,
+                "image_border_color":"#ffffff",
+            }
+            clip_split_params  = {}
             clip_follow_params = {}
         elif frame_layout == "follow_bar":
             _default_velvet = {
@@ -3137,11 +3460,6 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             thumb_path = ""
 
         # ── Phase 5: post-render storage upload ──────────────────────
-        # Upload the finished clip to cloud storage when STORAGE_BACKEND
-        # is not 'local'.  The local file is kept alive until the pipeline
-        # process exits (runner.py owns cleanup via the output directory).
-        # job_id is not available inside pipeline.py (subprocess context),
-        # so we use a timestamp-based directory name as the key prefix.
         storage_url_ec  = ""
         storage_key_ec  = ""
         storage_bknd_ec = ""
@@ -3153,12 +3471,9 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 content_type="video/mp4",
             )
         except Exception as _upload_err:
-            # Log but do NOT abort the pipeline — the local file is still
-            # valid and runner.py will import it successfully.  The DB row
-            # will simply have empty storage_* fields until the next upload.
             print(f"  [storage] upload failed for clip {i+1}: {_upload_err}", flush=True)
 
-        ec = {
+        return {
             "clip_path":        os.path.abspath(out_path),
             "raw_path":         os.path.abspath(raw_path),
             "thumb_path":       os.path.abspath(thumb_path) if thumb_path else "",
@@ -3185,7 +3500,29 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             "storage_key":      storage_key_ec,
             "storage_backend":  storage_bknd_ec,
         }
-        editor_clips.append(ec)
+
+    # Concurrency knob — default 1 (sequential, identical to legacy
+    # behaviour). Set KAIZER_COMPOSE_CONCURRENCY=2 alongside
+    # KAIZER_FFMPEG_THREADS=2 on a 4-core box to roughly halve a
+    # multi-clip job's wall-clock without raising peak CPU above 100%.
+    _compose_n = max(1, int(os.environ.get("KAIZER_COMPOSE_CONCURRENCY", "1") or "1"))
+    editor_clips: list[dict] = []
+    if _compose_n <= 1 or len(clips) <= 1:
+        for _i, _clip in enumerate(clips):
+            ec = _compose_one(_i, _clip)
+            if ec:
+                editor_clips.append(ec)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"    [parallel] composing {len(clips)} clips with concurrency={_compose_n}")
+        with ThreadPoolExecutor(max_workers=_compose_n,
+                                thread_name_prefix="kaizer-compose") as _ex:
+            # executor.map preserves submission order, so editor_clips
+            # ends up in clip-index order without an explicit sort.
+            for ec in _ex.map(lambda args: _compose_one(*args),
+                              [(i, c) for i, c in enumerate(clips)]):
+                if ec:
+                    editor_clips.append(ec)
 
     # ════ STEP 6: Save Metadata + Launch Editor ════
     print(f"\n  [6/{TOTAL}] Saving metadata & launching editor ...")

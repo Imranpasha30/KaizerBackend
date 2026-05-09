@@ -300,6 +300,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── OpenTelemetry — opt-in (KAIZER_OTEL_ENABLED=true) ───────────────────────
+# Initialise the SDK and attach FastAPI auto-instrumentation BEFORE any
+# router gets registered against `app`, so every endpoint is covered.
+# When OTEL is disabled, init_tracing returns False and the helpers in
+# tracing.span() are no-ops (zero overhead).
+try:
+    import tracing as _tracing
+    _tracing.init_tracing(service_name="kaizer-backend",
+                          service_version="2.0.0")
+    _tracing.instrument_fastapi(app)
+except Exception as _exc:
+    print(f"[startup] tracing init failed (non-fatal): {_exc}")
+
 # ── Routers ──────────────────────────────────────────────────────────────────
 # Auth (register / login / Google sign-in / me).
 app.include_router(auth_router)
@@ -373,10 +386,22 @@ PLATFORMS = {
     "youtube_full":   {"label": "YouTube Full",   "width": 1920, "height": 1080},
 }
 
+# Frame layouts — single source of truth lives in pipeline_core.pipeline
+# (the CLI's --frame argparse list is built from it). We keep human-friendly
+# labels here so the React UI doesn't have to parse the CLI-style ones, but
+# the KEYS are pinned to pipeline.FRAME_LAYOUTS so a layout that doesn't
+# exist in the renderer can never be offered to the frontend.
+from pipeline_core.pipeline import FRAME_LAYOUTS as _PIPELINE_FRAME_LAYOUTS
+
+_FRAME_LABELS = {
+    "torn_card":   "Torn Card — Classic torn-edge news card layout",
+    "clean_card":  "Clean Card — Straight-edge layout with framed bottom image",
+    "split_frame": "Split Frame — Thumbnail on top + Video on colored background",
+    "follow_bar":  "Follow Bar — News card with follow bar at bottom",
+}
 FRAME_LAYOUTS = {
-    "torn_card":  "Torn Card — Classic torn-edge news card layout",
-    "follow_bar": "Follow Bar — News card with follow bar at bottom",
-    "minimal":    "Minimal — Clean single-section layout",
+    k: _FRAME_LABELS.get(k, _PIPELINE_FRAME_LAYOUTS[k])
+    for k in _PIPELINE_FRAME_LAYOUTS.keys()
 }
 
 

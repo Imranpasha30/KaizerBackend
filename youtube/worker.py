@@ -1,22 +1,42 @@
-"""Asyncio upload worker — single loop, polls upload_jobs table.
+"""Upload worker — Redis Streams consumer, with DB-poll fallback.
 
-Design:
-  - One background asyncio task spun up on FastAPI startup.
-  - Polls every POLL_INTERVAL seconds for a `queued` row.
-  - Runs the (sync, blocking) upload on a thread via run_in_executor so the
-    event loop stays free.
-  - On failure, applies exponential backoff:
-        attempts 1..MAX_ATTEMPTS → 30s, 1m, 2m, 5m, 15m, 60m
-  - On quota exhaustion: stays `queued` with a 1-hour backoff stamp, so it
-    retries after the quota resets.
-  - On process restart: any row stuck in `uploading` becomes `queued` again.
-    Since `upload_uri` is persisted, the next run resumes from bytes_uploaded.
+Two job-distribution paths live here:
+
+1. **Primary — Redis Streams + Consumer Group** (see redis_queue.py).
+   The API XADDs a job_id to ``kaizer:uploads`` after creating the
+   row; this worker XREADGROUPs the message and processes the job.
+   Multiple worker pods in the same group load-balance naturally and
+   crash recovery via XCLAIM is built-in. This is the enterprise path.
+
+2. **Fallback — legacy DB poll on `upload_jobs.status='queued'`**.
+   Used only when ``REDIS_URL`` is unset or Redis is unreachable —
+   keeps single-host deployments running without a Redis dependency.
+   Also runs on startup once to bootstrap any rows that were created
+   before the Redis migration.
+
+Both paths converge on ``_process(job_id)`` which holds the actual
+upload + Postiz routing + retry policy.
+
+Failure model:
+  - On transient failure: ``_retry`` schedules a backoff and leaves
+    the message UNACKED so XCLAIM picks it back up if this worker
+    dies. Status flips back to 'queued' in DB.
+  - On terminal failure (>= MAX_ATTEMPTS, auth error, missing source):
+    ``_fail`` flips status to 'failed' AND XACKs the Redis message
+    so we don't reprocess. A future Stage will route these to the
+    DLQ stream (see ``redis_queue.send_to_dlq``).
+
+Worker enable gate:
+  Set ``KAIZER_WORKER_ENABLED=false`` in the env to make this module
+  a no-op. Useful on the Railway pod that's running stale code while
+  development happens locally.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import socket
 import tempfile
 import time
 import traceback
@@ -38,10 +58,58 @@ POLL_INTERVAL = 3.0
 MAX_ATTEMPTS  = 6
 BACKOFF_SECS  = (30, 60, 120, 300, 900, 3600)   # indexed by attempts
 
+# Redis Streams XREADGROUP block — long enough that an idle worker
+# isn't busy-looping, short enough that shutdown is responsive.
+REDIS_BLOCK_MS = 5_000
 
-# Module-level flag so shutdown can stop the loop cooperatively
+# How many concurrent consumer slots run inside one process. Each slot
+# is its own asyncio task with its own Redis consumer name, so they
+# don't fight over PEL ownership. Bound by the FFmpeg/network budget
+# of the host — concurrency=4 means 4 simultaneous uploads in flight.
+DEFAULT_CONCURRENCY = int(os.environ.get("KAIZER_WORKER_CONCURRENCY", "4"))
+
+
+# Module-level lifecycle state. Multiple slot-tasks live under _tasks.
 _running = False
-_task: Optional[asyncio.Task] = None
+_tasks: list = []
+
+# Base consumer name. Each slot appends `-{i}` so consumers stay
+# distinct in the same group.
+_CONSUMER_BASE = f"{socket.gethostname()}-{os.getpid()}"
+# Backwards-compat alias kept for code paths that reference the
+# legacy single-consumer name (admin debug endpoints, etc.).
+_CONSUMER_NAME = _CONSUMER_BASE
+
+# Runtime decision on whether to use the Redis path. Computed once
+# at startup (see `start()`) so the loop body doesn't keep probing.
+_using_redis = False
+
+
+def _worker_enabled() -> bool:
+    return (os.environ.get("KAIZER_WORKER_ENABLED", "true").strip().lower()
+            not in ("false", "0", "no", "off"))
+
+
+# ── Per-stage timing logger ─────────────────────────────────────
+# Emits a single line per job-lifecycle event so we can pipe to Loki/
+# CloudWatch later. Format is k=v space-separated for cheap grep.
+_metrics_logger = logging.getLogger("kaizer.worker.metrics")
+_metrics_logger.setLevel(logging.INFO)
+if not _metrics_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[metrics] %(message)s"))
+    _metrics_logger.addHandler(_h)
+    _metrics_logger.propagate = False
+
+
+def _emit_metric(stage: str, *, job_id: int, ms: float = 0.0,
+                 consumer: str = "", **extra) -> None:
+    parts = [f"stage={stage}", f"job_id={job_id}", f"ms={ms:.0f}"]
+    if consumer:
+        parts.append(f"consumer={consumer}")
+    for k, v in extra.items():
+        parts.append(f"{k}={v}")
+    _metrics_logger.info(" ".join(parts))
 
 
 def _next_retry_at(attempts: int) -> datetime:
@@ -50,25 +118,78 @@ def _next_retry_at(attempts: int) -> datetime:
 
 
 async def start() -> None:
-    """Called from FastAPI startup."""
-    global _running, _task
+    """Called from FastAPI startup. Spawns N concurrent consumer slots."""
+    global _running, _tasks, _using_redis
     if _running:
         return
+
+    if not _worker_enabled():
+        print("[upload-worker] DISABLED — KAIZER_WORKER_ENABLED is false. "
+              "This pod will NOT process jobs.")
+        return
+
+    # Probe Redis once. If it's unreachable we transparently fall back
+    # to the DB-poll path so single-host deployments still work.
+    try:
+        from redis_queue import is_enabled as _redis_enabled, ensure_group
+        if _redis_enabled():
+            ensure_group()
+            _using_redis = True
+        else:
+            _using_redis = False
+            print("[upload-worker] queue mode = DB-POLL (Redis disabled or unreachable)")
+    except Exception as exc:
+        _using_redis = False
+        print(f"[upload-worker] queue mode = DB-POLL (Redis init failed: {exc})")
+
     _running = True
     _recover_stuck_rows()
-    _task = asyncio.create_task(_loop(), name="kaizer-upload-worker")
+
+    # One-shot: bring legacy DB-only `queued` rows into the stream so
+    # the Redis path doesn't ignore them on first deploy.
+    if _using_redis:
+        try:
+            from redis_queue import bootstrap_existing_queued_jobs
+            db = SessionLocal()
+            try:
+                n = bootstrap_existing_queued_jobs(db)
+                if n:
+                    print(f"[upload-worker] bootstrap: enqueued {n} pre-existing job(s)")
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[upload-worker] bootstrap failed (non-fatal): {exc}")
+
+    # Spin up N consumer slots (only useful with Redis — DB-poll
+    # serialises through SessionLocal claims anyway, so 1 slot in
+    # that mode).
+    if _using_redis:
+        slots = max(1, DEFAULT_CONCURRENCY)
+        print(f"[upload-worker] queue mode = REDIS  base={_CONSUMER_BASE}  slots={slots}")
+        for i in range(slots):
+            consumer = f"{_CONSUMER_BASE}-{i}"
+            _tasks.append(asyncio.create_task(
+                _slot_loop(consumer),
+                name=f"kaizer-upload-worker-{i}",
+            ))
+    else:
+        _tasks.append(asyncio.create_task(
+            _slot_loop(_CONSUMER_BASE),
+            name="kaizer-upload-worker-0",
+        ))
 
 
 async def stop() -> None:
-    global _running, _task
+    global _running, _tasks
     _running = False
-    if _task:
-        _task.cancel()
+    for t in list(_tasks):
+        t.cancel()
+    for t in list(_tasks):
         try:
-            await _task
+            await t
         except (asyncio.CancelledError, Exception):
             pass
-        _task = None
+    _tasks = []
 
 
 def _recover_stuck_rows() -> None:
@@ -88,30 +209,189 @@ def _recover_stuck_rows() -> None:
         db.close()
 
 
-async def _loop() -> None:
+async def _slot_loop(consumer: str) -> None:
+    """One consumer slot — pulls + processes its share of jobs.
+
+    Multiple slots run concurrently in the same process and same
+    consumer group. Redis Streams guarantees exactly-one-of-the-
+    available-consumers receives each message, so slots don't fight.
+    Each slot's PEL is attributed to its consumer name, so a slot
+    crash only strands that slot's in-flight messages — XCLAIM
+    recovers them onto another slot after idle_ms.
+    """
     loop = asyncio.get_running_loop()
+
+    if _using_redis:
+        # First, claim any messages that were stranded in PEL by a
+        # previous crashed consumer (this consumer's previous boot,
+        # or a sibling slot that died). Walks every priority lane.
+        try:
+            from redis_queue import recover_pending
+            for msg_id, job_id, priority in recover_pending(consumer, idle_ms=60_000):
+                if not _running:
+                    return
+                await loop.run_in_executor(
+                    None, _process_redis, consumer, msg_id, job_id, priority,
+                )
+        except Exception:
+            traceback.print_exc()
+
     while _running:
         try:
-            job_id = await loop.run_in_executor(None, _pick_next)
-            if job_id is None:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-            await loop.run_in_executor(None, _process, job_id)
+            if _using_redis:
+                msgs = await loop.run_in_executor(None, _redis_pull_batch, consumer)
+                if not msgs:
+                    continue
+                for msg_id, job_id, priority in msgs:
+                    if not _running:
+                        return
+                    await loop.run_in_executor(
+                        None, _process_redis, consumer, msg_id, job_id, priority,
+                    )
+            else:
+                # Legacy fallback path. With concurrency=1 in DB-poll
+                # mode, the existing single-claim guard inside
+                # _pick_next is enough.
+                job_id = await loop.run_in_executor(None, _pick_next)
+                if job_id is None:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+                await loop.run_in_executor(None, _process, job_id)
         except asyncio.CancelledError:
             return
         except Exception:
-            # Never let the loop die from an unexpected exception
             traceback.print_exc()
             await asyncio.sleep(POLL_INTERVAL)
 
 
-def _pick_next() -> Optional[int]:
-    """Atomically claim the next queued row (oldest first, respecting backoff).
+def _redis_pull_batch(consumer: str) -> list:
+    """One XREADGROUP round across priority lanes. Returns a list of
+    ``(msg_id, job_id, priority)``."""
+    from redis_queue import consume_upload_jobs
+    try:
+        return list(consume_upload_jobs(
+            consumer, count=4, block_ms=REDIS_BLOCK_MS,
+        ))
+    except Exception as exc:
+        _worker_logger.warning("redis pull failed (will retry): %s", exc)
+        time.sleep(1.0)
+        return []
 
-    We rely on SQLite/Postgres row-level locking indirectly by bumping status
-    to 'uploading' in the same session. Two workers hitting the same row is
-    prevented by single-process deployment (v1). When we scale, add a
-    `claimed_by` worker_id + a conditional UPDATE.
+
+def _process_redis(consumer: str, msg_id: str, job_id: int, priority: str) -> None:
+    """Wraps `_process` with XACK on terminal status + DLQ on failure.
+
+    Carries ``priority`` end-to-end so each XACK / DLQ / re-enqueue
+    targets the correct lane. A pro-tier job that retries should come
+    back on ``hi``, not ``normal`` — the priority value is the source
+    of truth for "which lane did this message live in?".
+
+    Outcomes & PEL bookkeeping:
+      - status='done' on entry  → ACK, no work.
+      - status='failed'/'cancelled' on entry → ACK (terminal already).
+      - status='queued' or 'uploading' on entry → claim (status →
+        'uploading') and run _process.
+      - After _process: terminal status determines ACK vs DLQ vs
+        re-enqueue. See decision table below.
+    """
+    from redis_queue import (
+        ack_upload_job, enqueue_upload_job, send_to_dlq,
+    )
+    # OTel root span for the whole job lifecycle. When OTel is off this
+    # is a no-op; when on, the claim/process/ack child spans below
+    # become children of this one and the trace shows the full timeline
+    # in Tempo/Jaeger/Honeycomb.
+    import tracing
+    with tracing.span(
+        "worker.process_job",
+        **{
+            "kaizer.job_id":   job_id,
+            "kaizer.consumer": consumer,
+            "kaizer.priority": priority,
+            "kaizer.msg_id":   msg_id,
+        },
+    ) as job_span:
+        t_claim_start = time.monotonic()
+
+        # ── Phase A: Claim ─────────────────────────────────────────
+        with tracing.span("worker.claim", **{"kaizer.job_id": job_id}):
+            db = SessionLocal()
+            try:
+                row = db.query(models.UploadJob).filter(models.UploadJob.id == job_id).first()
+                if not row:
+                    _worker_logger.warning("redis: job_id=%s not in DB — acking and skipping", job_id)
+                    job_span.set_attribute("kaizer.outcome", "row_missing")
+                    ack_upload_job(msg_id, priority)
+                    return
+                if row.status == "done":
+                    job_span.set_attribute("kaizer.outcome", "already_done")
+                    ack_upload_job(msg_id, priority)
+                    return
+                if row.status in ("failed", "cancelled"):
+                    job_span.set_attribute("kaizer.outcome", "already_terminal")
+                    ack_upload_job(msg_id, priority)
+                    return
+                # Claim — flip status. Mirrors the old _pick_next semantics.
+                row.status = "uploading"
+                row.last_error = (row.last_error or "") + \
+                    f"\n[worker] redis-claimed at {datetime.now(timezone.utc).isoformat()} by {consumer} (lane={priority})"
+                db.commit()
+            finally:
+                db.close()
+
+        _emit_metric("claim", job_id=job_id, ms=(time.monotonic() - t_claim_start) * 1000,
+                     consumer=consumer, priority=priority)
+
+        # ── Phase B: Process ──────────────────────────────────────
+        with tracing.span("worker.process", **{"kaizer.job_id": job_id}) as proc_span:
+            t_proc_start = time.monotonic()
+            _process(job_id)
+            proc_ms = (time.monotonic() - t_proc_start) * 1000
+            proc_span.set_attribute("kaizer.proc_ms", proc_ms)
+
+        # ── Phase C: Decide ACK / DLQ / re-enqueue ────────────────
+        with tracing.span("worker.finalise", **{"kaizer.job_id": job_id}) as fin_span:
+            db = SessionLocal()
+            try:
+                row = db.query(models.UploadJob).filter(models.UploadJob.id == job_id).first()
+                if not row:
+                    ack_upload_job(msg_id, priority)
+                    _emit_metric("process_end", job_id=job_id, ms=proc_ms,
+                                 consumer=consumer, priority=priority, outcome="row_missing")
+                    fin_span.set_attribute("kaizer.outcome", "row_missing")
+                    job_span.set_attribute("kaizer.outcome", "row_missing")
+                    return
+                outcome = row.status
+                if outcome == "done":
+                    ack_upload_job(msg_id, priority)
+                elif outcome == "failed":
+                    send_to_dlq(msg_id, job_id, priority,
+                                reason=(row.last_error or "")[:500] or "no last_error recorded")
+                elif outcome == "cancelled":
+                    ack_upload_job(msg_id, priority)
+                elif outcome == "queued":
+                    ack_upload_job(msg_id, priority)
+                    try:
+                        enqueue_upload_job(job_id, priority=priority)
+                    except Exception as exc:
+                        _worker_logger.warning("re-enqueue failed for job %s: %s", job_id, exc)
+                else:
+                    outcome = f"unfinished:{outcome}"
+                _emit_metric("process_end", job_id=job_id, ms=proc_ms,
+                             consumer=consumer, priority=priority, outcome=outcome)
+                fin_span.set_attribute("kaizer.outcome", outcome)
+                job_span.set_attribute("kaizer.outcome", outcome)
+            finally:
+                db.close()
+
+
+def _pick_next() -> Optional[int]:
+    """Legacy DB-poll picker — used only when Redis is unavailable.
+
+    Atomically claim the next queued row (oldest first, respecting backoff).
+    Two workers hitting the same row is prevented in this fallback by
+    single-process deployment; the Redis path uses consumer groups
+    instead, which handle multi-worker correctly.
     """
     db = SessionLocal()
     try:
@@ -220,13 +500,15 @@ def _ensure_local_clip(
 
 
 def _process(job_id: int) -> None:
+    print(f"[worker DBG] _process({job_id}) entered")
     db = SessionLocal()
     try:
         job = db.query(models.UploadJob).filter(models.UploadJob.id == job_id).first()
         if not job:
+            print(f"[worker DBG] _process({job_id}): job missing")
             return
         if job.status != "uploading":
-            # Someone cancelled or changed state before we started
+            print(f"[worker DBG] _process({job_id}): status={job.status} (not 'uploading') — skipping")
             return
 
         clip = db.query(models.Clip).filter(models.Clip.id == job.clip_id).first()
@@ -383,9 +665,16 @@ def _process_via_postiz(
     inside Postiz first.
     """
     from clients import postiz as postiz_client
+    import os as _os
+    _key_len = len((_os.environ.get("POSTIZ_API_KEY") or "").strip())
+    _base    = _os.environ.get("POSTIZ_BASE_URL", "(default)")
+    print(f"[postiz-worker DBG] is_enabled={postiz_client.is_enabled()}  "
+          f"POSTIZ_API_KEY len={_key_len}  base={_base}")
     if not postiz_client.is_enabled():
         _fail(db, job,
-              "upload_provider=postiz but POSTIZ_API_KEY is not set in env")
+              f"upload_provider=postiz but POSTIZ_API_KEY is empty in worker env "
+              f"(len={_key_len} base={_base}). load_dotenv may have failed or "
+              f"the .env was edited after uvicorn started.")
         return
 
     # 1) Resolve the destination + its YouTube channel id.
@@ -395,10 +684,7 @@ def _process_via_postiz(
     if not dest_channel or not dest_channel.oauth_token:
         _fail(db, job, "destination profile not linked to YouTube")
         return
-    target_yt_id = (dest_channel.oauth_token.google_channel_id or "").strip()
-    if not target_yt_id:
-        _fail(db, job, "destination has no YouTube channel id (re-OAuth)")
-        return
+    yt_title = (dest_channel.oauth_token.google_channel_title or "").strip()
 
     # 2) Pull Postiz integrations and find the matching YT one.
     try:
@@ -407,54 +693,93 @@ def _process_via_postiz(
         _retry(db, job, f"Postiz unreachable: {e}")
         return
 
-    yt_integrations = [i for i in integrations
-                       if (i.get("provider") or "").lower() == "youtube"]
+    # Postiz Cloud's response shape:
+    #   { id, name, identifier ('youtube'/'twitter'/...),
+    #     profile (@handle-suffix), picture, disabled }
+    # The `identifier` field is the PROVIDER, not the YouTube channel
+    # id, so we match by `name` (channel display name like
+    # "Kaizer 30") against the Kaizer OAuthToken.google_channel_title.
+    yt_integrations = [
+        i for i in integrations
+        if (i.get("provider") or i.get("identifier") or "").lower() == "youtube"
+        and not i.get("disabled")
+    ]
+
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+    target_norm = _norm(yt_title)
     match = next(
-        (i for i in yt_integrations
-         if (i.get("identifier") or "").strip() == target_yt_id),
+        (i for i in yt_integrations if _norm(i.get("name", "")) == target_norm),
         None,
     )
-    # Fallback: if Postiz didn't expose identifier, take the SOLO YT
-    # integration when only one is connected — the common case for
-    # someone just getting started.
+    # Fallback: handle (profile field) starts-with match — Postiz adds
+    # a random suffix like "-y5p" to handles, so we strip it.
+    if not match:
+        for i in yt_integrations:
+            handle = (i.get("profile") or "").lstrip("@").split("-", 1)[0]
+            kz_handle = (dest_channel.oauth_token.channel_custom_url or "").lstrip("@")
+            if handle and kz_handle and _norm(handle) == _norm(kz_handle):
+                match = i
+                break
+    # Last resort: SOLO youtube integration on the Postiz account.
     if not match and len(yt_integrations) == 1:
         match = yt_integrations[0]
 
     if not match:
+        names = [i.get("name", "?") for i in yt_integrations]
         _fail(
             db, job,
             f"No Postiz YouTube integration matches channel "
-            f"{dest_channel.name!r} (yt_id={target_yt_id}). "
-            f"Connect it in Postiz → Channels → YouTube.",
+            f"{dest_channel.name!r} (yt_title={yt_title!r}). "
+            f"Postiz has {len(yt_integrations)} youtube integration(s): "
+            f"{names!r}. Match by exact name in Postiz UI or rename "
+            f"the channel there to match.",
         )
         return
 
-    # 3) Choose a public URL Postiz can fetch the bytes from.
-    #    Prefer R2 (already mirrored at clip-render time); fall back
-    #    to /api/file path which is reachable from the same host
-    #    (only works for self-hosted Postiz on the same network).
-    media_url = (clip.storage_url or "").strip()
-    if not media_url:
-        _fail(
-            db, job,
-            "Clip has no public storage_url for Postiz to fetch. "
-            "Re-render to push to R2 before publishing via Postiz.",
-        )
+    # 3) Upload the local video bytes to Postiz first. Postiz Cloud
+    #    references media by INTERNAL id, not URL — passing R2 URLs
+    #    fails validation with "image.0.id should not be null". Use
+    #    the resolved local path (already downloaded by
+    #    _ensure_local_clip) so we don't depend on Postiz's
+    #    network reaching R2.
+    job.attempts = (job.attempts or 0) + 1
+    _append_log(job, f"postiz: uploading video bytes "
+                       f"({Path(resolved_clip_path).name})…")
+    db.commit()
+    try:
+        upload = postiz_client.upload_file(resolved_clip_path,
+                                           mime_type="video/mp4")
+    except postiz_client.PostizAuthError as e:
+        _fail(db, job, f"Postiz auth on upload: {e}")
         return
+    except postiz_client.PostizError as e:
+        _retry(db, job, f"Postiz upload error: {e}")
+        return
+
+    media_id   = upload.get("id")
+    media_path = upload.get("path")
+    if not media_id:
+        _fail(db, job, f"Postiz upload returned no id: {upload!r}")
+        return
+    _append_log(job, f"postiz: upload OK id={media_id}")
 
     # 4) Compose the post + dispatch.
-    job.attempts = (job.attempts or 0) + 1
-    _append_log(job, f"postiz: posting to integration {match.get('id','?')} "
+    _append_log(job, f"postiz: scheduling on integration {match.get('id','?')} "
                        f"({match.get('name','?')})")
     db.commit()
     try:
         result = postiz_client.schedule_post(
             integration_ids=[match["id"]],
             text=(job.title or "") + (("\n\n" + job.description) if job.description else ""),
-            media_url=media_url,
+            media_id=media_id,
+            media_path=media_path,
             schedule_at_iso=(job.publish_at.isoformat()
                               if getattr(job, "publish_at", None) else None),
             type_="scheduled" if getattr(job, "publish_at", None) else "now",
+            yt_title=(job.title or "").strip()[:100] or None,
+            yt_privacy=(job.privacy_status or "public"),
         )
     except postiz_client.PostizAuthError as e:
         _fail(db, job, f"Postiz auth: {e}")

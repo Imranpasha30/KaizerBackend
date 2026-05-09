@@ -966,3 +966,135 @@ def get_upload_provider_public(
     _u: models.User = Depends(auth.current_user),
 ) -> dict:
     return {"upload_provider": _ss.get_upload_provider(db)}
+
+
+# ─── Queue / Worker observability (Stage 2 of Redis migration) ────────────
+
+@router.get("/queue/stats")
+def admin_queue_stats(_: models.User = Depends(auth.admin_required)) -> dict:
+    """Snapshot of the Redis Streams queue state — stream length, PEL,
+    per-consumer pending, DLQ size. Returns ``ok=False`` when Redis is
+    unreachable (the API still serves so the admin UI shows the error
+    rather than 500ing)."""
+    from redis_queue import queue_stats
+    return queue_stats()
+
+
+@router.get("/queue/dlq")
+def admin_queue_dlq(
+    count: int = Query(50, ge=1, le=500),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """List recent DLQ entries (newest first). Use ``count`` to scope
+    the page size — defaults to 50."""
+    from redis_queue import list_dlq, QueueError
+    try:
+        return {"entries": list_dlq(count=count)}
+    except QueueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/queue/dlq/{message_id}/replay")
+def admin_queue_replay(
+    message_id: str,
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Pop the named DLQ entry and re-enqueue its job_id to the main
+    upload stream. The message_id format is the Redis stream id
+    (e.g. ``1778312608609-0``) — get it from ``GET /queue/dlq``.
+
+    Returns the new stream message id of the replay so admin tools can
+    correlate."""
+    from redis_queue import replay_from_dlq, QueueError
+    try:
+        return replay_from_dlq(message_id)
+    except QueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ─── Gemini cache (Stage 4 of Redis migration) ──────────────────────────
+
+@router.get("/cache/gemini")
+def admin_gemini_cache_stats(_: models.User = Depends(auth.admin_required)) -> dict:
+    """Per-kind cache hits/misses/writes + a totals roll-up.
+
+    Use the hit_rate to decide whether a kind is paying its keep —
+    < 30% probably means the cache key is too narrow (over-keying on
+    something that should be canonicalised) or the temperature is
+    too high (creative variation defeating the cache).
+    """
+    import gemini_cache
+    return gemini_cache.stats()
+
+
+@router.delete("/cache/gemini")
+def admin_gemini_cache_reset(
+    kind: Optional[str] = Query(None,
+        description="Specific kind to wipe ('video', 'translation', etc.) — "
+                    "omit to reset all kinds."),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Wipe cached Gemini responses. Use after a prompt change or model
+    upgrade to make sure stale cached outputs aren't served."""
+    import gemini_cache
+    if kind and kind not in gemini_cache.KINDS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown cache kind {kind!r}. "
+                                   f"Valid: {sorted(gemini_cache.KINDS.keys())}")
+    deleted = gemini_cache.reset(kind)
+    return {"ok": True, "kind": kind or "*", "keys_deleted": deleted}
+
+
+# ─── Per-tenant rate-limit inspection (Stage 5) ─────────────────────────
+
+@router.get("/rate-limits/buckets")
+def admin_rate_limit_config(_: models.User = Depends(auth.admin_required)) -> dict:
+    """Return the plan→bucket→(burst, rate_per_s) config table.
+
+    The frontend uses this to render a "your plan's caps" panel; ops
+    use it to confirm a rate-limit change rolled out before debugging
+    a 429."""
+    import rate_limit
+    return {
+        "default_plan": rate_limit.DEFAULT_PLAN,
+        "limits": {
+            plan: {
+                bucket: {"burst": cfg[0], "rate_per_s": cfg[1]}
+                for bucket, cfg in buckets.items()
+            }
+            for plan, buckets in rate_limit.PLAN_LIMITS.items()
+        },
+        "auth_ip": {
+            "burst":      rate_limit.AUTH_IP_BURST,
+            "rate_per_s": rate_limit.AUTH_IP_RATE,
+        },
+    }
+
+
+@router.get("/rate-limits/state")
+def admin_rate_limit_state(
+    bucket: str = Query("create"),
+    plan:   str = Query("free"),
+    who:    str = Query(..., description="user:<id> or ip:<addr>"),
+    _:      models.User = Depends(auth.admin_required),
+) -> dict:
+    """Inspect a tenant's current bucket state — supports the "why am
+    I being rate-limited?" support flow without granting Redis-CLI
+    access. ``who`` matches the format the limiter writes:
+    ``user:<id>`` or ``ip:<addr>``."""
+    import rate_limit
+    return rate_limit.bucket_state(bucket, plan, who)
+
+
+@router.delete("/rate-limits/state")
+def admin_rate_limit_reset(
+    bucket: str = Query("create"),
+    plan:   str = Query("free"),
+    who:    str = Query(..., description="user:<id> or ip:<addr>"),
+    _:      models.User = Depends(auth.admin_required),
+) -> dict:
+    """Wipe a tenant's bucket. Use during incident response to unblock
+    a customer whose legitimate burst tripped the cap."""
+    import rate_limit
+    deleted = rate_limit.reset_bucket(bucket, plan, who)
+    return {"ok": True, "deleted": deleted, "key": f"kaizer:rl:{bucket}:{plan}:{who}"}

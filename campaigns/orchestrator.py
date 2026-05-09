@@ -140,7 +140,19 @@ def _enqueue_job_on_campaign(db: Session, job_id: int, campaign_id: int) -> int:
             )
             db.add(upload)
             db.commit()
+            db.refresh(upload)
             queued += 1
+
+            # Signal the worker via Redis. Campaigns are bulk fan-out
+            # work — route to the ``lo`` lane so a 500-channel campaign
+            # never blocks a paying tenant's live single upload sitting
+            # on ``hi`` or ``normal``.
+            try:
+                from redis_queue import enqueue_upload_job, is_enabled as _redis_on, priority_for_user
+                if _redis_on():
+                    enqueue_upload_job(upload.id, priority=priority_for_user(None, batch=True))
+            except Exception as exc:
+                print(f"[campaigns] redis enqueue failed for upload {upload.id}: {exc}")
 
             # 4. Phase D — translation fan-out
             if camp.auto_translate_to:
