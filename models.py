@@ -58,7 +58,7 @@ class Job(Base):
 
     id           = Column(Integer, primary_key=True, index=True)
     user_id      = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    status       = Column(String(20), default="pending")   # pending | running | done | failed
+    status       = Column(String(20), default="pending")   # pending | running | done | failed | cancelled
     platform     = Column(String(50))
     frame_layout = Column(String(50))
     video_name   = Column(String(255))
@@ -70,6 +70,12 @@ class Job(Base):
     # Wall-clock timing of the pipeline subprocess.
     started_at   = Column(DateTime(timezone=True), nullable=True)
     finished_at  = Column(DateTime(timezone=True), nullable=True)
+    # User-initiated cancellation flag. The cancel endpoint sets this AND
+    # calls runner.cancel_job() to walk the subprocess tree + kill ffmpeg
+    # children. The flag persists on the DB row so a runner restart can
+    # detect "this job was cancelled while we were down" and refuse to
+    # resume it.
+    cancel_requested = Column(Boolean, default=False, nullable=False)
 
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 

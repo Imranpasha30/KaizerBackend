@@ -61,14 +61,23 @@ def _migrate_schema():
 
         # ── jobs table columns ──────────────────────────────────────────
         existing_jobs = {c["name"] for c in inspector.get_columns("jobs")}
+        # NOTE on cancel_requested: SQLAlchemy declares the ORM-level
+        # default=False but the DB column itself needs a DEFAULT clause
+        # (PG rejects ADDing a NOT NULL column to a populated table
+        # without one). Dialect-aware default:
+        #   Postgres: BOOLEAN NOT NULL DEFAULT FALSE
+        #   SQLite:   BOOLEAN NOT NULL DEFAULT 0
+        _bool_false = "BOOLEAN NOT NULL DEFAULT FALSE" if engine.dialect.name == "postgresql" \
+                                                       else "BOOLEAN NOT NULL DEFAULT 0"
         job_additions = {
-            "frame_layout": "VARCHAR(50)",
-            "video_name":   "VARCHAR(255)",
-            "error":        "TEXT",
-            "language":     "VARCHAR(10) DEFAULT 'te'",
-            "user_id":      "INTEGER",
-            "started_at":   "DATETIME",
-            "finished_at":  "DATETIME",
+            "frame_layout":     "VARCHAR(50)",
+            "video_name":       "VARCHAR(255)",
+            "error":            "TEXT",
+            "language":         "VARCHAR(10) DEFAULT 'te'",
+            "user_id":          "INTEGER",
+            "started_at":       "DATETIME",
+            "finished_at":      "DATETIME",
+            "cancel_requested": _bool_false,
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
@@ -1230,6 +1239,74 @@ def delete_job(job_id: int, db: Session = Depends(get_db), user: models.User = D
     db.delete(job)
     db.commit()
     return {"deleted": job_id}
+
+
+@app.post("/api/jobs/{job_id}/cancel/")
+def cancel_job_endpoint(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Stop a running (or queued) job.
+
+    Behaviour:
+      - 404 if the job doesn't exist or belongs to a different user.
+      - No-op if the job is already in a terminal state (done / failed /
+        cancelled) — returns the current status so the UI can refresh.
+      - Otherwise: sets ``cancel_requested=True``, asks the runner to
+        tree-kill the live subprocess (if any), and stamps the job as
+        ``cancelled`` with ``finished_at=now``. The runner's exit
+        handler will see ``cancel_requested`` and avoid re-marking the
+        job as failed.
+    """
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in ("done", "failed", "cancelled"):
+        return {
+            "job_id":         job_id,
+            "status":         job.status,
+            "already_final":  True,
+            "killed_pids":    [],
+        }
+
+    # Set the flag FIRST so the runner's exit handler can read it.
+    job.cancel_requested = True
+    db.commit()
+
+    # Walk the subprocess tree + SIGKILL ffmpeg children. Returns even
+    # when no live process is tracked (queued jobs, or a job whose
+    # runner thread already exited).
+    try:
+        import runner as _runner
+        kill_result = _runner.cancel_job(job_id)
+    except Exception as exc:
+        kill_result = {"job_id": job_id, "found_running": False,
+                       "killed_pids": [], "error": str(exc)}
+
+    # Stamp final state. If the runner thread is still running it will
+    # see cancel_requested and skip the failed-status branch; this
+    # final write is idempotent either way because both code paths
+    # land on status="cancelled".
+    job.status = "cancelled"
+    if job.error and not job.error.startswith("Cancelled"):
+        job.error = "Cancelled by user. " + (job.error[:500] if job.error else "")
+    else:
+        job.error = "Cancelled by user."
+    from datetime import datetime as _dt, timezone as _tz
+    job.finished_at = _dt.now(_tz.utc)
+    db.commit()
+
+    return {
+        "job_id":         job_id,
+        "status":         "cancelled",
+        "already_final":  False,
+        "found_running":  kill_result.get("found_running", False),
+        "killed_pids":    kill_result.get("killed_pids", []),
+    }
 
 
 @app.get("/api/jobs/{job_id}/log/")

@@ -510,19 +510,92 @@ def run_ffmpeg(cmd):
 # STEP 1: GEMINI — Video Analysis + Cuts + Summary + Keywords
 # ═══════════════════════════════════════════════════════════
 
-# Compound schema block — spliced into GEMINI_PROMPT only when the caller
-# asks for the "Full Video + Shorts" combined output via mode="compound".
-# Gemini returns TWO cut sets (full_video_cuts + shorts_cuts) plus the
-# image_plan that drives content-aligned bulletin overlays, plus the
-# Telugu/Hindi headline for the shorts compose step, plus the marquee
-# points for the bulletin ticker. NO ChatGPT round-trip is needed after
-# this — everything text-decision lives here.
+# Base schema block — the COMPLETE single-platform JSON schema. Used when
+# the caller is NOT in compound mode (instagram_reel / youtube_short /
+# youtube_full standalone jobs). The Plan A redesigned prompt expects the
+# {compound_schema_block} placeholder to expand to the FULL schema text
+# — single mode gets this base-only version; compound mode gets the
+# extended version below that includes the additional fields.
 #
-# This block uses Python str.format placeholders for {language_name} +
-# {script_name}, so make sure to apply str.format BEFORE splicing into
-# the parent prompt template. The literal JSON braces are doubled (`{{`
-# and `}}`) so they survive the parent template's own .format() call.
-_COMPOUND_SCHEMA_BLOCK = r"""  "full_video_cuts": [
+# Both blocks use str.format placeholders for {language_name} + {script_name}
+# and are .format()'d BEFORE being spliced into the parent prompt. JSON
+# braces are doubled (`{{` / `}}`) so they survive the parent's .format().
+_BASE_SCHEMA_BLOCK = r"""{{
+  "video_type": "SOLO|INTERVIEW|PRESS_CONFERENCE|PANEL|MIXED",
+  "language": "{language_name}|English|Mixed",
+  "total_speakers": <number>,
+  "clips": [
+    {{
+      "index": 1,
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "summary": "<2-3 sentence summary in English>",
+      "summary_native": "<same summary in {language_name} using {script_name} script>",
+      "mood": "serious|dramatic|emotional|calm|heated|funny",
+      "speakers": <number of speakers in this clip>,
+      "importance": <1-10 score>
+    }}
+  ],
+  "overall_summary": "<5-6 sentence overall summary in English>",
+  "overall_summary_native": "<same summary in {language_name} using {script_name} script>",
+  "image_search_queries": [
+    "<SPECIFIC Google search query to find a real photo of the main person/event — in English>",
+    "<Second search query — different angle, e.g. location or incident photo>",
+    "<Third search query — IN {language_name} ({script_name} script) for local news article images>",
+    "<Fourth search query — another relevant person or topic>"
+  ],
+  "key_people": ["full name 1", "full name 2"],
+  "key_people_native": ["name1 in {script_name}", "name2 in {script_name}"],
+  "key_topics": ["topic 1", "topic 2", "topic 3"],
+  "key_locations": ["location 1", "location 2"],
+  "skipped_segments": [
+    {{
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "reason": "<one-line explanation, e.g. 'abandoned take, restarted at 00:42.10' or 'mic check before delivery began'>",
+      "category": "retake|warm_up|crew_talk|hesitation|aside|self_correction"
+    }}
+  ],
+  "retake_audit": "<one sentence with numbers proving the self-check ran: 'Scanned 5 clips, found 3 retake repetitions and 1 warm-up; tightened clip 1 start by 4.2s and dropped 7 spans totalling 38s.' Never SKIPPED.>"
+}}"""
+
+
+# Compound schema block — the COMPLETE base+compound JSON schema. Used
+# only when the caller asks for "Full Video + Shorts" via mode="compound".
+# Returns TWO cut sets (full_video_cuts + shorts_cuts) plus image_plan
+# that drives content-aligned bulletin overlays, plus the Telugu/Hindi
+# headline for the shorts compose step, plus the marquee points for the
+# bulletin ticker. NO ChatGPT round-trip needed after — everything
+# text-decision lives here.
+_COMPOUND_SCHEMA_BLOCK = r"""{{
+  "video_type": "SOLO|INTERVIEW|PRESS_CONFERENCE|PANEL|MIXED",
+  "language": "{language_name}|English|Mixed",
+  "total_speakers": <number>,
+  "clips": [
+    {{
+      "index": 1,
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "summary": "<2-3 sentence summary in English>",
+      "summary_native": "<same summary in {language_name} using {script_name} script>",
+      "mood": "serious|dramatic|emotional|calm|heated|funny",
+      "speakers": <number of speakers in this clip>,
+      "importance": <1-10 score>
+    }}
+  ],
+  "overall_summary": "<5-6 sentence overall summary in English>",
+  "overall_summary_native": "<same summary in {language_name} using {script_name} script>",
+  "image_search_queries": [
+    "<SPECIFIC Google search query to find a real photo of the main person/event — in English>",
+    "<Second search query — different angle, e.g. location or incident photo>",
+    "<Third search query — IN {language_name} ({script_name} script) for local news article images>",
+    "<Fourth search query — another relevant person or topic>"
+  ],
+  "key_people": ["full name 1", "full name 2"],
+  "key_people_native": ["name1 in {script_name}", "name2 in {script_name}"],
+  "key_topics": ["topic 1", "topic 2", "topic 3"],
+  "key_locations": ["location 1", "location 2"],
+  "full_video_cuts": [
     {{
       "index": 1,
       "start": "MM:SS.ss",
@@ -561,375 +634,110 @@ _COMPOUND_SCHEMA_BLOCK = r"""  "full_video_cuts": [
     "<short headline phrase 2 — {script_name} script>",
     "<short headline phrase 3 — {script_name} script>"
   ],
-"""
-
-
-GEMINI_PROMPT = """You are an expert {language_name} news video editor. Watch this video carefully.
-
-This video could be ANY of these types — detect which one:
-  - SOLO: One person reading/reporting news alone
-  - INTERVIEW: Two people — one asks questions, one answers
-  - PRESS_CONFERENCE: One person at podium, reporters asking questions
-  - PANEL: Multiple people (3+) discussing topics, possibly debating
-  - MIXED: Combination of above
-
-Your job: identify the BEST clip segments to cut from this video for social media.
-
-RULES FOR CUTTING:
-1. NEVER cut mid-sentence. Each clip must start and end at a natural pause.
-2. For INTERVIEW: each clip = one complete Question + Answer exchange.
-   If questioner asks follow-up, include it in same clip.
-3. For PRESS_CONFERENCE: each clip = one reporter's question + the full answer.
-   Include the question AND the complete response.
-4. For PANEL: each clip = one complete point/argument/exchange on a topic.
-   If speakers go back-and-forth on same topic, keep it together.
-5. For SOLO: cut at natural topic transitions. Each clip = one complete topic/story.
-6. For MIXED: apply the appropriate rule for each section.
-7. Clip duration: aim for {min_dur}-{max_dur} seconds each, ideal {ideal_dur}s.
-8. Maximum {max_clips} clips.
-9. Prefer moments with high energy, important statements, or emotional content.
-
-RAW FOOTAGE HANDLING — RETAKES, FALSE STARTS, AND CREW TALK (CRITICAL):
-
-This is RAW unedited footage. Treat it like a 30-year veteran editor would. Speakers
-fumble lines, restart sentences, do mic checks, ask the cameraman things, hesitate,
-lose their place, and try the same line 2, 3, 4, or more times before getting it
-right. Your job is to identify which moments are CONTENT (meant for the viewer) and
-which are NOISE (meant for crew, for themselves, or abandoned mid-attempt). Skip the
-noise. Use only the content. You have full semantic freedom across Telugu, Hindi,
-English, Kannada, Tamil, Malayalam, Bengali, Marathi, and code-mixed speech. There is
-NO keyword list. Reason from intent.
-
-10. MULTIPLE TAKES OF THE SAME LINE — keep ONLY the final clean version
-    If the speaker covers the same sentence, phrase, or idea more than once with no
-    narrative reason to repeat (no emphasis, no list, no rhetorical device), every
-    attempt except the final clean one was abandoned. The rule scales:
-      2 takes: drop the first, keep the second
-      3 takes: drop the first two, keep the third
-      4 or more takes: drop all earlier attempts, keep ONLY the last clean complete one
-      All takes broken: pick the most complete attempt as fallback
-
-    NEVER stitch two takes together. That produces broken duplicate sentences like:
-      "cricketer has hit a century with amazing Century with an amazing energy"
-    The correct output is the final clean take only:
-      "cricketer has hit a Century with an amazing energy"
-
-    A typical fumble chain looks like this:
-      Attempt 1: "cricketer has hit a century with amazing" [trails off]
-      Aside:     "wait wait, one more time"
-      Attempt 2: "cricketer has hit a Century with" [stops]
-      Aside:     "no no, again"
-      Attempt 3: "cricketer has" [breaks]
-      Filler:    "umm"
-      Attempt 4: "cricketer has hit a Century with an amazing energy" [clean]
-    Skip everything from Attempt 1 through the filler. Keep only Attempt 4.
-
-11. SKIP WARM-UP AT THE VIDEO START
-    The first 5 to 30 seconds of raw footage are almost always junk:
-      mic checks ("hello hello", "test test", "one two one two")
-      crew instructions ("ok start", "ready", "rolling", "shuru karo", "modalu cheppu")
-      throat clearing, laughs, casual chatter
-      adjusting the camera or notes
-      half-sentences spoken to no one
-    The first usable clip MUST begin at the moment the speaker shifts into delivery
-    voice: upright posture, looking at the lens, projected tone, opening line of
-    script aimed at the viewer.
-
-12. MID-RECORDING ASIDES AND CREW TALK
-    Skip any moment where the speaker:
-      addresses the crew, camera operator, or themselves instead of the viewer
-      comments on the recording itself rather than the topic
-      asks "did you get that?", "should I do it again?", "ok ah?" in any language
-      looks off-camera and shifts to informal register
-      reacts to an interruption (phone, door, ambient noise)
-
-13. HESITATION AND BROKEN CADENCE = RETAKE INCOMING
-    These patterns signal the segment leading up to them is an abandoned take. Drop
-    the abandoned segment:
-      trailing off mid-sentence with extended "umm", "aah", or silence
-      visibly searching for the next word, then restarting the sentence
-      long silence (more than 1 second) followed by the same sentence restarting
-      self-correction mid-word ("the price is fif... fifty five")
-      breath reset followed by restart
-
-14. EMPHASIS IS NOT A RETAKE
-    Distinguish carefully. KEEP these (they are intentional emphasis):
-      "no no no, that's wrong" (rhetorical repetition)
-      "bahut bahut dhanyavaad" (Hindi intensifier)
-      "chala chala bagundi" (Telugu emphatic praise)
-      "really really good"
-      a list where the same word repeats by function
-
-    DROP these (they are retakes):
-      "cricketer has hit a... cricketer has hit a Century" (restart after break)
-      "the bowler has done... let me say again... the bowler has done well" (explicit restart)
-      "fifty five... no fifty seven runs" (self-correction)
-
-    Emphasis has rhythm, energy, and intentional repetition. A retake has a break
-    in delivery, a tonal drop, and a fresh restart.
-
-15. USE THE VIDEO, NOT JUST THE AUDIO
-    You are watching the video, not just hearing it. Use visual cues to confirm
-    retake boundaries:
-      speaker breaking eye contact with the camera mid-sentence (about to restart)
-      visible frustration, head shake, sigh, eye roll (rejected take)
-      glancing down at notes between attempts
-      a hand wave or "cut" gesture in frame
-      posture reset, deep breath, or shoulder shrug before the real take begins
-      mouth movement that doesn't match a clean line (mumbling, false start)
-    These visual cues USUALLY happen at the boundary of an abandoned take. Use them
-    to lock in where to cut.
-
-16. END-OF-CLIP HANDLING
-    After a clean take finishes, the speaker often:
-      looks at the crew expectantly ("was that good?")
-      drops performance tone immediately
-      says "ok", "done", "cut", "next" in any language
-      laughs, exhales, or visibly relaxes
-    End the clip at the natural pause AFTER the final scripted sentence, BEFORE the
-    speaker drops out of performance mode.
-
-17. VIDEO TYPE AFFECTS RETAKE FREQUENCY
-    SOLO: high retake frequency. Apply rules 10 to 16 aggressively.
-    INTERVIEW: lower retake frequency. Natural pauses and re-phrasing are part of
-      conversation, NOT retakes. Be more conservative.
-    PRESS_CONFERENCE: almost no retakes. Treat all speech as content unless
-      obviously off-script crew chatter.
-    PANEL: live discussion. No retakes. Treat all speech as content.
-    MIXED: apply the appropriate rule per section.
-
-HARD RULES — VIOLATING THESE BREAKS THE EDIT:
-- Never stitch two takes of the same line together. Pick one whole take.
-- Never include warm-up or crew talk inside any clip.
-- Never include hesitation/filler that bridges an abandoned take and the final take.
-- When in doubt between two near-identical takes, pick the LATER one. Default
-  assumption: the speaker retook because the first was rejected.
-- When the final take is also broken, pick the most complete earlier attempt.
-- Rule 1 ("never cut mid-sentence") still applies AFTER retake filtering. First
-  decide which takes to keep, then snap clip edges to sentence boundaries within
-  the kept content.
-
-═══════════════════════════════════════════════════════════════════════════
-MANDATORY SELF-CHECK BEFORE YOU EMIT THE FINAL JSON — DO NOT SKIP
-═══════════════════════════════════════════════════════════════════════════
-
-You WILL miss retakes if you only listen once. Before finalising your clips:
-
-STEP A — TRANSCRIBE INTERNALLY.
-   In your head, transcribe the speech of every clip you are about to keep.
-   For each clip, write out the sentences the speaker says.
-
-STEP B — REPETITION SCAN.
-   Compare every sentence to every other sentence in the same clip AND to
-   sentences in neighbouring kept clips. If you find a sentence that appears
-   two or more times where:
-      • the first occurrence trails off, breaks mid-word, or is followed by
-        a pause + restart, AND
-      • the later occurrence is more complete, more confident, or runs to
-        a natural sentence end,
-   then the EARLIER occurrence is a retake. You must:
-      1. Trim it out of the kept clip OR drop it into skipped_segments.
-      2. Move the clip's start/end so the rejected attempt is no longer
-         inside the clip's [start, end] window.
-
-STEP C — BOUNDARY AUDIT.
-   Re-listen to the FIRST 1.5 seconds and LAST 1.5 seconds of every kept clip.
-   If you hear ANY of these at the edges, tighten the clip boundary inward:
-      • a half-word fragment ("…ondi anukunnaru" or "…hai")
-      • an abandoned restart ("ee… ee paddati lo… ee paddati lo")
-      • the speaker saying "again", "one more time", "ok", "cut", "done",
-        "next", "wait", "stop", "fir se", "mari okkasari", "inka okasari"
-      • a long silence (> 1 s) followed by a restart
-      • two breath sounds in a row before speech starts
-   Add the trimmed span to skipped_segments.
-
-STEP D — MANDATORY skipped_segments OUTPUT.
-   For SOLO videos (high retake frequency per rule 17), skipped_segments
-   MUST contain at LEAST ONE entry for the opening warm-up unless the speaker
-   was literally already speaking in performance voice in the very first
-   frame. If your skipped_segments is empty on a SOLO video, you did not
-   look hard enough — go back and run STEP B + STEP C again.
-
-STEP E — VERIFICATION FIELD.
-   In the JSON below, fill ``retake_audit`` with a one-sentence sanity note
-   describing what you looked for and what you dropped. This is the proof
-   that you actually ran the self-check.
-
-LANGUAGE-SPECIFIC RETAKE PATTERNS — examples to look for:
-
-Telugu (most common in our content):
-  RETAKE pattern:
-    "ee paddati lo… ee paddati lo manam chestamu" (started twice, drop first)
-    "anduke… anduke ante… anduke ante endhukante" (multiple false starts, keep last)
-    "rendu vela… ah rendu vela rupayalu" (restart with filler "ah" — drop "rendu vela…")
-  EMPHASIS (KEEP):
-    "chala chala bagundi" (genuine intensifier)
-    "kadu kadu kadu" (rhetorical "no no no")
-    "vere vere subjects" (functional list)
-
-Hindi:
-  RETAKE: "yeh kahani… yeh kahani hai… yeh kahani aaj ki" (drop everything before
-     the final complete attempt)
-  RETAKE: "modi ji ne kaha… ek minute… modi ji ne kaha hai" (mid-aside restart)
-  EMPHASIS (KEEP): "bahut bahut dhanyavaad" (intensifier)
-
-English (Indian newsroom):
-  RETAKE: "the bowler has done… let me say again… the bowler has done well"
-  RETAKE: "fifty five… no fifty seven runs" (self-correction — drop "fifty five")
-  EMPHASIS (KEEP): "really really good"
-
-Code-mixed (very common in Telugu / Hindi news):
-  RETAKE: "yeh case is about… ee case ante… yeh case is about Bandi Sanjay"
-  EMPHASIS (KEEP): "very very important issue"
-
-If the speaker visibly looks away, sighs, shakes head, or says any version of
-"again / once more / wait / stop / cut" in any language between two attempts of
-the same sentence, the FIRST attempt is GUARANTEED a retake. There is no
-ambiguity. Drop it.
-
-═══════════════════════════════════════════════════════════════════════════
-
-IMAGE SEARCH QUERIES — THIS IS CRITICAL:
-- Do NOT give generic keywords like "man speaking" or "podium".
-- Give SPECIFIC search queries that will find REAL news photos:
-  * Full names of people shown/mentioned
-  * Specific events with location + date when possible
-  * One query in native {script_name} script so local news sources surface
-  * Location + event combinations
-- Think: what would a journalist search on Google to find photos for this story?
-
-NATIVE LANGUAGE OUTPUT:
-- summary_native, overall_summary_native, key_people_native must use {script_name} script.
-- Do NOT transliterate to Latin. If the video is in {language_name}, write the native
-  fields in authentic {language_name}. If the video is in another language, still
-  provide {language_name} translations in the native fields.
-
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no ```):
-{{
-  "video_type": "SOLO|INTERVIEW|PRESS_CONFERENCE|PANEL|MIXED",
-  "language": "{language_name}|English|Mixed",
-  "total_speakers": <number>,
-  "clips": [
-    {{
-      "index": 1,
-      "start": "MM:SS.ss",
-      "end": "MM:SS.ss",
-      "summary": "<2-3 sentence summary in English>",
-      "summary_native": "<same summary in {language_name} using {script_name} script>",
-      "mood": "serious|dramatic|emotional|calm|heated|funny",
-      "speakers": <number of speakers in this clip>,
-      "importance": <1-10 score>
-    }}
-  ],
-  "overall_summary": "<5-6 sentence overall summary in English>",
-  "overall_summary_native": "<same summary in {language_name} using {script_name} script>",
-  "image_search_queries": [
-    "<SPECIFIC Google search query to find a real photo of the main person/event — in English>",
-    "<Second search query — different angle, e.g. location or incident photo>",
-    "<Third search query — IN {language_name} ({script_name} script) for local news article images>",
-    "<Fourth search query — another relevant person or topic>"
-  ],
-  "key_people": ["full name 1", "full name 2"],
-  "key_people_native": ["name1 in {script_name}", "name2 in {script_name}"],
-  "key_topics": ["topic 1", "topic 2", "topic 3"],
-  "key_locations": ["location 1", "location 2"],
-{compound_schema_block}
   "skipped_segments": [
     {{
       "start": "MM:SS.ss",
       "end": "MM:SS.ss",
-      "reason": "<one-line explanation, e.g. 'abandoned take, restarted at 00:42.10' or 'mic check before delivery began'>",
+      "reason": "<one-line explanation; for retakes, name the repeated phrase>",
       "category": "retake|warm_up|crew_talk|hesitation|aside|self_correction"
     }}
   ],
-  "retake_audit": "<one-sentence proof that you ran the mandatory self-check: what repetitions you scanned for, how many retakes you found, what warm-up you dropped, AND whether any kept clip was tightened at its boundary. Example: 'Scanned 5 candidate clips, found 3 retake repetitions and 1 warm-up; tightened clip 1 start by 4.2s and dropped 7 spans totalling 38s.' If you skipped the self-check, write SKIPPED — and we will reject this response.>"
-}}
+  "retake_audit": "<one sentence with numbers proving the self-check ran: 'Scanned 5 clips, found 3 retake repetitions and 1 warm-up; tightened clip 1 start by 4.2s and dropped 7 spans totalling 38s.' Never SKIPPED.>"
+}}"""
 
-NOTES ON skipped_segments — THIS IS NOT OPTIONAL:
-- Emit every span you DROPPED while applying rules 10-17 above. This is a
-  REQUIRED field — list the warm-up, the abandoned takes, the asides, the
-  hesitation bridges. An empty array on a SOLO video means you did not run
-  the mandatory self-check (STEP A–D above).
-- The spans must be disjoint from your clips[] (kept content) and from each other.
-- Use the same MM:SS.ss timecode format as clips[].
-- "reason" should be specific enough that a human reviewer can verify your call
-  ("speaker said 'wait one more time' then restarted" beats "noise").
-- For every retake you detect, write reason that NAMES the repeated phrase
-  (e.g. "speaker said 'ee case is about' then restarted with the complete line
-  at 00:42.10") — verifying you actually heard the repetition, not guessed.
-- Default expectation for SOLO raw recordings: skipped_segments has 3–10
-  entries. Press conferences / panels: usually 0–2. If your numbers are
-  way off these defaults, recheck your work.
 
-NOTES ON COMPOUND MODE — read this only if the schema above contains the keys
-`full_video_cuts`, `shorts_cuts`, `image_plan`, `shorts_headline_native`,
-`bulletin_marquee_points`. If those keys are NOT present in the schema, ignore
-this entire section and use `clips[]` as you have been.
+GEMINI_PROMPT = """You are an expert {language_name} news video editor. Watch this raw, unedited footage carefully and produce a single JSON plan for downstream video processing.
 
-In compound mode this ONE response drives TWO separate outputs from the same
-source video — a long-form bulletin and a set of vertical short clips. They
-share the same raw material but the cuts are chosen independently.
+OUTPUT TOKEN BUDGET: ~3000 tokens total. Pace yourself: ~150 tokens per clip summary, ~80 tokens per image_plan entry. Compress prose. End your response with the closing }} of the JSON immediately followed by the sentinel <<END>> — nothing after.
 
-full_video_cuts[] — the bulletin clips:
-- Coherent ~{ideal_dur}s+ chunks that capture the OVERALL scenario / narrative
-  arc of the source video. Think "would this make a complete news story segment
-  on its own?".
-- 3–6 cuts typically; up to {max_clips}.
-- Cuts can be back-to-back to cover the whole story OR have gaps where you
-  intentionally drop weak material (the gaps are NOT skipped_segments — those
-  are for retake/warm-up only).
+OUTPUT FORMAT (strict):
+- Pure JSON object only. NO markdown fences (no ```json). NO trailing commas. NO comments. NO prose before or after.
+- Final characters of your response must be the JSON closing brace and the sentinel literal.
 
-shorts_cuts[] — the short-form highlight clips:
-- 3–6 punchy 15–60s clips that are "small glimpses of the overall scenario or
-  showing very important parts" — the moments that go viral on their own.
-- Shorts cuts can OVERLAP with full_video_cuts (a great moment goes in both).
-  Shorts cuts can also be ENTIRELY OUTSIDE full_video_cuts (a side moment too
-  short for the bulletin but irresistible as a short).
-- Pick for punch, not coverage. A single great line beats a whole paragraph.
-- `hook` is one English line — what would the YouTube thumbnail caption say?
+REASONING ORDER (mandatory, in this sequence):
+1. SCRUB for skipped_segments FIRST. Identify warm_up, retake, crew_talk, hesitation, aside, and self_correction spans. This is your self-check — it must produce visible output, not silent thought.
+2. PICK full_video_cuts inside the retake-free spans only. Aim for {min_dur}s minimum per clip, {max_clips} clips max. Cut at natural pauses, never mid-sentence.
+3. PICK shorts_cuts: 15–60s each, 3–6 entries, can overlap with full_video_cuts. Choose for punch, not coverage.
+4. CANONICALIZE entities the speaker mentions. Aggregate aliases into one canonical name (see Worked Example A). Hard cap: 6 unique IDs.
+5. SCHEDULE image_plan entries within clip boundaries (see Worked Example B).
+6. WRITE native-script metadata last.
 
-image_plan[] — FULL-VIDEO ONLY content-aligned imagery:
-- This is the ONLY source of truth for which image appears when in the bulletin.
-  Software generates ONE image per unique `id`, then overlays each entry on the
-  final stitched bulletin at its `show_at` for its `duration`. Get the timing
-  wrong and the wrong photo shows during the wrong sentence.
-- Hard rules:
-  * `id` is stable across the whole job. REUSE the same id when the same image
-    should reappear later (e.g. speaker mentions Rahul Gandhi twice — both
-    entries use id "img_01"). Do NOT mint a new id per appearance.
-  * Maximum 6 UNIQUE ids per job. Pick the 6 most important entities; do not
-    exceed 6 distinct ids.
-  * `topic_clue` is snake_case, lowercase ASCII, no spaces. Same clue every
-    time the same id is used.
-  * `entity_name` is the LITERAL word(s) the speaker says aloud when the image
-    should appear. Software anchors against the audio transcript using this
-    string, so write it as the speaker pronounces it.
-  * `show_at` is SOURCE-VIDEO TIME (the video you are watching) in MM:SS.ss
-    format. NOT stitched-output time — software re-maps after cutting.
-  * `show_at + duration` must fall ENTIRELY inside one full_video_cuts entry's
-    [start, end]. Do not let an entry straddle two clips.
-  * `duration` must be at least 2.0 seconds.
-  * `description` is one sentence fed verbatim to the image generator. Describe
-    WHAT should appear in the frame (subject, setting, mood).
-  * `clip_index` is the 1-indexed position of the matching full_video_cuts entry.
-- Image_plan does NOT apply to shorts_cuts. Leave shorts visuals alone — they
-  use a separate compose path.
-- If you cannot produce a valid image_plan, return an empty array [].
+SKIPPED_SEGMENTS CATEGORIES (use one of these exactly):
+- warm_up: mic checks, "test test", flat affect, throat clearing before delivery voice begins
+- retake: same sentence attempted ≥2 times — keep ONLY the last clean version, drop earlier attempts
+- crew_talk: speaker addresses someone off-camera ("Ravi, did you start recording?")
+- hesitation: filler "umm", "uhh" between abandoned and final take
+- aside: speaker breaks performance briefly ("one minute", "where was I", looks off-camera)
+- self_correction: factual error explicitly replaced ("Monday... sorry, on Tuesday")
 
-shorts_headline_native:
-- ONE Telugu / {language_name} headline burned into the shorts torn-card frame
-  at the top of every short clip.
-- Maximum 5-8 words. {script_name} script ONLY — no transliteration.
-- Punchy, ticker style. Include the main person/place name if mentioned.
-- This replaces the separate ChatGPT title call — no other model will be asked
-  for a headline.
+EMPHASIS IS NOT A RETAKE:
+- "chala chala bagundi" (intensifier) → KEEP all words
+- "really really good" → KEEP
+- "bahut bahut dhanyavaad" → KEEP
+- Pattern: repetition without a pause is emphasis. Pause >500ms + restart from semantic anchor is a retake.
 
-bulletin_marquee_points[]:
-- 3-7 short bullet headlines in {script_name} script. Each one is 4-7 words.
-- They become the scrolling marquee text along the bottom of the bulletin video.
-- Order matters — they scroll in the order you emit them.
-- Pick the 3-7 most newsworthy facts from the WHOLE source video, not just
-  one clip's contents.
+WORKED EXAMPLE A — ENTITY ID REUSE (drives 50% failure rate to ~0):
+Speaker mentions Narendra Modi at 01:20 as "PM Modi" and again at 08:45 as "Modi gaaru".
+
+WRONG (wastes the 6-ID budget):
+  image_plan[0] = {{"id": "img_01", "entity_name": "PM Modi", "show_at": "01:20.00", ...}}
+  image_plan[1] = {{"id": "img_02", "entity_name": "Modi gaaru", "show_at": "08:45.00", ...}}
+
+RIGHT (canonicalize aliases, reuse id):
+  image_plan[0] = {{"id": "img_modi", "entity_name": "Narendra Modi", "show_at": "01:20.00", ...}}
+  image_plan[1] = {{"id": "img_modi", "entity_name": "Narendra Modi", "show_at": "08:45.00", ...}}
+
+Aliases like "PM Modi", "Modi gaaru", "Bharath Pradhana Mantri", "Narendra Modi" all refer to ONE entity. Use ONE id. Same applies to all repeated entities.
+
+WORKED EXAMPLE B — IMAGE_PLAN BOUNDARIES (drives 5% drop rate to 0):
+Given: full_video_cuts[1] = {{"start": "01:00.00", "end": "02:00.00"}}
+
+VALID:   {{"clip_index": 1, "show_at": "01:30.00", "duration": 5.0}}
+  → 01:30 + 5s = 01:35 ∈ [01:00, 02:00] ✓
+
+INVALID: {{"clip_index": 1, "show_at": "01:58.00", "duration": 5.0}}
+  → 01:58 + 5s = 02:03 > 02:00 ✗ — software will silently drop this
+
+INVALID: {{"clip_index": 1, "show_at": "03:15.00", "duration": 4.0}}
+  → 03:15 outside clip 1 entirely ✗
+
+Verify show_at + duration ≤ clip_end for every entry.
+
+HARD RULES:
+- Never cut mid-sentence (rule applies AFTER retake filtering).
+- Never include warm-up or crew talk inside any kept clip.
+- skipped_segments MUST be non-empty for SOLO videos. Every single-take recording has at least a warm-up. If you emit [], you did not look hard enough — default expectation is 3–10 entries.
+- retake_audit MUST be a real sentence with numbers, never "SKIPPED".
+- image_plan description must describe what's in the frame ("politician in white kurta at a press conference"), NEVER name real public figures. The entity_name field carries identity separately.
+- duration ≥ 2.0 seconds for every image_plan entry.
+- shorts_headline_native and bulletin_marquee_points in {script_name} script ONLY. No Latin transliteration.
+
+LANGUAGE-SPECIFIC RETAKE PATTERNS:
+- Telugu retake: "ee paddati lo... ee paddati lo manam chestamu" → drop first attempt
+- Telugu emphasis: "chala chala bagundi" → keep
+- Hindi retake: "yeh kahani... yeh kahani aaj ki" → drop first
+- Hindi emphasis: "bahut bahut dhanyavaad" → keep
+- English retake: "the bowler has done... let me say again..." → drop earlier
+- English emphasis: "really really good" → keep
+- Code-mixed: same rules apply across language boundaries
+
+VIDEO TYPE AFFECTS RETAKE FREQUENCY:
+- SOLO: aggressive (3–10 skipped_segments typical)
+- INTERVIEW: moderate (1–4)
+- PRESS_CONFERENCE: light (0–2)
+- PANEL: light (0–2)
+
+COMPOUND MODE FIELDS (this mode):
+- full_video_cuts[]: 3–6 coherent {min_dur}s+ chunks covering overall scenario
+- shorts_cuts[]: 3–6 punchy 15–60s clips — CAN overlap full_video_cuts, CAN be outside them
+- image_plan[]: bulletin-only overlays, scheduled inside full_video_cuts clips
+- shorts_headline_native: ONE {script_name}-script headline (5–8 words) burned on every short
+- bulletin_marquee_points: 3–7 ticker phrases (4–7 words each) in {script_name} script
+
+RESPOND IN EXACTLY THIS JSON SCHEMA:
+{compound_schema_block}
+
+Remember: end with }}<<END>>. No exceptions.
 """
 
 
@@ -1249,13 +1057,21 @@ def analyze_video_with_gemini(
     max_dur = preset.get("max_dur", 90) or 300
     ideal_dur = preset.get("ideal_dur", 30) or 120
 
-    # Compound-mode schema block: emitted into {compound_schema_block} of
-    # GEMINI_PROMPT only when the caller asked for both formats at once.
-    # For "single" mode the placeholder collapses to an empty string and
-    # the prompt reads exactly as before — full backward compatibility.
-    compound_schema_block = ""
+    # Schema block selection: Plan A's redesigned prompt ends with
+    # "RESPOND IN EXACTLY THIS JSON SCHEMA: {compound_schema_block}",
+    # expecting the placeholder to carry the COMPLETE schema text for
+    # whichever mode is active.
+    #   - single mode  → _BASE_SCHEMA_BLOCK     (no compound fields)
+    #   - compound mode → _COMPOUND_SCHEMA_BLOCK (base + compound fields)
+    # Both blocks are themselves str.format()'d for {language_name} +
+    # {script_name} BEFORE being spliced into the parent prompt template.
     if mode == "compound":
         compound_schema_block = _COMPOUND_SCHEMA_BLOCK.format(
+            language_name=lang_cfg.name_english,
+            script_name=lang_cfg.script,
+        )
+    else:
+        compound_schema_block = _BASE_SCHEMA_BLOCK.format(
             language_name=lang_cfg.name_english,
             script_name=lang_cfg.script,
         )

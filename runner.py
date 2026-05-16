@@ -25,6 +25,114 @@ _PIPELINE_CONCURRENCY = max(1, int(os.getenv("KAIZER_PIPELINE_CONCURRENCY", "2")
 _PIPELINE_SEMAPHORE = threading.BoundedSemaphore(_PIPELINE_CONCURRENCY)
 
 
+# ─── User-initiated cancellation ─────────────────────────────────────
+# Maps job_id → currently-running subprocess.Popen so the cancel API
+# endpoint can find the process to terminate. Populated when the
+# subprocess spawns, cleaned up when it exits. Thread-safe.
+_ACTIVE_PROCS_LOCK = threading.Lock()
+_ACTIVE_PROCS: dict[int, subprocess.Popen] = {}
+
+
+def _register_proc(job_id: int, proc: subprocess.Popen) -> None:
+    with _ACTIVE_PROCS_LOCK:
+        _ACTIVE_PROCS[job_id] = proc
+
+
+def _deregister_proc(job_id: int) -> None:
+    with _ACTIVE_PROCS_LOCK:
+        _ACTIVE_PROCS.pop(job_id, None)
+
+
+def cancel_job(job_id: int) -> dict:
+    """Kill the pipeline subprocess + its entire descendant tree for ``job_id``.
+
+    Returns a small status dict the HTTP endpoint can serialise. Idempotent
+    and safe to call on jobs that have already finished or never started.
+
+    Implementation notes:
+      - SIGTERM first via Popen.terminate() to give ffmpeg a chance to
+        flush partial files. Wait 5 s.
+      - If still alive, walk the process tree via psutil and SIGKILL
+        every descendant (ffmpeg writers, helper python procs, etc.).
+        Without this, killing only the parent leaves ffmpeg orphaned and
+        the next render's GPU/disk locks stay held.
+      - The job row's status / cancel_requested / finished_at are
+        updated by the HTTP endpoint (it has the DB session). This
+        function is process-control only.
+    """
+    with _ACTIVE_PROCS_LOCK:
+        proc = _ACTIVE_PROCS.get(job_id)
+
+    if proc is None:
+        return {"job_id": job_id, "found_running": False, "killed_pids": []}
+
+    if proc.poll() is not None:
+        # Already exited on its own before we got the cancel.
+        _deregister_proc(job_id)
+        return {"job_id": job_id, "found_running": False, "killed_pids": []}
+
+    killed: list[int] = []
+
+    # Walk the process tree BEFORE terminating the parent so we don't
+    # lose references after the parent reaps its children.
+    descendants: list = []
+    try:
+        import psutil  # type: ignore
+        try:
+            parent = psutil.Process(proc.pid)
+            descendants = parent.children(recursive=True)
+        except psutil.NoSuchProcess:
+            descendants = []
+    except ImportError:
+        # psutil is in requirements but guard anyway — without it we
+        # still get the immediate child via Popen.kill().
+        descendants = []
+
+    # Graceful first.
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+    try:
+        proc.wait(timeout=5.0)
+        killed.append(proc.pid)
+    except subprocess.TimeoutExpired:
+        # SIGTERM ignored — escalate to SIGKILL on the whole tree.
+        for child in descendants:
+            try:
+                child.kill()
+                killed.append(child.pid)
+            except Exception:
+                pass
+        try:
+            proc.kill()
+            killed.append(proc.pid)
+        except Exception:
+            pass
+    except Exception:
+        # wait() can raise on Windows when the handle is gone — still
+        # try to kill descendants in case any are alive.
+        for child in descendants:
+            try:
+                child.kill()
+                killed.append(child.pid)
+            except Exception:
+                pass
+
+    # Some ffmpeg children may have survived SIGTERM. Final sweep.
+    for child in descendants:
+        try:
+            if child.is_running():
+                child.kill()
+                killed.append(child.pid)
+        except Exception:
+            pass
+
+    _deregister_proc(job_id)
+    return {"job_id": job_id, "found_running": True, "killed_pids": killed}
+
+
 def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  db_session_factory, language: str = "te",
                  default_image: str = "",
@@ -199,6 +307,11 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                     cwd=str(BASE_DIR),
                 )
 
+                # Register so the cancel_job() helper (called by the
+                # POST /api/jobs/<id>/cancel/ endpoint from a different
+                # thread) can find this Popen and tree-kill it.
+                _register_proc(job_id, process)
+
                 # The COMPOUND subprocess emits TWO [kaizer:meta] markers
                 # (one for the bulletin pass, one for the shorts pass);
                 # the single-platform subprocess emits ONE. Collecting
@@ -241,6 +354,24 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                     _flush_log_to_db(log_lines)
                 process.wait()
                 last_returncode = process.returncode
+                # Deregister regardless of exit reason — the cancel
+                # endpoint only cares about LIVE processes.
+                _deregister_proc(job_id)
+
+                # If the cancel endpoint killed this subprocess, treat
+                # the run as user-cancelled rather than failed. The
+                # returncode will be non-zero (SIGTERM / SIGKILL exits
+                # negative on POSIX, 1 on Windows), but the cause is
+                # user action, not a real pipeline error.
+                _cancel_db = db_session_factory()
+                try:
+                    _cj = _cancel_db.query(Job).filter(Job.id == job_id).first()
+                    _was_cancelled = bool(_cj and _cj.cancel_requested)
+                finally:
+                    _cancel_db.close()
+                if _was_cancelled:
+                    failed_pass = "cancelled"
+                    break
 
                 if process.returncode != 0:
                     failed_pass = pass_label
@@ -281,6 +412,18 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                         )
                     except Exception as _ai_exc:
                         print(f"[runner] generated-image asset import skipped: {_ai_exc}")
+            elif failed_pass == "cancelled":
+                # User stopped the job. Don't surface it as a failure —
+                # it's a deliberate action. Import any clips that DID
+                # finish before the kill so partial work isn't lost.
+                j.status = "cancelled"
+                if captured_meta_paths:
+                    try:
+                        for _meta in captured_meta_paths:
+                            _import_clips(j, db2, meta_override=Path(_meta))
+                    except Exception as _e:
+                        print(f"[runner] partial import after cancel: {_e}")
+                j.error = "Cancelled by user."
             elif failed_pass:
                 j.status = "failed"
                 # If pass A succeeded and pass B failed, try to import
