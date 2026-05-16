@@ -6,8 +6,12 @@ media/
 staticfiles/
 *.log
 
-# Environment
+# Environment — match every flavour: .env, .env.local, .env.production,
+# .env.staging, .env.foo.bak etc. Only .env.example (the public template)
+# is tracked.
 .env
+.env.*
+!.env.example
 
 # Output (generated clips — large files, gitignore)
 output/
