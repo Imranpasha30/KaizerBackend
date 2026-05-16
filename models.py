@@ -44,6 +44,14 @@ class User(Base):
     monthly_clip_count = Column(Integer,     default=0)
     usage_reset_at     = Column(DateTime(timezone=True), nullable=True)
 
+    # ── HeyGen avatar defaults ──────────────────────────────────────────
+    # Per-user "remember my last pick" for the Trending → HeyGen flow.
+    # Either can be null; the picker UI falls back to the server-wide
+    # HEYGEN_DEFAULT_AVATAR_ID / HEYGEN_DEFAULT_VOICE_ID env when both
+    # are blank. Stored as plain ids (HeyGen returns ~32-char strings).
+    heygen_avatar_id = Column(String(64), nullable=True)
+    heygen_voice_id  = Column(String(64), nullable=True)
+
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -130,6 +138,13 @@ class Channel(Base):
     logo_asset_id      = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
     mandatory_hashtags = Column(JSON, default=list)
     is_priority        = Column(Boolean, default=False)
+    # Per-channel upload route override.  Null = use the system-wide
+    # default from system_settings.UPLOAD_PROVIDER.  Lets the admin
+    # send one channel through Postiz and another through the native
+    # YouTube uploader simultaneously — useful while comparing the two
+    # paths side-by-side, or when one channel's google project has
+    # exhausted its daily quota.
+    upload_provider    = Column(String(20), nullable=True)  # "postiz" | "kaizer" | "native_rtmp" | null
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
     updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -208,6 +223,13 @@ class OAuthToken(Base):
     # KAIZER_DEFAULT_LOGO env; empty = no overlay.
     logo_asset_id        = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
 
+    # Per-YouTube-account upload route — same shape as the channel/job-
+    # level column.  This is the LEVEL users naturally configure on
+    # the "My YouTube Accounts" cards (one knob per real destination,
+    # not per style profile).  Worker precedence: job → oauth_token →
+    # channel → system default.  Null = inherit from channel/system.
+    upload_provider      = Column(String(20), nullable=True)
+
     channel = relationship("Channel", back_populates="oauth_token")
 
 
@@ -261,6 +283,12 @@ class UploadJob(Base):
     tags           = Column(JSON, default=list)
     category_id    = Column(String(10), default="25")   # 25 = News & Politics
     made_for_kids  = Column(Boolean, default=False)
+    # Per-publish upload route override.  Wins over Channel.upload_provider
+    # which wins over system_settings.UPLOAD_PROVIDER.  Lets a user pick
+    # "send this one through Postiz / send this one through native" at
+    # publish time — primarily a comparison tool while we validate the
+    # two paths produce identical YouTube metadata.
+    upload_provider = Column(String(20), nullable=True)  # "postiz" | "kaizer" | null
     video_id       = Column(String(50), default="")     # YouTube video ID after insert
     upload_uri     = Column(Text, default="")           # resumable session URI
     bytes_uploaded = Column(Integer, default=0)
@@ -406,6 +434,45 @@ class ClipTranslation(Base):
 # Phase E — Trending-topic radar
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ChannelVideo(Base):
+    """Cached catalogue of every video on a connected YouTube channel.
+
+    The poller in analytics/poller.py only samples uploads Kaizer
+    itself published. This table holds the channel's ENTIRE upload
+    history (fetched from YouTube Data API and cached) so the
+    Performance page can compute percentiles, surface "compare to
+    your other videos" views, and let the user pick any of their
+    own videos — not just the ones Kaizer created.
+
+    Keyed by (user_id, google_channel_id, video_id) because the same
+    YouTube video id is globally unique but per-user ownership
+    matters for tenant isolation.
+    """
+    __tablename__ = "channel_videos"
+    __table_args__ = (
+        UniqueConstraint("user_id", "google_channel_id", "video_id",
+                          name="uq_channel_video"),
+        Index("ix_channel_videos_gcid", "user_id", "google_channel_id"),
+    )
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    user_id            = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    google_channel_id  = Column(String(50), nullable=False)
+    video_id           = Column(String(50), nullable=False)
+    title              = Column(Text, default="")
+    # Snippet description trimmed to ~500 chars — full text isn't
+    # useful for the dashboard and wastes row size on long copy.
+    description_short  = Column(Text, default="")
+    published_at       = Column(DateTime(timezone=True), nullable=True, index=True)
+    duration_seconds   = Column(Integer, default=0)
+    view_count         = Column(BigInteger, default=0, index=True)
+    like_count         = Column(Integer, default=0)
+    comment_count      = Column(Integer, default=0)
+    thumbnail_url      = Column(String(500), default="")
+    last_synced_at     = Column(DateTime(timezone=True), server_default=func.now(),
+                                 onupdate=func.now())
+
+
 class UserAsset(Base):
     """Images / logos a user uploads to reuse across clips.
 
@@ -431,6 +498,14 @@ class UserAsset(Base):
     # = Assets root.  No physical folders on disk; this is purely a UI
     # organization string the frontend groups by.
     folder_path   = Column(String(255), default="", index=True)
+    # Optional fingerprint of the SOURCE VIDEO this asset was generated
+    # from (same hash function gemini_cache.hash_file_prefix uses — first
+    # 4 MiB + size, mtime EXCLUDED).  Set on bulletin OpenAI images by
+    # the runner so re-uploads of the same source can offer "reuse the
+    # images we already generated for this video" instead of paying for
+    # gpt-image-1 again.  Empty = "no source-video link" (e.g. user-
+    # uploaded logos, manually-uploaded backgrounds).
+    source_video_hash = Column(String(64), default="", index=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
     # ── Storage (Phase 5) ──────────────────────────────────────────
@@ -649,6 +724,71 @@ class GeminiCall(Base):
     created_at     = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class OpenAiCall(Base):
+    """One row per OpenAI API call (currently only gpt-image-1 for bulletin
+    images — extend ``purpose`` when we add chat-completion or whisper).
+
+    Mirrors ``gemini_calls``' design so the admin Usage page can show
+    Gemini + OpenAI spend side-by-side without bespoke aggregation.
+    """
+    __tablename__ = "openai_calls"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id         = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"),  nullable=True, index=True)
+    clip_id        = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"), nullable=True, index=True)
+    model          = Column(String(64),  nullable=False)   # gpt-image-1 / gpt-4o / whisper-1 / ...
+    purpose        = Column(String(64),  default="")       # bulletin-image / thumbnail / chat / transcribe
+    # Image-gen-specific (NULL for non-image calls).
+    image_size     = Column(String(20),  default="")       # 1024x1024 / 1024x1536 / 1536x1024
+    image_quality  = Column(String(10),  default="")       # low / medium / high / auto
+    image_count    = Column(Integer,     default=0)        # how many images returned in this single call
+    # Text/audio-call-specific (NULL for image calls).
+    prompt_tokens  = Column(Integer,     default=0)
+    output_tokens  = Column(Integer,     default=0)
+    total_tokens   = Column(Integer,     default=0)
+    cost_usd       = Column(Float,       default=0.0)      # best-effort from a hardcoded price table
+    latency_ms     = Column(Integer,     default=0)
+    status         = Column(String(16),  default="ok")     # ok / error / rate_limited
+    error          = Column(Text,        default="")
+    created_at     = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class YouTubeApiCall(Base):
+    """One row per YouTube Data API call (mostly uploads + thumbnail sets +
+    metadata fetches).
+
+    YouTube doesn't charge dollars — they bill in *quota units* against a
+    daily cap (10,000 / day per Google Cloud project by default).  We log
+    each call so the admin Usage page can answer:
+      • "Which videos burned the most quota?"  → upload kind correlation
+      • "What % of today's cap have we used?"  → operational alarm
+      • "Which user is driving us toward the cap?"
+    """
+    __tablename__ = "youtube_api_calls"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id        = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"),  nullable=True, index=True)
+    clip_id       = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"), nullable=True, index=True)
+    upload_job_id = Column(Integer, ForeignKey("upload_jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    channel_id    = Column(Integer, ForeignKey("channels.id", ondelete="SET NULL"), nullable=True, index=True)
+    # The actual YouTube channel id (UCxxxxx) that the call targeted.
+    # Stored alongside the local FK so we can group by destination even
+    # after the Channel row is deleted.
+    google_channel_id = Column(String(50), default="")
+    video_id      = Column(String(50), default="")        # YT video id (set after upload)
+    operation     = Column(String(64), nullable=False)    # videos.insert / thumbnails.set / videos.list / channels.list / search.list
+    quota_cost    = Column(Integer, default=0)            # cost in YouTube quota units for THIS call
+    publish_kind  = Column(String(10), default="")        # short / video — only for uploads
+    file_bytes    = Column(BigInteger, default=0)         # only for videos.insert
+    duration_seconds = Column(Float,   default=0.0)       # only for videos.insert
+    success       = Column(Boolean, default=True)
+    http_status   = Column(Integer, default=0)            # 200 / 403 (quotaExceeded) / 401 / 5xx
+    error         = Column(Text,    default="")
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class LiveCamera(Base):
     """One camera feed registered for a live event.
 
@@ -713,3 +853,204 @@ class SystemSetting(Base):
     updated_at = Column(DateTime(timezone=True),
                         server_default=func.now(),
                         onupdate=func.now())
+
+
+class SystemMetric(Base):
+    """Persistent CPU / RAM / GPU / disk sample.
+
+    A daemon thread in main.py writes one row every ~30 s; old rows are pruned
+    after 14 days. The admin Capacity tab reads this to size the future
+    cloud deployment ("p95 CPU at peak", "max GPU VRAM during compose", etc.).
+
+    All fields are nullable so a missing GPU or a transient psutil error
+    doesn't blow up the whole sample.
+    """
+    __tablename__ = "system_metrics"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    ts              = Column(DateTime(timezone=True), server_default=func.now(),
+                             nullable=False, index=True)
+    cpu_percent     = Column(Float,   nullable=True)
+    cpu_count       = Column(Integer, nullable=True)
+    ram_percent     = Column(Float,   nullable=True)
+    ram_used_gb     = Column(Float,   nullable=True)
+    ram_total_gb    = Column(Float,   nullable=True)
+    disk_percent    = Column(Float,   nullable=True)
+    disk_used_gb    = Column(Float,   nullable=True)
+    disk_total_gb   = Column(Float,   nullable=True)
+    gpu_util        = Column(Float,   nullable=True)   # 0..100, null if no GPU
+    gpu_mem_used_mb = Column(Integer, nullable=True)
+    gpu_mem_total_mb= Column(Integer, nullable=True)
+    gpu_temp_c      = Column(Integer, nullable=True)
+    proc_rss_gb     = Column(Float,   nullable=True)   # uvicorn worker RSS
+    proc_threads    = Column(Integer, nullable=True)
+    live_events     = Column(Integer, nullable=True)   # in-process live sessions
+    # Network deltas — bytes since previous sample. Null on the first sample.
+    net_rx_bps      = Column(BigInteger, nullable=True)
+    net_tx_bps      = Column(BigInteger, nullable=True)
+
+    # ── "Kaizer-only" rollup ────────────────────────────────────────
+    # Sum across the whole Kaizer process family: uvicorn + all its
+    # descendants (pipeline subprocesses, ffmpeg) + vite + cloudflared
+    # + the Redis container's docker-proxy process. This is the number
+    # to size the future cloud server against — the rest of the machine
+    # load belongs to Chrome / VS Code / etc and is irrelevant.
+    kaizer_cpu_percent  = Column(Float,   nullable=True)
+    kaizer_rss_gb       = Column(Float,   nullable=True)
+    kaizer_proc_count   = Column(Integer, nullable=True)
+    kaizer_ffmpeg_count = Column(Integer, nullable=True)   # how many ffmpeg's running = active encode stages
+    kaizer_gpu_util     = Column(Float,   nullable=True)   # best-effort, via nvidia-smi pmon
+
+
+class PasswordResetToken(Base):
+    """One-shot, time-limited reset token issued by /auth/forgot.
+
+    The token string is what we email / log; only its sha256 lives in the
+    DB so a leaked DB snapshot can't be used to impersonate. ``used_at``
+    is set the moment the token is consumed — re-use is a 400.
+
+    Why a separate table (not a column on ``users``): a user can request
+    multiple resets back-to-back (mistyped email, link lost), and we want
+    each request audit-able. Tokens expire 30 min after issue; the
+    cleanup runs lazily on the next /auth/forgot call.
+    """
+    __tablename__ = "password_reset_tokens"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash  = Column(String(64), nullable=False, unique=True, index=True)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at  = Column(DateTime(timezone=True), nullable=False)
+    used_at     = Column(DateTime(timezone=True), nullable=True)
+    requested_ip = Column(String(64), nullable=True)
+
+
+class ExpressJob(Base):
+    """Persistent record of an Express Mode autopub job.
+
+    Mirrors the in-memory ``express/state.py`` map but survives backend
+    restarts so the History panel can show jobs older than uptime.
+    State is written transactionally on every step transition (queued
+    → running → done | failed). Logs are kept short (last 500 lines)
+    so a misbehaving 30-min pipeline doesn't bloat the DB.
+
+    No FK to a "jobs" table — this is a separate flow from the main
+    Kaizer pipeline. Only the user_id link matters for tenancy.
+    """
+    __tablename__ = "express_jobs"
+
+    id           = Column(String(32), primary_key=True)   # secrets.token_urlsafe id
+    user_id      = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    status       = Column(String(16), nullable=False, default="queued")   # queued|running|done|failed
+    mode         = Column(String(32), nullable=True)      # publish-as-is|ai-trim|shorts
+    step         = Column(String(32), nullable=True)
+    progress     = Column(Integer, nullable=False, default=0)
+    message      = Column(String(512), nullable=True)
+    title        = Column(String(255), nullable=True)     # populated from results when done
+    log_json     = Column(Text, nullable=True)            # JSON-encoded list[str] of recent lines
+    results_json = Column(Text, nullable=True)            # JSON-encoded results dict (videos, postiz refs)
+    error        = Column(Text, nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class LiveBatch(Base):
+    """One submission of the Live Studio form.
+
+    A user uploads N videos and picks M channels per video; we expand
+    into N*M LiveStream rows (one ffmpeg push each). The batch holds
+    the shared metadata (SEO source flag, AI-generated SEO, etc.) so
+    individual streams don't duplicate it.
+
+    The actual video file lives in the system temp dir during upload +
+    broadcast, then optionally promoted to R2 for the backup/recovery
+    path. We never store the full file in DB.
+    """
+    __tablename__ = "live_batches"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Public id used in URLs / WS topics — separate from PK so we never
+    # leak the int counter to clients.
+    public_id     = Column(String(32), nullable=False, unique=True, index=True)
+    status        = Column(String(16), nullable=False, default="queued")
+    #   queued | uploading | streaming | done | failed | canceled
+    message       = Column(String(512), nullable=True)
+    total_streams = Column(Integer, nullable=False, default=0)   # N*M
+    streams_done  = Column(Integer, nullable=False, default=0)
+    streams_failed= Column(Integer, nullable=False, default=0)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class LiveStream(Base):
+    """One (video × channel) broadcast.
+
+    The granular unit. Each row corresponds to a single ffmpeg
+    subprocess pushing one video file (possibly looped) to one
+    YouTube channel for a configured duration in hours.
+
+    File path lifecycle:
+      - while uploading: ``upload_path`` is the growing temp file
+      - while streaming: same path, ffmpeg reads from it
+      - after broadcast: file is deleted from temp; R2 copy survives
+        in ``backup_url`` if backup_enabled.
+
+    Status flow:
+      queued -> uploading -> streaming -> done | failed
+      Special: ``canceled`` if the user kills it mid-broadcast.
+    """
+    __tablename__ = "live_streams"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    batch_id      = Column(Integer, ForeignKey("live_batches.id"), nullable=False, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    channel_id    = Column(Integer, ForeignKey("channels.id"), nullable=True, index=True)
+
+    # Source video grouping — multiple rows can share the same video
+    # (when one upload broadcasts to many channels). ``video_slot``
+    # uniquely identifies the video within the batch.
+    video_slot    = Column(Integer, nullable=False, default=0)
+
+    status        = Column(String(16), nullable=False, default="queued")
+    progress_pct  = Column(Integer, nullable=False, default=0)
+    message       = Column(String(512), nullable=True)
+    error         = Column(Text, nullable=True)
+
+    # Upload tracking
+    upload_path   = Column(String(512), nullable=True)        # local temp file
+    upload_bytes  = Column(BigInteger, nullable=False, default=0)
+    upload_total  = Column(BigInteger, nullable=True)         # known content-length, may be null
+    upload_done   = Column(Boolean, nullable=False, default=False)
+
+    # Broadcast config
+    target_hours  = Column(Float, nullable=False, default=1.0)
+    started_at    = Column(DateTime(timezone=True), nullable=True)
+    finished_at   = Column(DateTime(timezone=True), nullable=True)
+
+    # YouTube broadcast (minted via youtube/rtmp_provider.py)
+    yt_broadcast_id = Column(String(64), nullable=True)
+    yt_stream_id    = Column(String(64), nullable=True)
+    yt_ingest_url   = Column(String(255), nullable=True)
+    yt_stream_key   = Column(String(255), nullable=True)
+    yt_video_id     = Column(String(64), nullable=True)
+
+    # SEO — source flag distinguishes user-typed (trusted) from AI
+    seo_source    = Column(String(16), nullable=False, default="user")  # user | ai
+    title         = Column(String(255), nullable=True)
+    description   = Column(Text, nullable=True)
+    tags_json     = Column(Text, nullable=True)
+    privacy       = Column(String(16), nullable=False, default="unlisted")
+    made_for_kids = Column(Boolean, nullable=False, default=False)
+
+    # R2 preview backup (48 h post-broadcast, then auto-deleted; UI
+    # shows "Will be removed within 48 hrs"). YouTube is the durable
+    # copy — this R2 file is just a quick-preview convenience. The
+    # DB row itself survives forever for audit / history.
+    backup_enabled    = Column(Boolean, nullable=False, default=True)
+    backup_url        = Column(String(512), nullable=True)
+    backup_key        = Column(String(255), nullable=True)
+    backup_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

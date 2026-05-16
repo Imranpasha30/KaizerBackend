@@ -1,0 +1,38 @@
+# Local-dev Redis for Kaizer.
+#
+# Postgres is NOT in this compose file because the user runs PG 17
+# natively on the host (faster cold-start + no Docker layer for the
+# heaviest service). Redis is light enough that a container is fine,
+# and keeping it out of the host install means easy teardown
+# (``docker compose down -v`` wipes the cache/queue cleanly).
+#
+# Bring up:    docker compose -f docker-compose.dev.yml up -d
+# Tear down:   docker compose -f docker-compose.dev.yml down
+# Wipe data:   docker compose -f docker-compose.dev.yml down -v
+# Tail logs:   docker compose -f docker-compose.dev.yml logs -f redis
+#
+# After bringing it up, the .env should have:
+#   REDIS_URL=redis://localhost:6379
+# (Already set there as part of this migration.)
+
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: kaizer-redis-dev
+    # Persist data across container restarts so dev jobs don't lose
+    # the cached Gemini responses overnight. --appendonly yes turns
+    # on AOF (every write is fsynced to disk); cheap on dev volume.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "127.0.0.1:6379:6379"  # bind to loopback only — don't expose to LAN
+    volumes:
+      - kaizer-redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  kaizer-redis-data:

@@ -178,6 +178,8 @@ def schedule_post(
     type_: str = "draft",
     yt_title: Optional[str] = None,
     yt_privacy: str = "public",
+    yt_tags: Optional[list[str]] = None,
+    yt_made_for_kids: bool = False,
 ) -> dict:
     """Schedule a post across N integrations.
 
@@ -186,8 +188,9 @@ def schedule_post(
     integration_ids : list[str]
         IDs from list_integrations(). Each is a connected platform.
     text : str
-        Caption / body. Postiz auto-truncates per platform (Twitter
-        280, etc.) if you turn that on in its UI.
+        Caption / body. For YouTube targets this is the description.
+        Postiz auto-truncates per platform (Twitter 280, etc.) if
+        you turn that on in its UI.
     media_id : str | None
         Postiz file id from upload_file(). Required for posts with media.
     media_path : str | None
@@ -206,6 +209,14 @@ def schedule_post(
     yt_privacy : str
         YouTube privacy: 'public' | 'private' | 'unlisted'. Required
         per Postiz validation as ``posts.0.settings.type``.
+    yt_tags : list[str] | None
+        YouTube tags. Sanitised by the caller (no '<', '>', '"', etc.).
+        Wire format: ``[{value, label}, ...]`` — matches what the
+        Postiz dashboard sends from its own UI.
+    yt_made_for_kids : bool
+        "Self-declared made for kids" toggle (COPPA). Wire format
+        is the string "yes" / "no", which is what Postiz expects in
+        ``settings.selfDeclaredMadeForKids``.
 
     Raises PostizError on failure.
     """
@@ -219,6 +230,33 @@ def schedule_post(
         yt_title = first_line[:100] or "Untitled"
     yt_title = yt_title[:100]
 
+    # YouTube tags wire format: list of {value, label} objects, same
+    # shape the Postiz UI emits. Empty list means "no tags" which YT
+    # accepts. Cap at 500 chars combined, individual tag at 100 — we
+    # mirror the cap the native uploader's sanitize_tags() applies so
+    # the two paths produce identical metadata.
+    tag_objs: list[dict] = []
+    if yt_tags:
+        combined = 0
+        seen: set[str] = set()
+        for raw in yt_tags:
+            t = str(raw).strip()
+            while t.startswith("#"):
+                t = t[1:].strip()
+            t = t.replace("<", "").replace(">", "").replace('"', "").strip()
+            if not t:
+                continue
+            t = t[:100]
+            k = t.lower()
+            if k in seen:
+                continue
+            est = len(t) + 2 + (2 if "," in t or " " in t else 0)
+            if combined + est > 500:
+                break
+            seen.add(k)
+            tag_objs.append({"value": t, "label": t})
+            combined += est
+
     from datetime import datetime, timezone
     posts = []
     for iid in integration_ids:
@@ -230,8 +268,10 @@ def schedule_post(
             # settings keys per provider, but always validates that
             # title/type exist when YouTube is in the post.
             "settings": {
-                "title": yt_title,
-                "type":  yt_privacy,
+                "title":                    yt_title,
+                "type":                     yt_privacy,
+                "tags":                     tag_objs,
+                "selfDeclaredMadeForKids":  "yes" if yt_made_for_kids else "no",
             },
         }
         if media_id:

@@ -145,7 +145,14 @@ def _try_one_model(
             response_schema=_RESPONSE_SCHEMA,
             temperature=0.9,
             top_p=0.95,
-            max_output_tokens=4096,
+            # Bumped from 4096 → 8192. Telugu/Hindi tokens are denser
+            # than English (1 char ≈ 2-3 tokens), and the SEO payload
+            # is title + long description + 30 keywords + 12 hashtags
+            # + hook + ad copy. 4096 was getting clipped mid-string,
+            # producing "Unterminated string" JSONDecodeError. 8192 is
+            # the hard cap for gemini-2.0/2.5-flash; safe on all
+            # models in our fallback chain.
+            max_output_tokens=8192,
         )
         with log_gemini_call(
             db=db, user_id=user_id, job_id=job_id, clip_id=clip_id,
@@ -160,6 +167,23 @@ def _try_one_model(
         text = (resp.text or "").strip()
         if not text:
             raise TransientSEOError("Gemini returned empty response")
+
+        # If Gemini hit max_output_tokens mid-stream, the JSON will be
+        # truncated (unterminated string). Treat that as TRANSIENT so
+        # the @retry decorator gives us another shot — sometimes the
+        # second attempt comes in shorter and parses cleanly.
+        try:
+            _finish_reason = (
+                resp.candidates[0].finish_reason.name
+                if resp.candidates and resp.candidates[0].finish_reason else ""
+            )
+        except Exception:
+            _finish_reason = ""
+        if _finish_reason == "MAX_TOKENS":
+            raise TransientSEOError(
+                "Gemini hit max_output_tokens mid-stream (truncated JSON). "
+                "Will retry — bump max_output_tokens further if this keeps happening."
+            )
         data = json.loads(text)
         if not isinstance(data, dict):
             raise SEOGenerationError(f"Gemini returned non-object JSON: {type(data).__name__}")

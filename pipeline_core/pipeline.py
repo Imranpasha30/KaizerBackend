@@ -19,6 +19,7 @@ Requires:
 
 import os, sys, json, time, re, subprocess, math, random, shutil
 from datetime import datetime
+from typing import Optional
 
 # When this module is run as a standalone script (e.g. via
 # `python pipeline_core/pipeline.py ...` from the upload worker
@@ -163,11 +164,13 @@ def _maybe_upload_final(
     """
     try:
         from pipeline_core.storage import get_storage_provider
-        # Force "r2" so clip videos always end up in R2 regardless of
-        # STORAGE_BACKEND env var. The runner + asset uploads already do
-        # this; matching the behaviour here keeps the storage discipline
-        # consistent across the codebase.
-        provider = get_storage_provider("r2")
+        # Honour STORAGE_BACKEND so local dev keeps files on disk and
+        # prod (STORAGE_BACKEND=r2) ships them to R2. The local branch
+        # below early-returns an empty triple — the file is already on
+        # disk where the renderer wrote it, so there's nothing to "copy
+        # to local storage" and no DB columns to populate. The worker's
+        # _ensure_local_clip uses clip.file_path in that case.
+        provider = get_storage_provider()
         if provider.name == "local":
             return ("", "", "")
         # Forward-slash keys on all platforms.
@@ -319,6 +322,117 @@ def ts_to_sec(ts: str, video_dur: float = None) -> float:
         return 0.0
 
 
+def build_stitched_time_map(kept_clips: list) -> list:
+    """Build a source→stitched timestamp map from validated kept clips.
+
+    After cut_video_clips runs, the final bulletin is the concatenation
+    of each kept clip end-to-end. So a source-video timestamp `src_t`
+    inside the k-th kept clip translates to:
+
+        stitched_t = sum(durations of clips 0..k-1) + (src_t - clip_k.start)
+
+    A timestamp inside a CUT span (between two kept clips or before/after
+    the entire kept set) has no stitched equivalent — caller drops the
+    image_plan entry.
+    """
+    rows: list[dict] = []
+    cum = 0.0
+    for k in kept_clips:
+        ss = float(k.get("start_sec") or 0.0)
+        se = float(k.get("end_sec") or 0.0)
+        if se <= ss:
+            continue
+        rows.append({
+            "src_start":       round(ss, 3),
+            "src_end":         round(se, 3),
+            "stitched_offset": round(cum, 3),
+            "stitched_end":    round(cum + (se - ss), 3),
+            "clip_index":      k.get("index"),
+        })
+        cum += (se - ss)
+    return rows
+
+
+def to_stitched(src_t: float, time_map: list):
+    """Convert a source-video timestamp to a stitched-video timestamp.
+
+    Returns (stitched_t, clip_index, span) where ``span`` is the row from
+    ``time_map`` containing ``src_t``. Returns ``None`` when ``src_t``
+    falls inside a cut span or past the end of the last kept clip.
+    """
+    for row in time_map:
+        if row["src_start"] <= src_t < row["src_end"]:
+            stitched_t = row["stitched_offset"] + (src_t - row["src_start"])
+            return (stitched_t, row["clip_index"], row)
+    return None
+
+
+def _word_text(w) -> str:
+    if isinstance(w, dict):
+        return str(w.get("text") or w.get("word") or "")
+    return str(getattr(w, "text", "") or getattr(w, "word", ""))
+
+
+def _word_start(w) -> float:
+    if isinstance(w, dict):
+        return float(w.get("start") or w.get("start_sec") or 0.0)
+    return float(getattr(w, "start", 0.0) or getattr(w, "start_sec", 0.0))
+
+
+def whisper_anchor(
+    entity_name: str,
+    source_time: float,
+    whisper_words: list,
+    window_sec: float = 3.0,
+) -> tuple:
+    """Snap an image_plan show_at to the spoken word that names the entity.
+
+    Looks for ``entity_name``'s first token (case-insensitive, punctuation
+    stripped) inside ``[source_time - window, source_time + window]`` of
+    the Whisper word list. If found, returns ``(matched_word.start, info)``.
+    If not, returns ``(source_time, miss_info)`` so the caller falls back
+    to Gemini's original timing.
+
+    Designed to accept either Word dataclass instances OR plain dicts.
+    """
+    name = (entity_name or "").strip()
+    if not name or not whisper_words:
+        return source_time, {"matched": False, "reason": "empty entity or empty transcript"}
+
+    first_token = re.sub(r"[^\w]+", "", name.split()[0]).lower()
+    if not first_token:
+        return source_time, {"matched": False, "reason": "entity has no alphanumeric tokens"}
+
+    lo = source_time - window_sec
+    hi = source_time + window_sec
+    best = None  # (abs_drift, word_start, word_text)
+
+    for w in whisper_words:
+        ws = _word_start(w)
+        if ws < lo or ws > hi:
+            continue
+        wt = re.sub(r"[^\w]+", "", _word_text(w)).lower()
+        if not wt:
+            continue
+        if first_token in wt or wt in first_token:
+            drift = abs(ws - source_time)
+            if best is None or drift < best[0]:
+                best = (drift, ws, _word_text(w))
+
+    if best is None:
+        return source_time, {
+            "matched": False,
+            "reason": f"'{name}' not found in Whisper transcript within ±{window_sec}s of {source_time:.2f}s",
+        }
+    drift, word_start, matched_text = best
+    return word_start, {
+        "matched": True,
+        "word": matched_text,
+        "word_start_sec": round(word_start, 3),
+        "drift_corrected_sec": round(word_start - source_time, 3),
+    }
+
+
 def sec_to_ts(s: float) -> str:
     h = int(s // 3600)
     m = int((s % 3600) // 60)
@@ -396,6 +510,60 @@ def run_ffmpeg(cmd):
 # STEP 1: GEMINI — Video Analysis + Cuts + Summary + Keywords
 # ═══════════════════════════════════════════════════════════
 
+# Compound schema block — spliced into GEMINI_PROMPT only when the caller
+# asks for the "Full Video + Shorts" combined output via mode="compound".
+# Gemini returns TWO cut sets (full_video_cuts + shorts_cuts) plus the
+# image_plan that drives content-aligned bulletin overlays, plus the
+# Telugu/Hindi headline for the shorts compose step, plus the marquee
+# points for the bulletin ticker. NO ChatGPT round-trip is needed after
+# this — everything text-decision lives here.
+#
+# This block uses Python str.format placeholders for {language_name} +
+# {script_name}, so make sure to apply str.format BEFORE splicing into
+# the parent prompt template. The literal JSON braces are doubled (`{{`
+# and `}}`) so they survive the parent template's own .format() call.
+_COMPOUND_SCHEMA_BLOCK = r"""  "full_video_cuts": [
+    {{
+      "index": 1,
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "summary": "<2-3 sentence summary in English>",
+      "summary_native": "<same summary in {language_name} using {script_name} script>",
+      "importance": <1-10 score>
+    }}
+  ],
+  "shorts_cuts": [
+    {{
+      "index": 1,
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "hook": "<one-line punchy English hook describing why this moment goes viral>",
+      "importance": <1-10 score>
+    }}
+  ],
+  "image_plan": [
+    {{
+      "id": "img_01",
+      "topic_clue": "rahul_gandhi",
+      "entity_name": "Rahul Gandhi",
+      "description": "<one-sentence photo description fed to the image generator>",
+      "search_query": "<English Google query to find a real news photo of this entity>",
+      "search_query_native": "<same query in {script_name} script>",
+      "clip_index": 2,
+      "show_at": "MM:SS.ss",
+      "duration": 5.0,
+      "reason": "<why this image at this moment, e.g. 'speaker mentions Rahul Gandhi from 02:14 to 02:21'>"
+    }}
+  ],
+  "shorts_headline_native": "<the Telugu / {language_name} headline burned into the shorts torn-card frame — 5-8 words MAX, {script_name} script only>",
+  "bulletin_marquee_points": [
+    "<short headline phrase 1 — {script_name} script — 4-7 words>",
+    "<short headline phrase 2 — {script_name} script>",
+    "<short headline phrase 3 — {script_name} script>"
+  ],
+"""
+
+
 GEMINI_PROMPT = """You are an expert {language_name} news video editor. Watch this video carefully.
 
 This video could be ANY of these types — detect which one:
@@ -420,6 +588,206 @@ RULES FOR CUTTING:
 7. Clip duration: aim for {min_dur}-{max_dur} seconds each, ideal {ideal_dur}s.
 8. Maximum {max_clips} clips.
 9. Prefer moments with high energy, important statements, or emotional content.
+
+RAW FOOTAGE HANDLING — RETAKES, FALSE STARTS, AND CREW TALK (CRITICAL):
+
+This is RAW unedited footage. Treat it like a 30-year veteran editor would. Speakers
+fumble lines, restart sentences, do mic checks, ask the cameraman things, hesitate,
+lose their place, and try the same line 2, 3, 4, or more times before getting it
+right. Your job is to identify which moments are CONTENT (meant for the viewer) and
+which are NOISE (meant for crew, for themselves, or abandoned mid-attempt). Skip the
+noise. Use only the content. You have full semantic freedom across Telugu, Hindi,
+English, Kannada, Tamil, Malayalam, Bengali, Marathi, and code-mixed speech. There is
+NO keyword list. Reason from intent.
+
+10. MULTIPLE TAKES OF THE SAME LINE — keep ONLY the final clean version
+    If the speaker covers the same sentence, phrase, or idea more than once with no
+    narrative reason to repeat (no emphasis, no list, no rhetorical device), every
+    attempt except the final clean one was abandoned. The rule scales:
+      2 takes: drop the first, keep the second
+      3 takes: drop the first two, keep the third
+      4 or more takes: drop all earlier attempts, keep ONLY the last clean complete one
+      All takes broken: pick the most complete attempt as fallback
+
+    NEVER stitch two takes together. That produces broken duplicate sentences like:
+      "cricketer has hit a century with amazing Century with an amazing energy"
+    The correct output is the final clean take only:
+      "cricketer has hit a Century with an amazing energy"
+
+    A typical fumble chain looks like this:
+      Attempt 1: "cricketer has hit a century with amazing" [trails off]
+      Aside:     "wait wait, one more time"
+      Attempt 2: "cricketer has hit a Century with" [stops]
+      Aside:     "no no, again"
+      Attempt 3: "cricketer has" [breaks]
+      Filler:    "umm"
+      Attempt 4: "cricketer has hit a Century with an amazing energy" [clean]
+    Skip everything from Attempt 1 through the filler. Keep only Attempt 4.
+
+11. SKIP WARM-UP AT THE VIDEO START
+    The first 5 to 30 seconds of raw footage are almost always junk:
+      mic checks ("hello hello", "test test", "one two one two")
+      crew instructions ("ok start", "ready", "rolling", "shuru karo", "modalu cheppu")
+      throat clearing, laughs, casual chatter
+      adjusting the camera or notes
+      half-sentences spoken to no one
+    The first usable clip MUST begin at the moment the speaker shifts into delivery
+    voice: upright posture, looking at the lens, projected tone, opening line of
+    script aimed at the viewer.
+
+12. MID-RECORDING ASIDES AND CREW TALK
+    Skip any moment where the speaker:
+      addresses the crew, camera operator, or themselves instead of the viewer
+      comments on the recording itself rather than the topic
+      asks "did you get that?", "should I do it again?", "ok ah?" in any language
+      looks off-camera and shifts to informal register
+      reacts to an interruption (phone, door, ambient noise)
+
+13. HESITATION AND BROKEN CADENCE = RETAKE INCOMING
+    These patterns signal the segment leading up to them is an abandoned take. Drop
+    the abandoned segment:
+      trailing off mid-sentence with extended "umm", "aah", or silence
+      visibly searching for the next word, then restarting the sentence
+      long silence (more than 1 second) followed by the same sentence restarting
+      self-correction mid-word ("the price is fif... fifty five")
+      breath reset followed by restart
+
+14. EMPHASIS IS NOT A RETAKE
+    Distinguish carefully. KEEP these (they are intentional emphasis):
+      "no no no, that's wrong" (rhetorical repetition)
+      "bahut bahut dhanyavaad" (Hindi intensifier)
+      "chala chala bagundi" (Telugu emphatic praise)
+      "really really good"
+      a list where the same word repeats by function
+
+    DROP these (they are retakes):
+      "cricketer has hit a... cricketer has hit a Century" (restart after break)
+      "the bowler has done... let me say again... the bowler has done well" (explicit restart)
+      "fifty five... no fifty seven runs" (self-correction)
+
+    Emphasis has rhythm, energy, and intentional repetition. A retake has a break
+    in delivery, a tonal drop, and a fresh restart.
+
+15. USE THE VIDEO, NOT JUST THE AUDIO
+    You are watching the video, not just hearing it. Use visual cues to confirm
+    retake boundaries:
+      speaker breaking eye contact with the camera mid-sentence (about to restart)
+      visible frustration, head shake, sigh, eye roll (rejected take)
+      glancing down at notes between attempts
+      a hand wave or "cut" gesture in frame
+      posture reset, deep breath, or shoulder shrug before the real take begins
+      mouth movement that doesn't match a clean line (mumbling, false start)
+    These visual cues USUALLY happen at the boundary of an abandoned take. Use them
+    to lock in where to cut.
+
+16. END-OF-CLIP HANDLING
+    After a clean take finishes, the speaker often:
+      looks at the crew expectantly ("was that good?")
+      drops performance tone immediately
+      says "ok", "done", "cut", "next" in any language
+      laughs, exhales, or visibly relaxes
+    End the clip at the natural pause AFTER the final scripted sentence, BEFORE the
+    speaker drops out of performance mode.
+
+17. VIDEO TYPE AFFECTS RETAKE FREQUENCY
+    SOLO: high retake frequency. Apply rules 10 to 16 aggressively.
+    INTERVIEW: lower retake frequency. Natural pauses and re-phrasing are part of
+      conversation, NOT retakes. Be more conservative.
+    PRESS_CONFERENCE: almost no retakes. Treat all speech as content unless
+      obviously off-script crew chatter.
+    PANEL: live discussion. No retakes. Treat all speech as content.
+    MIXED: apply the appropriate rule per section.
+
+HARD RULES — VIOLATING THESE BREAKS THE EDIT:
+- Never stitch two takes of the same line together. Pick one whole take.
+- Never include warm-up or crew talk inside any clip.
+- Never include hesitation/filler that bridges an abandoned take and the final take.
+- When in doubt between two near-identical takes, pick the LATER one. Default
+  assumption: the speaker retook because the first was rejected.
+- When the final take is also broken, pick the most complete earlier attempt.
+- Rule 1 ("never cut mid-sentence") still applies AFTER retake filtering. First
+  decide which takes to keep, then snap clip edges to sentence boundaries within
+  the kept content.
+
+═══════════════════════════════════════════════════════════════════════════
+MANDATORY SELF-CHECK BEFORE YOU EMIT THE FINAL JSON — DO NOT SKIP
+═══════════════════════════════════════════════════════════════════════════
+
+You WILL miss retakes if you only listen once. Before finalising your clips:
+
+STEP A — TRANSCRIBE INTERNALLY.
+   In your head, transcribe the speech of every clip you are about to keep.
+   For each clip, write out the sentences the speaker says.
+
+STEP B — REPETITION SCAN.
+   Compare every sentence to every other sentence in the same clip AND to
+   sentences in neighbouring kept clips. If you find a sentence that appears
+   two or more times where:
+      • the first occurrence trails off, breaks mid-word, or is followed by
+        a pause + restart, AND
+      • the later occurrence is more complete, more confident, or runs to
+        a natural sentence end,
+   then the EARLIER occurrence is a retake. You must:
+      1. Trim it out of the kept clip OR drop it into skipped_segments.
+      2. Move the clip's start/end so the rejected attempt is no longer
+         inside the clip's [start, end] window.
+
+STEP C — BOUNDARY AUDIT.
+   Re-listen to the FIRST 1.5 seconds and LAST 1.5 seconds of every kept clip.
+   If you hear ANY of these at the edges, tighten the clip boundary inward:
+      • a half-word fragment ("…ondi anukunnaru" or "…hai")
+      • an abandoned restart ("ee… ee paddati lo… ee paddati lo")
+      • the speaker saying "again", "one more time", "ok", "cut", "done",
+        "next", "wait", "stop", "fir se", "mari okkasari", "inka okasari"
+      • a long silence (> 1 s) followed by a restart
+      • two breath sounds in a row before speech starts
+   Add the trimmed span to skipped_segments.
+
+STEP D — MANDATORY skipped_segments OUTPUT.
+   For SOLO videos (high retake frequency per rule 17), skipped_segments
+   MUST contain at LEAST ONE entry for the opening warm-up unless the speaker
+   was literally already speaking in performance voice in the very first
+   frame. If your skipped_segments is empty on a SOLO video, you did not
+   look hard enough — go back and run STEP B + STEP C again.
+
+STEP E — VERIFICATION FIELD.
+   In the JSON below, fill ``retake_audit`` with a one-sentence sanity note
+   describing what you looked for and what you dropped. This is the proof
+   that you actually ran the self-check.
+
+LANGUAGE-SPECIFIC RETAKE PATTERNS — examples to look for:
+
+Telugu (most common in our content):
+  RETAKE pattern:
+    "ee paddati lo… ee paddati lo manam chestamu" (started twice, drop first)
+    "anduke… anduke ante… anduke ante endhukante" (multiple false starts, keep last)
+    "rendu vela… ah rendu vela rupayalu" (restart with filler "ah" — drop "rendu vela…")
+  EMPHASIS (KEEP):
+    "chala chala bagundi" (genuine intensifier)
+    "kadu kadu kadu" (rhetorical "no no no")
+    "vere vere subjects" (functional list)
+
+Hindi:
+  RETAKE: "yeh kahani… yeh kahani hai… yeh kahani aaj ki" (drop everything before
+     the final complete attempt)
+  RETAKE: "modi ji ne kaha… ek minute… modi ji ne kaha hai" (mid-aside restart)
+  EMPHASIS (KEEP): "bahut bahut dhanyavaad" (intensifier)
+
+English (Indian newsroom):
+  RETAKE: "the bowler has done… let me say again… the bowler has done well"
+  RETAKE: "fifty five… no fifty seven runs" (self-correction — drop "fifty five")
+  EMPHASIS (KEEP): "really really good"
+
+Code-mixed (very common in Telugu / Hindi news):
+  RETAKE: "yeh case is about… ee case ante… yeh case is about Bandi Sanjay"
+  EMPHASIS (KEEP): "very very important issue"
+
+If the speaker visibly looks away, sighs, shakes head, or says any version of
+"again / once more / wait / stop / cut" in any language between two attempts of
+the same sentence, the FIRST attempt is GUARANTEED a retake. There is no
+ambiguity. Drop it.
+
+═══════════════════════════════════════════════════════════════════════════
 
 IMAGE SEARCH QUERIES — THIS IS CRITICAL:
 - Do NOT give generic keywords like "man speaking" or "podium".
@@ -464,8 +832,104 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no ```):
   "key_people": ["full name 1", "full name 2"],
   "key_people_native": ["name1 in {script_name}", "name2 in {script_name}"],
   "key_topics": ["topic 1", "topic 2", "topic 3"],
-  "key_locations": ["location 1", "location 2"]
+  "key_locations": ["location 1", "location 2"],
+{compound_schema_block}
+  "skipped_segments": [
+    {{
+      "start": "MM:SS.ss",
+      "end": "MM:SS.ss",
+      "reason": "<one-line explanation, e.g. 'abandoned take, restarted at 00:42.10' or 'mic check before delivery began'>",
+      "category": "retake|warm_up|crew_talk|hesitation|aside|self_correction"
+    }}
+  ],
+  "retake_audit": "<one-sentence proof that you ran the mandatory self-check: what repetitions you scanned for, how many retakes you found, what warm-up you dropped, AND whether any kept clip was tightened at its boundary. Example: 'Scanned 5 candidate clips, found 3 retake repetitions and 1 warm-up; tightened clip 1 start by 4.2s and dropped 7 spans totalling 38s.' If you skipped the self-check, write SKIPPED — and we will reject this response.>"
 }}
+
+NOTES ON skipped_segments — THIS IS NOT OPTIONAL:
+- Emit every span you DROPPED while applying rules 10-17 above. This is a
+  REQUIRED field — list the warm-up, the abandoned takes, the asides, the
+  hesitation bridges. An empty array on a SOLO video means you did not run
+  the mandatory self-check (STEP A–D above).
+- The spans must be disjoint from your clips[] (kept content) and from each other.
+- Use the same MM:SS.ss timecode format as clips[].
+- "reason" should be specific enough that a human reviewer can verify your call
+  ("speaker said 'wait one more time' then restarted" beats "noise").
+- For every retake you detect, write reason that NAMES the repeated phrase
+  (e.g. "speaker said 'ee case is about' then restarted with the complete line
+  at 00:42.10") — verifying you actually heard the repetition, not guessed.
+- Default expectation for SOLO raw recordings: skipped_segments has 3–10
+  entries. Press conferences / panels: usually 0–2. If your numbers are
+  way off these defaults, recheck your work.
+
+NOTES ON COMPOUND MODE — read this only if the schema above contains the keys
+`full_video_cuts`, `shorts_cuts`, `image_plan`, `shorts_headline_native`,
+`bulletin_marquee_points`. If those keys are NOT present in the schema, ignore
+this entire section and use `clips[]` as you have been.
+
+In compound mode this ONE response drives TWO separate outputs from the same
+source video — a long-form bulletin and a set of vertical short clips. They
+share the same raw material but the cuts are chosen independently.
+
+full_video_cuts[] — the bulletin clips:
+- Coherent ~{ideal_dur}s+ chunks that capture the OVERALL scenario / narrative
+  arc of the source video. Think "would this make a complete news story segment
+  on its own?".
+- 3–6 cuts typically; up to {max_clips}.
+- Cuts can be back-to-back to cover the whole story OR have gaps where you
+  intentionally drop weak material (the gaps are NOT skipped_segments — those
+  are for retake/warm-up only).
+
+shorts_cuts[] — the short-form highlight clips:
+- 3–6 punchy 15–60s clips that are "small glimpses of the overall scenario or
+  showing very important parts" — the moments that go viral on their own.
+- Shorts cuts can OVERLAP with full_video_cuts (a great moment goes in both).
+  Shorts cuts can also be ENTIRELY OUTSIDE full_video_cuts (a side moment too
+  short for the bulletin but irresistible as a short).
+- Pick for punch, not coverage. A single great line beats a whole paragraph.
+- `hook` is one English line — what would the YouTube thumbnail caption say?
+
+image_plan[] — FULL-VIDEO ONLY content-aligned imagery:
+- This is the ONLY source of truth for which image appears when in the bulletin.
+  Software generates ONE image per unique `id`, then overlays each entry on the
+  final stitched bulletin at its `show_at` for its `duration`. Get the timing
+  wrong and the wrong photo shows during the wrong sentence.
+- Hard rules:
+  * `id` is stable across the whole job. REUSE the same id when the same image
+    should reappear later (e.g. speaker mentions Rahul Gandhi twice — both
+    entries use id "img_01"). Do NOT mint a new id per appearance.
+  * Maximum 6 UNIQUE ids per job. Pick the 6 most important entities; do not
+    exceed 6 distinct ids.
+  * `topic_clue` is snake_case, lowercase ASCII, no spaces. Same clue every
+    time the same id is used.
+  * `entity_name` is the LITERAL word(s) the speaker says aloud when the image
+    should appear. Software anchors against the audio transcript using this
+    string, so write it as the speaker pronounces it.
+  * `show_at` is SOURCE-VIDEO TIME (the video you are watching) in MM:SS.ss
+    format. NOT stitched-output time — software re-maps after cutting.
+  * `show_at + duration` must fall ENTIRELY inside one full_video_cuts entry's
+    [start, end]. Do not let an entry straddle two clips.
+  * `duration` must be at least 2.0 seconds.
+  * `description` is one sentence fed verbatim to the image generator. Describe
+    WHAT should appear in the frame (subject, setting, mood).
+  * `clip_index` is the 1-indexed position of the matching full_video_cuts entry.
+- Image_plan does NOT apply to shorts_cuts. Leave shorts visuals alone — they
+  use a separate compose path.
+- If you cannot produce a valid image_plan, return an empty array [].
+
+shorts_headline_native:
+- ONE Telugu / {language_name} headline burned into the shorts torn-card frame
+  at the top of every short clip.
+- Maximum 5-8 words. {script_name} script ONLY — no transliteration.
+- Punchy, ticker style. Include the main person/place name if mentioned.
+- This replaces the separate ChatGPT title call — no other model will be asked
+  for a headline.
+
+bulletin_marquee_points[]:
+- 3-7 short bullet headlines in {script_name} script. Each one is 4-7 words.
+- They become the scrolling marquee text along the bottom of the bulletin video.
+- Order matters — they scroll in the order you emit them.
+- Pick the 3-7 most newsworthy facts from the WHOLE source video, not just
+  one clip's contents.
 """
 
 
@@ -637,16 +1101,22 @@ def upload_video_to_gemini(video_path: str) -> object:
 
 
 def _video_cache_key(video_path: str, preset: dict) -> str:
-    """Content-hash of video (first 4MB + size + mtime) + preset params.
+    """Content-hash of video (first 4MB + size) + preset params.
 
-    First 4 MB is enough to distinguish any two real videos; hashing 771 MB
-    to look up a cache entry would defeat the purpose of having a cache.
+    First 4 MB + byte-length is enough to distinguish any two real
+    videos; hashing 771 MB to look up a cache entry would defeat the
+    purpose of having a cache.
+
+    ``mtime`` is INTENTIONALLY excluded — re-uploading the same video
+    creates a new file with a fresh mtime, which would bust the cache
+    even though the bytes are identical. The whole point of this
+    cache is to skip Gemini when the user re-runs the same source.
     """
     import hashlib
     h = hashlib.sha256()
     try:
         st = os.stat(video_path)
-        h.update(f"{st.st_size}:{int(st.st_mtime)}".encode())
+        h.update(f"{st.st_size}".encode())
         with open(video_path, "rb") as f:
             h.update(f.read(4 * 1024 * 1024))
     except Exception:
@@ -656,6 +1126,12 @@ def _video_cache_key(video_path: str, preset: dict) -> str:
         "max_dur":   preset.get("max_dur"),
         "ideal_dur": preset.get("ideal_dur"),
         "max_clips": MAX_CLIPS,
+        # Prompt version: bump this string whenever GEMINI_PROMPT changes
+        # in a way that should invalidate cached responses (e.g. new rules,
+        # new fields, stricter retake detection). Old cache files become
+        # unreachable; first re-run of any video pays for one fresh
+        # Gemini call, then re-caches against the new key.
+        "prompt_version": "2026.05.16-stricter-retake-audit",
     }, sort_keys=True).encode())
     return h.hexdigest()[:16]
 
@@ -667,17 +1143,53 @@ def _cache_dir() -> str:
     return d
 
 
-def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te") -> dict:
+def analyze_video_with_gemini(
+    video_path: str,
+    preset: dict,
+    language: str = "te",
+    mode: str = "single",
+) -> dict:
     """Send video to Gemini, get cut decisions + summary + keywords.
 
     Cached: identical video + preset + language → same Gemini response, read from disk.
     Override with KAIZER_CACHE_GEMINI=false to force re-run.
+
+    Compound-job reuse: when ``KAIZER_REUSE_ANALYSIS_FROM`` env var
+    points at a previously-written analysis JSON, we skip the Gemini
+    call entirely and load that file. The compound runner uses this
+    to do ONE Gemini call across both pipeline passes — pass 1
+    produces the analysis, pass 2 reads it.
+
+    `mode` controls the schema Gemini is asked to return:
+      - "single"   → existing single-platform schema (clips[] only, no
+                     image_plan, no shorts_cuts, no bulletin marquee).
+                     Used by standalone youtube_short / youtube_full /
+                     instagram_reel jobs. Fully backward-compatible.
+      - "compound" → the new combined schema for "Full Video + Shorts".
+                     Adds full_video_cuts[], shorts_cuts[], image_plan[],
+                     shorts_headline_native, bulletin_marquee_points[].
+                     ONE Gemini call decides both formats and the
+                     bulletin imagery in a single round-trip.
     """
     # Lazy import so test harnesses that don't set sys.path can still load.
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     import languages as _langs
     lang_cfg = _langs.get(language)
+
+    # ── Compound-job reuse hook (highest priority) ───────────────
+    # The runner sets this env var on pass 2 of a compound job after
+    # capturing pass 1's [kaizer:analysis] stdout marker. Skipping
+    # Gemini saves ~$0.50 and ~30s per compound job.
+    _reuse_path = os.environ.get("KAIZER_REUSE_ANALYSIS_FROM", "").strip()
+    if _reuse_path and os.path.isfile(_reuse_path):
+        try:
+            with open(_reuse_path, "r", encoding="utf-8") as _f:
+                _cached = json.load(_f)
+            print(f"    ✓ Reusing Gemini analysis from prior pass ({os.path.basename(_reuse_path)}) — 0 quota burned")
+            return _cached
+        except Exception as _e:
+            print(f"    [reuse] failed to load {_reuse_path}: {_e} — falling back to fresh Gemini call")
 
     # ── Cache lookup (key includes language so te/hi outputs don't collide) ──
     # Two-tier cache: Redis first (cross-pod, enterprise scale), then
@@ -736,11 +1248,24 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
     min_dur = preset.get("min_dur", 15)
     max_dur = preset.get("max_dur", 90) or 300
     ideal_dur = preset.get("ideal_dur", 30) or 120
+
+    # Compound-mode schema block: emitted into {compound_schema_block} of
+    # GEMINI_PROMPT only when the caller asked for both formats at once.
+    # For "single" mode the placeholder collapses to an empty string and
+    # the prompt reads exactly as before — full backward compatibility.
+    compound_schema_block = ""
+    if mode == "compound":
+        compound_schema_block = _COMPOUND_SCHEMA_BLOCK.format(
+            language_name=lang_cfg.name_english,
+            script_name=lang_cfg.script,
+        )
+
     prompt = GEMINI_PROMPT.format(
         min_dur=min_dur, max_dur=max_dur,
         ideal_dur=ideal_dur, max_clips=MAX_CLIPS,
         language_name=lang_cfg.name_english,
         script_name=lang_cfg.script,
+        compound_schema_block=compound_schema_block,
     )
 
     # Model fallback chain — first entry is primary, rest are fallbacks tried
@@ -832,6 +1357,11 @@ def analyze_video_with_gemini(video_path: str, preset: dict, language: str = "te
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print(f"    ✓ Cached Gemini analysis at {cache_key}.json (disk)")
+            # Machine-parseable marker — the runner watches stdout for
+            # this line and uses the absolute path as
+            # ``KAIZER_REUSE_ANALYSIS_FROM`` on subsequent compound-job
+            # passes, so the second pass skips Gemini entirely.
+            print(f"[kaizer:analysis] {os.path.abspath(cache_path)}")
         except Exception as e:
             print(f"    [cache:disk] write failed: {e}")
     if cache_enabled and redis_key:
@@ -1100,9 +1630,296 @@ def _search_pexels(query: str, count: int = 3) -> list:
     return []
 
 
+
+def generate_image_pool_from_plan(
+    image_plan: list,
+    job_dir: str,
+    language: str = "en",
+    max_unique: int = 6,
+    dual_backend: bool = True,
+) -> dict:
+    """Dedup Gemini's image_plan by `id` and generate ONE image per unique id.
+
+    The image_plan may contain many entries (same entity referenced at
+    several moments) but only ONE image file per id is generated — the
+    overlay step reuses the same file at every show_at moment.
+
+    Returns a manifest keyed by id:
+        {
+          "img_01": {
+            "id": "img_01",
+            "topic_clue": "rahul_gandhi",
+            "description": "Rahul Gandhi at rally…",
+            "path":        "/abs/path/to/openai/img_01__rahul_gandhi.jpg",
+            "openai_path": "/abs/path/to/openai/img_01__rahul_gandhi.jpg",
+            "imagen_path": "/abs/path/to/imagen/img_01__rahul_gandhi.jpg",
+            "cached":      False,
+          },
+          ...
+        }
+
+    `path` is what downstream code reads to lay the image on screen. We
+    keep `path` pointing at the OpenAI render by default; the Imagen
+    render is saved alongside for A/B comparison. Once the operator
+    picks a winner they can flip `path` to point at the Imagen file.
+
+    Files land under <job_dir>/pool/openai/ and <job_dir>/pool/imagen/.
+    """
+    from pipeline_core import openai_images as _oi
+    if dual_backend:
+        from pipeline_core import imagen as _im
+
+    openai_dir = os.path.join(job_dir, "pool", "openai")
+    imagen_dir = os.path.join(job_dir, "pool", "imagen")
+    os.makedirs(openai_dir, exist_ok=True)
+    if dual_backend:
+        os.makedirs(imagen_dir, exist_ok=True)
+
+    # Dedupe by id, preserving Gemini's emission order. Cap at max_unique.
+    by_id: dict = {}
+    for entry in image_plan or []:
+        eid = (entry.get("id") or "").strip()
+        if not eid or eid in by_id:
+            continue
+        by_id[eid] = entry
+        if len(by_id) >= max_unique:
+            break
+
+    manifest: dict = {}
+    for eid, entry in by_id.items():
+        clue = re.sub(r"[^a-z0-9_]+", "_", (entry.get("topic_clue") or "").lower()).strip("_") or "image"
+        fname = f"{eid}__{clue}.jpg"
+        openai_path = os.path.join(openai_dir, fname)
+        imagen_path = os.path.join(imagen_dir, fname)
+
+        # Idempotency: skip OpenAI generation if a prior run produced it.
+        openai_cached = os.path.exists(openai_path) and os.path.getsize(openai_path) > 10_000
+        imagen_cached = os.path.exists(imagen_path) and os.path.getsize(imagen_path) > 10_000
+
+        # Build subject text — Gemini's per-entry description wins; fall
+        # back to entity_name / search_query.
+        subject_desc = (entry.get("description") or "").strip()
+        subject_q    = (entry.get("entity_name") or entry.get("search_query") or "").strip()
+        entities     = [entry["entity_name"]] if entry.get("entity_name") else []
+
+        if not openai_cached:
+            try:
+                _oi.generate_news_image(
+                    query=subject_desc or subject_q,
+                    entities=entities,
+                    topics=[clue],
+                    language=language,
+                    out_path=openai_path,
+                )
+            except Exception as exc:
+                print(f"    [image_pool] openai failed for {eid}: {exc}")
+        if dual_backend and not imagen_cached:
+            try:
+                _im.generate_news_image(
+                    query=subject_q,
+                    description=subject_desc or None,
+                    entities=entities,
+                    topics=[clue],
+                    language=language,
+                    out_path=imagen_path,
+                )
+            except Exception as exc:
+                print(f"    [image_pool] imagen failed for {eid}: {exc}")
+
+        openai_ok = os.path.exists(openai_path) and os.path.getsize(openai_path) > 10_000
+        imagen_ok = os.path.exists(imagen_path) and os.path.getsize(imagen_path) > 10_000
+
+        if not openai_ok and not imagen_ok:
+            print(f"    [image_pool] both backends failed for {eid} ({clue}) — entries with this id will be dropped")
+            continue
+
+        # Default render path: prefer OpenAI; fall back to Imagen if OpenAI failed.
+        render_path = openai_path if openai_ok else imagen_path
+        manifest[eid] = {
+            "id":          eid,
+            "topic_clue":  clue,
+            "description": entry.get("description") or "",
+            "path":        render_path,
+            "openai_path": openai_path if openai_ok else None,
+            "imagen_path": imagen_path if imagen_ok else None,
+            "cached":      openai_cached or imagen_cached,
+        }
+        if openai_ok and imagen_ok:
+            print(f"    [image_pool] {fname} ✓ openai+imagen")
+        elif openai_ok:
+            print(f"    [image_pool] {fname} ✓ openai (imagen skipped/failed)")
+        else:
+            print(f"    [image_pool] {fname} ✓ imagen only (openai failed)")
+
+    return manifest
+
+
+def resolve_image_plan(
+    image_plan: list,
+    pool_manifest: dict,
+    kept_clips: list,
+    whisper_words: list | None,
+    video_duration_sec: float,
+) -> list:
+    """Project Gemini's image_plan onto the stitched bulletin timeline.
+
+    For each entry, in order:
+      1. Look up the image file by `id` in pool_manifest. If missing,
+         drop with status=image_missing.
+      2. Map `show_at` (source time) → stitched time. If show_at fell
+         in a cut span, drop with status=in_cut_span.
+      3. If a Whisper word list is supplied, snap `show_at` to the
+         word the speaker said for ``entity_name`` (±3s window).
+      4. Clamp `duration` so the overlay doesn't bleed past its clip's
+         stitched end.
+    """
+    time_map = build_stitched_time_map(kept_clips)
+    resolved: list = []
+
+    for entry in image_plan or []:
+        eid = entry.get("id") or ""
+        out = {
+            "id":          eid,
+            "topic_clue":  entry.get("topic_clue") or "",
+            "entity_name": entry.get("entity_name") or "",
+            "description": entry.get("description") or "",
+            "clip_index":  entry.get("clip_index"),
+        }
+
+        if eid not in pool_manifest:
+            out["status"] = "image_missing"
+            out["reason"] = f"id '{eid}' has no generated image (pool exceeded cap or generation failed)"
+            resolved.append(out)
+            continue
+        out["image_path"] = pool_manifest[eid]["path"]
+
+        try:
+            src_show_at = ts_to_sec(entry.get("show_at", "00:00"), video_duration_sec)
+            duration    = float(entry.get("duration", 0.0) or 0.0)
+        except Exception as exc:
+            out["status"] = "bad_timestamp"
+            out["reason"] = f"parse failed: {exc}"
+            resolved.append(out)
+            continue
+
+        if duration < 2.0:
+            out["status"] = "duration_too_short"
+            out["reason"] = f"duration {duration:.2f}s < 2.0s minimum"
+            resolved.append(out)
+            continue
+        out["source_show_at_sec"] = round(src_show_at, 3)
+
+        # Whisper anchor (optional)
+        anchor_info: dict = {"matched": False, "reason": "no transcript supplied"}
+        if whisper_words:
+            anchored_t, anchor_info = whisper_anchor(
+                entry.get("entity_name") or "", src_show_at, whisper_words, window_sec=3.0,
+            )
+            src_show_at = anchored_t
+        out["whisper_anchor"] = anchor_info
+
+        mapped = to_stitched(src_show_at, time_map)
+        if mapped is None:
+            out["status"] = "in_cut_span"
+            out["reason"] = (
+                f"source time {src_show_at:.2f}s fell inside a cut span "
+                f"(image meant for a moment we removed)"
+            )
+            resolved.append(out)
+            continue
+        stitched_t, clip_index_resolved, span = mapped
+        out["stitched_show_at_sec"] = round(stitched_t, 3)
+        out["clip_index_resolved"]  = clip_index_resolved
+
+        # Boundary clamp
+        clip_stitched_end = span["stitched_end"]
+        max_allowed_dur = max(0.0, clip_stitched_end - stitched_t)
+        clamped_dur = min(duration, max_allowed_dur)
+        if clamped_dur < duration:
+            out["clamped_from_sec"] = round(duration, 3)
+        out["duration_sec"] = round(clamped_dur, 3)
+
+        if clamped_dur < 2.0:
+            out["status"] = "clamped_too_short"
+            out["reason"] = f"after clamp duration {clamped_dur:.2f}s < 2.0s — image would barely flash"
+            resolved.append(out)
+            continue
+
+        out["status"] = "ready"
+        resolved.append(out)
+
+    return resolved
+
+
+def overlay_image_plan(
+    stitched_video_path: str,
+    resolved_plan: list,
+    out_path: str,
+) -> str | None:
+    """Composite scheduled overlays onto the already-stitched bulletin.
+
+    Only entries with ``status == "ready"`` are rendered. Each unique
+    image_path becomes one ffmpeg input; overlays chain linearly using
+    ``enable='between(t,start,end)'`` so a single ffmpeg invocation
+    produces the final file.
+
+    Layout: news-broadcast inset — scaled to 30% of frame width, placed
+    in the upper-right with a 30px margin. Square images keep their
+    aspect ratio.
+
+    Returns out_path on success, None when there's nothing to render
+    (caller keeps the un-overlaid bulletin).
+    """
+    ready = [e for e in (resolved_plan or []) if e.get("status") == "ready" and e.get("image_path")]
+    if not ready:
+        print("  [overlay] no ready image_plan entries — keeping bulletin unchanged")
+        return None
+
+    # Dedupe inputs so the same image file is added once.
+    path_to_input_idx: dict = {}
+    inputs: list = ["-i", stitched_video_path]
+    for entry in ready:
+        p = entry["image_path"]
+        if p not in path_to_input_idx:
+            path_to_input_idx[p] = len(path_to_input_idx) + 1
+            inputs += ["-i", p]
+
+    fg_parts: list = []
+    # Pre-scale each unique image so overlay positioning is predictable.
+    for p, idx in path_to_input_idx.items():
+        fg_parts.append(f"[{idx}:v]scale=576:-1,format=yuva420p[i{idx}]")
+
+    prev = "[0:v]"
+    for k, entry in enumerate(ready, 1):
+        idx = path_to_input_idx[entry["image_path"]]
+        start_t = float(entry["stitched_show_at_sec"])
+        end_t   = start_t + float(entry["duration_sec"])
+        out_pin = f"[v{k}]"
+        fg_parts.append(
+            f"{prev}[i{idx}]overlay=x=W-w-30:y=30:"
+            f"enable='between(t,{start_t:.3f},{end_t:.3f})'{out_pin}"
+        )
+        prev = out_pin
+
+    fg = ";".join(fg_parts)
+    cmd = (
+        [FFMPEG_BIN, "-y"]
+        + inputs
+        + ["-filter_complex", fg,
+           "-map", prev,
+           "-map", "0:a?"]
+        + ENCODE_ARGS_INTERMEDIATE
+        + [out_path]
+    )
+    print(f"  [overlay] applying {len(ready)} entries across {len(path_to_input_idx)} unique image(s)")
+    run_ffmpeg(cmd)
+    return out_path
+
+
 def search_news_images(search_queries: list, people: list, topics: list,
                        output_dir: str, count: int = 5,
-                       language: str = "en") -> list:
+                       language: str = "en",
+                       skip_openai: bool = False) -> list:
     """
     Multi-source news image search.
     Priority: OpenAI (gpt-image-1) → Google CSE → DuckDuckGo → Pexels → Generated cards.
@@ -1112,6 +1929,14 @@ def search_news_images(search_queries: list, people: list, topics: list,
     geographic location hint (Telugu → Andhra/Telangana, Hindi → North
     India, etc.) so the visual reads as local news. Falls back to
     "India" for unknown / missing languages.
+
+    ``skip_openai=True`` jumps straight to the web-search chain (Google
+    CSE → DuckDuckGo → Pexels). Use this when the subject is a real
+    public figure or a specific named incident — OpenAI refuses to
+    render them by name and even if it didn't, viewers expect the
+    ACTUAL photo for those. Stories about generic themes should keep
+    skip_openai=False (the default) so AI-generated B-roll fills the
+    pool when Pexels has nothing topical.
     """
     images_dir = os.path.join(output_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
@@ -1141,9 +1966,14 @@ def search_news_images(search_queries: list, people: list, topics: list,
     # web-search loop below for that slot. Per-image fallback (not
     # all-or-nothing) means refusals on real-public-figure prompts
     # don't sink the whole batch.
+    #
+    # ``skip_openai=True`` short-circuits this step — used by the
+    # bulletin pool builder when the caller already knows the subject
+    # is a real public figure / named incident and wants the ACTUAL
+    # web photo, not an AI render.
     try:
         from pipeline_core.openai_images import generate_news_image, is_enabled
-        if is_enabled():
+        if is_enabled() and not skip_openai:
             print(f"    Trying OpenAI gpt-image-1 for up to {count} images ...")
             for qi, query in enumerate(queries):
                 if len(downloaded) >= count:
@@ -2764,6 +3594,255 @@ def _select_platform_and_frame(platform=None, frame_layout=None):
     return platform, frame_layout
 
 
+def run_compound_pipeline(
+    video_path: str,
+    language: str = "te",
+    *,
+    frame_layout: str = "torn_card",
+    use_default_brand_image: bool = False,
+) -> dict:
+    """Dedicated "Full Video + Shorts" pipeline — ONE Gemini call, both formats.
+
+    This replaces the prior compound flow (two sequential subprocesses, each
+    running the standalone single-platform pipeline). The new flow:
+
+    1. Calls ``analyze_video_with_gemini(mode="compound")`` ONCE. Gemini
+       returns ``full_video_cuts``, ``shorts_cuts``, ``image_plan`` (FULL
+       VIDEO ONLY), ``shorts_headline_native``, ``bulletin_marquee_points``
+       in a single JSON. ChatGPT is NOT called for titles or SEO.
+    2. Writes the compound analysis to ``<job_dir>/compound_analysis.json``
+       and two derivative files keyed by pass:
+         - ``analysis_full.json``  → ``clips`` aliased to ``full_video_cuts``
+         - ``analysis_short.json`` → ``clips`` aliased to ``shorts_cuts``
+    3. Runs the full-video pass FIRST (so the bulletin image pool can later
+       be reused for shorts) by calling ``run_pipeline()`` in-process with
+       ``KAIZER_REUSE_ANALYSIS_FROM`` pointed at ``analysis_full.json``.
+    4. Runs the shorts pass SECOND with ``analysis_short.json``. If
+       ``use_default_brand_image`` is True AND the operator has set
+       ``KAIZER_DEFAULT_IMAGE`` to a real file, the shorts pass uses that
+       asset and skips image search/generation entirely.
+
+    The derivative-file trick lets ``run_pipeline()`` stay 100% unchanged —
+    it sees ``clips[]`` as it always has. Phase C wires the image_plan
+    overlay step on top of the bulletin's output, also without touching
+    ``run_pipeline``.
+
+    Returns a dict ``{"full_meta": ..., "short_meta": ..., "compound_analysis": ...}``
+    where each value is a filesystem path (or None on per-pass failure).
+    """
+    print()
+    print(f"  ╔══════════════════════════════════════════════════════════")
+    print(f"  ║ Compound pipeline — Full Video + Shorts (single Gemini call)")
+    print(f"  ╚══════════════════════════════════════════════════════════")
+
+    # Resolve language config + bring up platform presets the same way
+    # run_pipeline does. We need a "preset" object to feed Gemini's
+    # min/max/ideal_dur — pick the LONG-FORM preset because Gemini emits
+    # both cut sets in compound mode but the duration targets are most
+    # meaningful for the bulletin clips. Shorts targets are baked into the
+    # NOTES ON COMPOUND MODE prose.
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import languages as _langs
+    lang_cfg = _langs.get(language)
+    full_preset = PLATFORM_PRESETS["youtube_full"]
+
+    # ── Output dir ─────────────────────────────────────────────
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_stem = os.path.splitext(os.path.basename(video_path))[0]
+    safe_stem = "".join(c for c in safe_stem if c.isalnum() or c in "-_")[:40] or "kaizer"
+    out_root  = os.environ.get("KAIZER_OUTPUT_ROOT") or os.path.abspath("output")
+    job_dir   = os.path.join(out_root, f"compound_{timestamp}_{safe_stem}")
+    os.makedirs(job_dir, exist_ok=True)
+    print(f"  Output: {job_dir}")
+
+    # ── Single Gemini call ─────────────────────────────────────
+    print(f"\n  [Gemini] Compound analysis (one call, both formats) …")
+    gemini_result = analyze_video_with_gemini(
+        video_path, full_preset, language=language, mode="compound",
+    )
+
+    # Persist the compound analysis intact for QA / replay.
+    compound_path = os.path.join(job_dir, "compound_analysis.json")
+    with open(compound_path, "w", encoding="utf-8") as f:
+        json.dump(gemini_result, f, ensure_ascii=False, indent=2)
+    print(f"    ✓ Saved {os.path.basename(compound_path)}")
+
+    full_cuts   = gemini_result.get("full_video_cuts") or gemini_result.get("clips") or []
+    shorts_cuts = gemini_result.get("shorts_cuts")     or []
+    image_plan  = gemini_result.get("image_plan")      or []
+    shorts_hl   = (gemini_result.get("shorts_headline_native") or "").strip()
+    marquee_pts = gemini_result.get("bulletin_marquee_points") or []
+
+    print(f"    full_video_cuts: {len(full_cuts)}  shorts_cuts: {len(shorts_cuts)}  "
+          f"image_plan: {len(image_plan)}  marquee_pts: {len(marquee_pts)}")
+    if shorts_hl:
+        print(f"    shorts headline: {shorts_hl}")
+
+    # ── Build the per-pass derivative analyses ─────────────────
+    # Each derivative reuses the compound JSON's metadata fields (summary,
+    # entities, image_search_queries, etc.) but swaps `clips[]` for the
+    # appropriate cut set so run_pipeline sees what it expects.
+    full_analysis  = dict(gemini_result)
+    full_analysis["clips"] = full_cuts
+    full_analysis_path = os.path.join(job_dir, "analysis_full.json")
+    with open(full_analysis_path, "w", encoding="utf-8") as f:
+        json.dump(full_analysis, f, ensure_ascii=False, indent=2)
+
+    short_analysis = dict(gemini_result)
+    short_analysis["clips"] = shorts_cuts
+    short_analysis_path = os.path.join(job_dir, "analysis_short.json")
+    with open(short_analysis_path, "w", encoding="utf-8") as f:
+        json.dump(short_analysis, f, ensure_ascii=False, indent=2)
+    print(f"    ✓ Wrote per-pass derivatives")
+
+    # ── Pass 1: Full video (bulletin) ──────────────────────────
+    full_meta = None
+    if full_cuts:
+        print(f"\n  ═══ PASS 1/2 — Full Video (bulletin) ═══")
+        os.environ["KAIZER_REUSE_ANALYSIS_FROM"] = full_analysis_path
+        try:
+            full_meta = run_pipeline(
+                video_path,
+                platform="youtube_full",
+                frame_layout="torn_card",
+                language=language,
+                render_mode="bulletin",
+            )
+        except Exception as exc:
+            print(f"  [compound] Full-video pass FAILED: {type(exc).__name__}: {exc}")
+        finally:
+            os.environ.pop("KAIZER_REUSE_ANALYSIS_FROM", None)
+
+        # ── Pass 1b: image_plan content-aligned overlays ──
+        # If Gemini emitted an image_plan, generate the dual-backend
+        # image pool and composite the overlays onto the stitched
+        # bulletin. The overlay step is purely additive: it produces
+        # bulletin_with_overlays.mp4 alongside the original bulletin.mp4.
+        # The editor_meta is updated to point at the overlaid version
+        # so R2 upload and the UI pick it up automatically.
+        if full_meta and image_plan:
+            try:
+                full_meta_dir = os.path.dirname(full_meta)
+                bulletin_dir  = os.path.join(full_meta_dir, "bulletin")
+                bulletin_mp4  = os.path.join(bulletin_dir, "bulletin.mp4")
+                if os.path.exists(bulletin_mp4):
+                    # Normalise the cuts so resolve_image_plan has start_sec/end_sec.
+                    vinfo = get_video_info(video_path) or {}
+                    src_dur = float(vinfo.get("duration") or 0.0)
+                    _kept: list = []
+                    for c in full_cuts:
+                        try:
+                            s = ts_to_sec(c.get("start", "00:00"), src_dur)
+                            e = ts_to_sec(c.get("end",   "00:00"), src_dur)
+                            if e > s:
+                                _kept.append({
+                                    **c,
+                                    "start_sec":    s,
+                                    "end_sec":      e,
+                                    "duration_sec": e - s,
+                                })
+                        except Exception:
+                            continue
+
+                    print(f"  [image_plan] {len(image_plan)} entries — generating dual-backend pool …")
+                    pool = generate_image_pool_from_plan(
+                        image_plan, job_dir=full_meta_dir,
+                        language=language, max_unique=6, dual_backend=True,
+                    )
+                    resolved = resolve_image_plan(
+                        image_plan,
+                        pool_manifest=pool,
+                        kept_clips=_kept,
+                        whisper_words=None,  # bulletin path doesn't produce a transcript yet
+                        video_duration_sec=src_dur,
+                    )
+                    ready_count = sum(1 for r in resolved if r.get("status") == "ready")
+                    print(f"  [image_plan] {ready_count}/{len(resolved)} entries resolved to ready")
+
+                    if ready_count > 0:
+                        overlay_out = os.path.join(bulletin_dir, "bulletin_with_overlays.mp4")
+                        if os.path.exists(overlay_out) and os.path.getsize(overlay_out) > 100_000:
+                            print(f"  [image_plan] {os.path.basename(overlay_out)} cached — skipping overlay pass")
+                        else:
+                            overlay_image_plan(bulletin_mp4, resolved, overlay_out)
+
+                        if os.path.exists(overlay_out) and os.path.getsize(overlay_out) > 100_000:
+                            print(f"  [image_plan] Final bulletin → {os.path.basename(overlay_out)}")
+                            # Update editor_meta to point at the overlaid file
+                            # so R2 upload + UI pick it up.
+                            try:
+                                with open(full_meta, "r", encoding="utf-8") as _mf:
+                                    _meta = json.load(_mf)
+                                for _c in _meta.get("clips") or []:
+                                    if _c.get("clip_path", "").endswith("bulletin.mp4"):
+                                        _c["clip_path"] = overlay_out
+                                        _c["clip_path_overlay"] = overlay_out
+                                        _c["clip_path_carousel_only"] = bulletin_mp4
+                                with open(full_meta, "w", encoding="utf-8") as _mf:
+                                    json.dump(_meta, _mf, ensure_ascii=False, indent=2)
+                            except Exception as _e:
+                                print(f"  [image_plan] editor_meta update skipped: {_e}")
+                    # Persist the resolved manifest for QA / debugging.
+                    try:
+                        with open(os.path.join(bulletin_dir, "image_plan_resolved.json"),
+                                  "w", encoding="utf-8") as _rf:
+                            json.dump(resolved, _rf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                else:
+                    print(f"  [image_plan] bulletin.mp4 not found at {bulletin_mp4} — overlay skipped")
+            except Exception as _ip_exc:
+                print(f"  [image_plan] FAILED ({type(_ip_exc).__name__}: {_ip_exc}) — keeping un-overlaid bulletin.mp4")
+        elif full_meta and not image_plan:
+            print(f"  [image_plan] Gemini emitted empty image_plan — keeping carousel-based bulletin")
+    else:
+        print(f"  [compound] No full_video_cuts emitted by Gemini — skipping bulletin pass")
+
+    # ── Pass 2: Shorts ─────────────────────────────────────────
+    short_meta = None
+    if shorts_cuts:
+        print(f"\n  ═══ PASS 2/2 — Shorts ═══")
+        os.environ["KAIZER_REUSE_ANALYSIS_FROM"] = short_analysis_path
+        # The default-image short-circuit already exists in run_pipeline
+        # (it reads KAIZER_DEFAULT_IMAGE). If the operator asked for it,
+        # surface a clear log line here; if the env var isn't set
+        # because no brand image is configured, run_pipeline falls
+        # through to the existing image search path.
+        if use_default_brand_image:
+            _dflt = os.environ.get("KAIZER_DEFAULT_IMAGE", "").strip()
+            if _dflt and os.path.exists(_dflt):
+                print(f"  [compound] use_default_brand_image=True — shorts will use {os.path.basename(_dflt)}")
+            else:
+                print(f"  [compound] use_default_brand_image=True but KAIZER_DEFAULT_IMAGE is unset/missing — "
+                      f"falling back to standard shorts image path")
+        try:
+            short_meta = run_pipeline(
+                video_path,
+                platform="youtube_short",
+                frame_layout=frame_layout,
+                language=language,
+            )
+        except Exception as exc:
+            print(f"  [compound] Shorts pass FAILED: {type(exc).__name__}: {exc}")
+        finally:
+            os.environ.pop("KAIZER_REUSE_ANALYSIS_FROM", None)
+    else:
+        print(f"  [compound] No shorts_cuts emitted by Gemini — skipping shorts pass")
+
+    print()
+    print(f"  ╔══════════════════════════════════════════════════════════")
+    print(f"  ║ Compound pipeline DONE")
+    print(f"  ║   full_meta:  {full_meta or '<skipped/failed>'}")
+    print(f"  ║   short_meta: {short_meta or '<skipped/failed>'}")
+    print(f"  ╚══════════════════════════════════════════════════════════")
+    return {
+        "full_meta":           full_meta,
+        "short_meta":          short_meta,
+        "compound_analysis":   compound_path,
+    }
+
+
 def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None,
                  language: str = "te", render_mode: str = None,
                  resume_dir: str = None):
@@ -2948,10 +4027,143 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 if duration_s < 120: return 5
                 return 6
 
+            # User-supplied pre-selected images take priority over OpenAI
+            # gen. Same image pool applies to every story (the carousel
+            # cycles through the list). When a story wants more images
+            # than the user provided, we cycle the list (mod N). When
+            # the user provided MORE than the story wants, we slice the
+            # first N. Empty env var → existing OpenAI path.
+            #
+            # JOB-LEVEL POOL MODE (default since 2026-05):
+            # Instead of generating per-story (e.g. 25 images for a 5-story
+            # bulletin), we generate ONE small pool of N diverse, news-
+            # relevant images using the FULL bulletin context, then cycle
+            # that pool through every story. Pros:
+            #   * ~75% cheaper ($0.24 for 6 vs $1.00 for 25)
+            #   * ~75% faster (6 fits in OpenAI Tier-1's 5/min limit)
+            #   * Less repetitive — per-story generation kept giving us
+            #     near-duplicates because every story shared the same
+            #     overall topic. Job-level uses a deduped subject pool.
+            # Override with KAIZER_BULLETIN_IMAGE_MODE=per_story for the
+            # legacy behaviour.
+            _preselected_raw = os.environ.get("KAIZER_BULLETIN_IMAGES", "").strip()
+            _preselected: list[str] = []
+            if _preselected_raw:
+                # Pipe-separated so Windows-style absolute paths
+                # (which contain ':') don't break the parsing.
+                for _p in _preselected_raw.split("|"):
+                    _p = _p.strip()
+                    if _p and os.path.isfile(_p):
+                        _preselected.append(_p)
+                if _preselected:
+                    print(f"  [bulletin] using {len(_preselected)} user-supplied image(s) for every story "
+                          f"(skipping OpenAI generation)")
+
+            # ── JOB-LEVEL POOL: one diverse pool for the whole bulletin ──
+            # Two-track strategy (default since 2026-05):
+            #   TRACK 1 — REAL PHOTOS for named people / incidents.
+            #     Gemini's `key_people` list = real public figures (politician,
+            #     actor, advocate, ...). For these we want the ACTUAL web
+            #     photo, not an AI render that OpenAI would refuse to draw
+            #     by name anyway. Routed straight to Google CSE / DDG /
+            #     Pexels via ``search_news_images(skip_openai=True)``.
+            #   TRACK 2 — AI-GENERATED B-ROLL for generic context.
+            #     Fills the remaining slots with topic-driven scenes
+            #     (courtroom, marketplace, broadcast studio, etc.).
+            #
+            # The two tracks combine into the unified pool, which the
+            # existing cycling code distributes across every story.
+            # Override with KAIZER_BULLETIN_IMAGE_MODE=per_story for the
+            # legacy per-story flow.
+            _img_mode = os.environ.get("KAIZER_BULLETIN_IMAGE_MODE", "per_job").lower()
+            _pool_size = max(3, min(12, int(os.environ.get("KAIZER_BULLETIN_POOL_SIZE", "6"))))
+            if not _preselected and _img_mode == "per_job":
+                try:
+                    from pipeline_core.openai_images import (
+                        generate_bulletin_image_pool, is_enabled as _openai_enabled,
+                    )
+                except Exception:
+                    _openai_enabled = lambda: False  # noqa: E731
+                    generate_bulletin_image_pool = None
+
+                # Cap real-photo allocation so we always leave ≥1 slot
+                # for generated B-roll variety. With 6-slot default and
+                # 4 named people, we'd take 5 real + 1 generated.
+                _real_cap = max(1, _pool_size - 1)
+                _n_real = min(len(people), _real_cap) if people else 0
+                _n_gen  = _pool_size - _n_real
+
+                _pool: list[str] = []
+
+                # ── TRACK 1: real photos for named people ────────────
+                if _n_real > 0:
+                    _real_dir = os.path.join(bulletin_dir, "_job_pool", "real")
+                    os.makedirs(_real_dir, exist_ok=True)
+                    print(f"  [bulletin] fetching {_n_real} real photo(s) "
+                          f"for named subjects: {', '.join(people[:_n_real])}")
+                    try:
+                        _real_imgs = search_news_images(
+                            search_queries=[],
+                            people=people[:_n_real],
+                            topics=[],
+                            output_dir=_real_dir,
+                            count=_n_real,
+                            language=lang_cfg.code,
+                            skip_openai=True,   # real photos only — NOT AI render
+                        ) or []
+                        _pool.extend(_real_imgs)
+                        print(f"  [bulletin] real-photo track filled {len(_real_imgs)}/{_n_real}")
+                    except Exception as _exc:
+                        print(f"  [bulletin][warn] real-photo track failed: {_exc}")
+
+                # ── TRACK 2: AI-generated B-roll for context ─────────
+                _n_gen_actual = _pool_size - len(_pool)
+                if _n_gen_actual > 0 and _openai_enabled() and generate_bulletin_image_pool is not None:
+                    _job_subjects: list[str] = []
+                    for _c in clips:
+                        _s = (_c.get("summary") or "").strip()
+                        if _s:
+                            _job_subjects.append(_s[:120])
+                    _gen_dir = os.path.join(bulletin_dir, "_job_pool", "generated")
+                    print(f"  [bulletin] generating {_n_gen_actual} AI image(s) "
+                          f"for topic/B-roll context ...")
+                    try:
+                        _gen_imgs = generate_bulletin_image_pool(
+                            pool_size=_n_gen_actual,
+                            entities=[],            # named people went to TRACK 1
+                            topics=topics + locations,
+                            queries=global_kw + _job_subjects,
+                            language=lang_cfg.code,
+                            out_dir=_gen_dir,
+                        ) or []
+                        _pool.extend(_gen_imgs)
+                    except Exception as _exc:
+                        print(f"  [bulletin][warn] AI-generated track failed: {_exc}")
+
+                _preselected = _pool
+                if _preselected:
+                    print(f"  [bulletin] job-level pool ready: {len(_preselected)} image(s) "
+                          f"({_n_real} real + {len(_preselected) - _n_real} AI) "
+                          f"will cycle across all {len(clips)} stories")
+                else:
+                    print(f"  [bulletin][warn] job-level pool empty — falling back to per-story generation")
+
             def _gen_for_story(i: int, c: dict) -> tuple[int, list[str], str]:
                 """Per-story worker. Returns (index, imgs, log_line)."""
                 per_story_dir = os.path.join(bulletin_dir, f"story_{i:02d}_assets")
                 os.makedirs(per_story_dir, exist_ok=True)
+                duration_s = float(c.get("duration_sec") or 60.0)
+                want = _adaptive_count(duration_s)
+
+                # Short-circuit: user pre-selected images for the bulletin.
+                # Cycle the pool so every story gets ``want`` images, even
+                # if the user supplied fewer. No OpenAI calls, no rate-
+                # limits, no $ spent.
+                if _preselected:
+                    imgs = [_preselected[k % len(_preselected)] for k in range(want)]
+                    return (i, imgs,
+                            f"    story_{i:02d}: {want} pre-selected image(s) (user pool of {len(_preselected)})")
+
                 # Resume cache check (≥half the desired count is enough)
                 images_cache_dir = os.path.join(per_story_dir, "images")
                 cached = sorted([
@@ -2961,8 +4173,8 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                     if f.lower().startswith("news_") and f.lower().endswith((".jpg", ".png"))
                 ])
                 cached = [p for p in cached if os.path.getsize(p) > 5000]
-                duration_s = float(c.get("duration_sec") or 60.0)
-                want = _adaptive_count(duration_s)
+                # ``duration_s`` / ``want`` already computed at the top
+                # of this worker; reuse them here.
                 if len(cached) >= max(2, want - 1):
                     return (i, cached[:want],
                             f"    story_{i:02d}: {len(cached)} cached image(s) (skipping OpenAI)")
@@ -3001,6 +4213,30 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                     story_images[idx] = imgs
                     print(log_line)
 
+            # Write a manifest of every per-story image generated this
+            # run. The runner reads this AFTER success and copies each
+            # image to the user's Assets folder (folder_path="generated/")
+            # so the user can browse what OpenAI produced for this job.
+            # The marker line below is the canonical signal — same
+            # contract as [kaizer:meta].
+            try:
+                _gen_manifest = []
+                for _idx, _imgs in enumerate(story_images):
+                    for _p in (_imgs or []):
+                        if _p and os.path.isfile(_p):
+                            _gen_manifest.append({
+                                "story_index": _idx,
+                                "path":        os.path.abspath(_p),
+                                "filename":    os.path.basename(_p),
+                            })
+                if _gen_manifest:
+                    _manifest_path = os.path.join(bulletin_dir, "_generated_images.json")
+                    with open(_manifest_path, "w", encoding="utf-8") as _fh:
+                        json.dump(_gen_manifest, _fh, ensure_ascii=False, indent=2)
+                    print(f"[kaizer:generated_images] {os.path.abspath(_manifest_path)}")
+            except Exception as _exc:
+                print(f"    [bulletin][warn] generated-images manifest failed: {_exc}")
+
             # ── 2) Render the ticker once (shared across every story).
             # Pick native-script summary for non-English so the ticker
             # reads in the language the user picked (Telugu, Hindi, …).
@@ -3015,12 +4251,31 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                         return native[:120]
                 return (c.get("summary") or "").strip()[:120]
 
-            all_headlines = [
-                _clip_text(c)
-                for c in clips if _clip_text(c)
-            ]
+            # Compound short-circuit: if Gemini supplied a
+            # bulletin_marquee_points list in compound mode, use it
+            # verbatim — these are the headlines Gemini selected to
+            # represent the whole source video. Falls through to the
+            # per-clip-summary derivation for standalone full jobs.
+            _gemini_marquee = gemini_result.get("bulletin_marquee_points") or []
+            _gemini_marquee = [str(m).strip() for m in _gemini_marquee if str(m).strip()]
+            if _gemini_marquee:
+                all_headlines = _gemini_marquee
+                print(f"    [bulletin] Using Gemini-supplied marquee "
+                      f"({len(all_headlines)} points)")
+            else:
+                all_headlines = [
+                    _clip_text(c)
+                    for c in clips if _clip_text(c)
+                ]
+            from pipeline_core import compose_deps
+
             ticker_path = os.path.join(bulletin_dir, "_ticker.png")
-            if os.path.exists(ticker_path) and os.path.getsize(ticker_path) > 1000:
+            ticker_inputs = [lang_cfg.font_primary] if lang_cfg.font_primary else []
+            ticker_extra = {
+                "headlines": all_headlines or ["KAIZER NEWS"],
+                "lang":      lang_cfg.code,
+            }
+            if compose_deps.is_fresh(ticker_path, ticker_inputs, ticker_extra, min_size=1000):
                 print(f"    [bulletin] ticker cached (skipping)")
             else:
                 try:
@@ -3029,17 +4284,21 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                         lang_cfg.code, lang_cfg.font_primary,
                         ticker_path,
                     )
+                    compose_deps.mark_built(ticker_path, ticker_inputs, ticker_extra)
                 except Exception as exc:
                     print(f"    [bulletin][warn] ticker render failed: {exc}")
                     ticker_path = ""
 
             # ── 3) Render channel bug once.
             bug_path = os.path.join(bulletin_dir, "_bug.png")
-            if os.path.exists(bug_path) and os.path.getsize(bug_path) > 500:
+            bug_inputs = [DEFAULT_LOGO] if DEFAULT_LOGO else []
+            bug_extra = {"channel_name": "KAIZER NEWS"}
+            if compose_deps.is_fresh(bug_path, bug_inputs, bug_extra, min_size=500):
                 print(f"    [bulletin] channel bug cached (skipping)")
             else:
                 try:
                     render_channel_bug("KAIZER NEWS", DEFAULT_LOGO or None, bug_path)
+                    compose_deps.mark_built(bug_path, bug_inputs, bug_extra)
                 except Exception as exc:
                     print(f"    [bulletin][warn] channel bug render failed: {exc}")
                     bug_path = None
@@ -3059,11 +4318,12 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 sidebar_is_video = False
                 if use_sidebar and len(imgs) >= 2:
                     sidebar_video = os.path.join(bulletin_dir, f"_sidebar_{i:02d}.mp4")
-                    # Idempotency: skip rebuild if a previous run produced
-                    # this carousel. >100 KB filters out empty / corrupt
-                    # leftovers from a half-run.
-                    if (os.path.exists(sidebar_video)
-                        and os.path.getsize(sidebar_video) > 100_000):
+                    # Content-aware cache: rebuild iff any of the input
+                    # images changed (e.g. user replaced one via the
+                    # editor) OR the duration changed. See compose_deps.
+                    sidebar_inputs = list(imgs[:5])
+                    sidebar_extra = {"duration_s": round(float(story_dur_s), 3)}
+                    if compose_deps.is_fresh(sidebar_video, sidebar_inputs, sidebar_extra):
                         print(f"    [bulletin] sidebar story_{i:02d} cached (skipping)")
                         sidebar_path = sidebar_video
                         sidebar_is_video = True
@@ -3073,6 +4333,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                                 imgs[:5], story_dur_s, sidebar_video,
                                 work_dir=os.path.join(bulletin_dir, f"_sidebar_work_{i:02d}"),
                             )
+                            compose_deps.mark_built(sidebar_video, sidebar_inputs, sidebar_extra)
                             sidebar_path = sidebar_video
                             sidebar_is_video = True
                         except Exception as exc:
@@ -3105,41 +4366,66 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
                 composed_path = os.path.join(bulletin_dir, f"composed_story_{i:02d}.mp4")
                 composed_ok = False
-                # Idempotency: if a previous run already produced this
-                # composed story (e.g. the failure happened later in the
-                # pipeline), skip the expensive FFmpeg compose call.
-                if (os.path.exists(composed_path)
-                    and os.path.getsize(composed_path) > 100_000):
+
+                # Build the deps fingerprint for this composed story.
+                # PiP makes this branch take an extra source clip, so we
+                # resolve the pip choice up-front to include in the deps.
+                pip_src = pick_pip_source(clips, i) if use_pip else None
+                composed_inputs = [
+                    raw_path, sidebar_path, ticker_path, bug_path,
+                    lang_cfg.font_primary,
+                ]
+                if pip_src:
+                    composed_inputs.append(pip_src[0])
+                composed_extra = {
+                    "title":       story_meta.title,
+                    "kicker":      story_meta.kicker,
+                    "language":    story_meta.language,
+                    "importance":  int(story_meta.importance),
+                    "story_index": int(story_meta.story_index),
+                    "total":       int(story_meta.total_stories),
+                    "use_pip":     bool(pip_src),
+                    "pip_start_s": round(float(pip_src[1]), 3) if pip_src else None,
+                    "pip_dur_s":   round(float(pip_src[2]), 3) if pip_src else None,
+                    "sidebar_is_video": bool(sidebar_is_video),
+                }
+
+                # Takeover helper — emits an inter-story full-screen
+                # transition AFTER a story (skipped on first/last).
+                def _maybe_takeover():
+                    last_idx = len(clips) - 1
+                    if not (use_takeovers and 0 < i < last_idx and len(imgs) >= 2):
+                        return
+                    takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
+                    takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
+                    takeover_inputs = list(imgs[:4])
+                    takeover_extra = {"duration_s": round(float(takeover_dur), 3)}
+                    if compose_deps.is_fresh(takeover_path, takeover_inputs, takeover_extra):
+                        print(f"    [bulletin] takeover_{i:02d}.mp4 cached (skipping)")
+                        story_paths.append(takeover_path)
+                        return
+                    try:
+                        build_fullscreen_takeover(
+                            imgs[:4], takeover_dur, takeover_path,
+                            work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
+                        )
+                        compose_deps.mark_built(takeover_path, takeover_inputs, takeover_extra)
+                        story_paths.append(takeover_path)
+                        print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
+                    except Exception as exc:
+                        print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+
+                # Content-aware cache: skip rebuild only when every
+                # input (raw clip, sidebar, ticker, bug, font, pip
+                # source) AND every text/flag param is unchanged.
+                if compose_deps.is_fresh(composed_path, composed_inputs, composed_extra):
                     print(f"    [bulletin] composed_story_{i:02d}.mp4 cached (skipping compose)")
                     composed_ok = True
                     story_paths.append(composed_path)
-                    # Also still emit takeover after a cached compose.
-                    last_idx = len(clips) - 1
-                    if (use_takeovers and i < last_idx and i > 0 and len(imgs) >= 2):
-                        takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
-                        takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
-                        if (os.path.exists(takeover_path)
-                            and os.path.getsize(takeover_path) > 100_000):
-                            print(f"    [bulletin] takeover_{i:02d}.mp4 cached (skipping)")
-                            story_paths.append(takeover_path)
-                        else:
-                            try:
-                                build_fullscreen_takeover(
-                                    imgs[:4], takeover_dur, takeover_path,
-                                    work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
-                                )
-                                story_paths.append(takeover_path)
-                                print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
-                            except Exception as exc:
-                                print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+                    _maybe_takeover()
                     continue
 
                 try:
-                    if use_pip:
-                        pip_src = pick_pip_source(clips, i)
-                    else:
-                        pip_src = None
-
                     if pip_src and sidebar_path and ticker_path:
                         pip_clip, pip_start, pip_dur = pip_src
                         compose_pip_story(
@@ -3170,6 +4456,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                     print(f"    [bulletin][warn] compose story_{i:02d}: {exc}")
 
                 if composed_ok and os.path.isfile(composed_path):
+                    compose_deps.mark_built(composed_path, composed_inputs, composed_extra)
                     story_paths.append(composed_path)
                     print(f"    [bulletin] composed_story_{i:02d}.mp4 "
                           f"({kicker}, {story_dur_s:.0f}s)")
@@ -3178,26 +4465,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                     story_paths.append(raw_path)
                     print(f"    [bulletin] story_{i:02d} fell back to raw slice")
 
-                # Phase 3 — full-screen takeover between stories.
-                # Skip after first/last + when carousel is off + need ≥2 images.
-                last_idx = len(clips) - 1
-                if (use_takeovers and i < last_idx and i > 0 and len(imgs) >= 2):
-                    takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
-                    takeover_path = os.path.join(bulletin_dir, f"takeover_{i:02d}.mp4")
-                    if (os.path.exists(takeover_path)
-                        and os.path.getsize(takeover_path) > 100_000):
-                        print(f"    [bulletin] takeover_{i:02d}.mp4 cached (skipping)")
-                        story_paths.append(takeover_path)
-                    else:
-                        try:
-                            build_fullscreen_takeover(
-                                imgs[:4], takeover_dur, takeover_path,
-                                work_dir=os.path.join(bulletin_dir, f"_takeover_work_{i:02d}"),
-                            )
-                            story_paths.append(takeover_path)
-                            print(f"    [bulletin] takeover_{i:02d}.mp4 ({takeover_dur:.1f}s)")
-                        except Exception as exc:
-                            print(f"    [bulletin][warn] takeover_{i:02d}: {exc}")
+                _maybe_takeover()
 
         # ── Stitch the assembled segment list into the final bulletin ──
         if not story_paths:
@@ -3222,6 +4490,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             f"total={result.total_duration_s/60:.1f} min"
         )
         print(f"  [bulletin] Output: {bulletin_out}")
+
         bulletin_storage_url = ""
         bulletin_storage_key = ""
         bulletin_storage_backend = ""
@@ -3245,6 +4514,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         # show up as separate Shorts cards in the web UI). The runner
         # reads the [kaizer:meta] marker line below to locate this
         # file unambiguously.
+        meta_path = ""
         try:
             meta_path = os.path.join(OUTPUT_DIR, "editor_meta.json")
             # Build a one-entry "clips" list that points at the single
@@ -3287,11 +4557,31 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             print(f"[kaizer:meta] {meta_path}")
         except Exception as exc:
             print(f"  [bulletin][warn] editor_meta.json write failed: {exc}")
-        return
+            meta_path = ""
+        # Return the meta path so run_compound_pipeline can locate the
+        # bulletin.mp4 it just produced and run the image_plan overlay
+        # step on top of it. Standalone bulletin callers (CLI / runner)
+        # ignore the return value as before.
+        return meta_path
 
-    # ════ STEP 3: Generate Title with ChatGPT ════
-    print(f"\n  [3/{TOTAL}] Generating {lang_cfg.name_english} headline ...")
-    title_result = generate_title_chatgpt(summary, people, topics, language=lang_cfg.code)
+    # ════ STEP 3: Generate Title ════
+    # Compound short-circuit: when run_compound_pipeline has populated
+    # gemini_result["shorts_headline_native"] in a prior single Gemini
+    # call, skip the ChatGPT title turn entirely and use Gemini's
+    # headline. Standalone shorts jobs (no compound) keep the existing
+    # ChatGPT path so behaviour is unchanged for them.
+    _shorts_headline_native = (gemini_result.get("shorts_headline_native") or "").strip()
+    if _shorts_headline_native:
+        print(f"\n  [3/{TOTAL}] Using Gemini-supplied shorts headline (no ChatGPT call) ...")
+        title_result = {
+            "title_native":  _shorts_headline_native,
+            "title_telugu":  _shorts_headline_native,  # legacy alias
+            "title_english": "",
+            "source":        "gemini-compound",
+        }
+    else:
+        print(f"\n  [3/{TOTAL}] Generating {lang_cfg.name_english} headline ...")
+        title_result = generate_title_chatgpt(summary, people, topics, language=lang_cfg.code)
     title_native = title_result.get("title_native") or title_result.get("title_telugu", "KAIZER NEWS")
     title_en = title_result.get("title_english", "")
     # Legacy alias — several downstream code paths still read title_te
@@ -3633,6 +4923,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     except Exception as e:
         print(f"  Could not auto-launch editor: {e}")
 
+
     print("=" * 60)
     return meta_path
 
@@ -3678,6 +4969,16 @@ if __name__ == "__main__":
     _parser.add_argument("--default-image", default="",
                          help="Absolute path to an image the user uploaded; when set, "
                               "every clip uses THIS image instead of a fetched stock photo.")
+    _parser.add_argument("--compound", action="store_true",
+                         help="Run the dedicated 'Full Video + Shorts' compound "
+                              "pipeline: ONE Gemini call returns both cut sets + "
+                              "image_plan + shorts_headline_native + bulletin marquee, "
+                              "then the bulletin and shorts passes run in-process "
+                              "back-to-back. Replaces the legacy two-subprocess fan-out.")
+    _parser.add_argument("--use-default-brand-image", action="store_true",
+                         help="Compound mode only: when set, the shorts pass uses the "
+                              "image at --default-image as its lower-panel art and "
+                              "skips image search/generation. Pairs with --compound.")
     _args = _parser.parse_args()
     _video = _args.video
     if _args.default_image:
@@ -3712,7 +5013,16 @@ if __name__ == "__main__":
         "pip":       bool(_args.pip),
     }
 
-    run_pipeline(os.path.abspath(_video), platform=_args.platform,
-                 frame_layout=_args.frame, language=_args.language,
-                 render_mode=_args.render_mode,
-                 resume_dir=_args.resume_dir)
+    if _args.compound:
+        # Compound dedicated pipeline — ONE Gemini call, both formats.
+        run_compound_pipeline(
+            os.path.abspath(_video),
+            language=_args.language,
+            frame_layout=_args.frame or "torn_card",
+            use_default_brand_image=bool(_args.use_default_brand_image),
+        )
+    else:
+        run_pipeline(os.path.abspath(_video), platform=_args.platform,
+                     frame_layout=_args.frame, language=_args.language,
+                     render_mode=_args.render_mode,
+                     resume_dir=_args.resume_dir)

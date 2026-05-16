@@ -92,14 +92,26 @@ _LANG_TO_LOCATION = {
 }
 
 _PROMPT_TEMPLATE = (
-    "Photorealistic news photograph for an Indian news broadcast. "
-    "Subject: {subject}. "
+    # ── Style anchor ───────────────────────────────────────────────────
+    # Explicitly grounded in Indian regional news-channel aesthetics so
+    # gpt-image-1 leans on the TV9 / NDTV / ETV / Zee News reference set
+    # in its training data rather than stock Western broadcast imagery.
+    "Photorealistic news photograph in the visual style of an Indian "
+    "news channel (TV9, NDTV, ETV, Zee News). "
+    # ── Relevance hook ─────────────────────────────────────────────────
+    # Reinforced because the model otherwise drifts to generic newsroom
+    # B-roll. The subject text is built from real entities + topics
+    # extracted by Gemini from the actual transcript.
+    "The image MUST be directly relevant to this news subject: {subject}. "
     "Setting: {location}. "
+    # ── Composition + technical ────────────────────────────────────────
     "Style: documentary news photography, natural daylight, broadcast "
     "TV quality, slight motion-blur for authenticity, 16:9 horizontal "
     "composition with the subject in the right two-thirds. "
-    "No text overlays, no logos, no watermarks, no banners. "
-    "Realistic anonymous faces only — no celebrities, no politicians, "
+    # ── Hard rules ────────────────────────────────────────────────────
+    "No text overlays, no logos, no watermarks, no banners, no on-screen "
+    "channel branding. "
+    "Realistic anonymous Indian faces only — no celebrities, no politicians, "
     "no real public figures by name. Image must be safe for general "
     "audiences."
 )
@@ -192,18 +204,59 @@ def generate_news_image(
 
     client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=_TIMEOUT)
 
+    # Pull the owning job/user out of the env the runner sets when it
+    # spawns the pipeline subprocess.  Either being absent (e.g. ad-hoc
+    # CLI run) just leaves the corresponding column NULL on the logged
+    # OpenAiCall row — aggregate-by-day still works.
+    try:
+        _job_id  = int(os.environ.get("KAIZER_JOB_ID")  or 0) or None
+        _user_id = int(os.environ.get("KAIZER_USER_ID") or 0) or None
+    except (TypeError, ValueError):
+        _job_id = _user_id = None
+
     # One retry on transient errors only.
     last_err: Optional[BaseException] = None
     started = time.monotonic()
+    resp = None
+    # Local import — keeps test envs that lack the DB happy.
+    try:
+        from learning.openai_log import log_openai_call as _log_openai
+    except Exception:
+        _log_openai = None
+
     for attempt in (1, 2):
         try:
-            resp = client.images.generate(
-                model=_MODEL,
-                prompt=prompt,
-                size=_SIZE,
-                quality=_QUALITY,
-                n=1,
-            )
+            # Wrap each call so we capture even transient retries as
+            # separate rows — admin can see "X rate-limited attempts
+            # before success" in the timeline.
+            if _log_openai is not None:
+                with _log_openai(
+                    db=None,
+                    user_id=_user_id,
+                    job_id=_job_id,
+                    clip_id=None,
+                    model=_MODEL,
+                    purpose="bulletin-image",
+                    image_size=_SIZE,
+                    image_quality=_QUALITY,
+                    image_count=1,
+                ) as _call:
+                    resp = client.images.generate(
+                        model=_MODEL,
+                        prompt=prompt,
+                        size=_SIZE,
+                        quality=_QUALITY,
+                        n=1,
+                    )
+                    _call.record_image(resp)
+            else:
+                resp = client.images.generate(
+                    model=_MODEL,
+                    prompt=prompt,
+                    size=_SIZE,
+                    quality=_QUALITY,
+                    n=1,
+                )
             break  # success
         except Exception as exc:
             last_err = exc
@@ -262,3 +315,93 @@ def generate_news_image(
         f"(${cost:.3f}, model={_MODEL}, quality={_QUALITY})"
     )
     return out_path
+
+
+# ─── Bulletin-level pool generator ────────────────────────────────────
+#
+# Generate ONE small set of diverse images for an ENTIRE bulletin instead
+# of per-story. The carousel cycles through this pool across all stories.
+#
+# Why job-level beats per-story:
+#  1. 6 images per job  ≈ 75% cheaper than 25 per job (~$0.24 vs $0.96)
+#  2. ~75% faster (OpenAI Tier 1 caps at 5 images/min — 6 fits in 1 min)
+#  3. Less repetitive: we vary the subject across the 6 calls so the
+#     pool actually looks different, whereas per-story prompts the same
+#     topic 4–6 times in a row and gets near-duplicates.
+
+def generate_bulletin_image_pool(
+    *,
+    pool_size: int,
+    entities: list,
+    topics: list,
+    queries: list,
+    language: str,
+    out_dir: str,
+) -> list[str]:
+    """Generate ``pool_size`` visually distinct, news-relevant images
+    using the FULL bulletin context (everything Gemini extracted across
+    every story). Each call uses a different subject so the pool is
+    actually varied.
+
+    Returns the list of image file paths written under ``out_dir``.
+    Empty list when OpenAI is disabled or every attempt failed — caller
+    falls back to existing per-story flow.
+    """
+    if not is_enabled():
+        return []
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ── Build a deduped pool of subject candidates (entities first,
+    # topics next, queries last). Each pool slot picks a different
+    # subject so the resulting 6 images cover the full story range
+    # rather than 6 variants of the same prompt.
+    seen: set[str] = set()
+    subjects: list[str] = []
+
+    def _push(s: str) -> None:
+        s = (s or "").strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        subjects.append(s)
+
+    for e in (entities or []):
+        if isinstance(e, str): _push(e)
+    for t in (topics or []):
+        if isinstance(t, str): _push(t)
+    for q in (queries or []):
+        if isinstance(q, str): _push(q[:80])
+
+    if not subjects:
+        subjects = ["general Indian news scene"]
+
+    out: list[str] = []
+    for i in range(pool_size):
+        # Rotate through the subject pool so consecutive images differ.
+        subject = subjects[i % len(subjects)]
+        out_path = os.path.join(out_dir, f"news_{i+1:02d}.jpg")
+        # Skip if already exists from a prior cache (resume safety).
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 5000:
+            print(f"    [openai-pool] reuse cached {os.path.basename(out_path)}")
+            out.append(out_path)
+            continue
+        # Reuse the single-image generator. Each call has its own
+        # built-in retry on rate-limit (one retry, 2s wait).
+        result = generate_news_image(
+            query=subject,
+            entities=[subject],     # forces _build_prompt to pick this subject
+            topics=topics or [],
+            language=language,
+            out_path=out_path,
+        )
+        if result:
+            out.append(result)
+
+    if out:
+        print(f"  [openai-pool] generated {len(out)}/{pool_size} job-level "
+              f"images in {os.path.basename(out_dir)}")
+    return out

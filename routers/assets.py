@@ -137,6 +137,41 @@ def list_assets(
     return [_to_dict(a) for a in rows]
 
 
+@router.get("/by-video-hash")
+def list_assets_for_video(
+    hash: str,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Return previously-generated assets tagged with this source video hash.
+
+    Used by the NewJob page: when the user picks a source video, the
+    frontend hashes its first 4 MiB + byte-length (matching
+    ``gemini_cache.hash_file_prefix``) and asks here.  Non-empty results
+    drive the "We already generated N images for this exact video —
+    reuse them?" prompt so the user can skip a fresh gpt-image-1 run
+    and the $ / quota that goes with it.
+
+    Returns the same dict shape ``GET /api/assets/`` does, sorted newest
+    first.  Empty hash → empty list (avoids accidentally matching
+    every never-tagged asset row).
+    """
+    h = (hash or "").strip()
+    if not h:
+        return []
+    rows = (
+        db.query(models.UserAsset)
+          .filter(
+              models.UserAsset.user_id == user.id,
+              models.UserAsset.kind != "folder_marker",
+              models.UserAsset.source_video_hash == h,
+          )
+          .order_by(models.UserAsset.created_at.desc())
+          .all()
+    )
+    return [_to_dict(a) for a in rows]
+
+
 @router.post("/upload", status_code=201)
 async def upload_asset(
     file: UploadFile = File(...),
@@ -185,10 +220,10 @@ async def upload_asset(
     storage_url = ""
     thumb_storage_url = ""
     try:
-        storage = get_storage_provider("r2")
+        storage = get_storage_provider()  # honours STORAGE_BACKEND
         rel_dir = f"user_assets/{user.id}/"
         obj = storage.upload(str(out_path), rel_dir + out_path.name, content_type=mime)
-        storage_backend = "r2"
+        storage_backend = storage.name
         storage_key = obj.key
         storage_url = obj.url
         if thumb_path:
@@ -197,20 +232,23 @@ async def upload_asset(
             )
             thumb_storage_url = thumb_obj.url
 
-        # Cleanup: R2 has the bytes, drop the local copies. The frontend
-        # serves from storage_url; if the local file is gone, callers
-        # that need the bytes pull from R2 via materialize_asset_locally.
-        try:
-            out_path.unlink(missing_ok=True)
-            if thumb_path and Path(thumb_path).exists():
-                Path(thumb_path).unlink(missing_ok=True)
-        except Exception as cleanup_exc:
-            print(f"[assets] post-upload cleanup warning: {cleanup_exc}")
+        # Drop the temp copy only when a remote backend now owns the
+        # bytes. In local-storage mode the "storage" IS the local
+        # disk — deleting would orphan the file the asset row points
+        # at.
+        if storage.name != "local":
+            try:
+                out_path.unlink(missing_ok=True)
+                if thumb_path and Path(thumb_path).exists():
+                    Path(thumb_path).unlink(missing_ok=True)
+            except Exception as cleanup_exc:
+                print(f"[assets] post-upload cleanup warning: {cleanup_exc}")
     except Exception as exc:
-        # R2 upload failed — keep going with local-disk-only mode so the
-        # endpoint still returns a working asset row. The frontend's
-        # _to_dict() falls back to /api/file/ when storage_url is empty.
-        print(f"[assets] R2 upload failed for {out_path.name}: {exc}")
+        # Storage upload failed — keep going with local-disk-only
+        # mode so the endpoint still returns a working asset row.
+        # The frontend's _to_dict() falls back to /api/file/ when
+        # storage_url is empty.
+        print(f"[assets] storage upload failed for {out_path.name}: {exc}")
 
     # If this upload is marked default → demote any previous default
     if is_default_ad:

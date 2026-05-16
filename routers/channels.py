@@ -33,6 +33,18 @@ class ChannelIn(BaseModel):
     mandatory_hashtags: List[str] = Field(default_factory=list)
     is_priority: bool = False
     logo_asset_id: Optional[int] = None
+    # "postiz" | "kaizer" | None (= use system default)
+    upload_provider: Optional[str] = None
+
+    @field_validator("upload_provider")
+    @classmethod
+    def _provider_must_be_valid(cls, v):
+        if v is None or v == "":
+            return None
+        v = str(v).strip().lower()
+        if v not in {"postiz", "kaizer"}:
+            raise ValueError("upload_provider must be 'postiz', 'kaizer', or null")
+        return v
 
     @field_validator("fixed_tags", "hashtags", "mandatory_hashtags")
     @classmethod
@@ -67,6 +79,18 @@ class ChannelPatch(BaseModel):
     # Pass `null` explicitly to clear the logo.  Pass an int to set it to a
     # UserAsset (ownership validated server-side).
     logo_asset_id: Optional[int] = None
+    # "postiz" | "kaizer" | "" (= clear → fall back to system default)
+    upload_provider: Optional[str] = None
+
+    @field_validator("upload_provider")
+    @classmethod
+    def _provider_must_be_valid_patch(cls, v):
+        if v is None or v == "":
+            return None
+        v = str(v).strip().lower()
+        if v not in {"postiz", "kaizer"}:
+            raise ValueError("upload_provider must be 'postiz', 'kaizer', or null")
+        return v
 
     @field_validator("fixed_tags", "hashtags", "mandatory_hashtags")
     @classmethod
@@ -131,6 +155,9 @@ def _to_dict(c: models.Channel) -> dict:
         "is_priority": bool(c.is_priority),
         "logo_asset_id": c.logo_asset_id,
         "logo":          logo_asset,
+        # null = "use system default" — the UI shows the resolved
+        # value via the system-settings endpoint when null.
+        "upload_provider": c.upload_provider,
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         "connected": tok is not None and bool(tok.refresh_token_enc),

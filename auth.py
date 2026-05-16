@@ -205,3 +205,157 @@ def decrypt(ciphertext: str) -> str:
     to "****" on failure (never leak the raw ciphertext)."""
     from crypto import decrypt as _dec
     return _dec(ciphertext or "")
+
+
+# ─── Password reset (forgot-password flow) ────────────────────────────────
+#
+# Two write paths into ``users.password_hash``:
+#  - ``set_password`` for a *logged-in* user who knows their old password (or
+#    is a Google-only account setting one for the first time).
+#  - ``consume_reset_token`` for the unauthenticated forgot-password flow:
+#    the user proves possession of a single-use token mailed/logged earlier.
+#
+# Token bytes are 32 random URL-safe chars; only the SHA-256 of the token is
+# persisted, so a leaked DB doesn't grant impersonation. Tokens live 30 min.
+
+import hashlib
+
+RESET_TOKEN_TTL_MIN = int(os.getenv("KAIZER_RESET_TOKEN_TTL_MIN", "30"))
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def set_password(db: Session, user: "models.User", new_password: str) -> None:
+    """Hash + store a new password. Caller has already authenticated the user
+    (either by current password or by a valid reset token)."""
+    user.password_hash = hash_password(new_password)
+    db.commit()
+
+
+def make_reset_token(db: Session, user: "models.User", *, requested_ip: str = "") -> str:
+    """Issue a one-shot reset token. Returns the raw token (only shown once)."""
+    raw = secrets.token_urlsafe(32)
+    row = models.PasswordResetToken(
+        user_id=user.id,
+        token_hash=_hash_token(raw),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=RESET_TOKEN_TTL_MIN),
+        requested_ip=(requested_ip or "")[:64],
+    )
+    db.add(row)
+    db.commit()
+    return raw
+
+
+def lookup_valid_reset(db: Session, raw_token: str) -> Optional["models.PasswordResetToken"]:
+    """Return the row IFF the token exists, hasn't been used, and hasn't
+    expired. Returns None in all the failure cases — never raises."""
+    if not raw_token:
+        return None
+    row = (db.query(models.PasswordResetToken)
+             .filter(models.PasswordResetToken.token_hash == _hash_token(raw_token))
+             .first())
+    if not row:
+        return None
+    if row.used_at is not None:
+        return None
+    expires = row.expires_at
+    if expires is None:
+        return None
+    # Normalise to UTC for comparison (timezone-aware DBs return aware; SQLite naive)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires:
+        return None
+    return row
+
+
+def consume_reset_token(db: Session, row: "models.PasswordResetToken",
+                        new_password: str) -> "models.User":
+    """Apply a verified token: set the new password, mark the token used."""
+    user = db.query(models.User).filter(models.User.id == row.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=400, detail="Account no longer exists")
+    user.password_hash = hash_password(new_password)
+    row.used_at = datetime.now(timezone.utc)
+    db.commit()
+    return user
+
+
+def purge_expired_reset_tokens(db: Session) -> int:
+    """Best-effort cleanup of stale rows. Called opportunistically on each
+    /forgot request. Returns the number deleted."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    n = (db.query(models.PasswordResetToken)
+           .filter(models.PasswordResetToken.created_at < cutoff)
+           .delete(synchronize_session=False))
+    db.commit()
+    return n
+
+
+# ─── Email delivery (best-effort) ─────────────────────────────────────────
+# SMTP is OPTIONAL. When ``KAIZER_SMTP_HOST`` is set the reset link is
+# emailed; otherwise the link is just logged so the operator can grab it
+# from the admin Logs tab during pre-launch.
+
+def _smtp_configured() -> bool:
+    return bool(os.getenv("KAIZER_SMTP_HOST"))
+
+
+def send_reset_email(*, to_email: str, reset_url: str, user_name: str = "") -> bool:
+    """Send a password-reset email via SMTP. Always logs the URL to stdout
+    (which the admin Logs tab captures), so dev/pre-launch works without
+    SMTP credentials. Returns True if an actual email was sent."""
+    # ALWAYS log — admin Logs panel uses this as the dev fallback.
+    print(f"[auth.reset] password-reset link for {to_email}: {reset_url}")
+
+    if not _smtp_configured():
+        return False
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    try:
+        host = os.environ["KAIZER_SMTP_HOST"]
+        port = int(os.environ.get("KAIZER_SMTP_PORT", "587"))
+        user = os.environ.get("KAIZER_SMTP_USER", "")
+        pwd  = os.environ.get("KAIZER_SMTP_PASS", "")
+        sender = os.environ.get("KAIZER_SMTP_FROM", user or "noreply@kaizer.local")
+        use_tls = os.environ.get("KAIZER_SMTP_TLS", "true").lower() in ("1", "true", "yes")
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Reset your Kaizer password"
+        msg["From"]    = sender
+        msg["To"]      = to_email
+
+        text = (
+            f"Hi{(' ' + user_name) if user_name else ''},\n\n"
+            f"Someone (hopefully you) asked to reset your Kaizer password. "
+            f"Open this link within {RESET_TOKEN_TTL_MIN} minutes to choose a new one:\n\n"
+            f"{reset_url}\n\n"
+            f"If you didn't ask for this, just ignore this email — your password "
+            f"won't change.\n"
+        )
+        html = (
+            f"<p>Hi{(' ' + user_name) if user_name else ''},</p>"
+            f"<p>Someone (hopefully you) asked to reset your Kaizer password. "
+            f"Open this link within <b>{RESET_TOKEN_TTL_MIN} minutes</b> to choose a new one:</p>"
+            f"<p><a href=\"{reset_url}\">{reset_url}</a></p>"
+            f"<p>If you didn't ask for this, ignore this email — your password won't change.</p>"
+        )
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html",  "utf-8"))
+
+        with smtplib.SMTP(host, port, timeout=10) as s:
+            if use_tls:
+                s.starttls()
+            if user:
+                s.login(user, pwd)
+            s.sendmail(sender, [to_email], msg.as_string())
+        print(f"[auth.reset] SMTP sent to {to_email}")
+        return True
+    except Exception as exc:
+        # Don't surface failure to the caller — we already logged the link.
+        print(f"[auth.reset] SMTP send failed for {to_email}: {exc}")
+        return False

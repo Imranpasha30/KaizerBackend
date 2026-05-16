@@ -24,13 +24,19 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import asyncio
+import json
+from queue import Empty
+
 import psutil
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import desc, func
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy import case, desc, func
 from sqlalchemy.orm import Session
 
 import auth
 import models
+import system_observer
 from database import get_db
 
 
@@ -282,6 +288,359 @@ def system_metrics(_: models.User = Depends(auth.admin_required)) -> dict:
         "live_events_running": _live_events_running(),
         "timestamp":      _iso(_utcnow()),
     }
+
+
+@router.get("/rtmp/activity")
+def rtmp_activity(
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+    _:  models.User = Depends(auth.admin_required),
+) -> dict:
+    """Consolidated audit log of the RTMP-live agent.
+
+    Surfaces three rollups, all derived from existing tables (no new
+    schema needed):
+
+      * ``totals``      — minted broadcasts, successful pushes, failures,
+                          and approximate quota saved vs the regular
+                          ``videos.insert`` path
+      * ``recent``      — last 25 broadcasts with channel, duration,
+                          status, watch URL
+      * ``by_channel``  — per-channel counts so you can see which
+                          channels are riding the RTMP path
+
+    Data sources:
+      - ``YouTubeApiCall`` rows where operation starts with 'live*' or
+        is ``videos.insert`` (used to count minted broadcasts and
+        compute quota saved).
+      - ``UploadJob`` rows where ``upload_provider='native_rtmp'``
+        (used for per-broadcast outcomes + recent list).
+    """
+    cutoff = _utcnow() - timedelta(days=int(days))
+
+    # ── 1) Total broadcasts minted (one per liveBroadcasts.insert) ──
+    mint_count = (
+        db.query(func.count(models.YouTubeApiCall.id))
+          .filter(models.YouTubeApiCall.operation == "liveBroadcasts.insert")
+          .filter(models.YouTubeApiCall.created_at >= cutoff)
+          .scalar()
+    ) or 0
+
+    # ── 2) UploadJob outcomes for the RTMP path ────────────────────
+    rtmp_jobs_total = (
+        db.query(func.count(models.UploadJob.id))
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.created_at >= cutoff)
+          .scalar()
+    ) or 0
+    rtmp_jobs_done = (
+        db.query(func.count(models.UploadJob.id))
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.status == "done")
+          .filter(models.UploadJob.created_at >= cutoff)
+          .scalar()
+    ) or 0
+    rtmp_jobs_failed = (
+        db.query(func.count(models.UploadJob.id))
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.status == "failed")
+          .filter(models.UploadJob.created_at >= cutoff)
+          .scalar()
+    ) or 0
+    rtmp_jobs_inflight = (
+        db.query(func.count(models.UploadJob.id))
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.status.in_(["queued", "uploading", "processing"]))
+          .filter(models.UploadJob.created_at >= cutoff)
+          .scalar()
+    ) or 0
+
+    # ── 3) Quota burn comparison (units saved) ─────────────────────
+    # Successful native_rtmp jobs would each have cost 1600 units via
+    # videos.insert. Actual cost is ~250 (mint + bind + transition +
+    # thumbnail). The delta is what you saved.
+    UNITS_VIDEOS_INSERT = 1600
+    UNITS_RTMP_TYPICAL  = 250
+    units_saved = rtmp_jobs_done * (UNITS_VIDEOS_INSERT - UNITS_RTMP_TYPICAL)
+    units_spent_rtmp = rtmp_jobs_done * UNITS_RTMP_TYPICAL
+
+    # ── 4) Recent broadcasts (last 25) ─────────────────────────────
+    recent_rows = (
+        db.query(models.UploadJob, models.Channel)
+          .outerjoin(models.Channel, models.Channel.id == models.UploadJob.channel_id)
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.created_at >= cutoff)
+          .order_by(desc(models.UploadJob.created_at))
+          .limit(25)
+          .all()
+    )
+    recent = []
+    for j, ch in recent_rows:
+        recent.append({
+            "job_id":       int(j.id),
+            "clip_id":      int(j.clip_id) if j.clip_id else None,
+            "channel_id":   int(j.channel_id) if j.channel_id else None,
+            "channel_name": (ch.name if ch else "") or "",
+            "video_id":     j.video_id or "",
+            "watch_url":    (f"https://www.youtube.com/watch?v={j.video_id}"
+                             if j.video_id else ""),
+            "status":       j.status,
+            "title":        (j.title or "")[:120],
+            "bytes_uploaded": int(j.bytes_uploaded or 0),
+            "bytes_total":  int(j.bytes_total or 0),
+            "attempts":     int(j.attempts or 0),
+            "last_error":   (j.last_error or "")[:200],
+            "created_at":   _iso(j.created_at),
+            "updated_at":   _iso(j.updated_at),
+        })
+
+    # ── 5) Per-channel rollup ──────────────────────────────────────
+    by_channel_rows = (
+        db.query(
+            models.Channel.id,
+            models.Channel.name,
+            func.count(models.UploadJob.id),
+            func.sum(
+                case((models.UploadJob.status == "done", 1), else_=0)
+            ),
+            func.sum(
+                case((models.UploadJob.status == "failed", 1), else_=0)
+            ),
+        )
+          .join(models.UploadJob, models.UploadJob.channel_id == models.Channel.id)
+          .filter(models.UploadJob.upload_provider == "native_rtmp")
+          .filter(models.UploadJob.created_at >= cutoff)
+          .group_by(models.Channel.id, models.Channel.name)
+          .order_by(desc(func.count(models.UploadJob.id)))
+          .limit(20)
+          .all()
+    )
+    by_channel = [
+        {
+            "channel_id":   int(r[0]),
+            "channel_name": r[1] or "",
+            "total":        int(r[2] or 0),
+            "done":         int(r[3] or 0),
+            "failed":       int(r[4] or 0),
+        }
+        for r in by_channel_rows
+    ]
+
+    return {
+        "window": {
+            "days":  int(days),
+            "start": _iso(cutoff),
+            "end":   _iso(_utcnow()),
+        },
+        "enabled": (
+            os.environ.get("KAIZER_NATIVE_RTMP_ENABLED", "false").lower()
+            in ("1", "true", "yes", "on")
+        ),
+        "concurrency": int(os.environ.get("KAIZER_RTMP_CONCURRENCY", "2") or 2),
+        "totals": {
+            "broadcasts_minted":  int(mint_count),
+            "jobs_total":         int(rtmp_jobs_total),
+            "jobs_done":          int(rtmp_jobs_done),
+            "jobs_failed":        int(rtmp_jobs_failed),
+            "jobs_inflight":      int(rtmp_jobs_inflight),
+            "success_rate_pct":   round(
+                (rtmp_jobs_done / rtmp_jobs_total * 100.0) if rtmp_jobs_total else 0.0,
+                1,
+            ),
+            "units_spent_rtmp":   int(units_spent_rtmp),
+            "units_saved":        int(units_saved),
+            "videos_insert_equivalent_cost": int(rtmp_jobs_done * UNITS_VIDEOS_INSERT),
+        },
+        "recent":     recent,
+        "by_channel": by_channel,
+    }
+
+
+@router.get("/system/history")
+def system_history(
+    hours: float = Query(24.0, ge=0.1, le=24 * 14,
+                         description="Window size in hours (max 14d retention)."),
+    bucket_minutes: int = Query(0, ge=0, le=240,
+                                description="If >0, bucket samples for chart density."),
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Persistent CPU/RAM/GPU/disk history sampled by ``system_observer``.
+
+    Returns raw rows by default (one per ~30s). Pass ``bucket_minutes=15``
+    for a smoother long-window chart; the bucketing happens in Python
+    rather than SQL so the dialect doesn't matter.
+    """
+    cutoff = _utcnow() - timedelta(hours=float(hours))
+    rows = (
+        db.query(models.SystemMetric)
+          .filter(models.SystemMetric.ts >= cutoff)
+          .order_by(models.SystemMetric.ts.asc())
+          .all()
+    )
+
+    def _row(r):
+        return {
+            "ts":               _iso(r.ts),
+            "cpu_percent":      r.cpu_percent,
+            "ram_percent":      r.ram_percent,
+            "ram_used_gb":      r.ram_used_gb,
+            "disk_percent":     r.disk_percent,
+            "gpu_util":         r.gpu_util,
+            "gpu_mem_used_mb":  r.gpu_mem_used_mb,
+            "gpu_mem_total_mb": r.gpu_mem_total_mb,
+            "gpu_temp_c":       r.gpu_temp_c,
+            "proc_rss_gb":      r.proc_rss_gb,
+            "proc_threads":     r.proc_threads,
+            "live_events":      r.live_events,
+            "net_rx_bps":       r.net_rx_bps,
+            "net_tx_bps":       r.net_tx_bps,
+            # Kaizer-only rollup (the actual stack footprint, no Chrome/VS Code noise)
+            "kaizer_cpu_percent":  getattr(r, "kaizer_cpu_percent",  None),
+            "kaizer_rss_gb":       getattr(r, "kaizer_rss_gb",       None),
+            "kaizer_proc_count":   getattr(r, "kaizer_proc_count",   None),
+            "kaizer_ffmpeg_count": getattr(r, "kaizer_ffmpeg_count", None),
+            "kaizer_gpu_util":     getattr(r, "kaizer_gpu_util",     None),
+        }
+
+    if bucket_minutes <= 0 or len(rows) < 4:
+        samples = [_row(r) for r in rows]
+    else:
+        # Bucket by floor-to-N-minutes. p95 over each bucket so the chart
+        # shows realistic peaks rather than averaging the bursts away.
+        bucket_s = bucket_minutes * 60
+        buckets: dict[int, list[models.SystemMetric]] = {}
+        anchor = rows[0].ts.timestamp() if rows else 0
+        for r in rows:
+            k = int((r.ts.timestamp() - anchor) // bucket_s)
+            buckets.setdefault(k, []).append(r)
+
+        def _pct(values, p):
+            xs = sorted([v for v in values if v is not None])
+            if not xs:
+                return None
+            idx = min(len(xs) - 1, max(0, int(round((p / 100) * (len(xs) - 1)))))
+            return xs[idx]
+
+        samples = []
+        for k in sorted(buckets):
+            chunk = buckets[k]
+            mid = chunk[len(chunk) // 2]
+            samples.append({
+                "ts":               _iso(mid.ts),
+                # p95 for utilisation curves — captures real peaks.
+                "cpu_percent":      _pct([r.cpu_percent  for r in chunk], 95),
+                "ram_percent":      _pct([r.ram_percent  for r in chunk], 95),
+                "ram_used_gb":      _pct([r.ram_used_gb  for r in chunk], 95),
+                "disk_percent":     _pct([r.disk_percent for r in chunk], 95),
+                "gpu_util":         _pct([r.gpu_util     for r in chunk], 95),
+                "gpu_mem_used_mb":  _pct([r.gpu_mem_used_mb for r in chunk], 95),
+                "gpu_mem_total_mb": chunk[-1].gpu_mem_total_mb,
+                "gpu_temp_c":       _pct([r.gpu_temp_c   for r in chunk], 95),
+                "proc_rss_gb":      _pct([r.proc_rss_gb  for r in chunk], 95),
+                "proc_threads":     _pct([r.proc_threads for r in chunk], 95),
+                "live_events":      _pct([r.live_events  for r in chunk], 95),
+                "net_rx_bps":       _pct([r.net_rx_bps   for r in chunk], 95),
+                "net_tx_bps":       _pct([r.net_tx_bps   for r in chunk], 95),
+                # Kaizer-only rollup
+                "kaizer_cpu_percent":  _pct([getattr(r, "kaizer_cpu_percent",  None) for r in chunk], 95),
+                "kaizer_rss_gb":       _pct([getattr(r, "kaizer_rss_gb",       None) for r in chunk], 95),
+                "kaizer_proc_count":   _pct([getattr(r, "kaizer_proc_count",   None) for r in chunk], 95),
+                "kaizer_ffmpeg_count": _pct([getattr(r, "kaizer_ffmpeg_count", None) for r in chunk], 95),
+                "kaizer_gpu_util":     _pct([getattr(r, "kaizer_gpu_util",     None) for r in chunk], 95),
+            })
+
+    # Headline summary across the window — drives the capacity tab's KPI tiles.
+    def _series_summary(key, scale=1.0):
+        xs = sorted([getattr(r, key) for r in rows if getattr(r, key) is not None])
+        if not xs:
+            return {"avg": None, "p95": None, "max": None}
+        avg = sum(xs) / len(xs)
+        p95 = xs[min(len(xs) - 1, max(0, int(round(0.95 * (len(xs) - 1)))))]
+        return {
+            "avg": round(avg * scale, 2),
+            "p95": round(p95 * scale, 2),
+            "max": round(xs[-1] * scale, 2),
+        }
+
+    summary = {
+        # Whole-machine context (Chrome / VS Code / etc included)
+        "cpu_percent":    _series_summary("cpu_percent"),
+        "ram_percent":    _series_summary("ram_percent"),
+        "ram_used_gb":    _series_summary("ram_used_gb"),
+        "gpu_util":       _series_summary("gpu_util"),
+        "gpu_mem_used_mb":_series_summary("gpu_mem_used_mb"),
+        "proc_rss_gb":    _series_summary("proc_rss_gb"),
+        "live_events":    _series_summary("live_events"),
+        # Kaizer-only rollup — the cloud-sizing numbers
+        "kaizer_cpu_percent":  _series_summary("kaizer_cpu_percent"),
+        "kaizer_rss_gb":       _series_summary("kaizer_rss_gb"),
+        "kaizer_proc_count":   _series_summary("kaizer_proc_count"),
+        "kaizer_ffmpeg_count": _series_summary("kaizer_ffmpeg_count"),
+        "kaizer_gpu_util":     _series_summary("kaizer_gpu_util"),
+    }
+
+    return {
+        "window": {
+            "hours":  float(hours),
+            "start":  _iso(cutoff),
+            "end":    _iso(_utcnow()),
+            "buckets_minutes": int(bucket_minutes),
+        },
+        "summary":  summary,
+        "samples":  samples,
+        "raw_count": len(rows),
+    }
+
+
+# ─── Endpoints: live log tail ─────────────────────────────────────────────
+
+@router.get("/logs/recent")
+def logs_recent(
+    limit: int = Query(500, ge=1, le=2000),
+    level: Optional[str] = Query(None, description="Filter to one of: info|warning|error|debug"),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Return the most recent N lines from the in-memory ring buffer."""
+    items = system_observer.get_buffer().snapshot(limit=int(limit), level=level)
+    return {"lines": items, "count": len(items)}
+
+
+@router.get("/logs/stream")
+async def logs_stream(
+    request: Request,
+    _: models.User = Depends(auth.admin_required),
+):
+    """SSE endpoint that pushes every new log line as it lands in the buffer.
+
+    Each event payload is a JSON object: ``{id, ts, level, source, line}``.
+    Replays nothing — the client should call ``/logs/recent`` first for the
+    backlog, then connect here for the live tail.
+    """
+    buf = system_observer.get_buffer()
+    queue = buf.subscribe()
+
+    async def _gen():
+        try:
+            yield "retry: 3000\n\n"   # tell EventSource to reconnect quickly
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    entry = queue.get_nowait()
+                except Empty:
+                    # Yield a heartbeat comment every 15s so proxies don't kill us.
+                    await asyncio.sleep(0.5)
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        finally:
+            buf.unsubscribe(queue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",   # disable nginx/cloudflare buffering
+    })
 
 
 # ─── Endpoints: users ─────────────────────────────────────────────────────
@@ -1098,3 +1457,539 @@ def admin_rate_limit_reset(
     import rate_limit
     deleted = rate_limit.reset_bucket(bucket, plan, who)
     return {"ok": True, "deleted": deleted, "key": f"kaizer:rl:{bucket}:{plan}:{who}"}
+
+
+# ─── Storage promotion (local → R2) ─────────────────────────────────────
+#
+# Backs the admin "Promote to R2" button. Walks every Clip + UserAsset
+# row whose storage_backend='local' (or whose thumb/image URL begins
+# with /media/) and uploads the underlying file to R2 with the same
+# key, then updates the row. Idempotent + dry-run-by-default.
+
+@router.post("/storage/promote-to-r2")
+def admin_storage_promote_to_r2(
+    dry_run: bool = Query(True, description="When True (default), nothing is uploaded or written. Set to False for the live run."),
+    db: Session = Depends(get_db),
+    _:  models.User = Depends(auth.admin_required),
+) -> dict:
+    """Promote every local-stored Clip + UserAsset row to R2.
+
+    Run dry-run FIRST. Inspect the returned ``totals`` and ``tables``
+    fields, then re-run with ``?dry_run=false`` to commit. Safe to
+    re-run after a partial failure — rows already on R2 are skipped.
+    """
+    from storage_migration import promote_local_to_r2
+    return promote_local_to_r2(db, dry_run=dry_run)
+
+
+# ─── Phase 13 — Unified Usage Dashboard ────────────────────────────────
+# One endpoint, one JSON payload, all the breakdowns the UI needs.
+#
+# Returning everything in one call lets the dashboard render with a
+# single HTTP round-trip and ensures every panel reflects the same
+# time window — no risk of the "Today" tile lagging the daily chart
+# by a polling cycle.
+
+# Daily YouTube Data API cap on a standard project.  Used to compute
+# the percentage-of-cap-used gauge.  When the user upgrades their
+# Google Cloud quota grant, bump this via env (KAIZER_YT_DAILY_CAP).
+_YT_DAILY_CAP = int(os.environ.get("KAIZER_YT_DAILY_CAP", "10000"))
+
+
+@router.get("/usage/dashboard")
+def usage_dashboard(
+    days: int = Query(30, ge=1, le=365, description="History window in days. Defaults to 30."),
+    db: Session = Depends(get_db),
+    _:  models.User = Depends(auth.admin_required),
+) -> dict:
+    """All-providers usage dashboard payload.
+
+    Returns one dict with these top-level sections:
+      * window        — period summary (start/end dates, days)
+      * overview      — totals per provider for the window + today
+      * timeseries    — daily per-provider totals for the line chart
+      * gemini        — purpose / model / user / job / video breakdowns
+      * openai        — purpose / model / user / job breakdowns
+      * youtube       — operation / channel / video breakdowns + cap %
+      * recent_calls  — last 25 calls per provider for the live tail
+    """
+    now      = _utcnow()
+    window_start = now - timedelta(days=int(days))
+    today_start  = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # ─── Helpers ────────────────────────────────────────────────
+    def _scalar(q):
+        v = q.scalar()
+        return float(v or 0)
+
+    def _scalar_int(q):
+        v = q.scalar()
+        return int(v or 0)
+
+    def _row_to_dict(headers, rows):
+        return [dict(zip(headers, r)) for r in rows]
+
+    # ─── Overview totals ────────────────────────────────────────
+    def _gemini_total(start):
+        return _scalar(
+            db.query(func.coalesce(func.sum(models.GeminiCall.cost_usd), 0.0))
+              .filter(models.GeminiCall.created_at >= start)
+        )
+
+    def _openai_total(start):
+        return _scalar(
+            db.query(func.coalesce(func.sum(models.OpenAiCall.cost_usd), 0.0))
+              .filter(models.OpenAiCall.created_at >= start)
+        )
+
+    def _yt_quota_total(start):
+        return _scalar_int(
+            db.query(func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0))
+              .filter(models.YouTubeApiCall.created_at >= start)
+              .filter(models.YouTubeApiCall.success == True)  # only successful calls burn quota
+        )
+
+    def _gemini_calls(start):
+        return _scalar_int(
+            db.query(func.count(models.GeminiCall.id))
+              .filter(models.GeminiCall.created_at >= start)
+        )
+
+    def _openai_calls(start):
+        return _scalar_int(
+            db.query(func.count(models.OpenAiCall.id))
+              .filter(models.OpenAiCall.created_at >= start)
+        )
+
+    def _yt_calls(start):
+        return _scalar_int(
+            db.query(func.count(models.YouTubeApiCall.id))
+              .filter(models.YouTubeApiCall.created_at >= start)
+        )
+
+    overview = {
+        "gemini": {
+            "today_cost_usd":  round(_gemini_total(today_start),  4),
+            "window_cost_usd": round(_gemini_total(window_start), 4),
+            "today_calls":     _gemini_calls(today_start),
+            "window_calls":    _gemini_calls(window_start),
+        },
+        "openai": {
+            "today_cost_usd":  round(_openai_total(today_start),  4),
+            "window_cost_usd": round(_openai_total(window_start), 4),
+            "today_calls":     _openai_calls(today_start),
+            "window_calls":    _openai_calls(window_start),
+        },
+        "youtube": {
+            "today_quota":   _yt_quota_total(today_start),
+            "window_quota":  _yt_quota_total(window_start),
+            "today_calls":   _yt_calls(today_start),
+            "window_calls":  _yt_calls(window_start),
+            "daily_cap":     _YT_DAILY_CAP,
+            "today_pct":     round(100.0 * _yt_quota_total(today_start) / max(_YT_DAILY_CAP, 1), 1),
+        },
+        "total_cost_today_usd":  round(
+            _gemini_total(today_start) + _openai_total(today_start), 4
+        ),
+        "total_cost_window_usd": round(
+            _gemini_total(window_start) + _openai_total(window_start), 4
+        ),
+    }
+
+    # ─── Daily timeseries (last N days) ─────────────────────────
+    # Postgres date_trunc; SQLAlchemy bridges to SQLite's strftime via
+    # the func layer (we use date() to be dialect-agnostic).
+    day_col_g = func.date(models.GeminiCall.created_at).label("d")
+    day_col_o = func.date(models.OpenAiCall.created_at).label("d")
+    day_col_y = func.date(models.YouTubeApiCall.created_at).label("d")
+
+    g_rows = (
+        db.query(
+            day_col_g,
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),     0.0),
+            func.coalesce(func.sum(models.GeminiCall.total_tokens), 0),
+            func.count(models.GeminiCall.id),
+        )
+        .filter(models.GeminiCall.created_at >= window_start)
+        .group_by(day_col_g).order_by(day_col_g).all()
+    )
+    o_rows = (
+        db.query(
+            day_col_o,
+            func.coalesce(func.sum(models.OpenAiCall.cost_usd),    0.0),
+            func.coalesce(func.sum(models.OpenAiCall.image_count), 0),
+            func.count(models.OpenAiCall.id),
+        )
+        .filter(models.OpenAiCall.created_at >= window_start)
+        .group_by(day_col_o).order_by(day_col_o).all()
+    )
+    y_rows = (
+        db.query(
+            day_col_y,
+            func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0),
+            func.count(models.YouTubeApiCall.id),
+        )
+        .filter(models.YouTubeApiCall.created_at >= window_start)
+        .filter(models.YouTubeApiCall.success == True)
+        .group_by(day_col_y).order_by(day_col_y).all()
+    )
+
+    timeseries = {
+        "gemini": _row_to_dict(("day","cost_usd","tokens","calls"), [
+            (str(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
+            for r in g_rows
+        ]),
+        "openai": _row_to_dict(("day","cost_usd","images","calls"), [
+            (str(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
+            for r in o_rows
+        ]),
+        "youtube": _row_to_dict(("day","quota","calls"), [
+            (str(r[0]), int(r[1] or 0), int(r[2] or 0))
+            for r in y_rows
+        ]),
+    }
+
+    # ─── Gemini breakdowns ─────────────────────────────────────
+    g_by_purpose = (
+        db.query(
+            models.GeminiCall.purpose,
+            func.coalesce(func.sum(models.GeminiCall.total_tokens), 0),
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),     0.0),
+            func.count(models.GeminiCall.id),
+        )
+        .filter(models.GeminiCall.created_at >= window_start)
+        .group_by(models.GeminiCall.purpose)
+        .order_by(desc(func.sum(models.GeminiCall.cost_usd)))
+        .all()
+    )
+    g_by_model = (
+        db.query(
+            models.GeminiCall.model,
+            func.coalesce(func.sum(models.GeminiCall.total_tokens), 0),
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),     0.0),
+            func.count(models.GeminiCall.id),
+        )
+        .filter(models.GeminiCall.created_at >= window_start)
+        .group_by(models.GeminiCall.model)
+        .order_by(desc(func.sum(models.GeminiCall.cost_usd)))
+        .all()
+    )
+    g_top_users = (
+        db.query(
+            models.GeminiCall.user_id,
+            models.User.email,
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),     0.0),
+            func.coalesce(func.sum(models.GeminiCall.total_tokens), 0),
+            func.count(models.GeminiCall.id),
+        )
+        .outerjoin(models.User, models.User.id == models.GeminiCall.user_id)
+        .filter(models.GeminiCall.created_at >= window_start)
+        .group_by(models.GeminiCall.user_id, models.User.email)
+        .order_by(desc(func.sum(models.GeminiCall.cost_usd)))
+        .limit(10).all()
+    )
+    g_top_jobs = (
+        db.query(
+            models.GeminiCall.job_id,
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),         0.0),
+            func.coalesce(func.sum(models.GeminiCall.total_tokens),     0),
+            func.coalesce(func.sum(models.GeminiCall.file_bytes),       0),
+            func.coalesce(func.sum(models.GeminiCall.video_duration_s), 0.0),
+            func.count(models.GeminiCall.id),
+        )
+        .filter(models.GeminiCall.created_at >= window_start)
+        .filter(models.GeminiCall.job_id.isnot(None))
+        .group_by(models.GeminiCall.job_id)
+        .order_by(desc(func.sum(models.GeminiCall.cost_usd)))
+        .limit(15).all()
+    )
+    # Video-size & duration buckets so the user can see the
+    # cost-per-byte and cost-per-second story.
+    g_video_only = (
+        db.query(
+            func.coalesce(func.sum(models.GeminiCall.cost_usd),         0.0),
+            func.coalesce(func.sum(models.GeminiCall.file_bytes),       0),
+            func.coalesce(func.sum(models.GeminiCall.video_duration_s), 0.0),
+            func.count(models.GeminiCall.id),
+        )
+        .filter(models.GeminiCall.created_at >= window_start)
+        .filter(models.GeminiCall.file_bytes > 0)
+        .one()
+    )
+
+    gemini = {
+        "by_purpose": _row_to_dict(("purpose","tokens","cost_usd","calls"), [
+            (r[0] or "(unset)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in g_by_purpose
+        ]),
+        "by_model": _row_to_dict(("model","tokens","cost_usd","calls"), [
+            (r[0] or "(unknown)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in g_by_model
+        ]),
+        "top_users": _row_to_dict(("user_id","email","cost_usd","tokens","calls"), [
+            (int(r[0]) if r[0] else None, r[1] or "(system)",
+             round(float(r[2] or 0), 4), int(r[3] or 0), int(r[4] or 0))
+            for r in g_top_users
+        ]),
+        "top_jobs": _row_to_dict(
+            ("job_id","cost_usd","tokens","file_bytes","duration_s","calls"),
+            [
+                (int(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0),
+                 int(r[3] or 0), round(float(r[4] or 0), 1), int(r[5] or 0))
+                for r in g_top_jobs
+            ],
+        ),
+        "video_uploads": {
+            "cost_usd":      round(float(g_video_only[0] or 0), 4),
+            "total_bytes":   int(g_video_only[1] or 0),
+            "total_seconds": round(float(g_video_only[2] or 0), 1),
+            "call_count":    int(g_video_only[3] or 0),
+            "cost_per_minute_usd": round(
+                (float(g_video_only[0] or 0) /
+                 max(float(g_video_only[2] or 0) / 60.0, 0.001)),
+                5,
+            ) if g_video_only[2] else 0.0,
+        },
+    }
+
+    # ─── OpenAI breakdowns ─────────────────────────────────────
+    o_by_purpose = (
+        db.query(
+            models.OpenAiCall.purpose,
+            func.coalesce(func.sum(models.OpenAiCall.image_count), 0),
+            func.coalesce(func.sum(models.OpenAiCall.cost_usd),    0.0),
+            func.count(models.OpenAiCall.id),
+        )
+        .filter(models.OpenAiCall.created_at >= window_start)
+        .group_by(models.OpenAiCall.purpose)
+        .order_by(desc(func.sum(models.OpenAiCall.cost_usd)))
+        .all()
+    )
+    o_by_model = (
+        db.query(
+            models.OpenAiCall.model,
+            func.coalesce(func.sum(models.OpenAiCall.image_count), 0),
+            func.coalesce(func.sum(models.OpenAiCall.cost_usd),    0.0),
+            func.count(models.OpenAiCall.id),
+        )
+        .filter(models.OpenAiCall.created_at >= window_start)
+        .group_by(models.OpenAiCall.model)
+        .order_by(desc(func.sum(models.OpenAiCall.cost_usd)))
+        .all()
+    )
+    o_top_users = (
+        db.query(
+            models.OpenAiCall.user_id,
+            models.User.email,
+            func.coalesce(func.sum(models.OpenAiCall.cost_usd),    0.0),
+            func.coalesce(func.sum(models.OpenAiCall.image_count), 0),
+            func.count(models.OpenAiCall.id),
+        )
+        .outerjoin(models.User, models.User.id == models.OpenAiCall.user_id)
+        .filter(models.OpenAiCall.created_at >= window_start)
+        .group_by(models.OpenAiCall.user_id, models.User.email)
+        .order_by(desc(func.sum(models.OpenAiCall.cost_usd)))
+        .limit(10).all()
+    )
+    o_top_jobs = (
+        db.query(
+            models.OpenAiCall.job_id,
+            func.coalesce(func.sum(models.OpenAiCall.cost_usd),    0.0),
+            func.coalesce(func.sum(models.OpenAiCall.image_count), 0),
+            func.count(models.OpenAiCall.id),
+        )
+        .filter(models.OpenAiCall.created_at >= window_start)
+        .filter(models.OpenAiCall.job_id.isnot(None))
+        .group_by(models.OpenAiCall.job_id)
+        .order_by(desc(func.sum(models.OpenAiCall.cost_usd)))
+        .limit(15).all()
+    )
+
+    openai = {
+        "by_purpose": _row_to_dict(("purpose","images","cost_usd","calls"), [
+            (r[0] or "(unset)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in o_by_purpose
+        ]),
+        "by_model": _row_to_dict(("model","images","cost_usd","calls"), [
+            (r[0] or "(unknown)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in o_by_model
+        ]),
+        "top_users": _row_to_dict(("user_id","email","cost_usd","images","calls"), [
+            (int(r[0]) if r[0] else None, r[1] or "(system)",
+             round(float(r[2] or 0), 4), int(r[3] or 0), int(r[4] or 0))
+            for r in o_top_users
+        ]),
+        "top_jobs": _row_to_dict(("job_id","cost_usd","images","calls"), [
+            (int(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
+            for r in o_top_jobs
+        ]),
+    }
+
+    # ─── YouTube breakdowns ────────────────────────────────────
+    y_by_op = (
+        db.query(
+            models.YouTubeApiCall.operation,
+            func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0),
+            func.count(models.YouTubeApiCall.id),
+        )
+        .filter(models.YouTubeApiCall.created_at >= window_start)
+        .filter(models.YouTubeApiCall.success == True)
+        .group_by(models.YouTubeApiCall.operation)
+        .order_by(desc(func.sum(models.YouTubeApiCall.quota_cost)))
+        .all()
+    )
+    y_by_channel = (
+        db.query(
+            models.YouTubeApiCall.google_channel_id,
+            func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0),
+            func.count(models.YouTubeApiCall.id),
+        )
+        .filter(models.YouTubeApiCall.created_at >= window_start)
+        .filter(models.YouTubeApiCall.success == True)
+        .filter(models.YouTubeApiCall.google_channel_id != "")
+        .group_by(models.YouTubeApiCall.google_channel_id)
+        .order_by(desc(func.sum(models.YouTubeApiCall.quota_cost)))
+        .limit(10).all()
+    )
+    y_by_kind = (
+        db.query(
+            models.YouTubeApiCall.publish_kind,
+            func.coalesce(func.sum(models.YouTubeApiCall.quota_cost),       0),
+            func.coalesce(func.sum(models.YouTubeApiCall.file_bytes),       0),
+            func.coalesce(func.sum(models.YouTubeApiCall.duration_seconds), 0.0),
+            func.count(models.YouTubeApiCall.id),
+        )
+        .filter(models.YouTubeApiCall.created_at >= window_start)
+        .filter(models.YouTubeApiCall.success == True)
+        .filter(models.YouTubeApiCall.publish_kind != "")
+        .group_by(models.YouTubeApiCall.publish_kind)
+        .order_by(desc(func.sum(models.YouTubeApiCall.quota_cost)))
+        .all()
+    )
+    y_top_videos = (
+        db.query(
+            models.YouTubeApiCall.video_id,
+            models.YouTubeApiCall.publish_kind,
+            func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0),
+            func.coalesce(func.max(models.YouTubeApiCall.file_bytes), 0),
+            func.coalesce(func.max(models.YouTubeApiCall.duration_seconds), 0.0),
+            func.count(models.YouTubeApiCall.id),
+        )
+        .filter(models.YouTubeApiCall.created_at >= window_start)
+        .filter(models.YouTubeApiCall.success == True)
+        .filter(models.YouTubeApiCall.video_id != "")
+        .group_by(models.YouTubeApiCall.video_id, models.YouTubeApiCall.publish_kind)
+        .order_by(desc(func.sum(models.YouTubeApiCall.quota_cost)))
+        .limit(15).all()
+    )
+
+    youtube = {
+        "by_operation": _row_to_dict(("operation","quota","calls"), [
+            (r[0] or "(unknown)", int(r[1] or 0), int(r[2] or 0))
+            for r in y_by_op
+        ]),
+        "by_channel": _row_to_dict(("google_channel_id","quota","calls"), [
+            (r[0], int(r[1] or 0), int(r[2] or 0))
+            for r in y_by_channel
+        ]),
+        "by_publish_kind": _row_to_dict(
+            ("kind","quota","total_bytes","total_seconds","calls"),
+            [
+                (r[0] or "(unset)", int(r[1] or 0), int(r[2] or 0),
+                 round(float(r[3] or 0), 1), int(r[4] or 0))
+                for r in y_by_kind
+            ],
+        ),
+        "top_videos": _row_to_dict(
+            ("video_id","kind","quota","file_bytes","duration_seconds","calls"),
+            [
+                (r[0], r[1] or "(unset)", int(r[2] or 0), int(r[3] or 0),
+                 round(float(r[4] or 0), 1), int(r[5] or 0))
+                for r in y_top_videos
+            ],
+        ),
+    }
+
+    # ─── Recent calls tail (last 25 per provider) ─────────────
+    def _gemini_recent():
+        rows = (
+            db.query(models.GeminiCall)
+              .order_by(desc(models.GeminiCall.created_at))
+              .limit(25).all()
+        )
+        return [{
+            "id":         r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "user_id":    r.user_id,
+            "job_id":     r.job_id,
+            "clip_id":    r.clip_id,
+            "model":      r.model,
+            "purpose":    r.purpose,
+            "tokens":     int(r.total_tokens or 0),
+            "cost_usd":   round(float(r.cost_usd or 0), 5),
+            "latency_ms": int(r.latency_ms or 0),
+            "status":     r.status,
+        } for r in rows]
+
+    def _openai_recent():
+        rows = (
+            db.query(models.OpenAiCall)
+              .order_by(desc(models.OpenAiCall.created_at))
+              .limit(25).all()
+        )
+        return [{
+            "id":         r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "user_id":    r.user_id,
+            "job_id":     r.job_id,
+            "clip_id":    r.clip_id,
+            "model":      r.model,
+            "purpose":    r.purpose,
+            "image_size":    r.image_size,
+            "image_quality": r.image_quality,
+            "image_count":   int(r.image_count or 0),
+            "cost_usd":      round(float(r.cost_usd or 0), 5),
+            "latency_ms":    int(r.latency_ms or 0),
+            "status":        r.status,
+        } for r in rows]
+
+    def _youtube_recent():
+        rows = (
+            db.query(models.YouTubeApiCall)
+              .order_by(desc(models.YouTubeApiCall.created_at))
+              .limit(25).all()
+        )
+        return [{
+            "id":           r.id,
+            "created_at":   r.created_at.isoformat() if r.created_at else None,
+            "user_id":      r.user_id,
+            "job_id":       r.job_id,
+            "channel_id":   r.channel_id,
+            "google_channel_id": r.google_channel_id,
+            "video_id":     r.video_id,
+            "operation":    r.operation,
+            "quota_cost":   int(r.quota_cost or 0),
+            "publish_kind": r.publish_kind,
+            "file_bytes":   int(r.file_bytes or 0),
+            "duration_seconds": round(float(r.duration_seconds or 0), 1),
+            "success":      bool(r.success),
+            "http_status":  int(r.http_status or 0),
+        } for r in rows]
+
+    return {
+        "window": {
+            "days":  int(days),
+            "start": window_start.isoformat(),
+            "end":   now.isoformat(),
+        },
+        "overview":     overview,
+        "timeseries":   timeseries,
+        "gemini":       gemini,
+        "openai":       openai,
+        "youtube":      youtube,
+        "recent_calls": {
+            "gemini":  _gemini_recent(),
+            "openai":  _openai_recent(),
+            "youtube": _youtube_recent(),
+        },
+    }

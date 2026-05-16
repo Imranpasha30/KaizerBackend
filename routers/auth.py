@@ -126,8 +126,16 @@ def google_signin(payload: GoogleIn, db: Session = Depends(get_db)):
     try:
         from google.oauth2 import id_token as _idt
         from google.auth.transport import requests as _grequests
+        # ``clock_skew_in_seconds`` absorbs the small drift between
+        # Google's token-issue clock and the local server clock. Without
+        # this tolerance a 1-second drift trips "Token used too early"
+        # on the user's first sign-in (seen on Windows boxes that haven't
+        # NTP-synced recently). 10 s is the canonical google-auth-library
+        # default — large enough to forgive normal drift, small enough
+        # that replay-window attacks are still bounded.
         info = _idt.verify_oauth2_token(
-            payload.credential, _grequests.Request(), client_id
+            payload.credential, _grequests.Request(), client_id,
+            clock_skew_in_seconds=10,
         )
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Google credential: {e}")
@@ -228,3 +236,170 @@ def auth_config():
             in ("1", "true", "yes", "on")
         ),
     }
+
+
+# ─── Password management ──────────────────────────────────────────────────
+#
+# Three flows:
+#   1. /me/has-password   — frontend asks "should I show Set or Change?"
+#   2. /me/password       — authenticated change/set (Google users hit this
+#                           with current_password=null to set their first pw)
+#   3. /forgot + /reset   — unauthenticated reset via single-use token
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: Optional[str] = Field(None, max_length=200,
+        description="Required only if the account already has a password set.")
+    new_password: str = Field(..., min_length=8, max_length=200)
+
+    @field_validator("new_password")
+    @classmethod
+    def _strength(cls, v: str) -> str:
+        # Minimal-but-meaningful: 8+ chars + at least one digit OR symbol.
+        # Anything stricter just irritates users; password resets are cheap.
+        if not any(c.isdigit() or not c.isalnum() for c in v):
+            raise ValueError("Add at least one digit or symbol to the new password.")
+        return v
+
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    token:        str = Field(..., min_length=10, max_length=200)
+    new_password: str = Field(..., min_length=8, max_length=200)
+
+    @field_validator("new_password")
+    @classmethod
+    def _strength(cls, v: str) -> str:
+        if not any(c.isdigit() or not c.isalnum() for c in v):
+            raise ValueError("Add at least one digit or symbol to the new password.")
+        return v
+
+
+@router.get("/me/has-password")
+def has_password(user: models.User = Depends(_auth.current_user)):
+    """Frontend uses this to label the Settings section.
+
+    Returns ``{has_password, signin_methods}`` so the UI can show "Set a
+    password" for Google-only accounts and "Change password" for the rest.
+    """
+    methods = []
+    if user.password_hash: methods.append("password")
+    if user.google_sub:    methods.append("google")
+    return {
+        "has_password":   bool(user.password_hash),
+        "signin_methods": methods,
+        "google_linked":  bool(user.google_sub),
+    }
+
+
+@router.post("/me/password")
+def change_password(
+    payload: ChangePasswordIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(_auth.current_user),
+):
+    """Set or change the password for the currently signed-in user.
+
+    If the account already has a password, ``current_password`` must match.
+    Google-only accounts (no password yet) can omit it — this is the
+    "Set a password" path that lets a Google user sign in via email later.
+    """
+    if user.password_hash:
+        if not payload.current_password or not _auth.verify_password(
+                payload.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    _auth.set_password(db, user, payload.new_password)
+    return {"ok": True, "message": "Password updated."}
+
+
+@router.post("/forgot-password")
+def forgot_password(
+    payload: ForgotPasswordIn,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Issue a one-shot reset token and email/log it.
+
+    Always returns 200 with the same shape regardless of whether the email
+    exists — that prevents email-enumeration. The actual delivery happens
+    out-of-band (SMTP if configured, else logged to admin Logs tab).
+    """
+    email = payload.email.lower().strip()
+    # Lazy cleanup of week-old tokens — keeps the table small.
+    try:
+        _auth.purge_expired_reset_tokens(db)
+    except Exception:
+        pass
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+
+    # Always behave identically from the caller's POV (anti-enumeration).
+    if user and user.is_active:
+        # Figure out the public origin to build the reset URL.
+        # Prefer the Origin header (real browser); fall back to env.
+        import os as _os
+        origin = (request.headers.get("origin")
+                  or request.headers.get("referer", "").rstrip("/")
+                  or _os.getenv("KAIZER_PUBLIC_ORIGIN", "")
+                  or "https://test.kaizerx.com")
+        # Strip any path from the referer
+        if "://" in origin:
+            scheme, rest = origin.split("://", 1)
+            host = rest.split("/", 1)[0]
+            origin = f"{scheme}://{host}"
+        raw = _auth.make_reset_token(
+            db, user,
+            requested_ip=(request.client.host if request.client else "")[:64],
+        )
+        reset_url = f"{origin}/reset-password?token={raw}"
+        _auth.send_reset_email(
+            to_email=user.email,
+            reset_url=reset_url,
+            user_name=user.name or "",
+        )
+
+    return {
+        "ok": True,
+        "message": ("If an account with that email exists, a password-reset "
+                    "link has been sent. The link expires in "
+                    f"{_auth.RESET_TOKEN_TTL_MIN} minutes."),
+    }
+
+
+@router.get("/reset-password/validate")
+def validate_reset(token: str):
+    """Cheap pre-check from the Reset page so we can tell the user
+    'this link is expired / already used' before they type a new password."""
+    db = next(get_db())
+    try:
+        row = _auth.lookup_valid_reset(db, token)
+        if not row:
+            return {"valid": False, "reason": "expired_or_invalid"}
+        user = db.query(models.User).filter(models.User.id == row.user_id).first()
+        return {
+            "valid": True,
+            "email": user.email if user else None,
+            "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+        }
+    finally:
+        db.close()
+
+
+@router.post("/reset-password")
+def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
+    """Consume a reset token and set a new password. Returns a fresh JWT so
+    the user is logged in immediately after a successful reset."""
+    row = _auth.lookup_valid_reset(db, payload.token)
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="This reset link is invalid or has expired. Please request a new one.",
+        )
+    user = _auth.consume_reset_token(db, row, payload.new_password)
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    return _with_token(user)

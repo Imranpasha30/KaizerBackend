@@ -55,6 +55,52 @@ class PublishRequest(BaseModel):
     tags:           Optional[List[str]] = None
     category_id:    Optional[str] = None
     made_for_kids:  bool = False
+    # Per-publish upload route override.  "postiz" | "kaizer" |
+    # "native_rtmp" | null.  When null we fall through to
+    # Channel.upload_provider and then to the system-wide default —
+    # so most users never set this; it's exposed primarily for one-shot
+    # overrides and side-by-side comparison runs.
+    upload_provider: Optional[str] = None
+
+    # Per-CHANNEL override map: { "12": "native_rtmp", "13": "kaizer" }.
+    # Wins over ``upload_provider`` (the batch-wide value) so a single
+    # publish call can route different channels through different
+    # providers.  Used by the bulk publish modal to honour each
+    # channel's row-level selector.  Keys are stringified channel IDs
+    # to match JSON conventions.  Missing keys fall through to the
+    # batch value, then the per-channel default, then system default.
+    upload_provider_by_channel: Optional[dict[str, Optional[str]]] = None
+
+    @field_validator("upload_provider")
+    @classmethod
+    def _upload_provider(cls, v):
+        if v is None or v == "":
+            return None
+        v = str(v).strip().lower()
+        if v not in {"postiz", "kaizer", "native_rtmp"}:
+            raise ValueError("upload_provider must be 'postiz', 'kaizer', 'native_rtmp', or null")
+        return v
+
+    @field_validator("upload_provider_by_channel")
+    @classmethod
+    def _upload_provider_map(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("upload_provider_by_channel must be a dict")
+        cleaned: dict[str, Optional[str]] = {}
+        for k, vv in v.items():
+            if vv is None or vv == "":
+                cleaned[str(k)] = None
+                continue
+            vs = str(vv).strip().lower()
+            if vs not in {"postiz", "kaizer", "native_rtmp"}:
+                raise ValueError(
+                    f"upload_provider_by_channel[{k!r}] must be 'postiz', "
+                    f"'kaizer', 'native_rtmp', or null"
+                )
+            cleaned[str(k)] = vs
+        return cleaned or None
 
     @field_validator("privacy_status")
     @classmethod
@@ -110,6 +156,10 @@ def _to_dict(job: models.UploadJob) -> dict:
         "made_for_kids":  bool(job.made_for_kids),
         "video_id":       job.video_id or None,
         "video_url":      f"https://youtu.be/{job.video_id}" if job.video_id else None,
+        # Per-job override (null = resolved at worker time from
+        # channel/system default).  Surfaced so the Uploads page
+        # can display "via Postiz" / "via Native YouTube" on each row.
+        "upload_provider": getattr(job, "upload_provider", None) or None,
         "bytes_uploaded": job.bytes_uploaded or 0,
         "bytes_total":    job.bytes_total or 0,
         "progress_pct":   round(100 * (job.bytes_uploaded or 0) / max(job.bytes_total or 1, 1), 1),
@@ -334,6 +384,22 @@ def publish_clip(
         # Use seo_clip (may be the donor sibling) for SEO content;
         # everything else still uses the actual clip being uploaded.
         title, description, tags = _compose_metadata(seo_clip, channel, payload)
+        # Resolve the per-(clip × channel) upload route.
+        # Precedence (most specific → least specific):
+        #   1. payload.upload_provider_by_channel[str(channel.id)]
+        #      — the per-channel override from the publish modal
+        #   2. payload.upload_provider — the batch-wide override
+        # Whatever lands in `effective_provider` is stamped on the
+        # UploadJob row and wins over Channel.upload_provider and
+        # system default in the worker's routing chain.
+        # ``None`` here means "let the worker resolve" (no override).
+        effective_provider = payload.upload_provider
+        if payload.upload_provider_by_channel:
+            ch_key = str(channel.id)
+            if ch_key in payload.upload_provider_by_channel:
+                # Explicit None / "" in the map = "remove override for
+                # this channel only, even if a batch override is set".
+                effective_provider = payload.upload_provider_by_channel[ch_key]
         job = models.UploadJob(
             user_id=user.id,
             clip_id=clip.id,
@@ -347,6 +413,10 @@ def publish_clip(
             tags=tags,
             category_id=payload.category_id or "25",
             made_for_kids=payload.made_for_kids,
+            # null at this layer means "let the worker resolve via
+            # Channel.upload_provider → system default".  Set on the
+            # row so admin can audit what each comparison run used.
+            upload_provider=effective_provider,
         )
         db.add(job)
         created.append(job)

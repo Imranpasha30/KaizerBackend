@@ -122,6 +122,11 @@ def upload_video(
     Transient failures raise TransientUploadError; the worker catches them,
     records an attempt, and retries. `progress_cb(uploaded, total)` is called
     after every chunk with the *checkpointed* byte counts.
+
+    The whole upload (start → final chunk → video_id) is wrapped in
+    ``log_youtube_call`` so the admin Usage dashboard sees ONE row per
+    real videos.insert burn (1600 quota units), regardless of how many
+    HTTP chunks googleapiclient ended up making under the hood.
     """
     path = Path(clip_path)
     if not path.exists():
@@ -132,47 +137,80 @@ def upload_video(
         job.bytes_total = size
         db.commit()
 
+    # Pull the destination's google_channel_id for the log row so the
+    # dashboard can group quota burn by real YT channel even after the
+    # local Channel row is deleted.
+    _gcid = ""
+    try:
+        ch = getattr(job, "channel", None)
+        tok = getattr(ch, "oauth_token", None) if ch else None
+        _gcid = (getattr(tok, "google_channel_id", "") or "")[:50]
+    except Exception:
+        _gcid = ""
+
+    try:
+        from learning.youtube_quota_log import log_youtube_call as _log_yt
+    except Exception:
+        _log_yt = None
+
+    media = None
     try:
         yt = _yt(creds)
         media = MediaFileUpload(
             str(path), chunksize=CHUNK_SIZE, resumable=True, mimetype="video/mp4",
         )
-        request = yt.videos().insert(
-            part="snippet,status",
-            body=_build_body(job),
-            media_body=media,
-            notifySubscribers=False,
-        )
+        # The entire resumable upload session is ONE quota event.
+        with (_log_yt(
+                db=db,
+                user_id=getattr(job, "user_id", None),
+                upload_job_id=getattr(job, "id", None),
+                clip_id=getattr(job, "clip_id", None),
+                channel_id=getattr(job, "channel_id", None),
+                google_channel_id=_gcid,
+                operation="videos.insert",
+                publish_kind=(getattr(job, "publish_kind", "") or "")[:10],
+                file_bytes=int(size or 0),
+              ) if _log_yt is not None else _nullctx()) as _call:
+            request = yt.videos().insert(
+                part="snippet,status",
+                body=_build_body(job),
+                media_body=media,
+                notifySubscribers=False,
+            )
 
-        response = None
-        last_emitted = -1
-        while response is None:
-            try:
-                status, response = request.next_chunk()
-            except HttpError as e:
-                raise _wrap_http(e) from e
-            except Exception as e:
-                # Network hiccup — treat as transient
-                raise TransientUploadError(f"chunk failed: {e}") from e
+            response = None
+            last_emitted = -1
+            while response is None:
+                try:
+                    status, response = request.next_chunk()
+                except HttpError as e:
+                    raise _wrap_http(e) from e
+                except Exception as e:
+                    # Network hiccup — treat as transient
+                    raise TransientUploadError(f"chunk failed: {e}") from e
 
-            if status is not None:
-                uploaded = int(getattr(status, "resumable_progress", 0) or 0)
-                job.bytes_uploaded = uploaded
-                db.commit()
-                if progress_cb and uploaded != last_emitted:
-                    progress_cb(uploaded, size)
-                    last_emitted = uploaded
+                if status is not None:
+                    uploaded = int(getattr(status, "resumable_progress", 0) or 0)
+                    job.bytes_uploaded = uploaded
+                    db.commit()
+                    if progress_cb and uploaded != last_emitted:
+                        progress_cb(uploaded, size)
+                        last_emitted = uploaded
 
-        if not response or "id" not in response:
-            raise UploadError(f"videos.insert returned no id: {response}")
+            if not response or "id" not in response:
+                raise UploadError(f"videos.insert returned no id: {response}")
 
-        video_id = response["id"]
-        job.video_id       = video_id
-        job.bytes_uploaded = size
-        db.commit()
-        if progress_cb:
-            progress_cb(size, size)
-        return video_id
+            video_id = response["id"]
+            job.video_id       = video_id
+            job.bytes_uploaded = size
+            db.commit()
+            if progress_cb:
+                progress_cb(size, size)
+            # Stamp the row with the resulting video_id so the dashboard
+            # can correlate "quota burn → YouTube URL" later.
+            if _call is not None and hasattr(_call, "record_video_id"):
+                _call.record_video_id(video_id)
+            return video_id
     finally:
         # googleapiclient's MediaFileUpload keeps a file handle open — close it
         # so subsequent operations on the same path (restart, cleanup) don't
@@ -184,10 +222,31 @@ def upload_video(
             pass
 
 
-def set_thumbnail(creds: Credentials, video_id: str, thumb_path: str) -> None:
+# Tiny no-op context manager used when log_youtube_call isn't importable
+# (test envs, partial installs).  Keeps the with-block structure identical.
+from contextlib import contextmanager as _contextmanager
+@_contextmanager
+def _nullctx():
+    yield None
+
+
+def set_thumbnail(
+    creds: Credentials,
+    video_id: str,
+    thumb_path: str,
+    *,
+    job: Optional["models.UploadJob"] = None,
+) -> None:
     """Upload the clip's still frame as the video's thumbnail.
 
     No-op if the file is missing. Resizes to ≤ 2 MB via Pillow if needed.
+
+    ``job`` (optional, kw-only) — when supplied, the call is logged to
+    ``YouTubeApiCall`` so the admin Usage dashboard can attribute the
+    50-unit thumbnails.set quota burn to the right user / upload job /
+    channel.  Older call sites that don't pass it still work; the row
+    just lands with NULL FK columns and shows under "system" in the
+    dashboard.
     """
     path = Path(thumb_path or "")
     if not path.exists():
@@ -195,6 +254,21 @@ def set_thumbnail(creds: Credentials, video_id: str, thumb_path: str) -> None:
 
     src = str(path)
     tmp_shrunk: Optional[Path] = None
+
+    # Resolve google_channel_id for the log row when we can.
+    _gcid = ""
+    try:
+        ch = getattr(job, "channel", None) if job is not None else None
+        tok = getattr(ch, "oauth_token", None) if ch else None
+        _gcid = (getattr(tok, "google_channel_id", "") or "")[:50]
+    except Exception:
+        _gcid = ""
+
+    try:
+        from learning.youtube_quota_log import log_youtube_call as _log_yt
+    except Exception:
+        _log_yt = None
+
     try:
         if path.stat().st_size > THUMB_MAX_BYTES:
             tmp_shrunk = _shrink(path)
@@ -202,10 +276,22 @@ def set_thumbnail(creds: Credentials, video_id: str, thumb_path: str) -> None:
 
         yt = _yt(creds)
         media = MediaFileUpload(src, mimetype="image/jpeg", resumable=False)
-        try:
-            yt.thumbnails().set(videoId=video_id, media_body=media).execute()
-        except HttpError as e:
-            raise _wrap_http(e) from e
+        # Wrap the actual API call so 50 units of quota burn shows in
+        # the dashboard, with attribution back to the upload job.
+        with (_log_yt(
+                db=None,
+                user_id=getattr(job, "user_id", None) if job else None,
+                upload_job_id=getattr(job, "id", None) if job else None,
+                clip_id=getattr(job, "clip_id", None) if job else None,
+                channel_id=getattr(job, "channel_id", None) if job else None,
+                google_channel_id=_gcid,
+                video_id=(video_id or "")[:50],
+                operation="thumbnails.set",
+              ) if _log_yt is not None else _nullctx()) as _call:
+            try:
+                yt.thumbnails().set(videoId=video_id, media_body=media).execute()
+            except HttpError as e:
+                raise _wrap_http(e) from e
     finally:
         if tmp_shrunk and tmp_shrunk.exists():
             try: tmp_shrunk.unlink()

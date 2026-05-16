@@ -96,14 +96,20 @@ def make_key(*parts: Any) -> str:
 
 
 def hash_file_prefix(path: str, *, prefix_bytes: int = 4 * 1024 * 1024) -> str:
-    """Content hash from the first ``prefix_bytes`` of a file + size +
-    mtime. 4 MiB is enough to distinguish any two real videos and
-    keeps the hash cheap on multi-hundred-MB sources.
+    """Content hash from the first ``prefix_bytes`` of a file + size.
+
+    4 MiB is enough to distinguish any two real videos and keeps the
+    hash cheap on multi-hundred-MB sources.
+
+    ``mtime`` is INTENTIONALLY excluded — re-uploading the same video
+    creates a new file with a fresh mtime, which busts the cache even
+    though the bytes are identical. The whole point of this cache is
+    to skip Gemini when the user uploads the same source twice.
     """
     h = hashlib.sha256()
     try:
         st = os.stat(path)
-        h.update(f"{st.st_size}:{int(st.st_mtime)}".encode())
+        h.update(f"{st.st_size}".encode())
         with open(path, "rb") as f:
             h.update(f.read(prefix_bytes))
     except Exception:

@@ -126,6 +126,9 @@ def list_accounts(
                 # Overlay logo for videos rendered under this YT account
                 "logo_asset_id":        t.logo_asset_id,
                 "logo":                 logo_map.get(t.logo_asset_id) if t.logo_asset_id else None,
+                # Per-YT-account upload route (null = inherit channel /
+                # system default).  Set via POST /upload-provider below.
+                "upload_provider":      t.upload_provider or None,
                 # Sibling Brand Accounts the user can toggle on/off as
                 # publish destinations. Includes the primary itself with
                 # is_primary=true so the UI can render it locked-on.
@@ -236,6 +239,51 @@ def set_account_logo(
     ch.oauth_token.logo_asset_id = payload.logo_asset_id
     db.commit()
     return {"channel_id": channel_id, "logo_asset_id": payload.logo_asset_id}
+
+
+class AccountProviderRequest(BaseModel):
+    # "postiz" | "kaizer" | None (= clear → inherit channel/system)
+    upload_provider: str | None = None
+
+
+@router.post("/accounts/{channel_id}/upload-provider")
+def set_account_upload_provider(
+    channel_id: int,
+    payload: AccountProviderRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Set (or clear) the upload route on the REAL YouTube account.
+
+    Lives on OAuthToken because the choice belongs to the destination
+    (this YT channel goes via Postiz / this one via native), not to
+    the style profile.  Null = inherit Channel.upload_provider →
+    system default per the worker's precedence chain.
+
+    Validates: the channel is owned by the caller AND linked to YT.
+    """
+    ch = db.query(models.Channel).filter(
+        models.Channel.id == channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not ch:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not ch.oauth_token:
+        raise HTTPException(
+            status_code=409,
+            detail="This profile is not linked to a YouTube account. Link it first.",
+        )
+
+    v = (payload.upload_provider or "").strip().lower() or None
+    if v is not None and v not in {"postiz", "kaizer"}:
+        raise HTTPException(
+            status_code=422,
+            detail="upload_provider must be 'postiz', 'kaizer', or null",
+        )
+
+    ch.oauth_token.upload_provider = v
+    db.commit()
+    return {"channel_id": channel_id, "upload_provider": v}
 
 
 @router.get("/authorize")

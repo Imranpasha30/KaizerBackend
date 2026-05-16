@@ -203,9 +203,17 @@ def _build_scale_crop_filter(
         hold_end = 0.4 * dur
         zoom_dur = max(0.01, dur - hold_end)
         # Before hold_end: factor = 1.0; after: factor grows linearly.
+        # FFmpeg filtergraph parser splits on top-level commas to
+        # identify filter boundaries — commas inside if() get misread
+        # as filter separators (the parser then hits ",crop=…" as a
+        # broken filter and fails with "No option name near 'frame'").
+        # Each comma inside the expression must be escaped with ``\,``
+        # so the parser treats it as part of the argument list.  In
+        # Python source that's ``\\,`` — one backslash for the Python
+        # string literal, one for FFmpeg's filter-arg escape.
         factor = (
-            f"if(lt(t,{hold_end:.4f}),"
-            f"1,"
+            f"if(lt(t\\,{hold_end:.4f})\\,"
+            f"1\\,"
             f"1+{intensity:.4f}*((t-{hold_end:.4f})/{zoom_dur:.4f}))"
         )
         return f"scale={_scale_expr(factor)}:eval=frame,crop={width}:{height}"

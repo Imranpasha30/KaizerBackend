@@ -274,6 +274,102 @@ def clear_clip_seo(clip_id: int, db: Session = Depends(get_db)):
     return {"clip_id": clip_id, "cleared": True}
 
 
+@router.post("/clips/{clip_id}/seo/apply-to-job-shorts")
+def apply_seo_to_job_shorts(
+    clip_id: int,
+    db: Session = Depends(get_db),
+):
+    """Copy this clip's SEO JSON to every OTHER Short in the same job.
+
+    Unlike the per-clip ``PUT /clips/{id}/seo`` which only updates an
+    existing SEO row, this endpoint UPSERTS — clips that have no SEO
+    yet get the donor's full JSON copied wholesale, and clips that
+    already have SEO get overwritten.  Solves the editor's "I only
+    generated SEO on clip 1 but the others can't publish because they
+    have no SEO" problem in a single round trip.
+
+    Skips:
+      * the source clip itself
+      * any bulletin clip (their SEO model differs; user must generate
+        separately on each)
+      * clips in a different job (channel safety + scoping)
+
+    Returns counts so the UI can show how many were updated vs how
+    many already had identical content.
+    """
+    src = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
+    if not src:
+        raise HTTPException(status_code=404, detail="Source clip not found")
+    if not src.seo:
+        raise HTTPException(
+            status_code=409,
+            detail="No SEO on this clip yet — generate it first",
+        )
+    # Validate the donor JSON parses so we don't propagate corruption.
+    try:
+        donor_seo = json.loads(src.seo)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=500,
+            detail="Source clip's SEO is corrupt — regenerate it first",
+        )
+
+    siblings = (
+        db.query(models.Clip)
+          .filter(models.Clip.job_id == src.job_id)
+          .filter(models.Clip.id != src.id)
+          .all()
+    )
+    # Mark the copy in metadata so audit trails can tell donors from
+    # generated SEO on the target rows. Doesn't affect publish behaviour.
+    donor_seo = dict(donor_seo)
+    donor_seo["copied_from_clip_id"] = int(src.id)
+    donor_seo["copied_at"]           = datetime.now(timezone.utc).isoformat()
+    donor_blob = json.dumps(donor_seo, ensure_ascii=False)
+
+    updated = 0
+    created = 0
+    skipped_bulletin = 0
+    skipped_identical = 0
+    target_ids: list[int] = []
+
+    for s in siblings:
+        if (s.frame_type or "").lower() == "bulletin":
+            skipped_bulletin += 1
+            continue
+        if s.seo == donor_blob:
+            skipped_identical += 1
+            continue
+        had_seo = bool(s.seo)
+        s.seo = donor_blob
+        # Reset variants — they were generated from the OLD seo and are
+        # now stale. The composer will regenerate per-channel variants
+        # at publish time from the donor SEO.
+        s.seo_variants = "{}"
+        if had_seo:
+            updated += 1
+        else:
+            created += 1
+        target_ids.append(int(s.id))
+        # Mirror the donor's status so the UI shows them as "ready".
+        try:
+            _set_status(int(s.id), "ready")
+        except Exception:
+            pass
+    db.commit()
+
+    return {
+        "source_clip_id":    int(src.id),
+        "job_id":            int(src.job_id) if src.job_id else None,
+        "target_clip_ids":   target_ids,
+        "created":           created,            # had no SEO before
+        "updated":           updated,            # overwrote existing
+        "skipped_bulletin":  skipped_bulletin,
+        "skipped_identical": skipped_identical,
+        "total_applied":     created + updated,
+    }
+
+
 # ─── Compose-preview for PublishModal (pure function, no side effects) ────────
 
 @router.get("/clips/{clip_id}/seo/compose-preview")

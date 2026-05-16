@@ -44,16 +44,20 @@ def _authed_yt_for(db: Session, channel_id: int):
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
-def _pick_pollable_uploads(db: Session) -> List[models.UploadJob]:
+def _pick_pollable_uploads(db: Session, channel_id: int | None = None) -> List[models.UploadJob]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=SAMPLE_WINDOW_DAYS)
-    return (
+    q = (
         db.query(models.UploadJob)
           .filter(models.UploadJob.status.in_(["done", "processing"]))
           .filter(models.UploadJob.video_id != "")
           .filter(models.UploadJob.updated_at >= cutoff)
-          .order_by(models.UploadJob.updated_at.desc())
-          .limit(500)
-          .all()
+    )
+    if channel_id is not None:
+        q = q.filter(models.UploadJob.channel_id == int(channel_id))
+    return (
+        q.order_by(models.UploadJob.updated_at.desc())
+         .limit(500)
+         .all()
     )
 
 
@@ -62,15 +66,22 @@ def _chunks(seq: List, n: int) -> Iterable[List]:
         yield seq[i:i + n]
 
 
-def poll_once() -> dict:
-    """Single sweep — poll stats for every recent upload, write ClipPerformance rows."""
+def poll_once(channel_id: int | None = None) -> dict:
+    """Single sweep — poll stats for every recent upload, write ClipPerformance rows.
+
+    When ``channel_id`` is provided, only uploads for that style profile
+    are sampled.  Powers the per-channel "Poll Now" button on the
+    Performance page so the admin can refresh one channel's numbers
+    without burning YouTube Data API quota on the others.
+    """
     db = SessionLocal()
     try:
-        uploads = _pick_pollable_uploads(db)
+        uploads = _pick_pollable_uploads(db, channel_id=channel_id)
         if not uploads:
             return {"sampled_at": datetime.now(timezone.utc).isoformat(),
                     "sampled":    0,
-                    "note":       "no recent uploads"}
+                    "note":       f"no recent uploads"
+                                  + (f" for channel {channel_id}" if channel_id else "")}
 
         public_client = _public_yt()
         sampled = 0

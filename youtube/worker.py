@@ -524,15 +524,156 @@ def _process(job_id: int) -> None:
             _fail(db, job, str(resolve_err))
             return
 
-        # ─── Provider routing (admin-controlled, system-wide) ─────
-        # Default = 'postiz': uploads go through the Postiz integration
-        # for that destination's YouTube channel. Native Kaizer code
-        # path (quota/auth/uploader below) only runs when admin has
-        # flipped the toggle to 'kaizer' in Admin → Settings.
+        # ─── Prefer Pro Editor beta render if newer than original ───
+        # The editor writes its result to
+        # ``output/beta_renders/clip_<id>/<style>_beta.mp4`` and a
+        # ``latest.json`` next to it.  Without this lookup the upload
+        # would publish the pipeline's original output even when the
+        # user had re-rendered the clip with a different font / colour
+        # / style pack — their visual edits would be invisible on
+        # YouTube.  Best-effort: any failure falls through to the
+        # original resolved path so the upload still completes.
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            base_dir = _Path(__file__).resolve().parent.parent
+            beta_meta = base_dir / "output" / "beta_renders" / f"clip_{clip.id}" / "latest.json"
+            if beta_meta.exists():
+                meta = _json.loads(beta_meta.read_text(encoding="utf-8"))
+                beta_path = (meta.get("beta_path") or "").strip()
+                if beta_path and _Path(beta_path).exists():
+                    beta_mtime = _Path(beta_path).stat().st_mtime
+                    orig_mtime = (
+                        _Path(resolved_clip_path).stat().st_mtime
+                        if resolved_clip_path and _Path(resolved_clip_path).exists()
+                        else 0
+                    )
+                    if beta_mtime > orig_mtime:
+                        _append_log(
+                            job,
+                            f"using beta render (style={meta.get('style_pack')}) "
+                            f"instead of original — picks up editor changes",
+                        )
+                        db.commit()
+                        resolved_clip_path = beta_path
+        except Exception as _beta_exc:
+            _append_log(job, f"beta-render lookup skipped: {_beta_exc}")
+
+        # ─── Provider routing (four-tier precedence) ────────────────
+        # Precedence: per-job override → per-YT-account (OAuthToken) →
+        # per-style-profile (Channel) → system default.  Each
+        # ``upload_provider`` column is null-by-default so legacy rows
+        # fall straight through to the system setting.
+        #
+        # OAuthToken is the LEVEL users naturally configure on the
+        # "My YouTube Accounts" cards (one knob per real destination,
+        # not per style profile).  Channel.upload_provider stays as a
+        # finer override when one YT account hosts multiple style
+        # profiles that need different routes (rare but possible).
         from system_settings import get_upload_provider
-        provider = get_upload_provider(db)
+        _dest_channel_for_routing = db.query(models.Channel).filter(
+            models.Channel.id == job.channel_id,
+        ).first()
+        _dest_tok_for_routing = (
+            _dest_channel_for_routing.oauth_token
+            if _dest_channel_for_routing else None
+        )
+        provider_job     = getattr(job, "upload_provider", None) or None
+        provider_oauth   = (getattr(_dest_tok_for_routing, "upload_provider", None)
+                            if _dest_tok_for_routing else None) or None
+        provider_channel = (getattr(_dest_channel_for_routing, "upload_provider", None)
+                            if _dest_channel_for_routing else None) or None
+        provider_system  = get_upload_provider(db)
+        provider = (
+            provider_job
+            or provider_oauth
+            or provider_channel
+            or provider_system
+        )
+        # Source labels make it obvious in the row log which knob
+        # decided the route — useful when comparing identical clips
+        # published to multiple channels with different settings.
+        if provider_job:
+            _source = "per-publish override"
+        elif provider_oauth:
+            _yt_name = (getattr(_dest_tok_for_routing, "google_channel_title", "")
+                        or "this YouTube account")
+            _source = f"YT account default ({_yt_name!r})"
+        elif provider_channel:
+            _source = f"style-profile default ({_dest_channel_for_routing.name!r})"
+        else:
+            _source = "system default"
+        _append_log(
+            job,
+            f"route: provider={provider!r}  ({_source})  | "
+            f"job={provider_job!r} yt={provider_oauth!r} "
+            f"channel={provider_channel!r} system={provider_system!r}",
+        )
+        db.commit()
+
         if provider == "postiz":
             _process_via_postiz(db, job, clip, resolved_clip_path)
+            return
+
+        # ─── Native RTMP-live route ─────────────────────────────────
+        # Quota-friendly path: bypasses ``videos.insert`` (1,600 units)
+        # in favour of the YouTube Live Streaming API (~250 units total
+        # across mint + finalize). Video appears as a "past stream" on
+        # the channel, fully editable / monetisable / commentable.
+        # See youtube/rtmp_agent.py for the lifecycle.
+        if provider == "native_rtmp":
+            if os.environ.get("KAIZER_NATIVE_RTMP_ENABLED", "false").lower() not in (
+                "1", "true", "yes", "on"
+            ):
+                _fail(db, job,
+                    "RTMP route requested but KAIZER_NATIVE_RTMP_ENABLED is off "
+                    "(set in .env to enable the feature)")
+                return
+            from youtube import rtmp_agent
+            from youtube.rtmp_provider import TransientRtmpError
+
+            _video_id_holder = {"id": ""}
+            _fail_msg_holder = {"msg": ""}
+
+            def _on_finish(vid: str) -> None:
+                _video_id_holder["id"] = vid
+
+            def _on_fail(msg: str) -> None:
+                _fail_msg_holder["msg"] = msg
+
+            try:
+                rtmp_agent.process_via_rtmp(
+                    db, job, clip, resolved_clip_path,
+                    append_log=_append_log,
+                    on_finish=_on_finish,
+                    on_fail=_on_fail,
+                )
+            except TransientRtmpError as t_exc:
+                _retry(db, job, f"transient RTMP error: {t_exc}")
+                return
+            except Exception as exc:
+                _fail(db, job, f"RTMP unexpected error: {exc}")
+                return
+
+            if _fail_msg_holder["msg"]:
+                _fail(db, job, _fail_msg_holder["msg"])
+                return
+
+            _vid = _video_id_holder["id"]
+            if not _vid:
+                _fail(db, job, "RTMP path completed without a video_id (unexpected)")
+                return
+
+            # Match the videos.insert success contract: only video_id +
+            # status are persisted on this row. The watch URL is derived
+            # from video_id at read time (consistent with the existing
+            # path). UploadJob has no video_url / completed_at columns.
+            job.video_id   = _vid
+            job.status     = "done"
+            job.last_error = ""
+            db.commit()
+            _append_log(job, f"[rtmp] published: https://www.youtube.com/watch?v={_vid}")
+            db.commit()
             return
 
         # ─── Quota check ───────────────────────────────────────────
@@ -553,6 +694,22 @@ def _process(job_id: int) -> None:
         # ─── Upload ────────────────────────────────────────────────
         job.attempts = (job.attempts or 0) + 1
         _append_log(job, f"starting upload (attempt {job.attempts})")
+        # Comparison block — identical schema is emitted by the Postiz
+        # path so the two routes can be diffed line-by-line. Keys are
+        # the YouTube metadata fields each path sends.
+        _append_log(
+            job,
+            "[compare:native] "
+            f"title={(job.title or '')[:60]!r} "
+            f"desc_len={len(job.description or '')} "
+            f"tags={len(list(job.tags or []))} "
+            f"category={job.category_id!r} "
+            f"privacy={job.privacy_status!r} "
+            f"made_for_kids={bool(job.made_for_kids)} "
+            f"lang={'te'!r} "
+            f"thumbnail={'yes' if clip.thumb_path else 'no'} "
+            f"embeddable=True publicStatsViewable=True notifySubscribers=False",
+        )
         db.commit()
 
         def _progress(uploaded: int, total: int) -> None:
@@ -602,9 +759,12 @@ def _process(job_id: int) -> None:
             db.commit()
 
             # ─── Thumbnail (best-effort, charged separately) ────
+            # Pass `job=` so the youtube_quota_log row gets attributed
+            # to the right user / upload job / channel in the admin
+            # Usage dashboard.
             if clip.thumb_path and quota.reserve(db, quota.COST_THUMBNAIL_SET):
                 try:
-                    uploader.set_thumbnail(creds, video_id, clip.thumb_path)
+                    uploader.set_thumbnail(creds, video_id, clip.thumb_path, job=job)
                     _append_log(job, "thumbnail applied")
                 except uploader.UploadError as e:
                     _append_log(job, f"thumbnail failed (non-fatal): {e}")
@@ -738,59 +898,173 @@ def _process_via_postiz(
         )
         return
 
-    # 3) Upload the local video bytes to Postiz first. Postiz Cloud
-    #    references media by INTERNAL id, not URL — passing R2 URLs
-    #    fails validation with "image.0.id should not be null". Use
-    #    the resolved local path (already downloaded by
-    #    _ensure_local_clip) so we don't depend on Postiz's
-    #    network reaching R2.
+    # 3) Per-destination logo overlay (before upload to Postiz).
+    #    Same machinery the native path uses: each Kaizer Channel can
+    #    have its own logo (Channel.logo_asset_id, or the OAuthToken's
+    #    logo_asset_id which wins when both are set — mirroring
+    #    main.py's download-with-logo logic). The pipeline renders a
+    #    clean master so this is where channel-specific branding gets
+    #    burned in.  If anything fails, we upload the clean master.
+    upload_path = resolved_clip_path
+    overlay_temp: str | None = None
+    try:
+        logo_asset_id = None
+        dest_tok = dest_channel.oauth_token
+        if dest_tok and getattr(dest_tok, "logo_asset_id", None):
+            logo_asset_id = dest_tok.logo_asset_id
+        elif getattr(dest_channel, "logo_asset_id", None):
+            logo_asset_id = dest_channel.logo_asset_id
+
+        if logo_asset_id:
+            logo_asset = db.query(models.UserAsset).filter(
+                models.UserAsset.id == logo_asset_id,
+            ).first()
+            if logo_asset:
+                from asset_resolver import materialize_asset_locally
+                logo_local = materialize_asset_locally(logo_asset)
+                if logo_local:
+                    _append_log(
+                        job,
+                        f"postiz: overlaying destination logo "
+                        f"({logo_asset.filename})…",
+                    )
+                    db.commit()
+                    from youtube import logo_overlay
+                    overlaid = logo_overlay.overlay_logo(
+                        resolved_clip_path, logo_local
+                    )
+                    if overlaid and overlaid != resolved_clip_path:
+                        upload_path = overlaid
+                        overlay_temp = overlaid
+                        _append_log(job, "postiz: logo overlay applied")
+                    else:
+                        _append_log(
+                            job,
+                            "postiz: logo overlay failed — uploading clean master",
+                        )
+    except Exception as e:
+        _append_log(job, f"postiz: logo overlay skipped: {e}")
+        upload_path = resolved_clip_path
+        overlay_temp = None
+
+    # 4) Upload the (possibly logo-branded) video bytes to Postiz.
+    #    Postiz Cloud references media by INTERNAL id, not URL —
+    #    passing R2 URLs fails validation with "image.0.id should not
+    #    be null". Use the resolved local path (already downloaded by
+    #    _ensure_local_clip) so we don't depend on Postiz's network
+    #    reaching R2.
     job.attempts = (job.attempts or 0) + 1
     _append_log(job, f"postiz: uploading video bytes "
-                       f"({Path(resolved_clip_path).name})…")
+                       f"({Path(upload_path).name})…")
     db.commit()
     try:
-        upload = postiz_client.upload_file(resolved_clip_path,
-                                           mime_type="video/mp4")
-    except postiz_client.PostizAuthError as e:
-        _fail(db, job, f"Postiz auth on upload: {e}")
-        return
-    except postiz_client.PostizError as e:
-        _retry(db, job, f"Postiz upload error: {e}")
-        return
+        try:
+            upload = postiz_client.upload_file(upload_path,
+                                               mime_type="video/mp4")
+        except postiz_client.PostizAuthError as e:
+            _fail(db, job, f"Postiz auth on upload: {e}")
+            return
+        except postiz_client.PostizError as e:
+            _retry(db, job, f"Postiz upload error: {e}")
+            return
 
-    media_id   = upload.get("id")
-    media_path = upload.get("path")
-    if not media_id:
-        _fail(db, job, f"Postiz upload returned no id: {upload!r}")
-        return
-    _append_log(job, f"postiz: upload OK id={media_id}")
+        media_id   = upload.get("id")
+        media_path = upload.get("path")
+        if not media_id:
+            _fail(db, job, f"Postiz upload returned no id: {upload!r}")
+            return
+        _append_log(job, f"postiz: upload OK id={media_id}")
 
-    # 4) Compose the post + dispatch.
-    _append_log(job, f"postiz: scheduling on integration {match.get('id','?')} "
-                       f"({match.get('name','?')})")
-    db.commit()
-    try:
-        result = postiz_client.schedule_post(
-            integration_ids=[match["id"]],
-            text=(job.title or "") + (("\n\n" + job.description) if job.description else ""),
-            media_id=media_id,
-            media_path=media_path,
-            schedule_at_iso=(job.publish_at.isoformat()
-                              if getattr(job, "publish_at", None) else None),
-            type_="scheduled" if getattr(job, "publish_at", None) else "now",
-            yt_title=(job.title or "").strip()[:100] or None,
-            yt_privacy=(job.privacy_status or "public"),
+        # 5) Compose the post + dispatch.
+        #    SEO push goes via Postiz's `settings` block on the YouTube
+        #    integration: title, privacy ("type"), tags, and
+        #    selfDeclaredMadeForKids — same fields the native uploader's
+        #    videos.insert body uses.  The post body's `text` is the
+        #    YouTube DESCRIPTION (not title+description glued — that put
+        #    the title into the description box twice).
+        _append_log(job, f"postiz: scheduling on integration {match.get('id','?')} "
+                           f"({match.get('name','?')})")
+        # Comparison block — identical schema as the native path's
+        # [compare:native] line.  Diffing these two lines is the
+        # canonical way to verify SEO parity.  Postiz today does NOT
+        # accept category / language / embeddable / publicStats / no-
+        # notify, so those fields show 'n/a' in the postiz row.
+        _append_log(
+            job,
+            "[compare:postiz] "
+            f"title={(job.title or '')[:60]!r} "
+            f"desc_len={len(job.description or '')} "
+            f"tags={len(list(job.tags or []))} "
+            f"category='n/a' "
+            f"privacy={(job.privacy_status or 'public')!r} "
+            f"made_for_kids={bool(job.made_for_kids)} "
+            f"lang='n/a' "
+            f"thumbnail={'auto-pick'} "
+            f"embeddable=n/a publicStatsViewable=n/a notifySubscribers=n/a",
         )
-    except postiz_client.PostizAuthError as e:
-        _fail(db, job, f"Postiz auth: {e}")
-        return
-    except postiz_client.PostizError as e:
-        _retry(db, job, f"Postiz error: {e}")
-        return
+        db.commit()
+        try:
+            result = postiz_client.schedule_post(
+                integration_ids=[match["id"]],
+                text=(job.description or ""),
+                media_id=media_id,
+                media_path=media_path,
+                schedule_at_iso=(job.publish_at.isoformat()
+                                  if getattr(job, "publish_at", None) else None),
+                type_="scheduled" if getattr(job, "publish_at", None) else "now",
+                yt_title=(job.title or "").strip()[:100] or None,
+                yt_privacy=(job.privacy_status or "public"),
+                yt_tags=list(job.tags or []),
+                yt_made_for_kids=bool(job.made_for_kids),
+            )
+        except postiz_client.PostizAuthError as e:
+            _fail(db, job, f"Postiz auth: {e}")
+            return
+        except postiz_client.PostizError as e:
+            _retry(db, job, f"Postiz error: {e}")
+            return
 
-    job.status = "done"
-    _append_log(job, f"postiz: scheduled OK ({result})")
-    db.commit()
+        # 6) Best-effort: pull the YouTube video id out of the Postiz
+        #    response so the Uploads page can render the "Open on
+        #    YouTube" link.  Postiz's response shape varies by post
+        #    type — for immediate posts the published URL usually
+        #    appears under `releaseURL` / `publishedUrl` / `url` on
+        #    each entry; for scheduled posts it won't be there yet
+        #    (a later poller will need to fetch it).  Search the whole
+        #    JSON blob recursively to be format-agnostic.
+        try:
+            import re as _re
+            blob = str(result or "")
+            # youtu.be/<id>  OR  youtube.com/watch?v=<id>  OR  /shorts/<id>
+            m = _re.search(
+                r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/))"
+                r"([A-Za-z0-9_-]{11})",
+                blob,
+            )
+            if m:
+                job.video_id = m.group(1)
+                _append_log(job, f"postiz: captured YouTube video_id {job.video_id}")
+            else:
+                _append_log(
+                    job,
+                    "postiz: no YouTube URL in immediate response — "
+                    "link will appear once Postiz publishes (or via later poll)",
+                )
+        except Exception as _e:
+            _append_log(job, f"postiz: video_id parse skipped: {_e}")
+
+        job.status = "done"
+        _append_log(job, f"postiz: scheduled OK ({result})")
+        db.commit()
+    finally:
+        # Drop the overlay temp file (no-op when overlay didn't run or
+        # overlay_logo() returned the original path on failure).
+        if overlay_temp:
+            try:
+                from youtube import logo_overlay
+                logo_overlay.cleanup_overlay(overlay_temp, resolved_clip_path)
+            except Exception:
+                pass
 
 
 def _retry(db: Session, job: models.UploadJob, err: str) -> None:
