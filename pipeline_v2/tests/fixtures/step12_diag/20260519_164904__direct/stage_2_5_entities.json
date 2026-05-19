@@ -1,0 +1,87 @@
+{
+  "entities": [
+    {
+      "canonical_name": "Bandi Bhagirath",
+      "native_name": "బండి భగీరత్",
+      "first_mention_word_idx": 14,
+      "type": "PERSON",
+      "mentions": [
+        14,
+        53,
+        171,
+        195,
+        206,
+        287,
+        318,
+        330,
+        337,
+        340,
+        368,
+        394,
+        510,
+        720,
+        735,
+        739,
+        1396,
+        1397,
+        1420,
+        1421
+      ]
+    },
+    {
+      "canonical_name": "High Court",
+      "native_name": "హైకోర్టు",
+      "first_mention_word_idx": 710,
+      "type": "ORG",
+      "mentions": [
+        710,
+        1033,
+        1070
+      ]
+    },
+    {
+      "canonical_name": "Telangana",
+      "native_name": "తెలంగాణ",
+      "first_mention_word_idx": 11,
+      "type": "PLACE",
+      "mentions": [
+        11,
+        85,
+        603,
+        272
+      ]
+    },
+    {
+      "canonical_name": "Hyderabad",
+      "native_name": "హైదరాబాద్",
+      "first_mention_word_idx": 90,
+      "type": "PLACE",
+      "mentions": [
+        90
+      ]
+    },
+    {
+      "canonical_name": "Nageshwar Rao",
+      "native_name": "నాగేశ్వర్ రావు",
+      "first_mention_word_idx": 263,
+      "type": "PERSON",
+      "mentions": [
+        263,
+        264,
+        277,
+        278
+      ]
+    },
+    {
+      "canonical_name": "Revanth Reddy",
+      "native_name": "రేవంత్రెడ్డి",
+      "first_mention_word_idx": 470,
+      "type": "PERSON",
+      "mentions": [
+        470,
+        471,
+        1416
+      ]
+    }
+  ]
+}

@@ -49,7 +49,6 @@ from typing import Any
 from inngest import (
     Context,
     NonRetriableError,
-    Step,
     TriggerEvent,
 )
 
@@ -547,8 +546,25 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
         if not timestamp:
             import time as _time
             timestamp = _time.strftime("%Y%m%d_%H%M%S")
+
+        # Stage 4 cancel_check (Step 12.3 Test 2 fix, backlog item
+        # 76). Stage 4's render takes ~5 min; without an internal
+        # cancel-check the user's cancel sits idle until finalize's
+        # cooperative check fires (potentially 5 min later). The
+        # callback below re-queries Job.cancel_requested at every
+        # sub-phase boundary inside _render_impl and raises
+        # NonRetriableError -- the same shape any other Inngest
+        # step boundary cancel produces. Propagation:
+        #   _render_impl     -> Stage 4 render() classifier
+        #   render()         -> _stage_4_render_handler's caller
+        #   process_video_v2 -> except Exception -> _mark_job_failed
+        #   Inngest          -> run.status=FAILED with cancel slug
+        def _stage_4_cancel_check() -> None:
+            _check_cancelled(job_id)
+
         result: RenderResult = renderer.render(
             job_output, timestamp=timestamp,
+            cancel_check=_stage_4_cancel_check,
         )
     except PermanentRenderError as exc:
         logger.warning(
@@ -706,8 +722,13 @@ _inngest = get_client()
     trigger=TriggerEvent(event="video/v2/uploaded"),
     retries=2,
 )
-async def process_video_v2(ctx: Context, step: Step) -> dict:
+async def process_video_v2(ctx: Context) -> dict:
     """Top-level orchestrator: 7 sequential Inngest steps.
+
+    Inngest SDK 0.5.18 calls the handler with a single ``Context``
+    argument; ``step`` is reached via ``ctx.step``. (Older versions
+    passed ``step`` as a second positional arg -- see backlog item
+    72 for the signature evolution.)
 
     Event data contract (sent by runner.py's V2 branch):
 
@@ -732,6 +753,9 @@ async def process_video_v2(ctx: Context, step: Step) -> dict:
     """
     event_data = ctx.event.data
     job_id = event_data.get("job_id")
+    # SDK 0.5.18: step accessor lives on Context; bind locally so
+    # the existing ``step.run(...)`` call sites below stay unchanged.
+    step = ctx.step
     logger.info(
         "process_video_v2 starting: job_id=%s video_path=%s",
         job_id, event_data.get("video_path"),
@@ -775,7 +799,15 @@ async def process_video_v2(ctx: Context, step: Step) -> dict:
         envelope = await step.run(
             FINALIZE, _finalize_handler, envelope,
         )
-    except BaseException as exc:
+    # IMPORTANT: catch Exception, not BaseException.
+    # Inngest SDK 0.5.18 uses BaseException-subclassed flow-control
+    # exceptions (ResponseInterrupt, SkipInterrupt, NestedStepInterrupt)
+    # which are raised after every step.run() yield to signal step
+    # completion. These MUST propagate to the SDK executor uncaught.
+    # Catching BaseException here would intercept them, falsely marking
+    # the Job as failed even though Inngest sees the run as completed.
+    # See backlog item 74 for the empirical discovery (Step 12.2b run #5).
+    except Exception as exc:
         # Terminal failure path. Write Job.status='failed' + Job.error
         # then RE-RAISE so Inngest's retry policy + UI see the failure.
         _mark_job_failed(job_id, exc)

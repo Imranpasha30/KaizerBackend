@@ -239,6 +239,8 @@ class TestV2STTProvidersEndpoint:
         expected_keys = {
             "id", "display_name", "tier",
             "cost_per_min_usd", "configured", "description",
+            # Step 12.5: per-provider warnings list (item 59).
+            "warnings",
         }
         for provider in result:
             assert set(provider.keys()) == expected_keys
@@ -333,6 +335,50 @@ class TestV2STTProvidersEndpoint:
         assert by_id["whisper-groq"]["cost_per_min_usd"] == 0.0
         assert by_id["deepgram"]["cost_per_min_usd"] == 0.0097
         assert by_id["assemblyai"]["cost_per_min_usd"] == 0.0070
+
+    # ---- Step 12.5 / backlog 59: warnings field ---------------------
+
+    def test_v2_stt_providers_includes_warnings_for_whisper_groq(
+        self, monkeypatch, main_module,
+    ):
+        # The whisper-groq entry surfaces the empirical
+        # Indian-language timestamp issue (Step 12.2a Path 2
+        # investigation, backlog 57). The frontend wizard reads
+        # this list and shows it as a warning hint when the user
+        # selects whisper-groq.
+        for k in ("GROQ_API_KEY", "DEEPGRAM_API_KEY", "ASSEMBLYAI_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        result = main_module.get_v2_stt_providers()
+        by_id = {p["id"]: p for p in result}
+        groq_warnings = by_id["whisper-groq"]["warnings"]
+        assert isinstance(groq_warnings, list)
+        assert len(groq_warnings) >= 1, (
+            "whisper-groq must have at least one warning string "
+            "documenting the Indian-language timestamp issue."
+        )
+        # The warning text MUST mention 'Telugu' or 'Hindi' (or
+        # both) so the UI rendering reads naturally.
+        combined = " ".join(groq_warnings).lower()
+        assert "telugu" in combined or "hindi" in combined, (
+            f"whisper-groq warning must reference Telugu/Hindi; "
+            f"got: {groq_warnings!r}"
+        )
+
+    def test_v2_stt_providers_other_providers_have_empty_warnings(
+        self, monkeypatch, main_module,
+    ):
+        # Deepgram + AssemblyAI have no known issues today and
+        # must return ``warnings: []`` (NOT missing the key).
+        for k in ("GROQ_API_KEY", "DEEPGRAM_API_KEY", "ASSEMBLYAI_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        result = main_module.get_v2_stt_providers()
+        by_id = {p["id"]: p for p in result}
+        for provider_id in ("deepgram", "assemblyai"):
+            warnings = by_id[provider_id]["warnings"]
+            assert warnings == [], (
+                f"{provider_id} should have empty warnings list "
+                f"(no known issues); got {warnings!r}"
+            )
 
     def test_display_names_human_readable(self, monkeypatch, main_module):
         # Pin display names so UI design doesn't silently drift.
@@ -510,5 +556,218 @@ class TestRunPipelineV2Branch:
         # Preset shape
         assert event.data["preset"]["width"] == 1080
         assert event.data["preset"]["height"] == 1920
+
+
+# ====================================================================== #
+# Step 12.2b: V2 Inngest serve mount                                      #
+# ====================================================================== #
+
+
+class TestV2InngestServeMount:
+    """The Inngest Dev Server (and prod Inngest Cloud) discover the V2
+    function by polling ``/api/inngest`` on the host FastAPI app.
+    ``main.py`` mounts that handler via ``register_v2_inngest`` at the
+    very end of module load, guarded by ``KAIZER_V2_ENABLED``.
+
+    These tests use route-inspection (``app.routes``) so they don't
+    require an HTTP server -- the registration happens at module
+    import time, so reloading ``main`` under different env vars is
+    the right shape for the test.
+    """
+
+    @staticmethod
+    def _reload_main_fresh():
+        # Drop both main AND the inngest_app idempotency guard so the
+        # mount happens fresh on the next import. Without resetting
+        # the guard, a prior test's import would block the mount.
+        if "main" in sys.modules:
+            del sys.modules["main"]
+        # Lazy import so a missing pipeline_v2 path doesn't trip
+        # collection; register_v2_inngest's module is normally added
+        # to sys.path by main.py's V2 block. Direct import works here
+        # because conftest already arranged the path.
+        try:
+            from pipeline_v2.inngest_app import _reset_for_tests
+            _reset_for_tests()
+        except ImportError:
+            # If pipeline_v2 isn't on sys.path yet, the next main
+            # import will add it and the guard starts False naturally.
+            pass
+        return importlib.import_module("main")
+
+    def test_inngest_app_module_imports_cleanly(self):
+        # Smoke import: the module loads + register_v2_inngest is
+        # callable. Catches dependency-missing regressions before
+        # the route-inspection tests run.
+        from pipeline_v2.inngest_app import register_v2_inngest
+        assert callable(register_v2_inngest)
+
+    def test_v2_enabled_mounts_inngest_route(self, monkeypatch):
+        # With KAIZER_V2_ENABLED=1, main.py module-load mounts the
+        # ``/api/inngest`` serve endpoint via inngest.fast_api.serve.
+        # The Inngest SDK registers three HTTP methods on that path
+        # (GET for function discovery, POST for invocation, PUT for
+        # sync) -- we assert at least one of them appears.
+        monkeypatch.setenv("KAIZER_V2_ENABLED", "1")
+        m = self._reload_main_fresh()
+        inngest_paths = [
+            r.path for r in m.app.routes
+            if hasattr(r, "path") and r.path == "/api/inngest"
+        ]
+        assert len(inngest_paths) >= 1, (
+            f"expected /api/inngest mounted when V2 enabled, "
+            f"got {len(inngest_paths)} matching routes"
+        )
+        # Inngest SDK registers exactly 3 HTTP methods on the path.
+        methods = set()
+        for r in m.app.routes:
+            if hasattr(r, "path") and r.path == "/api/inngest":
+                methods.update(getattr(r, "methods", set()) or set())
+        assert {"GET", "POST", "PUT"}.issubset(methods), (
+            f"expected GET+POST+PUT on /api/inngest, got {methods}"
+        )
+
+    def test_v2_disabled_does_not_mount_inngest_route(self, monkeypatch):
+        # With KAIZER_V2_ENABLED=0, the V2 block is skipped and the
+        # /api/inngest route does NOT mount. The 4 V1 platforms ship
+        # with a byte-identical route table to pre-V2.
+        monkeypatch.setenv("KAIZER_V2_ENABLED", "0")
+        m = self._reload_main_fresh()
+        inngest_paths = [
+            r.path for r in m.app.routes
+            if hasattr(r, "path") and "/inngest" in r.path.lower()
+        ]
+        assert len(inngest_paths) == 0, (
+            f"expected NO inngest routes when V2 disabled, "
+            f"got {inngest_paths}"
+        )
+
+    def test_process_video_v2_signature_compatible_with_inngest_sdk(self):
+        """Inngest SDK 0.5.18 calls ``handler(ctx)`` -- a SINGLE
+        positional argument. The handler must accept exactly one
+        parameter; ``step`` is reached via ``ctx.step``.
+
+        Pre-Step-12.2b the orchestrator was declared
+        ``async def process_video_v2(ctx, step)`` -- which Inngest
+        invoked as ``handler(ctx)`` and failed with
+        ``TypeError: process_video_v2() missing 1 required positional
+        argument: 'step'``. That bug cost 4 failed E2E runs to
+        surface (none of which exercise this signature at unit-test
+        time today). This test locks the contract so future Inngest
+        SDK bumps that change the calling convention fail HERE
+        instead of 76 seconds into a real Inngest dev run.
+
+        See backlog item 72 for the signature evolution.
+        """
+        import inspect
+        from pipeline_v2.orchestrator import process_video_v2
+
+        # The @inngest.create_function decorator wraps the original
+        # async def into an inngest.Function object. The underlying
+        # handler is stored on ``_handler``.
+        underlying = getattr(process_video_v2, "_handler", None)
+        assert underlying is not None, (
+            "process_video_v2._handler missing -- the @create_function "
+            "decorator's API changed; update this test to find the "
+            "new attribute name."
+        )
+
+        params = list(inspect.signature(underlying).parameters)
+        assert params == ["ctx"], (
+            f"process_video_v2 must accept exactly one positional "
+            f"argument 'ctx' (Inngest SDK 0.5.18 calling convention); "
+            f"got parameters={params}. Backlog item 72."
+        )
+        # Defensive: 'step' must NOT reappear in the signature --
+        # that was the failure mode that took 4 E2E runs to diagnose.
+        assert "step" not in params, (
+            "process_video_v2 must not have a 'step' parameter; "
+            "access step via ctx.step. See backlog item 72."
+        )
+
+    def test_orchestrator_terminal_catch_does_not_intercept_baseexception(
+        self,
+    ):
+        """V2 orchestrator's outer terminal-failure try/except MUST catch
+        ``Exception``, not ``BaseException``. Inngest SDK 0.5.18 uses
+        ``BaseException``-subclassed flow-control exceptions
+        (``ResponseInterrupt``, ``SkipInterrupt``, ``NestedStepInterrupt``)
+        that are raised after every step.run() yield to signal step
+        completion. These MUST propagate to the SDK executor uncaught.
+        Catching ``BaseException`` intercepts them and falsely marks the
+        Job as failed even though Inngest sees the run as completed --
+        leading to the "Inngest dashboard COMPLETED but DB shows
+        Job.status='failed'" symptom diagnosed in Step 12.2b run #5.
+
+        AST-level check (read the source text + grep) rather than a
+        runtime check because the actual ResponseInterrupt flow is hard
+        to mock cleanly. Intent: "you shouldn't catch BaseException
+        in the orchestrator's try-wrapper, period."
+
+        See backlog item 74.
+        """
+        from pathlib import Path
+        orch_path = (
+            Path(__file__).resolve().parent.parent
+            / "pipeline_v2" / "pipeline_v2" / "orchestrator.py"
+        )
+        assert orch_path.is_file(), f"orchestrator.py not found at {orch_path}"
+        src = orch_path.read_text(encoding="utf-8")
+
+        # Locate the process_video_v2 function body. We only want to
+        # assert about the wrapper INSIDE that function -- other
+        # helpers in the file may legitimately catch BaseException.
+        marker = "async def process_video_v2"
+        start = src.find(marker)
+        assert start >= 0, "process_video_v2 not found in orchestrator.py"
+        # Take a slice covering the function body (next function or EOF).
+        next_def = src.find("\nasync def ", start + len(marker))
+        if next_def == -1:
+            next_def = src.find("\ndef ", start + len(marker))
+        if next_def == -1:
+            next_def = len(src)
+        body = src[start:next_def]
+
+        # The wrapper must NOT catch BaseException, and MUST catch
+        # Exception. Both checks together lock the contract.
+        assert "except BaseException" not in body, (
+            "process_video_v2 must not catch BaseException -- Inngest "
+            "SDK flow-control exceptions (ResponseInterrupt, etc.) "
+            "subclass BaseException and must propagate uncaught. "
+            "See backlog item 74."
+        )
+        assert "except Exception" in body, (
+            "process_video_v2 must have a terminal `except Exception` "
+            "wrapper that calls _mark_job_failed on real failures. "
+            "See backlog item 74."
+        )
+
+    def test_inngest_sdk_flow_control_exceptions_subclass_baseexception(
+        self,
+    ):
+        """Document the SDK invariant the orchestrator's
+        ``except Exception`` choice depends on. If Inngest ever changes
+        these to subclass ``Exception`` instead, this test fails and
+        flags the orchestrator's catch as eligible for re-evaluation
+        (the current `except Exception` would still be correct but
+        the BaseException-avoidance rationale would no longer apply).
+
+        See backlog item 74.
+        """
+        from inngest._internal.step_lib.base import (
+            ResponseInterrupt,
+            SkipInterrupt,
+            NestedStepInterrupt,
+        )
+        for cls in (ResponseInterrupt, SkipInterrupt, NestedStepInterrupt):
+            assert issubclass(cls, BaseException), (
+                f"{cls.__name__} should subclass BaseException"
+            )
+            assert not issubclass(cls, Exception), (
+                f"{cls.__name__} unexpectedly subclasses Exception. "
+                f"This means Inngest changed the contract; re-evaluate "
+                f"backlog item 74's empirical assumption."
+            )
+
 
 

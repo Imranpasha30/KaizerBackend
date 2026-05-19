@@ -1,0 +1,165 @@
+{
+  "transcript": {
+    "words": [
+      {
+        "w": "హలో",
+        "s": 0.16,
+        "e": 0.48,
+        "speaker": 0,
+        "confidence": 0.81591797
+      },
+      {
+        "w": "నమస్తే",
+        "s": 0.48,
+        "e": 0.96,
+        "speaker": 0,
+        "confidence": 1.0
+      },
+      {
+        "w": "వెల్కమ్",
+        "s": 0.96,
+        "e": 1.36,
+        "speaker": 0,
+        "confidence": 0.9885254
+      },
+      {
+        "w": "టు",
+        "s": 1.36,
+        "e": 1.4399999,
+        "speaker": 0,
+        "confidence": 0.99609375
+      },
+      {
+        "w": "కైసన్",
+        "s": 1.4399999,
+        "e": 1.8399999,
+        "speaker": 0,
+        "confidence": 0.6924642
+      },
+      {
+        "w": "న్యూస్",
+        "s": 1.8399999,
+        "e": 2.0,
+        "speaker": 0,
+        "confidence": 0.70214844
+      },
+      {
+        "w": "ఏదైతే",
+        "s": 2.0,
+        "e": 2.32,
+        "speaker": 0,
+        "confidence": 0.63427734
+      },
+      {
+        "w": "గత",
+        "s": 2.32,
+        "e": 2.56,
+        "speaker": 0,
+        "confidence": 1.0
+      },
+      {
+        "w": "కొద్ది",
+        "s": 2.56,
+        "e": 2.8799999,
+        "speaker": 0,
+        "confidence": 0.9951172
+      },
+      {
+        "w": "రోజుల",
+        "s": 2.8799999,
+        "e": 3.12,
+        "speaker": 0,
+        "confidence": 0.9980469
+      },
+      {
+        "w": "నుంచి",
+        "s": 3.12,
+        "e": 3.4399998,
+        "speaker": 0,
+        "confidence": 0.9980469
+      },
+      {
+        "w": "తెలంగాణలో",
+        "s": 3.4399998,
+        "e": 4.08,
+        "speaker": 0,
+        "confidence": 0.99316406
+      },
+      {
+        "w": "హా",
+        "s": 4.08,
+        "e": 4.4,
+        "speaker": 0,
+        "confidence": 0.47485352
+      },
+      {
+        "w": "టాపిక్",
+        "s": 4.4,
+        "e": 4.64,
+        "speaker": 0,
+        "confidence": 0.9970703
+      },
+      {
+        "w": "నడుస్తుందో",
+        "s": 4.64,
+        "e": 5.2799997,
+        "speaker": 0,
+        "confidence": 0.8852539
+      },
+      {
+        "w": "బండి",
+        "s": 5.2799997,
+        "e": 5.52,
+        "speaker": 0,
+        "confidence": 0.93359375
+      },
+      {
+        "w": "భగిరెత్సులో",
+        "s": 5.52,
+        "e": 6.3999996,
+        "speaker": 0,
+        "confidence": 0.71494836
+      },
+      {
+        "w": "నిన్న",
+        "s": 6.3999996,
+        "e": 6.7999997,
+        "speaker": 0,
+        "confidence": 0.6904297
+      },
+      {
+        "w": "రాత్రికి",
+        "s": 6.7999997,
+        "e": 7.3599997,
+        "speaker": 0,
+        "confidence": 0.9875488
+      },
+      {
+        "w": "కథ",
+        "s": 7.3599997,
+        "e": 7.68,
+        "speaker": 0,
+        "confidence": 0.99609375
+      }
+    ],
+    "duration_sec": 713.952,
+    "detected_languages": [
+      "te"
+    ],
+    "provider": "deepgram",
+    "_word_count": 1474
+  },
+  "transcript_json_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\transcript.json",
+  "metadata_json_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\stt_metadata.json",
+  "stt_provider": "deepgram",
+  "stt_audio_duration_sec": 713.952,
+  "stt_wall_seconds": 9.220647500002087,
+  "stt_cost_usd": 0.11542224000000001,
+  "stt_word_count": 1474,
+  "stt_avg_confidence": 0.8479410244504726,
+  "stt_language_detected": "te",
+  "stt_request_id": "019e3ff7-e21e-7ed1-a54d-6430c94cab64",
+  "stt_language_hint": "te",
+  "stt_brief": "",
+  "stt_names": []
+}

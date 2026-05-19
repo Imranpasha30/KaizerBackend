@@ -13,6 +13,31 @@ context is NOT a short.
 
 ---
 
+## CRITICAL: SHORTS DURATION CONSTRAINT
+
+EVERY shorts_cut in your output MUST satisfy:
+
+  end_sec - start_sec  >=  15.0   (no shorter than 15 seconds)
+  end_sec - start_sec  <=  60.0   (no longer than 60 seconds)
+
+This is a HARD rule. Violations are rejected by downstream validation
+and force the entire bulletin to retry. Do NOT emit borderline cases
+like 14.9s or 60.5s.
+
+  ✓ VALID:   {"start_sec":  12.5, "end_sec":  35.2}   duration 22.7s
+  ✓ VALID:   {"start_sec": 100.0, "end_sec": 158.5}   duration 58.5s
+  ✗ INVALID: {"start_sec": 215.3, "end_sec": 223.2}   duration  7.9s  — TOO SHORT
+  ✗ INVALID: {"start_sec": 100.0, "end_sec": 175.0}   duration 75.0s  — TOO LONG
+
+Before emitting EACH shorts_cut, mentally verify:
+    "Is end_sec - start_sec between 15.0 and 60.0?"
+If the natural moment is shorter than 15s, EXTEND start_sec or
+end_sec to a nearby word boundary that brings the duration into
+range. If the moment is longer than 60s, TRIM to the most
+share-worthy 60-second window.
+
+---
+
 ## Inputs
 
 You receive:

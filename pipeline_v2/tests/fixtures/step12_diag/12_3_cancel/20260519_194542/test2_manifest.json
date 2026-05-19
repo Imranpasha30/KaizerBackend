@@ -1,0 +1,38 @@
+{
+  "timestamp": "20260519_195024",
+  "mode": "inngest_stage_4_cancel",
+  "test_video": "E:\\kaizer new data training\\videos\\test.mp4",
+  "worker_pid": 26256,
+  "inngest": {
+    "run_id": "01KS09FCD3AF2X53B8CFMF1B3T",
+    "app_id_uuid": "98d49272-f7ee-5ba3-af64-aef74a2da371",
+    "sent_event_ids": [
+      "01KS09FCA4HBYJXM9JFTETRRCD"
+    ],
+    "final_status": "FAILED"
+  },
+  "cancel": {
+    "stage_4_entered_at_s": 266.21,
+    "cancel_requested_at_s": 266.23,
+    "terminal_status_at_s": 280.42,
+    "time_to_terminal_s": 14.2,
+    "time_to_zero_ffmpeg_s": 14.19,
+    "v1_cancel_job_invoked": true
+  },
+  "processes_before_cancel": [
+    {
+      "pid": 18896,
+      "name": "ffmpeg.exe",
+      "exe_basename": "ffmpeg.exe",
+      "parent_pid": 26256,
+      "cmdline_head": "C:\\Users\\user\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.EXE -y -ss 74.415 -t 35.93 -i E:\\kaizer new data training\\vide"
+    }
+  ],
+  "processes_after_cancel": [],
+  "job_state_at_terminal": {
+    "status": "failed",
+    "current_stage": null,
+    "error_snippet": "NonRetriableError: cancelled: job 991200302 cancel_requested=True\nTraceback (most recent call last):\n  File \"E:\\kaizer new data training\\kaizer\\KaizerBackend\\pipeline_v2\\pipeline_v2\\orchestrator.py\", line 796, in process_video_v2\n    envelope = await step.run(\n  File \"E:\\kaizer new data training\\venv\\lib\\site-packages\\inngest\\_internal\\step_lib\\step_async.py\", line 213, in run\n    raise err\n  File \"E:\\kaizer new data training\\venv\\lib\\site-packages\\inngest\\_internal\\step_lib\\step_async.py\", line"
+  },
+  "wall_seconds": 280.42
+}

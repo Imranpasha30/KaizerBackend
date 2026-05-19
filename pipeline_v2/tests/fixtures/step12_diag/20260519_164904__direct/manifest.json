@@ -1,0 +1,31 @@
+{
+  "timestamp": "20260519_170319",
+  "mode": "direct",
+  "test_video": "E:\\kaizer new data training\\videos\\test.mp4",
+  "stt_provider": "deepgram",
+  "wall_seconds": 853.43,
+  "cost_usd": {
+    "stage_0_ingest": 0.0,
+    "stage_1_transcribe": 0.1154,
+    "stage_2_continuity": 0.0,
+    "stage_2_5_entities": 0.0,
+    "stage_3_fanout": 0.0,
+    "stage_4_render": 0.0,
+    "finalize": 0.0,
+    "TOTAL": 0.1154
+  },
+  "checks": {
+    "stage_0_mezzanine": "PASS",
+    "stage_1_word_array": "PASS",
+    "stage_2_decisions": "PASS",
+    "stage_2_5_entities": "PASS",
+    "stage_3_fanout": "PASS",
+    "stage_4_render": "PASS",
+    "finalize_db": "PASS"
+  },
+  "outputs": {
+    "shorts_editor_meta": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\editor_meta.json",
+    "bulletin_mp4": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin.mp4",
+    "bulletin_size_mb": 207.27
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "timestamp": "20260519_184426",
+  "mode": "inngest",
+  "test_video": "E:\\kaizer new data training\\videos\\test.mp4",
+  "stt_provider": "deepgram",
+  "inngest": {
+    "run_id": "01KS053XS4EF87T590RP9R2CVS",
+    "app_id_uuid": "98d49272-f7ee-5ba3-af64-aef74a2da371",
+    "sent_event_ids": [
+      "01KS053XJ2E2KM6AFZQ4CKJFNP"
+    ],
+    "from_iso": "2026-05-19T12:59:33Z",
+    "final_status": "COMPLETED",
+    "dispatch_latency_s": 1.03
+  },
+  "wall_seconds": 893.09,
+  "cost_usd": {
+    "finalize": 0.0,
+    "stage_0_ingest": 0.0,
+    "stage_1_transcribe": 0.1154,
+    "stage_2_5_entities": 0.0,
+    "stage_2_continuity": 0.0,
+    "stage_3_fanout": 0.0,
+    "stage_4_render": 0.0,
+    "TOTAL": 0.1154
+  },
+  "checks": {
+    "stage_0_mezzanine": "PASS",
+    "stage_1_word_array": "PASS",
+    "stage_2_decisions": "PASS",
+    "stage_2_5_entities": "PASS",
+    "stage_3_fanout": "PASS",
+    "stage_4_render": "PASS",
+    "finalize_db": "PASS"
+  }
+}

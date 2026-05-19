@@ -1,0 +1,34 @@
+{
+  "timestamp": "20260519_200105",
+  "mode": "inngest_idempotency_dedup",
+  "test_video": "E:\\kaizer new data training\\videos\\test.mp4",
+  "inngest": {
+    "app_id_uuid": "98d49272-f7ee-5ba3-af64-aef74a2da371",
+    "from_iso": "2026-05-19T14:29:05Z",
+    "run_id": "01KS0A7VZ22V8KDJK4DGDYN6MJ",
+    "final_status": "FAILED"
+  },
+  "idempotency": {
+    "event_id_used": "job-991200400",
+    "send_1_result": [
+      "01KS0A7VT82Z5E3XPBST11JSPE"
+    ],
+    "send_2_result": [
+      "01KS0A80PRHTT9RDR849W51099"
+    ],
+    "time_between_sends_s": 5.007,
+    "runs_observed": 1,
+    "dedup_verified": true
+  },
+  "execution": {
+    "post_30s_status": "RUNNING",
+    "cancel_requested_at_s": 45.03,
+    "terminal_status_at_s": 119.47,
+    "wall_seconds": 119.47
+  },
+  "job_state_at_terminal": {
+    "status": "failed",
+    "current_stage": null,
+    "error_snippet": "NonRetriableError: cancelled: job 991200400 cancel_requested=True\nTraceback (most recent call last):\n  File \"E:\\kaizer new data training\\kaizer\\KaizerBackend\\pipeline_v2\\pipeline_v2\\orchestrator.py\", line 784, in process_video_v2\n    envelope = await step.run(\n  File \"E:\\kaizer new data training\\ven"
+  }
+}

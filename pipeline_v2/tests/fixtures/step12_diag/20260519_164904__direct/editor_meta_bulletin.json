@@ -1,0 +1,32 @@
+{
+  "render_mode": "bulletin",
+  "platform": "full_video_shorts_v2",
+  "language": "te",
+  "stories": 1,
+  "skipped": 10,
+  "duration_s": 713.792,
+  "clips": [
+    {
+      "clip_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin_with_overlays.mp4",
+      "thumb_path": "",
+      "image_path": "",
+      "duration": 713.792,
+      "frame_type": "bulletin",
+      "text": "తెలంగాణలో బండి భగీరథ్ కేసుపై తాజా వివరాలను బులెటిన్ అందిస్తుంది. బాధితురాలు మైనర్ కాదని, మేజర్ అని కోర్టు స్పష్టం చేసింది. భగీరథ్ మధ్యంతర బెయిల్ పిటిషన్‌పై తీర్పును గురువారానికి రిజర్వ్ చేశారు. బాధితురాలి తరపు న్యాయవాది నాగేశ్వర్ రావు మరో నలుగురు బాధితులు బయటకు వస్తారని వెల్లడించారు. సిటీ సివిల్ కోర్టు గ్యాగ్ ఆర్డర్ జారీ చేసిందా లేదా అనే దానిపై న్యాయవాదుల మధ్య వివాదం కొనసాగుతోంది.",
+      "sentiment": "",
+      "entities": [
+        "Bandi Bhagirath",
+        "Nageshwar Rao",
+        "Revanth Reddy"
+      ],
+      "card_params": {},
+      "section_pct": {},
+      "follow_params": {},
+      "storage_url": "",
+      "storage_key": "",
+      "storage_backend": "",
+      "clip_path_overlay": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin_with_overlays.mp4",
+      "clip_path_carousel_only": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin.mp4"
+    }
+  ]
+}

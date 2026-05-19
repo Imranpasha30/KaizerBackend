@@ -1,0 +1,173 @@
+{
+  "shorts_cuts": [
+    {
+      "index": 0,
+      "start_sec": 72.16,
+      "end_sec": 110.345,
+      "hook": "Bail petition verdict reserved for Thursday",
+      "importance": 8
+    },
+    {
+      "index": 1,
+      "start_sec": 129.455,
+      "end_sec": 159.28,
+      "hook": "Nageshwar Rao reveals Bhagirath's past cases",
+      "importance": 7
+    },
+    {
+      "index": 2,
+      "start_sec": 202.06,
+      "end_sec": 223.205,
+      "hook": "Revanth Reddy: 'Law spares no one'",
+      "importance": 7
+    },
+    {
+      "index": 3,
+      "start_sec": 271.785,
+      "end_sec": 287.3,
+      "hook": "Police slow to find Bhagirath, public questions",
+      "importance": 6
+    },
+    {
+      "index": 4,
+      "start_sec": 335.84,
+      "end_sec": 363.21,
+      "hook": "No court protection: Will Bhagirath be arrested?",
+      "importance": 8
+    },
+    {
+      "index": 5,
+      "start_sec": 404.635,
+      "end_sec": 449.88,
+      "hook": "Court issues gag order on media content",
+      "importance": 7
+    }
+  ],
+  "metadata": {
+    "video_type": "SOLO",
+    "language": "te-en",
+    "total_speakers": 1,
+    "overall_summary": "The bulletin provides updates on the Bandi Bhagirath case in Telangana. The court has clarified that the victim is an adult, not a minor, based on official records. The verdict on Bhagirath's interim bail petition has been reserved for Thursday. The victim's lawyer, Nageshwar Rao, revealed that four other victims are expected to come forward. Additionally, there is a dispute among advocates regarding whether a gag order was actually issued by the City Civil Court concerning the case.",
+    "overall_summary_native": "తెలంగాణలో బండి భగీరథ్ కేసుపై తాజా వివరాలను బులెటిన్ అందిస్తుంది. బాధితురాలు మైనర్ కాదని, మేజర్ అని కోర్టు స్పష్టం చేసింది. భగీరథ్ మధ్యంతర బెయిల్ పిటిషన్‌పై తీర్పును గురువారానికి రిజర్వ్ చేశారు. బాధితురాలి తరపు న్యాయవాది నాగేశ్వర్ రావు మరో నలుగురు బాధితులు బయటకు వస్తారని వెల్లడించారు. సిటీ సివిల్ కోర్టు గ్యాగ్ ఆర్డర్ జారీ చేసిందా లేదా అనే దానిపై న్యాయవాదుల మధ్య వివాదం కొనసాగుతోంది.",
+    "shorts_headline_native": "బండి భగీరథ్‌ కేసు: కోర్టు తీర్పు, నలుగురు బాధితులు",
+    "bulletin_marquee_points": [
+      "బండి భగీరథ్‌ కేసులో కొత్త మలుపు",
+      "బాధితురాలు మైనర్ కాదు, మేజర్ అని కోర్టు స్పష్టం",
+      "మధ్యంతర బెయిల్ తీర్పు గురువారానికి రిజర్వ్",
+      "నాగేశ్వర్ రావు సంచలన ప్రకటన: మరో నలుగురు బాధితులు",
+      "గ్యాగ్ ఆర్డర్ పైన న్యాయవాదుల మధ్య వాగ్వాదం"
+    ],
+    "image_search_queries": [
+      "Bandi Bhagirath court case",
+      "Telangana High Court building",
+      "Indian judicial system",
+      "lawyer press conference India",
+      "Revanth Reddy statement"
+    ],
+    "key_people": [
+      "Bandi Bhagirath",
+      "Nageshwar Rao",
+      "Revanth Reddy"
+    ],
+    "key_people_native": [
+      "బండి భగీరత్",
+      "నాగేశ్వర్ రావు",
+      "రేవంత్రెడ్డి"
+    ],
+    "key_topics": [
+      "Bandi Bhagirath case",
+      "interim bail",
+      "gag order",
+      "victim's age",
+      "police investigation"
+    ],
+    "key_locations": [
+      "Telangana",
+      "Hyderabad"
+    ]
+  },
+  "image_plan": {
+    "entries": [
+      {
+        "entity_name": "Telangana",
+        "entity_name_native": "తెలంగాణ",
+        "description": "Map of Telangana state in India",
+        "clip_index": 0,
+        "show_at_sec": 4.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Bandi Bhagirath",
+        "entity_name_native": "బండి భగీరత్",
+        "description": "Bandi Bhagirath headshot",
+        "clip_index": 0,
+        "show_at_sec": 6.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Hyderabad",
+        "entity_name_native": "హైదరాబాద్",
+        "description": "Hyderabad city skyline",
+        "clip_index": 0,
+        "show_at_sec": 39.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Nageshwar Rao",
+        "entity_name_native": "నాగేశ్వర్ రావు",
+        "description": "Nageshwar Rao headshot",
+        "clip_index": 0,
+        "show_at_sec": 120.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Bandi Bhagirath",
+        "entity_name_native": "బండి భగీరత్",
+        "description": "Bandi Bhagirath case file",
+        "clip_index": 0,
+        "show_at_sec": 143.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Revanth Reddy",
+        "entity_name_native": "రేవంత్రెడ్డి",
+        "description": "Telangana CM Revanth Reddy at a public event",
+        "clip_index": 0,
+        "show_at_sec": 212.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Telangana",
+        "entity_name_native": "తెలంగాణ",
+        "description": "Telangana police logo or police station exterior",
+        "clip_index": 0,
+        "show_at_sec": 273.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "High Court",
+        "entity_name_native": "హైకోర్టు",
+        "description": "High Court building exterior",
+        "clip_index": 0,
+        "show_at_sec": 327.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Bandi Bhagirath",
+        "entity_name_native": "బండి భగీరత్",
+        "description": "Bandi Bhagirath mugshot or court sketch",
+        "clip_index": 0,
+        "show_at_sec": 339.0,
+        "duration_sec": 5.0
+      },
+      {
+        "entity_name": "Revanth Reddy",
+        "entity_name_native": "రేవంత్రెడ్డి",
+        "description": "Revanth Reddy speaking at a press conference",
+        "clip_index": 0,
+        "show_at_sec": 699.0,
+        "duration_sec": 5.0
+      }
+    ]
+  }
+}

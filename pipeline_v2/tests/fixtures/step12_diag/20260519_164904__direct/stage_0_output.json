@@ -1,0 +1,12 @@
+{
+  "mezzanine_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\mezzanine.mp4",
+  "audio_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\source.mp3",
+  "duration_sec": 713.92,
+  "encoder_used": "libx264",
+  "width": 1920,
+  "height": 1080,
+  "source_was_vfr": false,
+  "transcode_seconds": 117.6530117000002,
+  "audio_extract_seconds": 10.907772100003058,
+  "wall_seconds": 117.65317829999913
+}

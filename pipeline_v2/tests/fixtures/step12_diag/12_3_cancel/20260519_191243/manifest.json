@@ -1,0 +1,28 @@
+{
+  "timestamp": "20260519_191533",
+  "mode": "inngest_mid_pipeline_cancel",
+  "test_video": "E:\\kaizer new data training\\videos\\test.mp4",
+  "stt_provider": "deepgram",
+  "inngest": {
+    "run_id": "01KS07JZ1HTQNT1YG2YP6PT7K0",
+    "app_id_uuid": "98d49272-f7ee-5ba3-af64-aef74a2da371",
+    "sent_event_ids": [
+      "01KS07JZ00Z05GNQP446EB4PFT"
+    ],
+    "from_iso": "2026-05-19T13:42:43Z",
+    "final_status": "FAILED"
+  },
+  "cancel": {
+    "stage_at_cancel_trigger": "stage_1_transcribe",
+    "cancel_requested_at_s": 155.68,
+    "terminal_status_at_s": 169.76,
+    "time_to_cancel_s": 14.09
+  },
+  "job_state_at_terminal": {
+    "status": "failed",
+    "current_stage": null,
+    "cancel_requested": true,
+    "error_snippet": "NonRetriableError: cancelled: job 991200301 cancel_requested=True\nTraceback (most recent call last):\n  File \"E:\\kaizer new data training\\kaizer\\KaizerBackend\\pipeline_v2\\pipeline_v2\\orchestrator.py\", line 770, in process_video_v2\n    envelope = await step.run(\n  File \"E:\\kaizer new data training\\venv\\lib\\site-packages\\inngest\\_internal\\step_lib\\step_async.py\", line 213, in run\n    raise err\n  File \"E:\\kaizer new data training\\venv\\lib\\site-packages\\inngest\\_internal\\step_lib\\step_async.py\", line"
+  },
+  "wall_seconds": 169.76
+}

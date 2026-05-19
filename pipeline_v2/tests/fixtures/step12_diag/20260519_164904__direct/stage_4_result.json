@@ -1,0 +1,16 @@
+{
+  "shorts_editor_meta_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\editor_meta.json",
+  "bulletin_editor_meta_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\editor_meta.json",
+  "composed_shorts_count": 6,
+  "bulletin": {
+    "bulletin_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin.mp4",
+    "overlay_path": "C:\\Users\\user\\AppData\\Local\\Temp\\pytest-of-user\\pytest-89\\test_full_pipeline_real_apis0\\out\\bulletin\\bulletin_with_overlays.mp4",
+    "overlay_applied": true,
+    "duration_s": 713.792,
+    "stories_rendered": 1,
+    "stories_skipped": 0,
+    "warnings": [
+      "bulletin total 11.9 min is below target floor 60 min — output will still ship."
+    ]
+  }
+}

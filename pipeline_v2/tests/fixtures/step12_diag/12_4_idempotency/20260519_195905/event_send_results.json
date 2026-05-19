@@ -1,0 +1,11 @@
+{
+  "send_1_result": [
+    "01KS0A7VT82Z5E3XPBST11JSPE"
+  ],
+  "send_2_result": [
+    "01KS0A80PRHTT9RDR849W51099"
+  ],
+  "send_1_at_iso": "2026-05-19T14:29:05.992841+00:00",
+  "send_2_at_iso": "2026-05-19T14:29:11.000237+00:00",
+  "time_between_sends_s": 5.007
+}

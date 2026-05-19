@@ -22,6 +22,7 @@ import pytest
 from pipeline_v2.models import (
     CleanTranscript,
     Entity,
+    EntityType,
     FullVideoCut,
     ImagePlan,
     ImagePlanEntry,
@@ -259,12 +260,29 @@ class TestImagePlanToV1Dict:
     def test_empty_plan(self):
         assert image_plan_to_v1_dict(ImagePlan(entries=[]), []) == []
 
-    def test_no_id_field_emitted(self):
-        # Per the post_v2_backlog "?" id bug: V2 ImagePlanEntry has no
-        # `id` field. The converter must NOT emit one.
+    def test_emits_synth_id_for_v1_compat(self):
+        # V2 ImagePlanEntry has no `id` field (Entity uses
+        # canonical_name as identity per Step 6 D-12). The converter
+        # synthesises ``img_NNN`` ids at the V2->V1 boundary so V1's
+        # pool_manifest lookup works without polluting V2's schema.
+        # See ``synth_id_map_for_image_plan``.
         plan = ImagePlan(entries=[_image_plan_entry()])
         out = image_plan_to_v1_dict(plan, [_entity()])
-        assert "id" not in out[0]
+        assert out[0]["id"] == "img_000"
+
+    def test_synth_ids_dedupe_by_entity_name(self):
+        # Two entries for the same entity share one synth_id (so V1
+        # resolves them to the same image file -- "one image per
+        # unique id, reused across moments" per pipeline.py:1466).
+        plan = ImagePlan(entries=[
+            _image_plan_entry("Modi", clip_index=0, show_at=5.0),
+            _image_plan_entry("Reddy", clip_index=0, show_at=15.0),
+            _image_plan_entry("Modi", clip_index=1, show_at=25.0),
+        ])
+        out = image_plan_to_v1_dict(
+            plan, [_entity("Modi"), _entity("Reddy")],
+        )
+        assert [d["id"] for d in out] == ["img_000", "img_001", "img_000"]
 
 
 # ====================================================================== #
@@ -437,6 +455,85 @@ class TestCutRawBulletinStories:
         assert mock_v1.call_count == 1
         assert out == []
 
+    def test_writes_raw_clips_to_bulletin_dir_not_output_dir(
+        self, render: Stage4Render,
+    ):
+        # Regression test for Step 12.2a re-run #4 Fix B: bulletin's
+        # raw cut must write to ``bulletin_dir`` so V1's path-cache
+        # idempotency in cut_video_clips (pipeline.py:1235) doesn't
+        # silently reuse a same-named raw_clip from the shorts pass.
+        # Pre-#4 bug: bulletin_dir == output_dir, so a 21-second
+        # shorts raw_clip_01.mp4 was reused as the bulletin's
+        # raw input, truncating a 12-minute bulletin to 21 seconds.
+        captured_output_dirs: list[str] = []
+
+        def _v1_mock(video_path, clips, output_dir):
+            captured_output_dirs.append(output_dir)
+            for i, c in enumerate(clips, 1):
+                c["raw_path"] = f"{output_dir}/raw_clip_{i:02d}.mp4"
+                c["duration_sec"] = float(c.get("end_sec", 0.0)
+                                          - c.get("start_sec", 0.0))
+
+        with patch(
+            "pipeline_v2.stages.stage_4_render._v1_cut_video_clips",
+            side_effect=_v1_mock,
+        ):
+            render.cut_raw_bulletin_stories(
+                [_full_video_cut(0, 0, 720)], _metadata(),
+            )
+
+        assert len(captured_output_dirs) == 1
+        bulletin_dir_str = str(render.bulletin_dir)
+        output_dir_str = str(render.output_dir)
+        assert captured_output_dirs[0] == bulletin_dir_str, (
+            f"bulletin raw cut must write to bulletin_dir, "
+            f"got {captured_output_dirs[0]!r}"
+        )
+        assert captured_output_dirs[0] != output_dir_str, (
+            "bulletin_dir and output_dir must NOT be the same path "
+            "(would re-introduce the V1 cache-collision bug)"
+        )
+
+    def test_bulletin_raw_paths_differ_from_shorts_raw_paths(
+        self, render: Stage4Render,
+    ):
+        # End-to-end regression: when both cut_raw_shorts and
+        # cut_raw_bulletin_stories run in the same render, the raw
+        # clip files MUST live in different directories so V1's
+        # cache check at pipeline.py:1235 can't collide.
+        from pipeline_v2.models import ShortsCut
+
+        def _v1_mock(video_path, clips, output_dir):
+            for i, c in enumerate(clips, 1):
+                c["raw_path"] = f"{output_dir}/raw_clip_{i:02d}.mp4"
+                c["duration_sec"] = float(c.get("end_sec", 0.0)
+                                          - c.get("start_sec", 0.0))
+
+        shorts_cut = ShortsCut(
+            index=0, start_sec=10.0, end_sec=30.0,
+            hook="hk", importance=5,
+        )
+
+        with patch(
+            "pipeline_v2.stages.stage_4_render._v1_cut_video_clips",
+            side_effect=_v1_mock,
+        ):
+            shorts_clips = render.cut_raw_shorts([shorts_cut], _metadata())
+            bulletin_clips = render.cut_raw_bulletin_stories(
+                [_full_video_cut(0, 0, 720)], _metadata(),
+            )
+
+        shorts_raw = shorts_clips[0]["raw_path"]
+        bulletin_raw = bulletin_clips[0]["raw_path"]
+        assert shorts_raw != bulletin_raw, (
+            f"shorts and bulletin must produce DIFFERENT raw_clip "
+            f"paths; got both at {shorts_raw!r}"
+        )
+        # Specifically, bulletin's raw should be under bulletin_dir
+        bulletin_dir_parts = str(render.bulletin_dir).replace("\\", "/")
+        bulletin_raw_norm = bulletin_raw.replace("\\", "/")
+        assert bulletin_dir_parts in bulletin_raw_norm
+
 
 # ====================================================================== #
 # Step 9.2: Stage4Render.resolve_images                                   #
@@ -444,41 +541,75 @@ class TestCutRawBulletinStories:
 
 
 class TestResolveImages:
-    """Wires V1's resolve_image_plan. Per D-9.5, populates the
-    instance image_pool with entity_name -> image_path mappings so
-    subsequent passes can reuse.
+    """Wires V1's resolve_image_plan. Per the 12.2a re-run #2 fixes:
+
+      * Pre-step: walk unique entity_names from image_plan, source via
+        ``ImageSourcer.source_for_entity`` for entities not already in
+        ``self.image_pool``. Populates pool with successful resolutions.
+
+      * Build V1-shape image_plan (with synthetic ``img_NNN`` ids per
+        D-9.2 boundary contract) + pool_manifest keyed by those ids.
+
+      * Call V1's resolve_image_plan WITHOUT ``output_dir`` kwarg
+        (V1's actual signature -- pure timeline mapper, not producer).
+
+    Most tests in this class patch ``ImageSourcer.source_for_entity``
+    to a deterministic stub so the test doesn't hit real search APIs.
+    The class-level ``_mock_sourcer`` fixture is the standard pattern.
     """
 
-    def _stub_resolved(self, entries: list[dict]) -> list[dict]:
-        return entries
+    @pytest.fixture
+    def _mock_sourcer(self, tmp_path: Path):
+        """Replace ImageSourcer.source_for_entity with a stub that
+        returns ``None`` by default (sourcer "misses"). Tests can
+        override per-call by mutating ``stub.return_value`` or
+        ``stub.side_effect``. Yields the MagicMock instance so tests
+        can inspect call args / set return values.
+        """
+        with patch(
+            "pipeline_v2.stages.stage_4_render.ImageSourcer",
+        ) as MockSourcer:
+            instance = MockSourcer.return_value
+            instance.source_for_entity.return_value = None
+            yield instance
 
-    def test_populates_image_pool_from_resolved_manifest(
-        self, render: Stage4Render,
+    def test_populates_image_pool_via_sourcer_pre_step(
+        self, render: Stage4Render, _mock_sourcer, tmp_path: Path,
     ):
+        # ImageSourcer returns a real path for each entity -> pool
+        # gets populated by the pre-step (BEFORE V1 is called).
         plan = ImagePlan(entries=[
             _image_plan_entry("Modi", clip_index=0),
             _image_plan_entry("Reddy", clip_index=1),
         ])
         entities = [_entity("Modi"), _entity("Reddy")]
+        modi_img = tmp_path / "modi.jpg"
+        reddy_img = tmp_path / "reddy.jpg"
+        modi_img.write_bytes(b"\x00" * 5_000)
+        reddy_img.write_bytes(b"\x00" * 5_000)
 
-        resolved = [
-            {"entity_name": "Modi",  "image_path": "/abs/news_01.jpg",
-             "status": "ready", "clip_index": 0},
-            {"entity_name": "Reddy", "image_path": "/abs/news_02.jpg",
-             "status": "ready", "clip_index": 1},
-        ]
+        def _stub_source(entity, brief, out_dir):
+            return {"Modi": modi_img, "Reddy": reddy_img}.get(
+                entity.canonical_name,
+            )
+        _mock_sourcer.source_for_entity.side_effect = _stub_source
+
         with patch(
             "pipeline_v2.stages.stage_4_render._v1_resolve_image_plan",
-            return_value=resolved,
+            return_value=[],
         ):
             render.resolve_images(plan, entities, kept_clip_dicts=[],
                                   full_metadata=_metadata())
 
-        assert render.image_pool["Modi"] == Path("/abs/news_01.jpg")
-        assert render.image_pool["Reddy"] == Path("/abs/news_02.jpg")
+        assert render.image_pool["Modi"] == modi_img
+        assert render.image_pool["Reddy"] == reddy_img
 
-    def test_skips_unready_entries(self, render: Stage4Render):
-        # Entries with status != "ready" should NOT poison the pool.
+    def test_skips_unready_entries(
+        self, render: Stage4Render, _mock_sourcer,
+    ):
+        # ImageSourcer returns None (search/gen all missed) so pool
+        # never gets populated; V1's "failed" return also doesn't
+        # poison the pool.
         plan = ImagePlan(entries=[_image_plan_entry("X", clip_index=0)])
         resolved = [
             {"entity_name": "X", "image_path": "/abs/news.jpg",
@@ -492,22 +623,25 @@ class TestResolveImages:
                                   full_metadata=_metadata())
         assert render.image_pool == {}
 
-    def test_pool_is_reused_across_calls(self, render: Stage4Render):
-        # D-9.5 test: a second resolve call sees the pool from the
-        # first call's resolution in its pool_manifest arg.
+    def test_pool_is_reused_across_calls(
+        self, render: Stage4Render, _mock_sourcer, tmp_path: Path,
+    ):
+        # D-9.5: first resolve populates pool via sourcer; second
+        # resolve sees pool["Modi"] cached and short-circuits the
+        # sourcer for that entity. The pool_manifest passed to V1
+        # on call 2 contains Modi keyed by its synth_id.
         plan_a = ImagePlan(entries=[_image_plan_entry("Modi", clip_index=0)])
         plan_b = ImagePlan(entries=[_image_plan_entry("Modi", clip_index=0)])
-        resolved_first = [
-            {"entity_name": "Modi", "image_path": "/abs/news_01.jpg",
-             "status": "ready", "clip_index": 0},
-        ]
+        modi_img = tmp_path / "modi.jpg"
+        modi_img.write_bytes(b"\x00" * 5_000)
+        _mock_sourcer.source_for_entity.return_value = modi_img
 
         captured_pool_manifests: list[dict] = []
 
-        def _v1_mock(v1_image_plan, *, output_dir, pool_manifest,
-                     kept_clips, whisper_words, video_duration_sec):
+        def _v1_mock(v1_image_plan, *, pool_manifest, kept_clips,
+                     whisper_words, video_duration_sec):
             captured_pool_manifests.append(pool_manifest)
-            return resolved_first
+            return []
 
         with patch(
             "pipeline_v2.stages.stage_4_render._v1_resolve_image_plan",
@@ -516,28 +650,33 @@ class TestResolveImages:
             render.resolve_images(plan_a, [_entity("Modi")],
                                   kept_clip_dicts=[],
                                   full_metadata=_metadata())
-            # Second pass: image_pool already has Modi cached
-            assert "Modi" in render.image_pool
+            assert render.image_pool["Modi"] == modi_img
+            # Second call: pool already has Modi -- sourcer should
+            # not be re-invoked for this entity.
+            _mock_sourcer.source_for_entity.reset_mock()
             render.resolve_images(plan_b, [_entity("Modi")],
                                   kept_clip_dicts=[],
                                   full_metadata=_metadata())
+            assert _mock_sourcer.source_for_entity.call_count == 0
 
-        # First call: empty pool_manifest. Second call: pool_manifest
-        # contains the Modi entry from the first resolution.
-        assert captured_pool_manifests[0]["entries"] == []
-        first_pool_names = {
-            e["entity_name"] for e in captured_pool_manifests[1]["entries"]
-        }
-        assert "Modi" in first_pool_names
+        # Both calls received a pool_manifest with Modi keyed by
+        # the synth_id img_000 (since Modi is the first/only entity
+        # in each image_plan).
+        assert "img_000" in captured_pool_manifests[0]
+        assert captured_pool_manifests[0]["img_000"]["topic_clue"] == "Modi"
+        assert captured_pool_manifests[0]["img_000"]["path"] == str(modi_img)
+        assert "img_000" in captured_pool_manifests[1]
 
-    def test_whisper_words_passed_as_none_d94(self, render: Stage4Render):
+    def test_whisper_words_passed_as_none_d94(
+        self, render: Stage4Render, _mock_sourcer,
+    ):
         # D-9.4: V2 skips whisper_anchor, passes whisper_words=None.
         plan = ImagePlan(entries=[_image_plan_entry()])
 
         captured_whisper = []
 
-        def _v1_mock(v1_image_plan, *, output_dir, pool_manifest,
-                     kept_clips, whisper_words, video_duration_sec):
+        def _v1_mock(v1_image_plan, *, pool_manifest, kept_clips,
+                     whisper_words, video_duration_sec):
             captured_whisper.append(whisper_words)
             return []
 
@@ -550,16 +689,18 @@ class TestResolveImages:
                                   full_metadata=_metadata())
         assert captured_whisper[0] is None
 
-    def test_v1_image_plan_dict_shape(self, render: Stage4Render):
-        # The dict V1 receives is the one converted by
-        # image_plan_to_v1_dict: 6 fields, no `id`.
+    def test_v1_image_plan_dict_shape(
+        self, render: Stage4Render, _mock_sourcer,
+    ):
+        # Post-12.2a fix: dict V1 receives has a synthetic ``id``
+        # field so V1's pool_manifest lookup works.
         plan = ImagePlan(entries=[
             _image_plan_entry("Modi", clip_index=0, show_at=12.5),
         ])
         captured = []
 
-        def _v1_mock(v1_image_plan, *, output_dir, pool_manifest,
-                     kept_clips, whisper_words, video_duration_sec):
+        def _v1_mock(v1_image_plan, *, pool_manifest, kept_clips,
+                     whisper_words, video_duration_sec):
             captured.append(v1_image_plan)
             return []
 
@@ -573,10 +714,94 @@ class TestResolveImages:
 
         assert len(captured[0]) == 1
         d = captured[0][0]
+        assert d["id"] == "img_000"
         assert d["entity_name"] == "Modi"
         assert d["clip_index"] == 0
         assert d["show_at"] == "00:12.500"
-        assert "id" not in d
+
+    def test_v1_call_omits_output_dir_kwarg(
+        self, render: Stage4Render, _mock_sourcer,
+    ):
+        # V1's resolve_image_plan signature does NOT accept output_dir
+        # (the previous V2 code wrongly passed it -- Bug #1 from
+        # 12.2a re-run #1). The fixed code must not pass it.
+        plan = ImagePlan(entries=[_image_plan_entry()])
+        with patch(
+            "pipeline_v2.stages.stage_4_render._v1_resolve_image_plan",
+        ) as v1_mock:
+            v1_mock.return_value = []
+            render.resolve_images(plan, [_entity()],
+                                  kept_clip_dicts=[],
+                                  full_metadata=_metadata())
+        assert v1_mock.call_count == 1
+        _, kwargs = v1_mock.call_args
+        assert "output_dir" not in kwargs
+
+    def test_pool_manifest_keyed_by_synth_id_not_by_entries_list(
+        self, render: Stage4Render, _mock_sourcer, tmp_path: Path,
+    ):
+        # V1's resolve_image_plan reads ``pool_manifest[eid]["path"]``
+        # so the manifest MUST be a dict keyed by synthetic id, not
+        # the old ``{"entries": [...]}`` shape (Bug #2 from 12.2a
+        # re-run #1).
+        img = tmp_path / "img.jpg"
+        img.write_bytes(b"\x00" * 5_000)
+        _mock_sourcer.source_for_entity.return_value = img
+        plan = ImagePlan(entries=[_image_plan_entry("Modi", clip_index=0)])
+
+        captured = []
+
+        def _v1_mock(v1_image_plan, *, pool_manifest, kept_clips,
+                     whisper_words, video_duration_sec):
+            captured.append(pool_manifest)
+            return []
+
+        with patch(
+            "pipeline_v2.stages.stage_4_render._v1_resolve_image_plan",
+            side_effect=_v1_mock,
+        ):
+            render.resolve_images(plan, [_entity("Modi")],
+                                  kept_clip_dicts=[],
+                                  full_metadata=_metadata())
+
+        pm = captured[0]
+        assert "entries" not in pm
+        assert "img_000" in pm
+        entry = pm["img_000"]
+        assert entry["id"] == "img_000"
+        assert entry["path"] == str(img)
+        assert entry["topic_clue"] == "Modi"
+
+    def test_orphan_entity_treated_as_other(
+        self, render: Stage4Render, _mock_sourcer,
+    ):
+        # An entity_name in image_plan with no matching canonical
+        # entity (orphan) should still hit the sourcer with a typed
+        # OTHER stub so the non-PERSON policy branch applies.
+        plan = ImagePlan(entries=[
+            _image_plan_entry("OrphanCity", clip_index=0),
+        ])
+
+        with patch(
+            "pipeline_v2.stages.stage_4_render._v1_resolve_image_plan",
+            return_value=[],
+        ):
+            render.resolve_images(plan, entities=[],  # no canonicals
+                                  kept_clip_dicts=[],
+                                  full_metadata=_metadata())
+
+        # source_for_entity was called once with a synthesised OTHER
+        # entity for "OrphanCity".
+        assert _mock_sourcer.source_for_entity.call_count == 1
+        call_args, call_kwargs = _mock_sourcer.source_for_entity.call_args
+        # ``entity`` is positional or keyword; check both call_args
+        # and call_kwargs to be defensive about caller style.
+        passed_entity = call_kwargs.get("entity") or (
+            call_args[0] if call_args else None
+        )
+        assert passed_entity is not None
+        assert passed_entity.canonical_name == "OrphanCity"
+        assert passed_entity.type == EntityType.OTHER
 
 
 # ====================================================================== #
@@ -667,18 +892,31 @@ class TestDispatchCompose:
 
 
 def _post_cut_clip(idx: int, raw_exists: bool = True,
-                   tmp_path: Path = None) -> dict:
-    """Build a post-cut clip dict (what cut_raw_shorts returns)."""
+                   tmp_path: Path = None,
+                   start_sec: float = None,
+                   end_sec: float = None) -> dict:
+    """Build a post-cut clip dict (what cut_raw_shorts returns).
+
+    Default start/end span is 20s, offset by idx so multiple clips
+    don't overlap. Caller can override via ``start_sec``/``end_sec``
+    for tests that need specific time windows (e.g. the show_at_sec
+    overlap regression suite for Step 12.2a re-run #4 Fix C).
+    """
     raw_path = ""
     if raw_exists:
         assert tmp_path is not None
         raw_path = str(tmp_path / f"raw_clip_{idx+1:02d}.mp4")
         Path(raw_path).write_text("fake raw clip bytes")
+    if start_sec is None:
+        start_sec = idx * 30.0
+    if end_sec is None:
+        end_sec = start_sec + 20.0
     return {
         "start": "00:00.000", "end": "00:20.000",
+        "start_sec": start_sec, "end_sec": end_sec,
         "summary": "hook", "mood": "", "importance": 7,
         "video_type": "SOLO", "v2_index": idx,
-        "raw_path": raw_path, "duration_sec": 20.0,
+        "raw_path": raw_path, "duration_sec": end_sec - start_sec,
     }
 
 
@@ -770,30 +1008,39 @@ class TestComposeShorts:
             with pytest.raises(RuntimeError, match=r"100%"):
                 render.compose_shorts([clip], _metadata(), [])
 
-    def test_no_image_isolated_failure_below_threshold(
+    def test_missing_raw_path_isolated_failure_below_threshold(
         self, render: Stage4Render, tmp_path: Path,
     ):
-        # 1 image-less clip out of 4 (25% failure) -> 3 clips ship,
-        # the missing-image clip is dropped silently (no raise).
+        # 1 clip out of 4 missing raw_path (25% failure) -> 3 clips
+        # ship, the missing-raw-path clip is dropped silently (no
+        # raise; we're under the 50% threshold).
+        #
+        # Note (12.2a re-run #4): the previous version of this test
+        # exercised the now-removed ``clip_image_map`` lookup. Under
+        # the show_at_sec overlap + round-robin algorithm, an empty
+        # pool fails ALL clips uniformly (not just one), so "isolated
+        # image failure" is no longer a natural single-clip dropout
+        # mode. The missing-raw-path branch IS still isolated per
+        # clip and serves the same testing purpose for the 50%
+        # threshold logic.
         clip_dicts = [_post_cut_clip(i, tmp_path=render.output_dir)
                       for i in range(4)]
+        # Wipe clip 1's raw_path so only that clip drops.
+        clip_dicts[1]["raw_path"] = ""
         (render.output_dir / "img.jpg").write_text("img")
         render.image_pool["X"] = render.output_dir / "img.jpg"
-        # Resolved entries for clips 0, 2, 3 only -- clip 1 has none.
+        # Resolved entries cover all clips (irrelevant since we use
+        # round-robin now; included so the no-image branch is never
+        # taken).
         resolved = [
             {"entity_name": "X", "image_path": str(render.output_dir / "img.jpg"),
-             "status": "ready", "clip_index": i}
-            for i in (0, 2, 3)
+             "status": "ready", "clip_index": i,
+             "source_show_at_sec": 1.0 + i}
+            for i in range(4)
         ]
-        # And remove the pool fallback so clip 1 truly has no image.
-        render.image_pool.clear()
         with self._patch_v1()["compose"], self._patch_v1()["subprocess_run"]:
-            # Even resolved entries can't help clip 1 because the
-            # fallback path checks the resolved map by v2_index --
-            # clip 1's index has no resolved entry.
-            # But since pool is empty, fallback also fails.
-            # Result: 1/4 dropped = 25%, no raise.
             out = render.compose_shorts(clip_dicts, _metadata(), resolved)
+        # 1/4 = 25% < 50% threshold -> 3 clips compose successfully
         assert len(out) == 3
 
     def test_compose_exception_skips_clip(
@@ -876,6 +1123,187 @@ class TestComposeShorts:
         # Both clips ended up using the pool image
         for c in out:
             assert c["image_path"].endswith("fallback.jpg")
+
+
+class TestComposeShortsPerClipImageSelection:
+    """Regression suite for Step 12.2a re-run #4 Fix C.
+
+    Pre-#4 bug: ``compose_shorts`` built a ``clip_image_map`` keyed
+    by ``r["clip_index"]`` from resolved image_plan entries. But
+    image_plan entries' ``clip_index`` references the BULLETIN's
+    full_video_cuts, NOT the shorts cut index. With one
+    full_video_cut, every image_plan entry mapped to clip_index=0,
+    so only shorts[0] got an image via the map; shorts[1..N-1]
+    fell through to ``next(iter(image_pool.values()))`` -- the
+    same first pool image for every short. Result: all shorts
+    rendered with the same picture.
+
+    Post-#4 algorithm: build an overlay list of
+    ``(source_show_at_sec, image_path)`` from ready entries. For
+    each short's ``[start_sec, end_sec]`` window, pick the first
+    overlay whose show_at_sec falls inside. On miss, round-robin
+    through the resolved image_pool by short index so each short
+    still gets a different image.
+    """
+
+    def _patch_v1(self):
+        return {
+            "compose": patch(
+                "pipeline_v2.stages.stage_4_render._v1_compose_clip",
+                return_value={"font_size": 80, "font_file": "f.ttf"},
+            ),
+            "subprocess_run": patch(
+                "pipeline_v2.stages.stage_4_render.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        }
+
+    def _put_image(self, render: Stage4Render, name: str) -> str:
+        p = render.output_dir / name
+        p.write_text("img")
+        render.image_pool[name.replace(".jpg", "")] = p
+        return str(p)
+
+    def test_compose_shorts_uses_show_at_overlap_when_available(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # 3 shorts at non-contiguous windows. image_plan has 2
+        # overlays covering shorts[0] and shorts[2]; shorts[1] has
+        # no overlap and falls back to round-robin.
+        clip_dicts = [
+            _post_cut_clip(0, tmp_path=render.output_dir,
+                           start_sec=0.0,    end_sec=20.0),
+            _post_cut_clip(1, tmp_path=render.output_dir,
+                           start_sec=50.0,   end_sec=70.0),
+            _post_cut_clip(2, tmp_path=render.output_dir,
+                           start_sec=100.0,  end_sec=120.0),
+        ]
+        modi_img    = self._put_image(render, "Modi.jpg")
+        reddy_img   = self._put_image(render, "Reddy.jpg")
+        other_img   = self._put_image(render, "Other.jpg")
+        resolved = [
+            # Modi overlay at 10s -> overlaps shorts[0] (0-20s).
+            {"entity_name": "Modi", "image_path": modi_img,
+             "status": "ready", "clip_index": 0,
+             "source_show_at_sec": 10.0},
+            # Reddy overlay at 110s -> overlaps shorts[2] (100-120s).
+            {"entity_name": "Reddy", "image_path": reddy_img,
+             "status": "ready", "clip_index": 0,
+             "source_show_at_sec": 110.0},
+        ]
+        with self._patch_v1()["compose"], self._patch_v1()["subprocess_run"]:
+            out = render.compose_shorts(clip_dicts, _metadata(), resolved)
+
+        assert len(out) == 3
+        assert out[0]["image_path"].endswith("Modi.jpg")
+        # shorts[1] has no overlap; round-robin uses pool index 1
+        # (Reddy in insertion order Modi, Reddy, Other). Verify it
+        # falls back rather than reusing Modi (the pre-#4 bug).
+        assert not out[1]["image_path"].endswith("Modi.jpg")
+        assert out[2]["image_path"].endswith("Reddy.jpg")
+
+    def test_compose_shorts_round_robin_when_no_overlap(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # 9 shorts, 6 pool images, ZERO overlapping image_plan
+        # entries -> every short must cycle through the pool
+        # (i % 6) instead of all sharing the first image.
+        clip_dicts = [
+            _post_cut_clip(i, tmp_path=render.output_dir,
+                           # All windows are in 500-600s range so
+                           # the source_show_at_sec=10.0 entry
+                           # below cannot overlap with any of them.
+                           start_sec=500.0 + i * 5,
+                           end_sec=500.0 + i * 5 + 4)
+            for i in range(9)
+        ]
+        pool_names = ["A", "B", "C", "D", "E", "F"]
+        pool_paths = [self._put_image(render, f"{n}.jpg")
+                      for n in pool_names]
+        # One ready overlay but at a timestamp NO short overlaps.
+        resolved = [{
+            "entity_name": "A",
+            "image_path": pool_paths[0],
+            "status": "ready", "clip_index": 0,
+            "source_show_at_sec": 10.0,
+        }]
+        with self._patch_v1()["compose"], self._patch_v1()["subprocess_run"]:
+            out = render.compose_shorts(clip_dicts, _metadata(), resolved)
+
+        assert len(out) == 9
+        # Round-robin produces pool[i % 6] for each short.
+        for i, c in enumerate(out):
+            expected = pool_paths[i % 6]
+            assert c["image_path"] == expected, (
+                f"short[{i}] expected {expected!r}, got {c['image_path']!r}"
+            )
+
+    def test_compose_shorts_distinct_images_per_clip(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Direct regression: the exact pre-#4 bug shape. 9 shorts +
+        # 6 distinct pool images. Assert no two consecutive shorts
+        # share the same image (the pre-#4 bug produced 9 identical
+        # image_paths).
+        clip_dicts = [
+            _post_cut_clip(i, tmp_path=render.output_dir,
+                           start_sec=float(i * 40),
+                           end_sec=float(i * 40 + 20))
+            for i in range(9)
+        ]
+        for name in ("A", "B", "C", "D", "E", "F"):
+            self._put_image(render, f"{name}.jpg")
+
+        # Empty resolved -> the overlay match path never fires and
+        # round-robin is the sole source of image_path assignment.
+        # This is the worst-case for the bug to reappear.
+        with self._patch_v1()["compose"], self._patch_v1()["subprocess_run"]:
+            out = render.compose_shorts(clip_dicts, _metadata(), [])
+
+        assert len(out) == 9
+        for i in range(1, len(out)):
+            assert out[i]["image_path"] != out[i - 1]["image_path"], (
+                f"shorts[{i}] and shorts[{i-1}] share the same image: "
+                f"{out[i]['image_path']!r} -- regression of the "
+                f"pre-#4 'all shorts share the same picture' bug."
+            )
+
+    def test_compose_shorts_handles_missing_source_show_at_sec(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Defensive: resolved entries that don't carry
+        # ``source_show_at_sec`` (e.g. status="image_missing" /
+        # "in_cut_span" branches in V1's resolve_image_plan that
+        # short-circuit before computing the source time) MUST be
+        # excluded from the overlap matching without raising.
+        # Round-robin still works as the fallback.
+        clip_dicts = [
+            _post_cut_clip(i, tmp_path=render.output_dir,
+                           start_sec=float(i * 30),
+                           end_sec=float(i * 30 + 20))
+            for i in range(3)
+        ]
+        a_img = self._put_image(render, "A.jpg")
+        b_img = self._put_image(render, "B.jpg")
+        resolved = [
+            # Missing source_show_at_sec entirely -> ignored.
+            {"entity_name": "A", "image_path": a_img,
+             "status": "ready", "clip_index": 0},
+            # Explicit None -> also ignored.
+            {"entity_name": "B", "image_path": b_img,
+             "status": "ready", "clip_index": 0,
+             "source_show_at_sec": None},
+        ]
+        with self._patch_v1()["compose"], self._patch_v1()["subprocess_run"]:
+            out = render.compose_shorts(clip_dicts, _metadata(), resolved)
+
+        assert len(out) == 3
+        # All 3 shorts got an image (round-robin through pool of 2).
+        assert all(c.get("image_path") for c in out)
+        # shorts[0] and shorts[2] both at pool[0] under RR (i % 2);
+        # shorts[1] at pool[1]. So at least 2 distinct images visible.
+        unique_images = {c["image_path"] for c in out}
+        assert len(unique_images) >= 2
 
 
 # ====================================================================== #
@@ -1398,7 +1826,7 @@ class TestRenderBulletinImagePoolReuse:
         bulletin_render.image_pool["Modi"] = tmp_path / "img_modi.jpg"
 
         captured_manifests = []
-        def _capture_resolve(v1_image_plan, *, output_dir, pool_manifest,
+        def _capture_resolve(v1_image_plan, *, pool_manifest,
                               kept_clips, whisper_words, video_duration_sec):
             captured_manifests.append(pool_manifest)
             return []
@@ -1424,23 +1852,30 @@ class TestRenderBulletinImagePoolReuse:
             side_effect=_stub_stitch,
         )
 
+        # Image_plan must reference Modi so it gets a synth_id; the
+        # pool_manifest is built from entries whose entity_name has
+        # both a sourced image AND a synth_id from this image_plan.
+        plan = ImagePlan(entries=[
+            _image_plan_entry("Modi", clip_index=0, show_at=12.5),
+        ])
+
         cuts = [_full_video_cut(0, 0, 60)]
         stack, mocks = _all_patches(bulletin_v1_patches)
         with stack:
             bulletin_render.render_bulletin(
                 full_video_cuts=cuts, metadata=_metadata(),
                 entities=[_entity("Modi")],
-                image_plan=ImagePlan(entries=[]),
+                image_plan=plan,
             )
 
-        # The pool_manifest passed to V1 contains the Modi entry
-        # that was already in the pool. V1 sees this and can skip
-        # re-downloading.
+        # The pool_manifest passed to V1 is keyed by synth_id and
+        # contains the Modi entry from the prior pass. V1 sees this
+        # and can skip re-downloading.
         assert len(captured_manifests) == 1
-        manifest_names = {
-            e["entity_name"] for e in captured_manifests[0]["entries"]
-        }
-        assert "Modi" in manifest_names
+        pm = captured_manifests[0]
+        assert "img_000" in pm
+        assert pm["img_000"]["topic_clue"] == "Modi"
+        assert pm["img_000"]["path"] == str(tmp_path / "img_modi.jpg")
 
 
 class TestRenderBulletinStitchFailure:
@@ -1896,3 +2331,371 @@ class TestRenderOrchestrator:
         )
         assert data["title_english"] == "ENGLISH HEADLINE"
         assert data["clips"][0]["title_english"] == "ENGLISH HEADLINE"
+
+
+# ====================================================================== #
+# Step 12.3 Test 2 fix: Stage 4 cancel_check sub-phase threading          #
+# ====================================================================== #
+
+
+class TestStage4CancelCheck:
+    """Verify the ``cancel_check`` callback is invoked between every
+    Stage 4 sub-phase (Step 12.3 Test 2 fix / backlog item 76).
+
+    Pre-fix bug: a user cancel during Stage 4 sat idle until the
+    cooperative ``_check_cancelled`` at finalize fired (~5 min
+    later) because ``_render_impl`` had no internal cancel checks.
+
+    Fix: ``cancel_check: Optional[callable]`` parameter threaded
+    through ``render()`` -> ``_render_impl()``, invoked before each
+    sub-phase (cut_raw_shorts / resolve_images / compose_shorts /
+    render_bulletin). When the callable raises, propagation exits
+    Stage 4 through render()'s classifier and into the orchestrator's
+    terminal catch.
+    """
+
+    def _setup_mocks(self, render, tmp_path):
+        """Same mock shape as TestRenderOrchestrator -- sub-renders
+        deterministic, orchestration testable."""
+        composed_clip = {
+            "start": "00:10.000", "end": "00:30.000",
+            "summary": "hook", "mood": "", "importance": 7,
+            "video_type": "SOLO", "v2_index": 0,
+            "raw_path": str(tmp_path / "raw_clip_01.mp4"),
+            "duration_sec": 20.0,
+            "clip_path": str(tmp_path / "clip_01.mp4"),
+            "thumb_path": str(tmp_path / "thumb_01.jpg"),
+            "image_path": str(tmp_path / "img_01.jpg"),
+            "card_params": {"font_file": "f.ttf"},
+            "split_params": {}, "follow_params": {},
+            "storage_url": "", "storage_key": "", "storage_backend": "",
+        }
+        bulletin_returns = {
+            "bulletin_path":     str(tmp_path / "bulletin" / "bulletin.mp4"),
+            "overlay_path":      str(tmp_path / "bulletin" / "bulletin_with_overlays.mp4"),
+            "overlay_applied":   True,
+            "duration_s":        60.0,
+            "stories_rendered":  1,
+            "stories_skipped":   0,
+            "warnings":          [],
+        }
+        return (
+            patch.object(render, "cut_raw_shorts", return_value=[composed_clip.copy()]),
+            patch.object(render, "resolve_images", return_value=[
+                {"entity_name": "Modi",
+                 "image_path": str(tmp_path / "img_01.jpg"),
+                 "status": "ready", "clip_index": 0},
+            ]),
+            patch.object(render, "compose_shorts", return_value=[composed_clip.copy()]),
+            patch.object(render, "render_bulletin", return_value=bulletin_returns),
+        )
+
+    def test_render_calls_cancel_check_between_sub_phases(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Full pipeline (shorts + bulletin): cancel_check fires
+        # before each of the 4 sub-phases (cut_raw_shorts,
+        # resolve_images, compose_shorts, render_bulletin).
+        job = _job_output(
+            shorts_cuts=[_shorts_cut(0, 10, 30)],
+            full_video_cuts=[_full_video_cut(0, 0, 60)],
+        )
+        cancel_check_calls = []
+
+        def _cancel_check():
+            cancel_check_calls.append(len(cancel_check_calls))
+
+        cut_p, res_p, comp_p, bul_p = self._setup_mocks(
+            render, render.output_dir,
+        )
+        with cut_p, res_p, comp_p, bul_p:
+            render.render(
+                job, timestamp="20260518_120000",
+                cancel_check=_cancel_check,
+            )
+        assert len(cancel_check_calls) == 4, (
+            f"expected 4 cancel_check invocations (cut/resolve/"
+            f"compose/bulletin); got {len(cancel_check_calls)}"
+        )
+
+    def test_render_propagates_cancel_check_exception(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # If cancel_check raises mid-Stage-4, the exception
+        # propagates up through render() to the caller (which the
+        # orchestrator's except clause catches in production).
+        job = _job_output(
+            shorts_cuts=[_shorts_cut(0, 10, 30)],
+            full_video_cuts=[_full_video_cut(0, 0, 60)],
+        )
+
+        from inngest import NonRetriableError
+
+        call_count = [0]
+
+        def _cancel_check_raises_on_2nd_call():
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise NonRetriableError(
+                    "cancelled: job 999 cancel_requested=True"
+                )
+
+        cut_p, res_p, comp_p, bul_p = self._setup_mocks(
+            render, render.output_dir,
+        )
+        with cut_p, res_p, comp_p, bul_p:
+            with pytest.raises(NonRetriableError, match="cancelled"):
+                render.render(
+                    job, timestamp="20260518_120000",
+                    cancel_check=_cancel_check_raises_on_2nd_call,
+                )
+        # Confirm the callback ran the second time before raising,
+        # i.e. the cancel actually interrupts mid-pipeline (would
+        # be exactly 2 calls if it stopped before cut_raw_shorts
+        # finished mocking; we want at least 2 to confirm
+        # mid-pipeline interrupt).
+        assert call_count[0] >= 2
+
+    def test_render_without_cancel_check_runs_normally(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # cancel_check=None (the default) is the V1-only / unit-test
+        # path. Backward compat: render() runs end-to-end without
+        # any extra DB reads.
+        job = _job_output(
+            shorts_cuts=[_shorts_cut(0, 10, 30)],
+            full_video_cuts=[_full_video_cut(0, 0, 60)],
+        )
+        cut_p, res_p, comp_p, bul_p = self._setup_mocks(
+            render, render.output_dir,
+        )
+        with cut_p, res_p, comp_p, bul_p:
+            result = render.render(
+                job, timestamp="20260518_120000",
+                # cancel_check NOT supplied
+            )
+        assert isinstance(result, RenderResult)
+        # Both editor_meta files still written -- baseline behaviour
+        # unaffected by the new parameter.
+        assert result.shorts_editor_meta_path is not None
+        assert result.bulletin_editor_meta_path is not None
+
+
+# ====================================================================== #
+# V2->V1 boundary contract test (real V1 resolve_image_plan)              #
+# ====================================================================== #
+
+
+class TestRealV1ResolveImagePlanContract:
+    """Verify the V2->V1 boundary against the REAL V1 ``resolve_image_plan``.
+
+    Step 12.2a re-run #1 found three boundary bugs that the regular
+    suite missed because every other resolve_images test mocks the
+    V1 function. This class deliberately does NOT mock V1's
+    ``resolve_image_plan`` -- it constructs a realistic input set
+    (entities, image_plan, kept_clips, on-disk dummy images) and
+    drives the actual V1 function to verify:
+
+      * V2's ``image_plan_to_v1_dict`` output has every field V1 reads
+        (id, entity_name, clip_index, show_at, duration)
+      * V2's ``pool_manifest`` shape is what V1 reads
+        (``pool_manifest[eid]["path"]``)
+      * No ``output_dir`` kwarg is passed (V1's signature doesn't accept it)
+      * V1 returns ``status="ready"`` for each entry whose synth_id
+        appears in the pool_manifest
+
+    The test is intentionally side-effect-free (no FFmpeg, no APIs,
+    no networking). It runs in the regular pytest suite so the
+    boundary breaks in CI rather than at production E2E time.
+
+    The ImageSourcer is mocked so the pre-step is a no-op; the test
+    pre-populates ``self.image_pool`` directly with on-disk dummy
+    images instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_op_sourcer(self):
+        """Patch ImageSourcer.source_for_entity to ALWAYS return None
+        so the pre-step in resolve_images doesn't hit real search /
+        generation APIs. Tests in this class pre-populate
+        ``self.image_pool`` directly to drive the V1 lookup.
+        """
+        with patch(
+            "pipeline_v2.stages.stage_4_render.ImageSourcer",
+        ) as MockSourcer:
+            MockSourcer.return_value.source_for_entity.return_value = None
+            yield
+
+    def _write_dummy_image(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # V1's resolve_image_plan only reads the manifest entry's
+        # "path" field as a STRING -- it never opens the file. A
+        # tiny placeholder is sufficient for contract verification.
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
+
+    def _make_kept_clips(self) -> list[dict]:
+        # Two contiguous clips covering the timeline. V1's resolve
+        # needs start_sec / end_sec / duration_sec on each so it can
+        # build the source-time -> stitched-time map.
+        return [
+            {"start_sec": 0.0,  "end_sec": 60.0,
+             "duration_sec": 60.0,
+             "start": "00:00.000", "end": "01:00.000"},
+            {"start_sec": 60.0, "end_sec": 120.0,
+             "duration_sec": 60.0,
+             "start": "01:00.000", "end": "02:00.000"},
+        ]
+
+    def test_real_v1_resolves_mixed_entity_types(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Mix of PERSON + ORG + PLACE to cover the type-aware policy
+        # branches even though we're not exercising the sourcer here.
+        entities = [
+            _entity("Bandi Bhagirath", type_=EntityType.PERSON),
+            _entity("High Court",      type_=EntityType.ORG),
+            _entity("Hyderabad",       type_=EntityType.PLACE),
+        ]
+        plan = ImagePlan(entries=[
+            _image_plan_entry("Bandi Bhagirath", clip_index=0,
+                              show_at=10.0, duration=4.0),
+            _image_plan_entry("High Court",      clip_index=1,
+                              show_at=70.0, duration=4.0),
+            _image_plan_entry("Hyderabad",       clip_index=1,
+                              show_at=90.0, duration=4.0),
+            # Repeat of Bandi Bhagirath -- should share synth_id with the
+            # first Bandi Bhagirath entry (one image, two timeline slots).
+            _image_plan_entry("Bandi Bhagirath", clip_index=1,
+                              show_at=110.0, duration=4.0),
+        ])
+
+        # Pre-populate the pool with on-disk dummy images so the
+        # ImageSourcer pre-step short-circuits (entities already
+        # cached) and V1 sees the populated pool_manifest.
+        for e in entities:
+            img = tmp_path / f"{e.canonical_name.replace(' ', '_')}.jpg"
+            self._write_dummy_image(img)
+            render.image_pool[e.canonical_name] = img
+
+        kept_clips = self._make_kept_clips()
+        resolved = render.resolve_images(
+            plan, entities,
+            kept_clip_dicts=kept_clips,
+            full_metadata=_metadata(),
+            whisper_words=None,
+            video_duration_sec=120.0,
+        )
+
+        assert len(resolved) == 4, (
+            "V1 should emit one resolved entry per image_plan entry"
+        )
+
+        # Every entry must have a `status` -- V1's failure modes
+        # (image_missing, in_cut_span, bad_timestamp, duration_too_short,
+        # clamped_too_short, ready) all set this field.
+        statuses = [r.get("status") for r in resolved]
+        assert all(s is not None for s in statuses), (
+            f"V1 didn't set status on every entry: {statuses}"
+        )
+
+        # All 4 entries should resolve to ready: the synth_ids are
+        # in pool_manifest (we pre-populated the pool), the
+        # show_at/duration are inside the kept_clips ranges, and
+        # the durations are >= 2.0s.
+        assert all(s == "ready" for s in statuses), (
+            f"Expected all ready, got: {statuses}"
+        )
+
+        # The two Bandi Bhagirath entries share one synth_id, hence
+        # one image_path -- verify they map to the same file.
+        bandi_paths = [
+            r["image_path"] for r in resolved
+            if r.get("entity_name") == "Bandi Bhagirath"
+        ]
+        assert len(bandi_paths) == 2
+        assert bandi_paths[0] == bandi_paths[1], (
+            "Same entity must map to the same image file across "
+            "image_plan entries (D-9.5 cross-pass pool reuse)"
+        )
+
+    def test_real_v1_marks_missing_pool_entry_as_image_missing(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # An image_plan entry whose entity isn't in the pool should
+        # come back from V1 with status="image_missing" -- the
+        # canonical V1 failure mode that we want surfaced cleanly.
+        plan = ImagePlan(entries=[
+            _image_plan_entry("Sourced",  clip_index=0,
+                              show_at=10.0, duration=4.0),
+            _image_plan_entry("Unsourced", clip_index=0,
+                              show_at=20.0, duration=4.0),
+        ])
+        entities = [
+            _entity("Sourced",   type_=EntityType.PLACE),
+            _entity("Unsourced", type_=EntityType.PLACE),
+        ]
+        img = tmp_path / "sourced.jpg"
+        self._write_dummy_image(img)
+        render.image_pool["Sourced"] = img
+        # Unsourced is deliberately NOT in the pool.
+
+        resolved = render.resolve_images(
+            plan, entities,
+            kept_clip_dicts=self._make_kept_clips(),
+            full_metadata=_metadata(),
+            video_duration_sec=120.0,
+        )
+
+        by_name = {r["entity_name"]: r for r in resolved}
+        assert by_name["Sourced"]["status"] == "ready"
+        assert by_name["Unsourced"]["status"] == "image_missing"
+
+    def test_real_v1_accepts_v2_pool_manifest_shape(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Regression test for Bug #2 (12.2a re-run #1): V1's
+        # ``resolve_image_plan`` reads ``pool_manifest[eid]["path"]``,
+        # NOT ``pool_manifest["entries"]``. If V2 ever regresses
+        # to the old shape, this test fails with status="image_missing"
+        # because the lookup hits the wrong key.
+        plan = ImagePlan(entries=[
+            _image_plan_entry("X", clip_index=0,
+                              show_at=10.0, duration=4.0),
+        ])
+        img = tmp_path / "x.jpg"
+        self._write_dummy_image(img)
+        render.image_pool["X"] = img
+
+        resolved = render.resolve_images(
+            plan, [_entity("X", type_=EntityType.PLACE)],
+            kept_clip_dicts=self._make_kept_clips(),
+            full_metadata=_metadata(),
+            video_duration_sec=120.0,
+        )
+        assert resolved[0]["status"] == "ready", (
+            f"V1 didn't accept the pool_manifest shape -- regression "
+            f"of Bug #2 from 12.2a re-run #1. Got: {resolved[0]}"
+        )
+
+    def test_real_v1_no_output_dir_kwarg(
+        self, render: Stage4Render, tmp_path: Path,
+    ):
+        # Regression test for Bug #1 (12.2a re-run #1): V2 must NOT
+        # pass output_dir to V1's resolve_image_plan. Calling the
+        # real V1 with the current V2 code -- if Bug #1 returns,
+        # we'd see TypeError("unexpected keyword argument 'output_dir'").
+        plan = ImagePlan(entries=[
+            _image_plan_entry("X", clip_index=0,
+                              show_at=10.0, duration=4.0),
+        ])
+        img = tmp_path / "x.jpg"
+        self._write_dummy_image(img)
+        render.image_pool["X"] = img
+
+        # No assertion -- the test passes if no exception is raised.
+        render.resolve_images(
+            plan, [_entity("X", type_=EntityType.PLACE)],
+            kept_clip_dicts=self._make_kept_clips(),
+            full_metadata=_metadata(),
+            video_duration_sec=120.0,
+        )

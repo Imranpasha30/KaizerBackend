@@ -129,6 +129,7 @@ from pipeline_v2.editor_meta_adapter import (
 )
 from pipeline_v2.models import (
     Entity,
+    EntityType,
     FullVideoCut,
     ImagePlan,
     ImagePlanEntry,
@@ -136,6 +137,7 @@ from pipeline_v2.models import (
     Metadata,
     ShortsCut,
 )
+from pipeline_v2.stages.stage_4_image_source import ImageSourcer
 
 logger = logging.getLogger("pipeline_v2.stage_4")
 
@@ -297,6 +299,14 @@ def shorts_cuts_to_v1_clip_dicts(
         {
             "start":      _format_mmss_mmm(c.start_sec),
             "end":        _format_mmss_mmm(c.end_sec),
+            # Raw float seconds alongside the MM:SS.mmm strings. V1
+            # helpers read ``start`` / ``end`` strings; V2's per-clip
+            # image selection in compose_shorts (Step 12.2a re-run #4)
+            # reads ``start_sec`` / ``end_sec`` floats so it can
+            # overlap-match against ``source_show_at_sec`` from
+            # resolved image_plan entries.
+            "start_sec":  c.start_sec,
+            "end_sec":    c.end_sec,
             "summary":    c.hook,         # D-8.9: hook is the per-clip summary
             "mood":       "",             # V2 doesn't track per-clip mood
             "importance": c.importance,
@@ -326,6 +336,8 @@ def full_video_cuts_to_v1_clip_dicts(
         {
             "start":      _format_mmss_mmm(c.start_sec),
             "end":        _format_mmss_mmm(c.end_sec),
+            "start_sec":  c.start_sec,   # see shorts converter for rationale
+            "end_sec":    c.end_sec,
             "summary":    "",
             "mood":       "",
             "importance": c.importance,
@@ -336,6 +348,28 @@ def full_video_cuts_to_v1_clip_dicts(
     ]
 
 
+def synth_id_map_for_image_plan(image_plan: ImagePlan) -> dict[str, str]:
+    """Build ``{entity_name: synth_id}`` for an ImagePlan, in
+    first-appearance order.
+
+    Synthesised IDs (``img_000``, ``img_001``, ...) are the V2->V1
+    boundary contract: V1's ``resolve_image_plan`` reads
+    ``entry["id"]`` and uses it as the pool_manifest lookup key. V2's
+    Entity model uses ``canonical_name`` as identity (locked in Step
+    6 D-12); rather than polluting V2's schema with a V1-compat ID
+    field, we synthesise here at the boundary. Two image_plan entries
+    that reference the same entity share the same synth_id so they
+    resolve to ONE image file -- mirroring V1's "one image per unique
+    id, reused across moments" pattern.
+    """
+    out: dict[str, str] = {}
+    for e in image_plan.entries:
+        if e.entity_name in out:
+            continue
+        out[e.entity_name] = f"img_{len(out):03d}"
+    return out
+
+
 def image_plan_to_v1_dict(
     image_plan: ImagePlan,
     entities: list[Entity],
@@ -343,28 +377,30 @@ def image_plan_to_v1_dict(
     """V2 ImagePlanEntry list -> V1-compatible image_plan entry list.
 
     V1's ``resolve_image_plan`` reads:
+      - id (synthesised at this boundary -- see synth_id_map_for_image_plan)
       - entity_name (matched against canonical entities)
       - description (image-search seed)
       - clip_index (which cut this overlay belongs to)
       - show_at (timestamp string "MM:SS.mmm")
       - duration (float seconds)
 
-    V2's ``ImagePlanEntry`` has these fields directly (after the D-7.2
-    trim). The only conversions:
+    V2's ``ImagePlanEntry`` has all fields except ``id`` directly
+    (Entity uses canonical_name as identity per Step 6 D-12). We
+    synthesise the V1-required id here so V1's pool_manifest lookup
+    works without touching V2's schema.
+
+    The only field-shape conversions:
       - ``show_at_sec`` (float) -> ``show_at`` (MM:SS.mmm string)
       - ``duration_sec`` -> ``duration``
-
-    V1 ALSO reads optional ``entity_name_native`` and ``id`` fields
-    from some code paths. We pass through entity_name_native; we omit
-    ``id`` per the post_v2_backlog ``"?"`` id bug (V1 tolerates
-    missing id, the bug is only in old V1 jobs that emitted it).
 
     ``entities`` is unused in the conversion itself but kept in the
     signature to leave room for future entity-lookup logic (e.g.
     enriching with native_name when ImagePlanEntry doesn't have one).
     """
+    synth_id = synth_id_map_for_image_plan(image_plan)
     return [
         {
+            "id":                 synth_id[e.entity_name],
             "entity_name":        e.entity_name,
             "entity_name_native": e.entity_name_native,
             "description":        e.description,
@@ -481,16 +517,31 @@ class Stage4Render:
         """Cut the source video into per-story raw segments for the
         bulletin pass.
 
-        Same wiring as ``cut_raw_shorts`` but with full_video_cuts.
-        V1's cut_video_clips works identically regardless of whether
-        the clip list is shorts-derived or bulletin-derived -- both
-        share the same start/end shape.
+        Same wiring as ``cut_raw_shorts`` but with full_video_cuts and
+        a SEPARATE output directory (``bulletin_dir`` instead of
+        ``output_dir``).
+
+        Why bulletin_dir, not output_dir (Step 12.2a re-run #4 fix):
+        V1's ``cut_video_clips`` is path-cache idempotent -- if
+        ``<output_dir>/raw_clip_NN.mp4`` already exists at >100KB it
+        SKIPS the cut and reuses the cached file
+        (pipeline.py:1235). V2 calls cut_video_clips twice in the
+        same render (once for shorts, once for bulletin); both
+        passes ask V1 to write ``raw_clip_NN.mp4`` to the same
+        output_dir, so the bulletin pass would silently reuse the
+        shorts' raw_clip files. With shorts typically being 15-60s
+        and the bulletin's full_video_cuts spanning the full
+        source video, the cached-reuse produces a bulletin
+        truncated to the first short's duration (the symptom that
+        triggered this fix). Writing to ``bulletin_dir`` gives the
+        bulletin pass a dedicated namespace so V1's cache check
+        never collides with the shorts pass.
         """
         v1_clips = full_video_cuts_to_v1_clip_dicts(full_video_cuts, metadata)
         _v1_cut_video_clips(
             str(self.video_path),
             v1_clips,
-            str(self.output_dir),
+            str(self.bulletin_dir),
         )
         return v1_clips
 
@@ -507,52 +558,132 @@ class Stage4Render:
     ) -> list[dict]:
         """Resolve V2's image_plan to actual on-disk image files.
 
-        Wires V1's ``resolve_image_plan``. V1's signature:
-          resolve_image_plan(
-            image_plan: list[dict],
-            *,
-            output_dir: str,
-            pool_manifest: dict,
-            kept_clips: list[dict],
-            whisper_words: list,
-            video_duration_sec: float,
-          ) -> list[dict]   # resolved entries with status + image_path
+        Sequence (post-12.2a Bug #1/#2/#3 fixes + Bug #4 sourcing):
 
-        Per D-9.5: image_pool is INSTANCE STATE. Same entity resolved
-        across both shorts and bulletin passes downloads ONCE. The
-        pool manifest passed to V1 holds prior resolutions; V1
-        appends to it.
+          1. Walk unique entity_names from image_plan.entries. For
+             each not already in ``self.image_pool``, call
+             ``ImageSourcer.source_for_entity`` -- applies the
+             locked policy (PERSON -> search-only, never generate;
+             non-PERSON -> search-first, generate as last resort).
+             Successful resolutions land in ``self.image_pool``.
 
-        Per D-9.4: whisper_words defaults to ``None`` -- we skip
-        whisper_anchor because Stage 3c already aligned timestamps
-        against full_video_cuts boundaries.
+          2. Build the V1-shape ``image_plan`` dict list (with
+             synthetic ``id`` keys per D-9.2's "V2->V1 boundary
+             contract") + the V1-shape ``pool_manifest`` keyed by
+             those same synthetic ids.
+
+          3. Call V1's ``resolve_image_plan`` (NO ``output_dir``
+             kwarg -- V1's signature is positional ``image_plan``
+             + keyword ``pool_manifest, kept_clips, whisper_words,
+             video_duration_sec``). V1 maps each entry onto the
+             stitched bulletin timeline.
+
+        Per D-9.5: ``image_pool`` is INSTANCE STATE. Same entity
+        resolved across both shorts and bulletin passes downloads
+        ONCE. The first pass populates the pool; subsequent passes
+        short-circuit the sourcing step.
+
+        Per D-9.4: ``whisper_words`` defaults to ``None`` -- Stage 3c
+        already aligned timestamps against full_video_cuts boundaries.
+
+        Backlog item 60: V1's own image_plan flow
+        (``generate_image_pool_from_plan``) pure-generates for every
+        entity including PERSON, violating the locked V2 policy. V2
+        does NOT inherit that behaviour; the policy lives in
+        ``ImageSourcer`` and runs ahead of V1's mapping function.
         """
-        v1_image_plan = image_plan_to_v1_dict(image_plan, entities)
-
-        # Build a pool_manifest dict in V1's expected shape from our
-        # instance image_pool. V1's resolve_image_plan checks the
-        # pool for cached entries before re-downloading.
-        pool_manifest = {
-            "entries": [
-                {"entity_name": name, "image_path": str(path)}
-                for name, path in self.image_pool.items()
-            ],
+        # ---- 1. Source images for entities not already in pool -----
+        # Build a {canonical_name -> Entity} lookup for the sourcer.
+        # Per the locked policy, entries whose entity_name isn't in
+        # canonical_entities default to EntityType.OTHER (safe: the
+        # non-PERSON branch tries search-first, generation last).
+        entity_by_name: dict[str, Entity] = {
+            e.canonical_name: e for e in entities
         }
+        brief = (full_metadata.overall_summary or "")[:200]
+        sourcer = ImageSourcer(language=full_metadata.language)
+        sourcing_out_dir = self.output_dir / "v2_images"
 
+        # Walk unique entity_names in first-appearance order so the
+        # logs read in the same order as Stage 3c's image_plan.
+        seen: set[str] = set()
+        for entry in image_plan.entries:
+            name = entry.entity_name
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in self.image_pool:
+                # Cross-pass cache hit (D-9.5).
+                continue
+            entity = entity_by_name.get(name)
+            if entity is None:
+                # Orphan entity_name (no matching canonical entity).
+                # Stage 3c's post-validate already drops orphans, so
+                # this is a defensive path. Build a typed OTHER stub
+                # so the sourcer's policy branch still works.
+                entity = Entity(
+                    canonical_name=name,
+                    native_name=entry.entity_name_native or name,
+                    first_mention_word_idx=0,
+                    type=EntityType.OTHER,
+                    mentions=[0],
+                )
+            path = sourcer.source_for_entity(
+                entity, brief=brief, out_dir=sourcing_out_dir,
+            )
+            if path is not None:
+                self.image_pool[name] = path
+
+        # ---- 2. Build V1-shape inputs -----------------------------
+        v1_image_plan = image_plan_to_v1_dict(image_plan, entities)
+        synth_id_by_name = synth_id_map_for_image_plan(image_plan)
+
+        # V1's pool_manifest shape (per pipeline.py:1563-1571):
+        #   { eid: {"id": eid, "topic_clue": clue, "path": render_path,
+        #           "description": desc, ...} }
+        # Keyed by entity ID (the synth_id we just generated). V1
+        # reads ``pool_manifest[eid]["path"]`` so the ``path`` key is
+        # the contract; the rest are diagnostic fields.
+        pool_manifest: dict = {}
+        # First-appearance description per entity (for diagnostics)
+        first_desc: dict[str, str] = {}
+        for entry in image_plan.entries:
+            first_desc.setdefault(entry.entity_name, entry.description)
+        for name, path in self.image_pool.items():
+            synth_id = synth_id_by_name.get(name)
+            if synth_id is None:
+                # Pool has an entry for an entity not referenced by
+                # this image_plan (e.g. seeded from a prior pass).
+                # Skip -- V1 only needs synth_ids referenced by
+                # the current v1_image_plan list.
+                continue
+            pool_manifest[synth_id] = {
+                "id":          synth_id,
+                "topic_clue":  name,
+                "description": first_desc.get(name, ""),
+                "path":        str(path),
+            }
+
+        # ---- 3. Call V1's resolve_image_plan ----------------------
+        # V1's signature (pipeline.py:1582):
+        #   resolve_image_plan(image_plan, pool_manifest, kept_clips,
+        #                      whisper_words, video_duration_sec)
+        # No ``output_dir`` kwarg -- V1 is a pure timeline mapper,
+        # not an image producer.
         resolved = _v1_resolve_image_plan(
             v1_image_plan,
-            output_dir=str(self.output_dir),
             pool_manifest=pool_manifest,
             kept_clips=kept_clip_dicts,
             whisper_words=whisper_words,        # None per D-9.4
             video_duration_sec=video_duration_sec,
         )
 
-        # Update our instance image_pool from the resolved manifest.
-        # The pool key is entity_name; value is the resolved image
-        # file path. Skip entries with status != "ready" or empty
-        # image_path -- those didn't actually produce a downloadable
-        # asset and shouldn't poison the cache.
+        # ---- 4. Defensive pool refresh from resolved --------------
+        # The sourcing pre-step (1) already populated the pool with
+        # everything V1 will resolve "ready". This loop is a safety
+        # net: if V1 returns a ``ready`` entry referencing a path
+        # we somehow didn't track, we still cache it. Harmless when
+        # the pre-step has already done the work.
         for r in resolved:
             name = r.get("entity_name", "")
             img_path = r.get("image_path", "")
@@ -740,18 +871,43 @@ class Stage4Render:
         lang_font_basename = os.path.basename(lang_cfg.font_primary) if lang_cfg.font_primary else ""
         lang_follow_text = lang_cfg.follow_bar_text
 
-        # Map clip_index -> image_path from resolved_image_plan.
-        # Fallback: if a clip has no image_plan entry, use the first
-        # available pool image; if pool is empty, skip the clip
-        # (counts toward failure ratio).
-        clip_image_map: dict[int, str] = {}
+        # Per-shorts image assignment (Step 12.2a re-run #4 fix):
+        # Build an overlay list of (source_show_at_sec, image_path) for
+        # every "ready" entry in ``resolved_image_plan``. For each
+        # shorts cut at [start_sec, end_sec], we pick the first overlay
+        # whose ``source_show_at_sec`` falls inside that window. When
+        # no overlay matches, we round-robin through ``self.image_pool``
+        # by short index so each short still gets a DIFFERENT image.
+        #
+        # Why not key by ``clip_index`` like the previous implementation:
+        # ``ImagePlanEntry.clip_index`` references the bulletin's
+        # ``full_video_cuts[idx]``, NOT the shorts cut index. Reusing
+        # that field for the shorts mapping meant every shorts cut
+        # looked up bulletin-cut-0's image, collapsing every short to
+        # the same picture. The show_at_sec overlap is the correct
+        # cross-cut bridge because Stage 3c emits per-moment timestamps
+        # in source-video time, which is the same coordinate space
+        # the shorts cuts use.
+        #
+        # Defensive: ``source_show_at_sec`` is emitted by V1's
+        # resolve_image_plan only for entries it successfully
+        # timeline-mapped (pipeline.py:1635). Entries that fell into
+        # an "image_missing" / "in_cut_span" branch never get this
+        # field. We exclude them from overlap matching.
+        overlays: list[tuple[float, str]] = []
         for r in resolved_image_plan:
             if r.get("status") != "ready":
                 continue
-            clip_idx = r.get("clip_index", -1)
             img_path = r.get("image_path", "")
-            if clip_idx >= 0 and img_path and clip_idx not in clip_image_map:
-                clip_image_map[clip_idx] = img_path
+            show_at = r.get("source_show_at_sec")
+            if not img_path or show_at is None:
+                continue
+            try:
+                overlays.append((float(show_at), img_path))
+            except (TypeError, ValueError):
+                continue
+
+        pool_values = list(self.image_pool.values())
 
         card_text = metadata.shorts_headline_native or "KAIZER NEWS"
         composed: list[dict] = []
@@ -768,12 +924,19 @@ class Stage4Render:
                 )
                 continue
 
-            v2_idx = clip.get("v2_index", i)
-            image_path = clip_image_map.get(v2_idx, "")
-            if not image_path and self.image_pool:
-                # Fallback: any image from the pool. V1 uses
-                # ``images[-1]`` when the indexed slot is missing.
-                image_path = str(next(iter(self.image_pool.values())))
+            # ---- Per-clip image selection (overlap first, RR fallback) ----
+            clip_start = float(clip.get("start_sec") or 0.0)
+            clip_end = float(clip.get("end_sec") or 0.0)
+            image_path = ""
+            for show_at, img in overlays:
+                if clip_start <= show_at <= clip_end:
+                    image_path = img
+                    break
+            if not image_path and pool_values:
+                # Round-robin fallback: cycle the resolved image pool
+                # by short index so each short gets a different image
+                # even when no entity overlay falls inside its window.
+                image_path = str(pool_values[i % len(pool_values)])
             if not image_path:
                 failures.append({"i": i, "reason": "no_image_available"})
                 logger.warning(
@@ -1200,6 +1363,7 @@ class Stage4Render:
         title_english: str = "",
         channel_name: str = "KAIZER NEWS",
         logo_path: Optional[str] = None,
+        cancel_check: Optional[callable] = None,
     ) -> RenderResult:
         """End-to-end Stage 4: shorts pass + bulletin pass.
 
@@ -1232,6 +1396,19 @@ class Stage4Render:
         conditions to ``PermanentRenderError`` so the orchestrator's
         Stage 4 handler can map to Inngest ``NonRetriableError``.
         Other exceptions propagate as-is for Inngest retry.
+
+        ``cancel_check`` parameter (Step 12.3 Test 2 fix, backlog
+        item 76): a callable invoked between every Stage 4 sub-phase
+        (cut_raw_shorts / resolve_images / compose_shorts /
+        render_bulletin). The callable should raise (typically
+        ``NonRetriableError``) when the user has requested cancel,
+        which propagates up through ``render()`` and out to the
+        orchestrator's terminal catch -- which marks the Job as
+        failed and short-circuits the run. Without this, a mid-
+        Stage-4 cancel waited the full ~5 min for the stage to
+        finish before the cooperative check at finalize fired.
+        Defaults to ``None`` (no cancel checks) so existing unit
+        tests + the V1-only call path are unaffected.
         """
         try:
             return self._render_impl(
@@ -1239,6 +1416,7 @@ class Stage4Render:
                 title_english=title_english,
                 channel_name=channel_name,
                 logo_path=logo_path,
+                cancel_check=cancel_check,
             )
         except PermanentRenderError:
             raise   # already classified; don't re-classify
@@ -1255,10 +1433,18 @@ class Stage4Render:
         title_english: str = "",
         channel_name: str = "KAIZER NEWS",
         logo_path: Optional[str] = None,
+        cancel_check: Optional[callable] = None,
     ) -> RenderResult:
         """Internal: the real render() body. Wrapped by render()'s
         try/except to convert known-permanent failures into
         PermanentRenderError.
+
+        ``cancel_check`` (when provided) is invoked between sub-phases
+        so a user cancel mid-Stage-4 short-circuits within seconds
+        rather than waiting for the whole stage to complete. The
+        callable raises on cancel (typically NonRetriableError);
+        propagation exits ``_render_impl`` and runs through render()'s
+        classifier and out to the orchestrator's terminal catch.
         """
         shorts_cuts = job_output.shorts_cuts
         full_video_cuts = job_output.stage_two.full_video_cuts
@@ -1273,12 +1459,18 @@ class Stage4Render:
 
         # ---- 1. SHORTS pass ------------------------------------------
         if shorts_cuts:
+            if cancel_check is not None:
+                cancel_check()
             shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata)
+            if cancel_check is not None:
+                cancel_check()
             resolved_shorts = self.resolve_images(
                 image_plan, entities,
                 kept_clip_dicts=shorts_clips,
                 full_metadata=metadata,
             )
+            if cancel_check is not None:
+                cancel_check()
             composed_shorts = self.compose_shorts(
                 shorts_clips, metadata, resolved_shorts,
             )
@@ -1347,6 +1539,8 @@ class Stage4Render:
 
         # ---- 2. BULLETIN pass ----------------------------------------
         if full_video_cuts:
+            if cancel_check is not None:
+                cancel_check()
             bulletin_result = self.render_bulletin(
                 full_video_cuts=full_video_cuts,
                 metadata=metadata,

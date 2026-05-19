@@ -663,6 +663,16 @@ _V2_STT_PROVIDER_CATALOG = [
             "Free tier (rate-limited). Good multilingual accuracy. "
             "100 MB file cap on dev tier."
         ),
+        # Step 12.5 / backlog item 59: surfaces in the wizard so a
+        # user picking Whisper-Groq for Telugu/Hindi sees the
+        # known-issue warning before submitting (the empirical
+        # finding from Step 12.2a Path 2 investigation, also
+        # backlog item 57).
+        "warnings": [
+            "Known timestamp issues with Telugu, Hindi, and other "
+            "Indian-language audio. Use Deepgram for Indian-language "
+            "content."
+        ],
     },
     {
         "id":              "deepgram",
@@ -674,6 +684,7 @@ _V2_STT_PROVIDER_CATALOG = [
             "Premium tier. Per-word confidence + diarization. "
             "Telugu single-language mode for V2 Telugu workloads."
         ),
+        "warnings": [],
     },
     {
         "id":              "assemblyai",
@@ -685,6 +696,7 @@ _V2_STT_PROVIDER_CATALOG = [
             "Mid-tier. Strong English accuracy; weaker on Indian "
             "languages. Includes word-level timestamps."
         ),
+        "warnings": [],
     },
 ]
 
@@ -711,6 +723,10 @@ def get_v2_stt_providers():
             "cost_per_min_usd": p["cost_per_min_usd"],
             "configured":       bool(api_key),
             "description":      p["description"],
+            # Step 12.5 / backlog 59: per-provider warning strings
+            # (empty list = no warnings). Frontend renders these
+            # as a tooltip / inline hint when surfacing the option.
+            "warnings":         list(p.get("warnings") or []),
         })
     return out
 
@@ -2092,3 +2108,26 @@ def _estimate_progress(log_lines: list, status: str) -> int:
     # Estimate from pipeline step markers in log
     steps_found = sum(1 for l in log_lines if "STEP" in l.upper())
     return min(90, steps_found * 9)
+
+
+# ── V2 Inngest serve mount (Step 12.2b) ──────────────────────────────────────
+# Mounts the V2 Inngest webhook at /api/inngest so the Inngest Dev Server
+# (and production Inngest Cloud) can discover process_video_v2 and drive
+# its step execution. Guarded by KAIZER_V2_ENABLED so V1-only deployments
+# get a byte-identical route table.
+#
+# Placed at the END of main.py so all V1 routes are declared first; the
+# inngest serve registers via @app.get/@app.post decorators which would
+# otherwise be shadowed if any V1 route shared the /api/inngest path
+# (none do today, but this guarantees the property forward).
+if _v2_enabled():
+    import sys as _sys
+    import os as _os
+    _pipeline_v2_dir = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "pipeline_v2",
+    )
+    if _pipeline_v2_dir not in _sys.path:
+        _sys.path.insert(0, _pipeline_v2_dir)
+    from pipeline_v2.inngest_app import register_v2_inngest
+    register_v2_inngest(app)

@@ -1,0 +1,9 @@
+{
+  "stage_0_ingest": 0.0,
+  "stage_1_transcribe": 0.11542224000000001,
+  "stage_2_continuity": 0.0,
+  "stage_2_5_entities": 0.0,
+  "stage_3_fanout": 0.0,
+  "stage_4_render": 0.0,
+  "finalize": 0.0
+}
