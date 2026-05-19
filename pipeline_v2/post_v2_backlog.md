@@ -659,3 +659,155 @@ Indian-language coverage
   run) or stable-per-job (default, dedupes duplicates). See
   item 71 for the diagnostic-signal angle when dedup is
   unexpectedly hit in production.
+
+### Item 78: Pre-existing V1 test failures triage (out of Step 12 scope)
+
+- **Surfaced**: 2026-05-19 during Step 12.6 broader-suite sweep.
+- **Failures (7 total, all V1-side, all pre-Step-12)**:
+  - ``tests/test_encode_args.py::test_encode_args_includes_loudnorm``
+  - ``tests/test_live_director_webrtc_ingest.py::test_start_spawns_two_ffmpeg_subprocesses``
+  - ``tests/test_live_director_webrtc_ingest.py::test_stop_closes_stdins_and_waits``
+  - ``tests/test_live_director_webrtc_ingest.py::test_chunk_pump_forwards_to_both_stdins``
+  - ``tests/test_live_director_webrtc_ingest.py::test_audio_reader_pushes_pcm_to_ring``
+  - ``tests/test_narrative.py::test_extract_without_gemini_key_end_to_end``
+  - ``tests/test_render_modes.py::TestRenderModeConfigs::test_all_six_modes_in_config``
+- **Evidence these are pre-existing, not V2 regressions**: ``git log`` on
+  each path shows last touch at or before ``b3861cb`` (Gemini SDK
+  migration commit, pre-Step-12). No V2 commit (``b3685e1``, ``cb8c9a9``)
+  touches these tests or the V1 code paths they exercise
+  (``pipeline_core/``, ``live_director/``, ``narrative.py``, render-mode
+  config).
+- **Why deferred from Step 12**: Step 12's scope was V2 production
+  validation. V1 unit-test fixes are out of scope and should not block
+  Beta launch.
+- **Recommended action**: dedicated mini-pass post-Step-13 to triage
+  each failure (likely candidates: stale fixtures, mocked-API drift,
+  loudnorm filter graph signature change). Time budget: ~1-2 hours
+  total. No production impact (these are unit tests, not behaviour
+  checks).
+
+### Item 79: Clip.job_id ON DELETE CASCADE only at the ORM layer
+
+- **Surfaced**: 2026-05-19 during Step 13 / Part 2.9 cascade verification.
+- **Behaviour observed**: ``clips.job_id`` ForeignKey is declared as
+  ``Column(Integer, ForeignKey("jobs.id"))`` -- no ``ondelete`` directive.
+  ``Job.clips`` relationship has ``cascade="all, delete"`` so ORM
+  deletes propagate; raw SQL deletes (or Postgres-side cascade in
+  multi-tenant cleanup scripts) leak orphan Clip rows.
+- **Why this is NOT a Step 13 fix**: the implementation plan
+  explicitly listed ``models.Clip database schema`` as a "DO NOT
+  TOUCH" item -- it's V1-shared and the migration would need
+  Postgres-side ``ALTER TABLE`` planning + a backfill audit.
+- **Recommended action**: post-Beta clean-up pass. Update the FK to
+  ``ForeignKey("jobs.id", ondelete="CASCADE")`` and ship a Phase-N
+  migration with a one-shot orphan-cleanup ``DELETE FROM clips
+  WHERE job_id NOT IN (SELECT id FROM jobs)``.
+
+### Item 80: Job naming + feedback shipped (Phase 14 / D-13.11 + D-13.13 + D-13.14)
+
+- **Status**: LANDED.
+- **Scope**:
+  - ``Job.name VARCHAR(120) NULL`` column.
+  - ``job_feedback`` table with CHECK [0,100] + unique (job_id, user_id).
+  - ``POST /api/jobs/{id}/feedback/`` + ``PATCH /api/jobs/{id}/rename/``
+    + name field on ``POST /api/jobs/create/``.
+  - Pure helper ``resolve_job_name(name_input, video_filename)`` in
+    main.py (8-line cap-and-fallback rule).
+- **Pure-helper rationale**: extracted so the cap-and-fallback rule
+  is unit-testable without TestClient + filesystem mocking. 7 tests
+  exercise both branches + boundary conditions.
+- **UI**: ``RenamableTitle`` + ``FeedbackPanel`` components live in
+  ``JobDetail.jsx``. Home.jsx prefers ``job.name`` with
+  ``video_name`` fallback so pre-Phase-14 jobs render unchanged.
+
+### Item 81: V2 user-facing stats + admin dashboard shipped (D-13.12)
+
+- **Status**: LANDED.
+- **User-facing**: ``GET /api/v2/stats/`` aggregates the calling
+  user's V2 jobs only. Surface = ``/v2-stats`` React route with a
+  KPI grid + success-rate card + average-rating card. Read-only.
+- **Admin-facing**: ``GET /api/admin/v2-feedback`` (paginated, 50/
+  page default) + ``GET /api/admin/v2-stats`` (failure breakdown,
+  rating distribution, cancellation rate). Mounted at ``/admin/v2``
+  via a TABS entry in Admin.jsx.
+- **Failure-slug classification**: ``_classify_failure_slug()`` maps
+  free-form Job.error into a stable set keyed off the
+  ``permanent:*`` prefix (e.g., ``empty_file``,
+  ``ffmpeg_not_found``, ``stt_failed``). Falls through to ``other``
+  for unrecognised errors so the bucket never crashes.
+
+### Item 82: V2 Beta launch infrastructure landed (D-13.5 + D-13.6)
+
+- **Status**: LANDED (script + docs).
+- **Preflight script** ``pipeline_v2/scripts/preflight_v2_launch.py``:
+  5 checks (env vars, ``INNGEST_DEV=0``, ``KAIZER_V2_ENABLED=1``,
+  DB reachable, Inngest Cloud reachable). 20 unit tests cover all
+  five branches. ``KAIZER_PREFLIGHT_SKIP_NETWORK=1`` lets unit tests
+  skip the live TCP probe.
+- **Runbook** ``pipeline_v2/RUNBOOK.md``: rollback procedure (D-13.5),
+  daily monitoring SQL (D-13.4), spend dashboards, common
+  ``permanent:*`` failure modes, cutover gating criteria (D-13.9).
+- **Changelog** ``CHANGELOG.md``: first formal entry, ships with
+  the V2 Beta launch. Prior changes remain in git log only.
+
+### Item 83: GCP Gemini spend cap (D-13.6) is operator-managed, not code
+
+- **Surfaced**: 2026-05-19 during Step 13 / D-13.6 lock-in.
+- **Status**: DOCUMENTED, action required by operator.
+- **What needs doing**: in Google Cloud console -> Billing -> Budgets
+  & alerts -> create a $50/day budget scoped to "Generative
+  Language" service with action "Disable billing on threshold".
+- **Why this is critical**: the internal cost-tracking ledger is
+  broken (backlog item 62) -- a Stage-2 retry loop on Gemini 2.5
+  Pro could burn $50-100/hr before manual detection. The GCP cap is
+  the only mechanism that physically prevents runaway.
+- **Tracked here** because the preflight script can't verify GCP-
+  console state from the host, and the rollback procedure assumes
+  the cap exists. Confirm the cap is in place BEFORE flipping
+  ``KAIZER_V2_ENABLED=1`` in production.
+
+### Item 84: Phased Beta rollout cohort (D-13.3)
+
+- **Surfaced**: 2026-05-19 during Step 13 / D-13.3 lock-in.
+- **Locked plan**:
+  1. **First 24h**: operator-only (~2-3 self-submitted jobs).
+  2. **First week**: operator + 3-5 trusted users.
+  3. **Week 2+**: broader release gated by telemetry (see item 80
+     admin dashboard + RUNBOOK section 4 daily checks).
+- **Mechanism**: no per-user gating in code -- ``KAIZER_V2_ENABLED``
+  toggles the platform card for every signed-in user. Cohort
+  control is "don't tell users" for now. If the cohort expands past
+  trusted-users, consider a per-user flag (e.g.
+  ``users.v2_beta_enabled``) but defer until the demand arrives.
+
+### Item 85: Cutover gate (D-13.9) -- 3 criteria, all must hold
+
+- **Surfaced**: 2026-05-19 during Step 13 / D-13.9 lock-in.
+- **Gate definition**:
+  1. >= 2 weeks of Beta uptime since launch.
+  2. >= 50 production V2 jobs (``platform='full_video_shorts_v2'``).
+  3. ZERO P1 incidents (defined as: any event that required
+     ``KAIZER_V2_ENABLED=0`` rollback) in the trailing 7 days.
+- **Step 14 (default cutover) is NOT in scope** of any current
+  session -- when the gate clears, re-open the discussion
+  deliberately rather than acting on the gate alone. Beta -> default
+  is a one-way door for V1 users; the V1 paths can stay alive
+  side-by-side indefinitely if the data supports it.
+
+### Item 86: ``test_main_v2.py`` cross-test fixture pollution (latent risk)
+
+- **Surfaced**: 2026-05-19 during Step 13 / Part 2 test design.
+- **Concern**: the ``v2_beta_app`` fixture installs FastAPI
+  ``dependency_overrides`` on the shared ``main.app`` object and
+  drops them in a ``finally``. If a test in a sibling file imports
+  ``main.app`` directly and runs in the same pytest session, it'll
+  see the wrong DB binding briefly while the override is active.
+- **Empirical status**: not currently a problem -- the shared-engine
+  in-memory SQLite is named uniquely
+  (``kaizer_v2_beta_test``) so a sibling test that creates its own
+  ``kaizer_admin_test`` engine doesn't collide. ``app.dependency_
+  overrides.clear()`` runs in the fixture teardown.
+- **Recommended hardening (deferred)**: switch the fixtures to use a
+  copy of the app instead of the singleton, or move to
+  ``starlette.testclient.TestClient`` with a per-test app factory.
+  ~30 min refactor. No active production impact.

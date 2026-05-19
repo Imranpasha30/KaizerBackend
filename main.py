@@ -82,6 +82,10 @@ def _migrate_schema():
             # for V2 jobs. NULL on V1 jobs (legacy subprocess path
             # doesn't write progress). NULL at finalize.
             "current_stage":    "VARCHAR(40)",
+            # Phase 14 / V2 Beta (D-13.11): user-supplied human label.
+            # NULL on pre-Phase-14 rows; create endpoint defaults to
+            # first 80 chars of video_name when caller omits the field.
+            "name":             "VARCHAR(120)",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
@@ -344,6 +348,12 @@ def _migrate_schema():
         if not inspector.has_table("password_reset_tokens"):
             Base.metadata.tables["password_reset_tokens"].create(conn)
 
+        # ── Phase 14 — V2 Beta launch: job feedback ──────────────────
+        # CheckConstraint + UniqueConstraint + Index are baked into the
+        # ORM definition; create() emits them with the table.
+        if not inspector.has_table("job_feedback"):
+            Base.metadata.tables["job_feedback"].create(conn)
+
         conn.commit()
 
 
@@ -602,6 +612,19 @@ def _v2_enabled() -> bool:
     raw = os.environ.get("KAIZER_V2_ENABLED", "1").strip().lower()
     return raw not in ("0", "false", "no", "off", "")
 
+
+def resolve_job_name(name_input: Optional[str], video_filename: Optional[str]) -> str:
+    """Phase 14 / V2 Beta (D-13.11) name resolution rule.
+
+    User-supplied value is capped at 120 chars (DB column width). Blank
+    or whitespace-only falls back to the first 80 chars of the upload
+    filename so the jobs list always shows something readable.
+    """
+    cleaned = (name_input or "").strip()[:120]
+    if cleaned:
+        return cleaned
+    return (video_filename or "")[:80]
+
 # Frame layouts — single source of truth lives in pipeline_core.pipeline
 # (the CLI's --frame argparse list is built from it). We keep human-friendly
 # labels here so the React UI doesn't have to parse the CLI-style ones, but
@@ -766,6 +789,7 @@ def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.cu
             "platform": j.platform,
             "frame_layout": j.frame_layout,
             "video_name": j.video_name,
+            "name": j.name,
             "language": j.language or "te",
             "created_at": j.created_at,
             "clip_count": len(j.clips),
@@ -793,6 +817,10 @@ async def create_job(
     # calling OpenAI gpt-image-1. Only meaningful for platforms that
     # render a bulletin (youtube_full / youtube_full_plus_shorts).
     bulletin_image_ids: str = Form(""),
+    # Phase 14 / V2 Beta (D-13.11): optional human-readable name. Caps at
+    # 120 chars (DB column width); blank/missing defaults to first 80
+    # chars of the source filename so the list never shows "(unnamed)".
+    name: str = Form(""),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -867,6 +895,9 @@ async def create_job(
     if _validation_warnings:
         _warning_prefix = "[input warnings] " + "; ".join(_validation_warnings) + "\n"
 
+    # Phase 14 / V2 Beta (D-13.11): see resolve_job_name() below.
+    _name_clean = resolve_job_name(name, video.filename)
+
     # Single Job row regardless of platform. The compound platform
     # ("youtube_full_plus_shorts") stores its original key here so the
     # runner can detect it and run TWO pipeline passes internally —
@@ -877,6 +908,7 @@ async def create_job(
         platform=platform,
         frame_layout=frame_layout,
         video_name=video.filename,
+        name=_name_clean,
         language=lang_cfg.code,
         status="pending",
         log=_warning_prefix,
@@ -1198,6 +1230,7 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "platform": job.platform,
         "frame_layout": job.frame_layout,
         "video_name": job.video_name,
+        "name": job.name,
         "language": job.language or "te",
         "log": job.log,
         "created_at":  job.created_at,
@@ -1230,6 +1263,136 @@ def get_job_status(job_id: int, db: Session = Depends(get_db), user: models.User
         # "Stage X of 7: <human label>" only when this is non-null.
         "current_stage": job.current_stage,
         "platform": job.platform,
+    }
+
+
+# Phase 14 / V2 Beta (D-13.14): rename a job mid-flight.
+@app.patch("/api/jobs/{job_id}/rename/")
+def rename_job(
+    job_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    new_name = (payload.get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="name must be non-empty")
+    if len(new_name) > 120:
+        raise HTTPException(status_code=400, detail="name must be <= 120 chars")
+
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job.name = new_name
+    db.commit()
+    db.refresh(job)
+    return {"id": job.id, "name": job.name}
+
+
+# Phase 14 / V2 Beta (D-13.13): submit 0-100 rating + optional comment.
+@app.post("/api/jobs/{job_id}/feedback/")
+def submit_job_feedback(
+    job_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    # Validate rating range up-front so we never INSERT a row that the
+    # DB CHECK constraint would reject (CHECK rejection wraps in
+    # IntegrityError which is harder to translate to a clear 400).
+    raw_rating = payload.get("rating")
+    if not isinstance(raw_rating, int) or isinstance(raw_rating, bool):
+        raise HTTPException(status_code=400, detail="rating must be an integer")
+    if raw_rating < 0 or raw_rating > 100:
+        raise HTTPException(status_code=400, detail="rating must be in [0, 100]")
+    comment = (payload.get("comment") or "").strip()
+
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(
+            status_code=400,
+            detail="feedback can only be submitted on completed jobs",
+        )
+
+    # Dup check — one feedback per (job, user). Returns 409 on second
+    # submission. UI may switch to an "Update" affordance later; for
+    # now the first vote is locked in.
+    existing = db.query(models.JobFeedback).filter(
+        models.JobFeedback.job_id == job_id,
+        models.JobFeedback.user_id == user.id,
+    ).first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="feedback already submitted for this job",
+        )
+
+    fb = models.JobFeedback(
+        job_id=job_id,
+        user_id=user.id,
+        rating=raw_rating,
+        comment=comment,
+    )
+    db.add(fb)
+    db.commit()
+    db.refresh(fb)
+    return {
+        "id": fb.id,
+        "job_id": fb.job_id,
+        "rating": fb.rating,
+        "comment": fb.comment,
+        "submitted_at": fb.submitted_at.isoformat() if fb.submitted_at else None,
+    }
+
+
+# Phase 14 / V2 Beta (D-13.12, user-facing): aggregate stats for the
+# calling user's V2 jobs only. Cheap query — drives the JobsStats page
+# header and the optional dashboard card.
+@app.get("/api/v2/stats/")
+def v2_user_stats(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    from sqlalchemy import func as _f
+    V2 = "full_video_shorts_v2"
+
+    rows = (
+        db.query(models.Job.status, _f.count(models.Job.id))
+          .filter(models.Job.user_id == user.id, models.Job.platform == V2)
+          .group_by(models.Job.status)
+          .all()
+    )
+    status_counts = {s: int(c) for s, c in rows}
+    total       = sum(status_counts.values())
+    completed   = status_counts.get("done", 0)
+    failed      = status_counts.get("failed", 0)
+    cancelled   = status_counts.get("cancelled", 0)
+    success_rate = round((completed / total * 100), 1) if total else 0.0
+
+    fb_row = (
+        db.query(_f.avg(models.JobFeedback.rating), _f.count(models.JobFeedback.id))
+          .join(models.Job, models.JobFeedback.job_id == models.Job.id)
+          .filter(models.JobFeedback.user_id == user.id, models.Job.platform == V2)
+          .one()
+    )
+    avg_rating   = round(float(fb_row[0]), 1) if fb_row[0] is not None else None
+    rating_count = int(fb_row[1] or 0)
+
+    return {
+        "total_v2_jobs":   total,
+        "completed_count": completed,
+        "failed_count":    failed,
+        "cancelled_count": cancelled,
+        "success_rate_pct": success_rate,
+        "average_rating":  avg_rating,
+        "rating_count":    rating_count,
     }
 
 

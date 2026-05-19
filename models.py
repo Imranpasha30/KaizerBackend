@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, DateTime, ForeignKey, Float, Boolean,
-    JSON, UniqueConstraint, Index,
+    JSON, UniqueConstraint, Index, CheckConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -62,6 +62,11 @@ class Job(Base):
     platform     = Column(String(50))
     frame_layout = Column(String(50))
     video_name   = Column(String(255))
+    # V2 Beta (Phase 14 / D-13.11): user-supplied human label for the
+    # job. Shown in JobsList + JobDetail. Defaults to first 80 chars
+    # of video_name when the form field is left blank. Editable mid-
+    # flight via PATCH /api/jobs/{id}/rename. NULL on pre-Phase-14 jobs.
+    name         = Column(String(120), nullable=True, default=None)
     language     = Column(String(10), default="te")        # ISO 639-1: te|hi|ta|kn|ml|bn|mr|gu|en
     output_dir   = Column(String(500), default="")
     log          = Column(Text, default="")
@@ -1070,3 +1075,35 @@ class LiveStream(Base):
 
     created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 14 — V2 Beta launch: job feedback (D-13.8 + D-13.13)
+#
+# Captures 0–100 rating + optional free-text comment after a V2 job
+# reaches status='done'. Surfaced to the admin via /api/admin/v2-feedback
+# and aggregated into /api/v2/stats + /api/admin/v2-stats.
+#
+# One row per (job, user) — the endpoint enforces this and returns 409
+# on duplicate submission. user_id ON DELETE SET NULL so aggregate
+# admin stats survive a user account deletion; job_id ON DELETE CASCADE
+# because feedback without the parent job is meaningless.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class JobFeedback(Base):
+    __tablename__ = "job_feedback"
+    __table_args__ = (
+        UniqueConstraint("job_id", "user_id", name="uq_job_feedback_user"),
+        CheckConstraint("rating >= 0 AND rating <= 100", name="ck_job_feedback_rating"),
+        Index("ix_job_feedback_submitted_at", "submitted_at"),
+    )
+
+    id           = Column(Integer, primary_key=True, index=True)
+    job_id       = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    user_id      = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"),
+                          nullable=True, index=True)
+    rating       = Column(Integer, nullable=False)
+    comment      = Column(Text, default="")
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now())

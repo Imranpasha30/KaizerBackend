@@ -1993,3 +1993,168 @@ def usage_dashboard(
             "youtube": _youtube_recent(),
         },
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 14 / V2 Beta — admin views (D-13.8 + D-13.12)
+#
+# Both endpoints are admin-only; they aggregate across ALL users (no
+# tenant scoping) because the Beta health view exists to triage the
+# whole population, not any one account.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_V2_PLATFORM = "full_video_shorts_v2"
+
+
+def _classify_failure_slug(error_text: str) -> str:
+    """Map a free-form Job.error into one of a small set of slugs the
+    admin dashboard groups by. Anything we don't recognise becomes
+    ``other``. The slugs match the ``permanent:*`` family the
+    orchestrator emits — see backlog item 67."""
+    if not error_text:
+        return "other"
+    head = error_text.lower()[:400]
+    if "permanent:" in head:
+        for slug in (
+            "empty_file", "ffmpeg_not_found", "stt_failed", "stt_quota",
+            "no_audio", "no_speech", "json_invalid", "schema_violation",
+            "render_failed", "cancelled",
+        ):
+            if f"permanent:{slug}" in head:
+                return slug
+        return "permanent_other"
+    if "cancel" in head:
+        return "cancelled"
+    if "ffmpeg" in head:
+        return "render_failed"
+    if "deepgram" in head or "whisper" in head or "stt" in head:
+        return "stt_failed"
+    if "gemini" in head:
+        return "gemini_failed"
+    return "other"
+
+
+@router.get("/v2-feedback")
+def v2_feedback_list(
+    offset: int = Query(0, ge=0),
+    limit:  int = Query(50, ge=1, le=200),
+    _: models.User = Depends(auth.admin_required),
+    db: Session = Depends(get_db),
+):
+    """Paginated list of V2 job feedback joined with job + user metadata."""
+    base_q = (
+        db.query(models.JobFeedback, models.Job, models.User)
+          .join(models.Job, models.JobFeedback.job_id == models.Job.id)
+          .outerjoin(models.User, models.JobFeedback.user_id == models.User.id)
+          .filter(models.Job.platform == _V2_PLATFORM)
+    )
+    total = base_q.count()
+    rows = (
+        base_q.order_by(desc(models.JobFeedback.submitted_at))
+              .offset(offset)
+              .limit(limit)
+              .all()
+    )
+    items = []
+    for fb, job, usr in rows:
+        items.append({
+            "id":           fb.id,
+            "rating":       fb.rating,
+            "comment":      fb.comment or "",
+            "submitted_at": _iso(fb.submitted_at),
+            "job": {
+                "id":         job.id,
+                "name":       job.name,
+                "video_name": job.video_name,
+                "status":     job.status,
+                "platform":   job.platform,
+                "created_at": _iso(job.created_at),
+            },
+            "user": (
+                {"id": usr.id, "email": usr.email}
+                if usr is not None
+                else {"id": None, "email": None}
+            ),
+        })
+    return {
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "items":  items,
+    }
+
+
+@router.get("/v2-stats")
+def v2_admin_stats(
+    _: models.User = Depends(auth.admin_required),
+    db: Session = Depends(get_db),
+):
+    """Global V2 aggregates + rating distribution + failure-by-slug."""
+    status_rows = (
+        db.query(models.Job.status, func.count(models.Job.id))
+          .filter(models.Job.platform == _V2_PLATFORM)
+          .group_by(models.Job.status)
+          .all()
+    )
+    status_breakdown = {s: int(c) for s, c in status_rows}
+    total_v2_jobs = sum(status_breakdown.values())
+
+    # Failure-by-slug — only inspect Job.error on terminal-failed rows.
+    failed_jobs = (
+        db.query(models.Job.error)
+          .filter(models.Job.platform == _V2_PLATFORM,
+                  models.Job.status == "failed")
+          .all()
+    )
+    failure_breakdown: dict[str, int] = {}
+    for (err,) in failed_jobs:
+        slug = _classify_failure_slug(err or "")
+        failure_breakdown[slug] = failure_breakdown.get(slug, 0) + 1
+
+    # Rating aggregate + distribution.
+    fb_row = (
+        db.query(func.avg(models.JobFeedback.rating),
+                 func.count(models.JobFeedback.id))
+          .join(models.Job, models.JobFeedback.job_id == models.Job.id)
+          .filter(models.Job.platform == _V2_PLATFORM)
+          .one()
+    )
+    avg_rating   = round(float(fb_row[0]), 1) if fb_row[0] is not None else None
+    rating_count = int(fb_row[1] or 0)
+
+    buckets = {"0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0}
+    if rating_count:
+        all_ratings = (
+            db.query(models.JobFeedback.rating)
+              .join(models.Job, models.JobFeedback.job_id == models.Job.id)
+              .filter(models.Job.platform == _V2_PLATFORM)
+              .all()
+        )
+        for (r,) in all_ratings:
+            if r <= 20:
+                buckets["0-20"] += 1
+            elif r <= 40:
+                buckets["21-40"] += 1
+            elif r <= 60:
+                buckets["41-60"] += 1
+            elif r <= 80:
+                buckets["61-80"] += 1
+            else:
+                buckets["81-100"] += 1
+
+    cancelled = status_breakdown.get("cancelled", 0)
+    cancel_rate = (
+        round((cancelled / total_v2_jobs * 100), 1)
+        if total_v2_jobs else 0.0
+    )
+
+    return {
+        "total_v2_jobs_all_users":   total_v2_jobs,
+        "status_breakdown":          status_breakdown,
+        "failure_breakdown_by_slug": failure_breakdown,
+        "average_rating_all_users":  avg_rating,
+        "rating_count":              rating_count,
+        "rating_distribution":       buckets,
+        "cancellation_rate_pct":     cancel_rate,
+    }

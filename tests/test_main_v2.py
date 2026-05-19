@@ -770,4 +770,491 @@ class TestV2InngestServeMount:
             )
 
 
+# ====================================================================== #
+# Step 13 / Phase 14 — V2 Beta launch endpoints                          #
+#                                                                         #
+# Covers:                                                                 #
+#   D-13.11 — resolve_job_name() + POST /api/jobs/create/ name field      #
+#   D-13.14 — PATCH /api/jobs/{id}/rename/                                #
+#   D-13.13 — POST /api/jobs/{id}/feedback/                               #
+#   D-13.12 — GET  /api/v2/stats/                                         #
+#   D-13.8  — GET  /api/admin/v2-feedback                                 #
+#   D-13.12 — GET  /api/admin/v2-stats                                    #
+# ====================================================================== #
+
+
+import json as _json
+from fastapi.testclient import TestClient as _TestClient
+from sqlalchemy import create_engine as _create_engine
+from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+import auth as _auth
+import models as _models
+from database import Base as _Base
+from database import get_db as _real_get_db
+
+
+@pytest.fixture
+def v2_beta_app():
+    """Fresh in-memory SQLite per test with admin + regular user seeded."""
+    engine = _create_engine(
+        "sqlite:///file:kaizer_v2_beta_test?mode=memory&cache=shared&uri=true",
+        future=True,
+        connect_args={"check_same_thread": False},
+    )
+    _Base.metadata.create_all(engine)
+    LocalSession = _sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    s = LocalSession()
+    try:
+        admin   = _models.User(id=1, email="admin@x", name="A", is_admin=True,  is_active=True)
+        regular = _models.User(id=2, email="user@x",  name="U", is_admin=False, is_active=True)
+        other   = _models.User(id=3, email="other@x", name="O", is_admin=False, is_active=True)
+        s.add_all([admin, regular, other])
+        s.commit()
+    finally:
+        s.close()
+
+    from main import app as _app
+
+    def _override_db():
+        db = LocalSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    # Default identity = regular user (id=2). Tests flip _CURRENT_USER_ID
+    # to exercise the admin and "other user" paths.
+    state = {"current_user_id": 2}
+
+    def _override_current_user():
+        db = LocalSession()
+        try:
+            return db.query(_models.User).filter(
+                _models.User.id == state["current_user_id"]
+            ).first()
+        finally:
+            db.close()
+
+    _app.dependency_overrides[_real_get_db]      = _override_db
+    _app.dependency_overrides[_auth.current_user] = _override_current_user
+
+    try:
+        yield _app, LocalSession, state
+    finally:
+        _app.dependency_overrides.clear()
+        _Base.metadata.drop_all(engine)
+
+
+def _seed_job(session_factory, *, user_id=2, status="done",
+              platform="full_video_shorts_v2", name="My Job",
+              video_name="src.mp4", error=""):
+    s = session_factory()
+    try:
+        j = _models.Job(
+            user_id=user_id,
+            status=status,
+            platform=platform,
+            frame_layout="torn_card",
+            video_name=video_name,
+            name=name,
+            language="te",
+            log="",
+            error=error,
+            output_dir="/tmp",
+        )
+        s.add(j)
+        s.commit()
+        s.refresh(j)
+        return j.id
+    finally:
+        s.close()
+
+
+def _seed_feedback(session_factory, *, job_id, user_id, rating, comment=""):
+    s = session_factory()
+    try:
+        fb = _models.JobFeedback(
+            job_id=job_id, user_id=user_id, rating=rating, comment=comment,
+        )
+        s.add(fb)
+        s.commit()
+        s.refresh(fb)
+        return fb.id
+    finally:
+        s.close()
+
+
+# ── resolve_job_name() pure helper ───────────────────────────────────────
+
+
+class TestResolveJobName:
+    def test_uses_user_value_when_provided(self, main_module):
+        assert main_module.resolve_job_name("My bulletin", "src.mp4") == "My bulletin"
+
+    def test_blank_falls_back_to_filename_first_80(self, main_module):
+        long_filename = "A" * 200 + ".mp4"
+        out = main_module.resolve_job_name("", long_filename)
+        assert out == "A" * 80
+        assert len(out) == 80
+
+    def test_whitespace_only_falls_back(self, main_module):
+        assert main_module.resolve_job_name("   ", "src.mp4") == "src.mp4"
+
+    def test_none_input_falls_back(self, main_module):
+        assert main_module.resolve_job_name(None, "src.mp4") == "src.mp4"
+
+    def test_user_value_capped_at_120(self, main_module):
+        long_input = "B" * 200
+        out = main_module.resolve_job_name(long_input, "src.mp4")
+        assert len(out) == 120
+        assert out == "B" * 120
+
+    def test_both_blank_returns_empty(self, main_module):
+        assert main_module.resolve_job_name(None, None) == ""
+
+    def test_unicode_preserved_within_cap(self, main_module):
+        # 4-char Telugu word — must survive verbatim.
+        assert main_module.resolve_job_name("వార్త", "src.mp4") == "వార్త"
+
+
+# ── PATCH /api/jobs/{id}/rename/ ──────────────────────────────────────────
+
+
+class TestJobRenameEndpoint:
+    def test_rename_succeeds(self, v2_beta_app):
+        app, S, _state = v2_beta_app
+        jid = _seed_job(S, user_id=2, name="Old name")
+        c = _TestClient(app)
+        r = c.patch(f"/api/jobs/{jid}/rename/", json={"name": "New name"})
+        assert r.status_code == 200
+        assert r.json() == {"id": jid, "name": "New name"}
+        # Confirm persisted
+        s = S()
+        try:
+            j = s.query(_models.Job).filter(_models.Job.id == jid).first()
+            assert j.name == "New name"
+        finally:
+            s.close()
+
+    def test_rename_unknown_job_returns_404(self, v2_beta_app):
+        app, *_ = v2_beta_app
+        c = _TestClient(app)
+        r = c.patch("/api/jobs/9999/rename/", json={"name": "X"})
+        assert r.status_code == 404
+
+    def test_rename_other_user_job_returns_404(self, v2_beta_app):
+        # Job owned by user_id=3; calling as user_id=2 (default).
+        app, S, _state = v2_beta_app
+        jid = _seed_job(S, user_id=3, name="Not mine")
+        c = _TestClient(app)
+        r = c.patch(f"/api/jobs/{jid}/rename/", json={"name": "Hijack"})
+        assert r.status_code == 404
+
+    def test_rename_blank_returns_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2)
+        c = _TestClient(app)
+        r = c.patch(f"/api/jobs/{jid}/rename/", json={"name": "   "})
+        assert r.status_code == 400
+
+    def test_rename_too_long_returns_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2)
+        c = _TestClient(app)
+        r = c.patch(f"/api/jobs/{jid}/rename/", json={"name": "x" * 121})
+        assert r.status_code == 400
+
+    def test_rename_exactly_120_chars_allowed(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2)
+        c = _TestClient(app)
+        r = c.patch(f"/api/jobs/{jid}/rename/", json={"name": "x" * 120})
+        assert r.status_code == 200
+
+
+# ── POST /api/jobs/{id}/feedback/ ─────────────────────────────────────────
+
+
+class TestJobFeedbackEndpoint:
+    def test_feedback_succeeds_with_rating_and_comment(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        c = _TestClient(app)
+        r = c.post(f"/api/jobs/{jid}/feedback/",
+                   json={"rating": 87, "comment": "Loved it"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["job_id"] == jid
+        assert body["rating"] == 87
+        assert body["comment"] == "Loved it"
+        assert body["submitted_at"]  # truthy ISO string
+
+    def test_feedback_rating_zero_boundary(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": 0},
+        )
+        assert r.status_code == 200
+
+    def test_feedback_rating_one_hundred_boundary(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": 100},
+        )
+        assert r.status_code == 200
+
+    def test_feedback_negative_rating_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": -1},
+        )
+        assert r.status_code == 400
+
+    def test_feedback_over_100_rating_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": 101},
+        )
+        assert r.status_code == 400
+
+    def test_feedback_non_int_rating_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": "not-a-number"},
+        )
+        assert r.status_code == 400
+
+    def test_feedback_unknown_job_404(self, v2_beta_app):
+        app, *_ = v2_beta_app
+        r = _TestClient(app).post(
+            "/api/jobs/9999/feedback/", json={"rating": 50},
+        )
+        assert r.status_code == 404
+
+    def test_feedback_other_user_job_404(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=3, status="done")  # owned by user 3
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": 50},
+        )
+        # Calling as user 2 (default) — job is not visible.
+        assert r.status_code == 404
+
+    def test_feedback_on_running_job_400(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="running")
+        r = _TestClient(app).post(
+            f"/api/jobs/{jid}/feedback/", json={"rating": 50},
+        )
+        assert r.status_code == 400
+
+    def test_feedback_duplicate_409(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        jid = _seed_job(S, user_id=2, status="done")
+        c = _TestClient(app)
+        r1 = c.post(f"/api/jobs/{jid}/feedback/", json={"rating": 70})
+        assert r1.status_code == 200
+        r2 = c.post(f"/api/jobs/{jid}/feedback/", json={"rating": 80})
+        assert r2.status_code == 409
+
+
+# ── GET /api/v2/stats/ ────────────────────────────────────────────────────
+
+
+class TestV2UserStatsEndpoint:
+    def test_all_zero_state(self, v2_beta_app):
+        app, *_ = v2_beta_app
+        r = _TestClient(app).get("/api/v2/stats/")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == {
+            "total_v2_jobs":   0,
+            "completed_count": 0,
+            "failed_count":    0,
+            "cancelled_count": 0,
+            "success_rate_pct": 0.0,
+            "average_rating":  None,
+            "rating_count":    0,
+        }
+
+    def test_mixed_state(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        # 4 V2 jobs for user 2: 2 done, 1 failed, 1 cancelled
+        j1 = _seed_job(S, user_id=2, status="done")
+        j2 = _seed_job(S, user_id=2, status="done")
+        _seed_job(S, user_id=2, status="failed")
+        _seed_job(S, user_id=2, status="cancelled")
+        # Noise rows that MUST be ignored
+        _seed_job(S, user_id=2, status="done", platform="youtube_short")
+        _seed_job(S, user_id=3, status="done")  # other user
+
+        _seed_feedback(S, job_id=j1, user_id=2, rating=80)
+        _seed_feedback(S, job_id=j2, user_id=2, rating=60)
+
+        r = _TestClient(app).get("/api/v2/stats/")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total_v2_jobs"]   == 4
+        assert body["completed_count"] == 2
+        assert body["failed_count"]    == 1
+        assert body["cancelled_count"] == 1
+        assert body["success_rate_pct"] == 50.0
+        assert body["average_rating"]  == 70.0
+        assert body["rating_count"]    == 2
+
+    def test_success_rate_rounding(self, v2_beta_app):
+        app, S, _ = v2_beta_app
+        _seed_job(S, user_id=2, status="done")
+        _seed_job(S, user_id=2, status="done")
+        _seed_job(S, user_id=2, status="failed")
+        r = _TestClient(app).get("/api/v2/stats/")
+        # 2/3 = 66.666... -> 66.7
+        assert r.json()["success_rate_pct"] == 66.7
+
+
+# ── GET /api/admin/v2-feedback ────────────────────────────────────────────
+
+
+class TestAdminV2FeedbackEndpoint:
+    def test_non_admin_blocked(self, v2_beta_app):
+        app, _S, state = v2_beta_app
+        state["current_user_id"] = 2  # regular
+        r = _TestClient(app).get("/api/admin/v2-feedback")
+        assert r.status_code == 403
+
+    def test_admin_sees_feedback_across_users(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        j_u2 = _seed_job(S, user_id=2, status="done", name="user-2 job")
+        j_u3 = _seed_job(S, user_id=3, status="done", name="user-3 job")
+        _seed_feedback(S, job_id=j_u2, user_id=2, rating=80, comment="ok")
+        _seed_feedback(S, job_id=j_u3, user_id=3, rating=20, comment="bad")
+
+        state["current_user_id"] = 1  # admin
+        r = _TestClient(app).get("/api/admin/v2-feedback")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 2
+        assert len(body["items"]) == 2
+        names = {item["job"]["name"] for item in body["items"]}
+        assert names == {"user-2 job", "user-3 job"}
+        # Most-recent first
+        ratings_in_order = [item["rating"] for item in body["items"]]
+        assert ratings_in_order[0] == 20  # last seeded -> latest -> first
+
+    def test_admin_excludes_v1_platform_feedback(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        j_v2 = _seed_job(S, user_id=2, status="done", platform="full_video_shorts_v2")
+        j_v1 = _seed_job(S, user_id=2, status="done", platform="youtube_short")
+        _seed_feedback(S, job_id=j_v2, user_id=2, rating=70)
+        _seed_feedback(S, job_id=j_v1, user_id=2, rating=30)
+
+        state["current_user_id"] = 1
+        body = _TestClient(app).get("/api/admin/v2-feedback").json()
+        assert body["total"] == 1
+        assert body["items"][0]["rating"] == 70
+
+    def test_admin_pagination(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        for _ in range(7):
+            jid = _seed_job(S, user_id=2, status="done")
+            _seed_feedback(S, job_id=jid, user_id=2, rating=50)
+
+        state["current_user_id"] = 1
+        c = _TestClient(app)
+        first = c.get("/api/admin/v2-feedback?limit=3&offset=0").json()
+        second = c.get("/api/admin/v2-feedback?limit=3&offset=3").json()
+        assert first["total"] == 7 and second["total"] == 7
+        assert len(first["items"])  == 3
+        assert len(second["items"]) == 3
+        ids_first  = {it["id"] for it in first["items"]}
+        ids_second = {it["id"] for it in second["items"]}
+        assert ids_first.isdisjoint(ids_second)
+
+
+# ── GET /api/admin/v2-stats ───────────────────────────────────────────────
+
+
+class TestAdminV2StatsEndpoint:
+    def test_non_admin_blocked(self, v2_beta_app):
+        app, _S, state = v2_beta_app
+        state["current_user_id"] = 2
+        r = _TestClient(app).get("/api/admin/v2-stats")
+        assert r.status_code == 403
+
+    def test_empty_payload_shape(self, v2_beta_app):
+        app, _S, state = v2_beta_app
+        state["current_user_id"] = 1
+        body = _TestClient(app).get("/api/admin/v2-stats").json()
+        for key in (
+            "total_v2_jobs_all_users", "status_breakdown",
+            "failure_breakdown_by_slug", "average_rating_all_users",
+            "rating_count", "rating_distribution",
+            "cancellation_rate_pct",
+        ):
+            assert key in body
+        assert body["total_v2_jobs_all_users"]  == 0
+        assert body["status_breakdown"]         == {}
+        assert body["failure_breakdown_by_slug"] == {}
+        assert body["average_rating_all_users"] is None
+        assert body["rating_count"]             == 0
+        assert body["rating_distribution"] == {
+            "0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0,
+        }
+
+    def test_failure_slug_classification(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        _seed_job(S, user_id=2, status="failed",
+                  error="permanent:empty_file: input was 0 bytes")
+        _seed_job(S, user_id=2, status="failed",
+                  error="permanent:ffmpeg_not_found: ffmpeg missing")
+        _seed_job(S, user_id=2, status="failed",
+                  error="user cancelled the pipeline")
+        _seed_job(S, user_id=3, status="failed",
+                  error="permanent:empty_file: another 0-byte case")
+        _seed_job(S, user_id=2, status="done")
+
+        state["current_user_id"] = 1
+        body = _TestClient(app).get("/api/admin/v2-stats").json()
+        assert body["total_v2_jobs_all_users"] == 5
+        assert body["status_breakdown"]["failed"] == 4
+        assert body["status_breakdown"]["done"]   == 1
+        # 2x empty_file across both users, 1x ffmpeg_not_found, 1x cancelled.
+        assert body["failure_breakdown_by_slug"]["empty_file"]       == 2
+        assert body["failure_breakdown_by_slug"]["ffmpeg_not_found"] == 1
+        assert body["failure_breakdown_by_slug"]["cancelled"]        == 1
+
+    def test_rating_distribution_buckets(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        # 5 jobs with 5 ratings, one in each bucket.
+        for r in (10, 30, 50, 70, 90):
+            jid = _seed_job(S, user_id=2, status="done")
+            _seed_feedback(S, job_id=jid, user_id=2, rating=r)
+
+        state["current_user_id"] = 1
+        body = _TestClient(app).get("/api/admin/v2-stats").json()
+        assert body["rating_count"] == 5
+        assert body["average_rating_all_users"] == 50.0
+        assert body["rating_distribution"] == {
+            "0-20": 1, "21-40": 1, "41-60": 1, "61-80": 1, "81-100": 1,
+        }
+
+    def test_cancellation_rate(self, v2_beta_app):
+        app, S, state = v2_beta_app
+        _seed_job(S, user_id=2, status="cancelled")
+        _seed_job(S, user_id=2, status="cancelled")
+        _seed_job(S, user_id=2, status="done")
+        _seed_job(S, user_id=2, status="failed")
+        state["current_user_id"] = 1
+        body = _TestClient(app).get("/api/admin/v2-stats").json()
+        # 2/4 = 50.0
+        assert body["cancellation_rate_pct"] == 50.0
+
+
 

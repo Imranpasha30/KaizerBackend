@@ -96,3 +96,79 @@ ALTER TABLE jobs DROP COLUMN IF EXISTS current_stage;
 ```
 
 Safe — column is purely additive, no FKs, no indexes.
+
+---
+
+## Phase 14 — V2 Beta: Job naming (D-13.11)
+
+Adds one nullable VARCHAR column to `jobs` so users can give each job
+a human-readable label that surfaces in JobsList + JobDetail.  Empty
+on rows created before Phase 14; the create endpoint defaults to the
+first 80 chars of `video_name` when the form field is left blank.
+Editable mid-flight via `PATCH /api/jobs/{id}/rename`.
+
+```sql
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS name VARCHAR(120);
+```
+
+### Rollback
+
+```sql
+ALTER TABLE jobs DROP COLUMN IF EXISTS name;
+```
+
+Safe — additive, no FK, no index.  UI falls back to `video_name`
+when `name` is NULL so a column drop is non-breaking at the data
+layer.
+
+---
+
+## Phase 15 — V2 Beta: Job feedback (D-13.8 + D-13.13)
+
+Adds one new table: `job_feedback`.  Captures 0–100 rating + optional
+free-text comment after a V2 job reaches `status='done'`.  Aggregated
+by `/api/v2/stats` (per-user) and `/api/admin/v2-stats` (global), and
+listed paginated for ops via `/api/admin/v2-feedback`.
+
+```sql
+CREATE TABLE IF NOT EXISTS job_feedback (
+    id            SERIAL PRIMARY KEY,
+    job_id        INTEGER NOT NULL REFERENCES jobs(id)  ON DELETE CASCADE,
+    user_id       INTEGER          REFERENCES users(id) ON DELETE SET NULL,
+    rating        INTEGER NOT NULL,
+    comment       TEXT DEFAULT '',
+    submitted_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT uq_job_feedback_user UNIQUE (job_id, user_id),
+    CONSTRAINT ck_job_feedback_rating CHECK (rating >= 0 AND rating <= 100)
+);
+
+CREATE INDEX IF NOT EXISTS ix_job_feedback_job_id        ON job_feedback (job_id);
+CREATE INDEX IF NOT EXISTS ix_job_feedback_user_id       ON job_feedback (user_id);
+CREATE INDEX IF NOT EXISTS ix_job_feedback_submitted_at  ON job_feedback (submitted_at);
+```
+
+### Cascade behaviour
+
+* `job_id ON DELETE CASCADE` — feedback without the parent job is
+  meaningless; deleting the job removes its feedback rows.
+* `user_id ON DELETE SET NULL` — admin aggregate stats (average rating,
+  rating distribution) survive a user-account deletion.
+
+### Endpoints
+
+* `POST /api/jobs/{job_id}/feedback` — auth required; status must be
+  `done`; returns 409 if the calling user already submitted feedback
+  for the job.
+* `GET  /api/v2/stats` — user-scoped aggregates (own jobs only).
+* `GET  /api/admin/v2-feedback` — admin-only paginated list.
+* `GET  /api/admin/v2-stats` — admin-only global aggregates +
+  rating distribution + failure-by-slug breakdown.
+
+### Rollback
+
+```sql
+DROP TABLE IF EXISTS job_feedback;
+```
+
+Safe — no other table has FKs into `job_feedback`.  Drop alone is
+sufficient; no need to clean up dependent objects.
