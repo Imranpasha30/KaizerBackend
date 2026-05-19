@@ -33,6 +33,101 @@ _ACTIVE_PROCS_LOCK = threading.Lock()
 _ACTIVE_PROCS: dict[int, subprocess.Popen] = {}
 
 
+# ── Step 11.4: V2 Inngest event dispatcher ───────────────────────────
+def _dispatch_v2_inngest_event(
+    *,
+    job_id: int,
+    video_path: str,
+    language: str,
+    platform: str,
+    frame: str,
+    stt_provider: str,
+    db_session_factory,
+) -> None:
+    """Fire ``video/v2/uploaded`` so the Inngest V2 worker picks up.
+
+    Idempotency key per Step 10 D-10.10: ``f"job-{job_id}"`` --
+    duplicate sends within Inngest's window are deduplicated.
+
+    Lazy import of pipeline_v2.inngest_client (i) avoids a
+    module-load circular if V2 wiring evolves and (ii) means
+    legacy V1-only runners that never call this path don't pay the
+    inngest SDK import cost.
+
+    Marks Job.status='running' synchronously so the UI shows the
+    job leaving 'pending' immediately, even before the Inngest
+    worker picks up the event. (The worker writes Job.current_stage
+    + final status as it progresses.)
+    """
+    # Lazy imports to keep V1-only call sites unaffected.
+    import sys as _sys
+    import os as _os
+    _pipeline_v2_dir = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "pipeline_v2",
+    )
+    if _pipeline_v2_dir not in _sys.path:
+        _sys.path.insert(0, _pipeline_v2_dir)
+    from inngest import Event
+    from pipeline_v2.inngest_client import get_client
+
+    # Mark the job as running + reset cancel flag in DB so the UI's
+    # status badge flips off "pending" right away.
+    try:
+        from models import Job
+        from datetime import datetime as _dt, timezone as _tz
+        db = db_session_factory()
+        try:
+            db.query(Job).filter(Job.id == job_id).update(
+                {
+                    "status":           "running",
+                    "started_at":       _dt.now(_tz.utc),
+                    "cancel_requested": False,
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception as _db_exc:
+        print(
+            f"[runner.v2] Job.status='running' DB write failed for "
+            f"job_id={job_id} (non-fatal; Inngest worker will keep "
+            f"writing status as it progresses): {_db_exc}"
+        )
+
+    # Build the event payload (D-10.13 / Step 10 event contract).
+    event_data = {
+        "job_id":       int(job_id),
+        "video_path":   str(video_path),
+        "language":     language or "te",
+        "platform":     platform,
+        "frame_layout": frame or "torn_card",
+        "stt_provider": stt_provider or "",
+        # preset is caller-supplied via Stage 4; we ship the PLATFORMS
+        # entry shape from main.py for the V2 platform. Looking it up
+        # here avoids pulling main into runner's import graph (would
+        # be circular). Stage 4's defaults handle missing fields.
+        "preset": {
+            "label": "Full Video + Shorts (V2 Beta)",
+            "width":  1080, "height": 1920,
+            "min_dur": 15, "max_dur": 60, "ideal_dur": 45,
+            "vertical": True,
+        },
+    }
+
+    client = get_client()
+    client.send_sync(events=Event(
+        name="video/v2/uploaded",
+        data=event_data,
+        id=f"job-{job_id}",   # D-10.10: idempotency key
+    ))
+    print(
+        f"[runner.v2] Inngest event sent: name=video/v2/uploaded "
+        f"job_id={job_id} stt_provider={stt_provider!r}"
+    )
+
+
 def _register_proc(job_id: int, proc: subprocess.Popen) -> None:
     with _ACTIVE_PROCS_LOCK:
         _ACTIVE_PROCS[job_id] = proc
@@ -137,7 +232,8 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  db_session_factory, language: str = "te",
                  default_image: str = "",
                  default_logo: str = "",
-                 bulletin_images: Optional[list] = None):
+                 bulletin_images: Optional[list] = None,
+                 stt_provider: str = ""):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -148,7 +244,32 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
       that the bulletin's per-story carousel will cycle through instead
       of calling OpenAI gpt-image-1. Passed to the subprocess via the
       ``KAIZER_BULLETIN_IMAGES`` env var (pipe-separated).
+    - `stt_provider` (V2 only) → STT provider key from the new
+      "Choose STT" wizard step. Ignored for the 4 V1 platforms;
+      flows into the Inngest event data for ``full_video_shorts_v2``.
+
+    Step 11.4 V2 branch (per Step 10 D-10.1, D-10.10):
+      When ``platform == "full_video_shorts_v2"``, fire an Inngest
+      ``video/v2/uploaded`` event with idempotency key
+      ``f"job-{job_id}"`` and return immediately. NO subprocess
+      spawn -- the Inngest worker picks up the event + runs
+      ``process_video_v2``. The function-level retry policy + cancel
+      bridge are wired in pipeline_v2/orchestrator.py.
+
+      The 4 V1 platforms fall through to the existing subprocess
+      path unchanged.
     """
+    if platform == "full_video_shorts_v2":
+        _dispatch_v2_inngest_event(
+            job_id=job_id,
+            video_path=video_path,
+            language=language,
+            platform=platform,
+            frame=frame,
+            stt_provider=stt_provider,
+            db_session_factory=db_session_factory,
+        )
+        return   # V2 worker takes over; no subprocess spawn
 
     def _run():
         from models import Job, Clip

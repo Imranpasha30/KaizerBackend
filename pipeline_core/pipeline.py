@@ -648,14 +648,14 @@ _COMPOUND_SCHEMA_BLOCK = r"""{{
 
 GEMINI_PROMPT = """You are an expert {language_name} news video editor. Watch this raw, unedited footage carefully and produce a single JSON plan for downstream video processing.
 
-OUTPUT TOKEN BUDGET: ~3000 tokens total. Pace yourself: ~150 tokens per clip summary, ~80 tokens per image_plan entry. Compress prose. End your response with the closing }} of the JSON immediately followed by the sentinel <<END>> — nothing after.
+OUTPUT TOKEN BUDGET: ~3500 tokens total, but retake_audit must always appear regardless of budget. Pace yourself: ~150 tokens per clip summary, ~80 tokens per image_plan entry. Compress prose. End your response with the closing }} of the JSON immediately followed by the sentinel <<END>> — nothing after.
 
 OUTPUT FORMAT (strict):
 - Pure JSON object only. NO markdown fences (no ```json). NO trailing commas. NO comments. NO prose before or after.
 - Final characters of your response must be the JSON closing brace and the sentinel literal.
 
 REASONING ORDER (mandatory, in this sequence):
-1. SCRUB for skipped_segments FIRST. Identify warm_up, retake, crew_talk, hesitation, aside, and self_correction spans. This is your self-check — it must produce visible output, not silent thought.
+1. SCRUB for skipped_segments FIRST. Identify warm_up, retake, crew_talk, hesitation, aside, and self_correction spans. This is your self-check — it must produce visible output in BOTH the skipped_segments[] array AND a one-sentence summary in retake_audit at the end. retake_audit is non-negotiable; never omit it.
 2. PICK full_video_cuts inside the retake-free spans only. Aim for {min_dur}s minimum per clip, {max_clips} clips max. Cut at natural pauses, never mid-sentence.
 3. PICK shorts_cuts: 15–60s each, 3–6 entries, can overlap with full_video_cuts. Choose for punch, not coverage.
 4. CANONICALIZE entities the speaker mentions. Aggregate aliases into one canonical name (see Worked Example A). Hard cap: 6 unique IDs.
@@ -669,6 +669,15 @@ SKIPPED_SEGMENTS CATEGORIES (use one of these exactly):
 - hesitation: filler "umm", "uhh" between abandoned and final take
 - aside: speaker breaks performance briefly ("one minute", "where was I", looks off-camera)
 - self_correction: factual error explicitly replaced ("Monday... sorry, on Tuesday")
+
+USE ONE OF THE SIX LITERAL STRINGS ABOVE — never invent new categories. Edge-case mapping:
+- "redundancy" / "duplication" / "repeated_content" → use retake
+- "filler" / "stalling" / "thinking_pause" → use hesitation
+- "off_topic" / "tangent" / "digression" → use aside
+- "mistake" / "error_correction" → use self_correction
+- "interruption" → use crew_talk
+- "intro_chatter" / "setup" → use warm_up
+If still unsure between two, prefer retake (most common case in raw footage).
 
 EMPHASIS IS NOT A RETAKE:
 - "chala chala bagundi" (intensifier) → KEEP all words
@@ -707,7 +716,7 @@ HARD RULES:
 - Never cut mid-sentence (rule applies AFTER retake filtering).
 - Never include warm-up or crew talk inside any kept clip.
 - skipped_segments MUST be non-empty for SOLO videos. Every single-take recording has at least a warm-up. If you emit [], you did not look hard enough — default expectation is 3–10 entries.
-- retake_audit MUST be a real sentence with numbers, never "SKIPPED".
+- retake_audit is MANDATORY — ALWAYS emit this field. NEVER omit it. NEVER "SKIPPED". Must be one sentence with concrete numbers (clip count, retakes found, warm-up dropped, seconds tightened). If you're running out of tokens, shorten clip summaries first — but retake_audit MUST appear in the final JSON.
 - image_plan description must describe what's in the frame ("politician in white kurta at a press conference"), NEVER name real public figures. The entity_name field carries identity separately.
 - duration ≥ 2.0 seconds for every image_plan entry.
 - shorts_headline_native and bulletin_marquee_points in {script_name} script ONLY. No Latin transliteration.

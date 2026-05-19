@@ -1,0 +1,28 @@
+Step 10.1 Inngest SDK install + import sanity check
+====================================================
+
+Installed: 2026-05-19
+
+Pip diff:
+  + inngest==0.5.18
+  + jcs==0.2.1            (transitive — canonical JSON serializer)
+
+No other packages affected; pydantic / httpx / pytest-asyncio already at compatible versions.
+
+Key Inngest 0.5.18 exports (used by the V2 orchestrator):
+  - Inngest                  client class
+  - Context                  per-run context (event data + state)
+  - Step                     durable step runner (.run / .send_event / .sleep)
+  - Function                 decorator return type
+  - NonRetriableError        skip-retry exception (CRITICAL for D-10.3 PermanentSTTError)
+  - RetryAfterError          rate-limit-aware backoff
+  - PydanticSerializer       for D-10.14 hybrid Pydantic/dict pattern
+  - TriggerCron, Throttle, RateLimit, Concurrency, Cancel, Singleton
+
+Inngest version detection: the SDK does NOT expose __version__ as a module attribute
+in 0.5.18; pinned via pyproject.toml + verified at install time.
+
+Import smoke test:
+  >>> from inngest import Inngest, Context, Step, NonRetriableError
+  >>> from inngest import PydanticSerializer, Function
+  All imports succeed.

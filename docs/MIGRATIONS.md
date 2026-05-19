@@ -58,3 +58,41 @@ DROP TABLE IF EXISTS gemini_calls;
   `oauth_tokens.refresh_token_enc` + `access_token_enc`.  The admin
   endpoints never serialize these columns — see `routers/admin.py`
   `_MASK_FIELDS` + `_mask_oauth()` for the redaction helper.
+
+---
+
+## Phase 13 — Pipeline V2 per-step progress (Step 10)
+
+Adds one nullable VARCHAR column to `jobs` so the V2 Inngest orchestrator
+can write per-step progress that the UI surfaces while a 10-minute V2
+render is running.  The legacy V1 subprocess path (the four pre-V2
+platforms) leaves this column NULL.
+
+```sql
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS current_stage VARCHAR(40);
+```
+
+### Values
+
+Written by the V2 orchestrator at the start of each Inngest step.  Reset
+to NULL when the job finalizes (success or failure).  Permitted values:
+
+* `stage_0_ingest`
+* `stage_1_transcribe`
+* `stage_2_continuity`
+* `stage_2_5_entities`
+* `stage_3_fanout`
+* `stage_4_render`
+* `finalize`
+
+The orchestrator writes this synchronously (not as an Inngest sub-step)
+because the write is fire-and-forget — UI freshness matters more than
+durability.  Reads from the column treat NULL as "no V2 step in flight".
+
+### Rollback
+
+```sql
+ALTER TABLE jobs DROP COLUMN IF EXISTS current_stage;
+```
+
+Safe — column is purely additive, no FKs, no indexes.

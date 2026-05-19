@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipeline_v2"
+version = "0.1.0"
+description = "Kaizer News V2 multi-stage pipeline (Deepgram -> Gemini Pro/Flash -> render). Side-by-side with v1 pipeline.py; touched only by the 'full_video_shorts_v2' platform option."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Kaizer News" }]
+
+# Phase-0 verified pins. These are the versions the v2 pipeline was
+# designed and tested against (see .claude/plans/swift-toasting-feather.md).
+# The shared venv at ../../../../venv currently has:
+#   google-genai 1.75.0  (>=1.0 allowed; 2.x upgrade is a separate step)
+#   pydantic     2.12.5  (>=2.x required)
+# Step 4 expanded into a multi-provider STT layer; faster-whisper was
+# dropped (local model + hallucination loops on Telugu). Per-provider
+# vendor SDKs are installed in their respective substeps:
+#   Step 4.1  google-cloud-speech + google-cloud-storage  (Chirp 3)
+#   Step 4.2  groq                                         (Whisper-Groq)
+#   Step 4.3  deepgram-sdk                                 (Deepgram Nova-3)
+#   Step 4.4  assemblyai                                   (AssemblyAI Universal-2)
+#   Step 4.5  (tbd, may be raw httpx)                      (Sarvam)
+# inngest and structlog also land later (Steps 10 / 5).
+dependencies = [
+  "pydantic>=2.10,<3",
+  "google-genai>=1.75,<3",     # Phase 0 target: 2.3.0 — venv has 1.75.0; upgrade gated on v1 compat check
+  "groq==1.2.0",                # Step 4.2 — Whisper-Groq STT provider
+  "deepgram-sdk==7.1.1",        # Step 4.3 — Deepgram Nova-3 STT provider
+  "assemblyai==0.64.2",         # Step 4.4 — AssemblyAI Universal-2 STT provider
+  "inngest==0.5.18",            # installed in Step 10
+  "structlog>=24.0",            # installed when first stage logger is wired
+  "boto3>=1.40",                # already in venv (R2 client, Step 2)
+  "psutil>=7",                  # already in venv (subprocess tree-kill)
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-mock>=3.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pipeline_v2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+asyncio_mode = "auto"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

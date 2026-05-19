@@ -1,0 +1,1394 @@
+"""Stage 4 -- Render (port of V1 pipeline_core.pipeline rendering).
+
+V2 owns the orchestration + JobOutput->V1-dict conversion. V1 owns
+the actual FFmpeg / Pillow work. Per Step 9 D-9.1: REUSE V1's render
+primitives verbatim. Byte-identical output is the architectural
+contract that lets V2 reuse V1's editor UI without modification.
+
+V1 PRIMITIVES IMPORTED (any signature change in V1 here breaks V2 --
+keep this list current):
+
+  pipeline_core.pipeline.cut_video_clips         (Step 9.1)
+  pipeline_core.pipeline.resolve_image_plan      (Step 9.2)
+  pipeline_core.pipeline.compose_clip            (Step 9.2: torn_card layout)
+  pipeline_core.pipeline.compose_split_frame     (Step 9.2: split_frame layout)
+  pipeline_core.pipeline.compose_clip_clean_card (Step 9.2: clean_card layout)
+  pipeline_core.pipeline.compose_follow_bar      (Step 9.2: follow_bar layout)
+  pipeline_core.pipeline.overlay_image_plan      (Step 9.3 bulletin overlay)
+  pipeline_core.pipeline._maybe_upload_final     (optional, R2 upload)
+  pipeline_core.pipeline.FFMPEG_BIN              (Step 9.2 thumbnails)
+
+  pipeline_core.longform_compose.compose_bulletin_story  (Step 9.3)
+  pipeline_core.longform_compose.compose_pip_story       (Step 9.3 with PiP)
+  pipeline_core.longform_compose.render_ticker           (Step 9.3 ticker)
+  pipeline_core.longform_compose.render_channel_bug      (Step 9.3 bug)
+  pipeline_core.longform_compose.make_sidebar_placeholder (Step 9.3 fallback)
+  pipeline_core.longform_compose.pick_pip_source         (Step 9.3 PiP)
+  pipeline_core.longform_compose.StoryMeta               (Step 9.3 dataclass)
+
+  pipeline_core.image_carousel.build_sidebar_carousel    (Step 9.3 carousel)
+  pipeline_core.image_carousel.build_fullscreen_takeover (Step 9.3 takeover)
+
+  pipeline_core.bulletin_stitcher.stitch_bulletin        (Step 9.3 final concat)
+  pipeline_core.bulletin_stitcher.BulletinStitchError    (Step 9.3 stitch exc)
+
+  pipeline_core.compose_deps.is_fresh / mark_built       (Step 9.3 cache)
+
+  pipeline_core.hw_accel.ACTIVE_ENCODER          (encoder selection, indirect)
+  pipeline_core.hw_accel.h264_args               (encoder args builder, indirect)
+
+KaizerBackend/ must be on sys.path for these imports to resolve. The
+test path is set up by ``pipeline_v2/conftest.py``; production runs
+via the dispatcher (Step 10) which adds the path explicitly.
+
+Decisions implemented in this module (cross-reference to Step 9 D-list):
+
+  D-9.1  -- reuse V1 verbatim (import, do not reimplement)
+  D-9.2  -- hybrid: Stage4Render class + 3 pure converter functions
+  D-9.3  -- output_dir is caller-supplied (constructor arg)
+  D-9.5  -- image_pool is instance state, shared across shorts+bulletin
+  D-9.7  -- 50% per-clip-failure guardrail (Step 9.2)
+  D-9.8  -- two sub-renders, sequential (Step 9.3 / 9.4)
+  D-9.10 -- frame_layout caller-supplied, default ``torn_card``
+  D-9.11 -- mirror V1 filename conventions, leave intermediates
+  D-9.13 -- three pure converter helpers (this file)
+  D-9.14 -- skip ChatGPT title step (V2 metadata.shorts_headline_native is
+            Pydantic-required, never empty)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ---- V1 primitive imports -------------------------------------------
+#
+# These imports may fail at module-load time if KaizerBackend/ is not
+# on sys.path. We provide a clear error message rather than letting
+# the import error propagate ambiguously.
+def _ensure_kaizer_backend_on_path() -> None:
+    """Add KaizerBackend/ to sys.path if missing.
+
+    Mirrors what ``conftest.py`` does for tests + what each script in
+    ``pipeline_v2/scripts/`` does for ad-hoc runs. The production
+    dispatcher (Step 10) sets the path before importing Stage 4, so
+    this is a defensive fallback.
+    """
+    here = Path(__file__).resolve()
+    # .../KaizerBackend/pipeline_v2/pipeline_v2/stages/stage_4_render.py
+    # parents[3] = KaizerBackend/
+    kaizer_backend = here.parents[3]
+    s = str(kaizer_backend)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+
+_ensure_kaizer_backend_on_path()
+
+# Imports MUST come after path setup. These are checked at module load
+# so an environment without V1 fails fast with a clear traceback.
+from pipeline_core.pipeline import cut_video_clips as _v1_cut_video_clips
+from pipeline_core.pipeline import resolve_image_plan as _v1_resolve_image_plan
+from pipeline_core.pipeline import compose_clip as _v1_compose_clip
+from pipeline_core.pipeline import compose_clip_clean_card as _v1_compose_clean_card
+from pipeline_core.pipeline import compose_follow_bar as _v1_compose_follow_bar
+from pipeline_core.pipeline import compose_split_frame as _v1_compose_split_frame
+from pipeline_core.pipeline import overlay_image_plan as _v1_overlay_image_plan
+from pipeline_core.pipeline import FFMPEG_BIN as _v1_FFMPEG_BIN
+from pipeline_core.longform_compose import (
+    compose_bulletin_story as _v1_compose_bulletin_story,
+    compose_pip_story as _v1_compose_pip_story,
+    render_ticker as _v1_render_ticker,
+    render_channel_bug as _v1_render_channel_bug,
+    make_sidebar_placeholder as _v1_make_sidebar_placeholder,
+    pick_pip_source as _v1_pick_pip_source,
+    StoryMeta as _V1StoryMeta,
+)
+from pipeline_core.image_carousel import (
+    build_sidebar_carousel as _v1_build_sidebar_carousel,
+    build_fullscreen_takeover as _v1_build_fullscreen_takeover,
+)
+from pipeline_core.bulletin_stitcher import (
+    stitch_bulletin as _v1_stitch_bulletin,
+    BulletinStitchError as _V1BulletinStitchError,
+)
+from pipeline_core import compose_deps as _v1_compose_deps
+import subprocess
+import languages as _v1_languages
+
+from pipeline_v2.editor_meta_adapter import (
+    ClipRenderArtifacts,
+    build_v1_bulletin_editor_meta,
+    build_v1_shorts_editor_meta,
+)
+from pipeline_v2.models import (
+    Entity,
+    FullVideoCut,
+    ImagePlan,
+    ImagePlanEntry,
+    JobOutput,
+    Metadata,
+    ShortsCut,
+)
+
+logger = logging.getLogger("pipeline_v2.stage_4")
+
+
+# ====================================================================== #
+# Defaults                                                                #
+# ====================================================================== #
+
+DEFAULT_FRAME_LAYOUT = "torn_card"      # D-9.10: V1's most common layout
+DEFAULT_PLATFORM = "full_video_shorts_v2"
+DEFAULT_DROP_RATIO_THRESHOLD = 0.5      # D-9.7: mirror D-7.10's guardrail
+
+
+# ====================================================================== #
+# PermanentRenderError (Step 10.3, mirrors PermanentSTTError pattern)    #
+# ====================================================================== #
+
+
+class PermanentRenderError(Exception):
+    """Raised by Stage 4 when render failure is unlikely to succeed
+    on retry. Orchestrator translates to Inngest's
+    ``NonRetriableError`` so Inngest skips retries.
+
+    Conditions providers SHOULD raise this for (slug prefix in message):
+
+      * ``ffmpeg_not_found``: FFmpeg binary not in PATH or wrong version
+      * ``disk_full``: ENOSPC on output dir write attempt
+      * ``source_video_corrupt``: FFprobe fails to parse input video
+      * ``encoder_unavailable_no_fallback``: all encoders fail
+        (NVENC, QSV, AMF, libx264)
+
+    Conditions providers MUST NOT raise this for (retry normally):
+
+      * Individual clip compose failures (handled by D-9.7 50% guardrail)
+      * R2 upload failures (transient)
+      * GPU OOM on one clip (transient -- may succeed with cleaner state)
+      * Filesystem permission errors (could be transient mount issue)
+
+    Reference: backlog item 50 (Inngest 0.5.18 has no per-step retries
+    so we use NonRetriableError for permanent-failure early-exit). A
+    12-min render that fails systematically (disk full, FFmpeg
+    missing) without this class costs 24 min of wasted Inngest retry.
+    """
+
+
+def _classify_render_error(exc: BaseException) -> Optional[str]:
+    """Map an exception to a PermanentRenderError slug, or None.
+
+    Returns a slug string (e.g. "ffmpeg_not_found: ...") when the
+    exception is a documented permanent condition; returns None for
+    everything else (caller treats as transient, Inngest will retry).
+
+    Pure classification helper: no side effects, safe to call from
+    inside an except clause.
+    """
+    msg = str(exc)
+    msg_lower = msg.lower()
+
+    # ffmpeg_not_found: FileNotFoundError mentioning ffmpeg
+    if isinstance(exc, FileNotFoundError):
+        if "ffmpeg" in msg_lower or "ffprobe" in msg_lower:
+            return f"ffmpeg_not_found: {exc}"
+
+    # disk_full: ENOSPC (errno 28 on Linux, 39 on Windows for "disk full")
+    if isinstance(exc, OSError):
+        errno = getattr(exc, "errno", None)
+        # ENOSPC=28 (linux/macos); on Windows it's ERROR_DISK_FULL=112
+        if errno in (28, 112):
+            return f"disk_full: {exc}"
+        if "no space left" in msg_lower or "disk full" in msg_lower:
+            return f"disk_full: {exc}"
+
+    # source_video_corrupt: ffprobe/ffmpeg with corrupt-stream signals
+    if "ffprobe" in msg_lower and (
+        "could not parse" in msg_lower
+        or "invalid data" in msg_lower
+        or "moov atom not found" in msg_lower
+    ):
+        return f"source_video_corrupt: {exc}"
+
+    # encoder_unavailable_no_fallback: hw_accel module reports all
+    # encoders failed
+    if "no h264 encoder available" in msg_lower or (
+        "encoder" in msg_lower and "unavailable" in msg_lower
+    ):
+        return f"encoder_unavailable_no_fallback: {exc}"
+
+    return None
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    """Top-level render output.
+
+    The caller (Step 10 Inngest dispatcher) gets back this tuple-like
+    carrier with paths to every artifact Stage 4 produced. Both
+    editor_meta.json files are written to disk; the paths here are
+    for telemetry / R2 upload bookkeeping.
+    """
+    # Paths to the two editor_meta.json files Stage 4 writes.
+    # Either may be None when the corresponding pass didn't run
+    # (e.g. job_output has zero shorts_cuts -> shorts pass skipped).
+    shorts_editor_meta_path:   Optional[str]
+    bulletin_editor_meta_path: Optional[str]
+
+    # Composed shorts artifacts (one per produced short, post-drop).
+    # Empty list if the shorts pass didn't run or produced nothing.
+    composed_shorts: list[dict]
+
+    # Bulletin assembly result (the dict returned by render_bulletin),
+    # or None if the bulletin pass didn't run.
+    bulletin: Optional[dict]
+
+
+# ====================================================================== #
+# Helpers                                                                 #
+# ====================================================================== #
+
+
+def _format_mmss_mmm(seconds: float) -> str:
+    """Format float-second to MM:SS.mmm.
+
+    Same algorithm as ``editor_meta_adapter._format_mmss_mmm`` --
+    duplicated here so Stage 4 doesn't take a dependency on the
+    adapter module (the dependency goes the other way: Stage 4
+    CALLS the adapter at the end). Handles 59.9999 -> "01:00.000"
+    carry-forward correctly.
+    """
+    total_ms = round(seconds * 1000)
+    total_secs = total_ms // 1000
+    ms = total_ms % 1000
+    minutes = total_secs // 60
+    secs = total_secs % 60
+    return f"{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+# ====================================================================== #
+# Pure converter functions (D-9.13)                                       #
+# ====================================================================== #
+
+
+def shorts_cuts_to_v1_clip_dicts(
+    shorts_cuts: list[ShortsCut],
+    metadata: Metadata,
+) -> list[dict]:
+    """V2 ShortsCut list -> V1-compatible clip dict list.
+
+    V1's render functions read ``clip["start"]`` / ``clip["end"]`` as
+    MM:SS.mmm strings, plus ``clip["summary"]`` / ``["mood"]`` /
+    ``["importance"]`` for editor_meta enrichment. Order is preserved
+    (Stage 4 sorts upstream).
+
+    Side-effect contract: V1's ``cut_video_clips`` MUTATES each clip
+    dict to add ``raw_path`` and ``duration_sec``. Callers should
+    treat the returned dicts as mutable carriers, NOT as
+    snapshot-then-discard data.
+    """
+    return [
+        {
+            "start":      _format_mmss_mmm(c.start_sec),
+            "end":        _format_mmss_mmm(c.end_sec),
+            "summary":    c.hook,         # D-8.9: hook is the per-clip summary
+            "mood":       "",             # V2 doesn't track per-clip mood
+            "importance": c.importance,
+            "video_type": metadata.video_type,
+            # Bookkeeping: original V2 ShortsCut.index, so post-cut
+            # we can sort+pair back to the source after cut_video_clips
+            # potentially drops clips (e.g. zero-duration).
+            "v2_index":   c.index,
+        }
+        for c in shorts_cuts
+    ]
+
+
+def full_video_cuts_to_v1_clip_dicts(
+    full_video_cuts: list[FullVideoCut],
+    metadata: Metadata,
+) -> list[dict]:
+    """V2 FullVideoCut list -> V1-compatible clip dict list.
+
+    Same shape as the shorts converter but with FullVideoCut's
+    importance + no per-cut hook (FullVideoCut doesn't carry one; the
+    bulletin uses the overall headline). ``summary`` is empty string
+    for compatibility with V1's bulletin path which doesn't read
+    per-clip summaries.
+    """
+    return [
+        {
+            "start":      _format_mmss_mmm(c.start_sec),
+            "end":        _format_mmss_mmm(c.end_sec),
+            "summary":    "",
+            "mood":       "",
+            "importance": c.importance,
+            "video_type": metadata.video_type,
+            "v2_index":   c.index,
+        }
+        for c in full_video_cuts
+    ]
+
+
+def image_plan_to_v1_dict(
+    image_plan: ImagePlan,
+    entities: list[Entity],
+) -> list[dict]:
+    """V2 ImagePlanEntry list -> V1-compatible image_plan entry list.
+
+    V1's ``resolve_image_plan`` reads:
+      - entity_name (matched against canonical entities)
+      - description (image-search seed)
+      - clip_index (which cut this overlay belongs to)
+      - show_at (timestamp string "MM:SS.mmm")
+      - duration (float seconds)
+
+    V2's ``ImagePlanEntry`` has these fields directly (after the D-7.2
+    trim). The only conversions:
+      - ``show_at_sec`` (float) -> ``show_at`` (MM:SS.mmm string)
+      - ``duration_sec`` -> ``duration``
+
+    V1 ALSO reads optional ``entity_name_native`` and ``id`` fields
+    from some code paths. We pass through entity_name_native; we omit
+    ``id`` per the post_v2_backlog ``"?"`` id bug (V1 tolerates
+    missing id, the bug is only in old V1 jobs that emitted it).
+
+    ``entities`` is unused in the conversion itself but kept in the
+    signature to leave room for future entity-lookup logic (e.g.
+    enriching with native_name when ImagePlanEntry doesn't have one).
+    """
+    return [
+        {
+            "entity_name":        e.entity_name,
+            "entity_name_native": e.entity_name_native,
+            "description":        e.description,
+            "clip_index":         e.clip_index,
+            "show_at":            _format_mmss_mmm(e.show_at_sec),
+            "duration":           e.duration_sec,
+        }
+        for e in image_plan.entries
+    ]
+
+
+# ====================================================================== #
+# Stage4Render class                                                      #
+# ====================================================================== #
+
+
+@dataclass
+class Stage4Render:
+    """Orchestrator for the V2 render pipeline.
+
+    Carries caller-supplied runtime state (paths, frame_layout,
+    platform, video source) and shared instance state (image_pool
+    per D-9.5). Stateless helper functions live at module level.
+
+    Mutability note: this class is NOT frozen; ``image_pool`` is
+    populated by Step 9.2's resolve_image_plan wiring and reused
+    across shorts + bulletin passes.
+
+    Bulletin feature toggles
+    ------------------------
+    The three ``use_*`` flags default to **True**, matching V1
+    production behavior so V2 output looks visibly equivalent to V1.
+    Each flag exists so ops can toggle a specific feature off if it
+    surfaces issues in production -- the per-feature OFF path is
+    just "skip the V1 helper call", no new code.
+
+      - ``use_sidebar_carousel``: build Ken-Burns sidebar video per
+        story (V1's build_sidebar_carousel). When False, falls back
+        to make_sidebar_placeholder static image.
+      - ``use_pip``: include a picture-in-picture overlay from
+        another clip (V1's compose_pip_story). When False, uses the
+        non-PiP compose_bulletin_story unconditionally.
+      - ``use_takeovers``: insert full-screen transition clips
+        between stories (V1's build_fullscreen_takeover). When
+        False, stories concat directly with no transition.
+    """
+
+    output_dir: Path
+    video_path: Path
+    preset: dict
+    frame_layout: str = DEFAULT_FRAME_LAYOUT
+    platform: str = DEFAULT_PLATFORM
+    drop_ratio_threshold: float = DEFAULT_DROP_RATIO_THRESHOLD
+
+    # Bulletin feature toggles (default ON, matching V1 production).
+    # Toggle off via constructor kwarg if a specific feature surfaces
+    # issues in production.
+    use_sidebar_carousel: bool = True
+    use_pip: bool = True
+    use_takeovers: bool = True
+
+    # Instance-level cache, populated by Step 9.2 image resolution.
+    # Maps canonical entity_name -> absolute path of resolved image
+    # file. Shared between shorts and bulletin passes so the same
+    # entity isn't re-downloaded twice.
+    image_pool: dict[str, Path] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Normalise paths to Path objects (callers may pass strings)
+        self.output_dir = Path(self.output_dir)
+        self.video_path = Path(self.video_path)
+        # Ensure output_dir exists. We do NOT create the video_path
+        # parent or do any I/O on the video file -- the source must
+        # already exist by the time Stage 4 runs (it was produced
+        # by Stage 0).
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Step 9.1: raw cut wiring -------------------------------------
+
+    def cut_raw_shorts(
+        self,
+        shorts_cuts: list[ShortsCut],
+        metadata: Metadata,
+    ) -> list[dict]:
+        """Cut the source video into per-shorts raw segments.
+
+        Wires V1's ``cut_video_clips`` against converted V2 inputs.
+        V1 mutates each clip dict in place to add ``raw_path`` (the
+        absolute path to the produced ``raw_clip_NN.mp4``) and
+        ``duration_sec``. Returns the mutated clip dict list.
+
+        On idempotent re-runs (V1's --resume-dir cache), already-cut
+        clips are reused without re-encoding (V1 checks size >100KB).
+
+        Per D-9.7: clip dicts where the raw cut failed to produce a
+        valid file will be missing ``raw_path``. This method returns
+        ALL dicts (including failed ones); the >50% guardrail is
+        applied at the compose stage (Step 9.2), not here.
+        """
+        v1_clips = shorts_cuts_to_v1_clip_dicts(shorts_cuts, metadata)
+        # V1's signature: cut_video_clips(video_path: str, clips: list, output_dir: str)
+        _v1_cut_video_clips(
+            str(self.video_path),
+            v1_clips,
+            str(self.output_dir),
+        )
+        return v1_clips
+
+    def cut_raw_bulletin_stories(
+        self,
+        full_video_cuts: list[FullVideoCut],
+        metadata: Metadata,
+    ) -> list[dict]:
+        """Cut the source video into per-story raw segments for the
+        bulletin pass.
+
+        Same wiring as ``cut_raw_shorts`` but with full_video_cuts.
+        V1's cut_video_clips works identically regardless of whether
+        the clip list is shorts-derived or bulletin-derived -- both
+        share the same start/end shape.
+        """
+        v1_clips = full_video_cuts_to_v1_clip_dicts(full_video_cuts, metadata)
+        _v1_cut_video_clips(
+            str(self.video_path),
+            v1_clips,
+            str(self.output_dir),
+        )
+        return v1_clips
+
+    # ---- Step 9.2: image resolution + compose dispatcher -------------
+
+    def resolve_images(
+        self,
+        image_plan: ImagePlan,
+        entities: list[Entity],
+        kept_clip_dicts: list[dict],
+        full_metadata: Metadata,
+        whisper_words: list = None,
+        video_duration_sec: Optional[float] = None,
+    ) -> list[dict]:
+        """Resolve V2's image_plan to actual on-disk image files.
+
+        Wires V1's ``resolve_image_plan``. V1's signature:
+          resolve_image_plan(
+            image_plan: list[dict],
+            *,
+            output_dir: str,
+            pool_manifest: dict,
+            kept_clips: list[dict],
+            whisper_words: list,
+            video_duration_sec: float,
+          ) -> list[dict]   # resolved entries with status + image_path
+
+        Per D-9.5: image_pool is INSTANCE STATE. Same entity resolved
+        across both shorts and bulletin passes downloads ONCE. The
+        pool manifest passed to V1 holds prior resolutions; V1
+        appends to it.
+
+        Per D-9.4: whisper_words defaults to ``None`` -- we skip
+        whisper_anchor because Stage 3c already aligned timestamps
+        against full_video_cuts boundaries.
+        """
+        v1_image_plan = image_plan_to_v1_dict(image_plan, entities)
+
+        # Build a pool_manifest dict in V1's expected shape from our
+        # instance image_pool. V1's resolve_image_plan checks the
+        # pool for cached entries before re-downloading.
+        pool_manifest = {
+            "entries": [
+                {"entity_name": name, "image_path": str(path)}
+                for name, path in self.image_pool.items()
+            ],
+        }
+
+        resolved = _v1_resolve_image_plan(
+            v1_image_plan,
+            output_dir=str(self.output_dir),
+            pool_manifest=pool_manifest,
+            kept_clips=kept_clip_dicts,
+            whisper_words=whisper_words,        # None per D-9.4
+            video_duration_sec=video_duration_sec,
+        )
+
+        # Update our instance image_pool from the resolved manifest.
+        # The pool key is entity_name; value is the resolved image
+        # file path. Skip entries with status != "ready" or empty
+        # image_path -- those didn't actually produce a downloadable
+        # asset and shouldn't poison the cache.
+        for r in resolved:
+            name = r.get("entity_name", "")
+            img_path = r.get("image_path", "")
+            status = r.get("status", "")
+            if name and img_path and status == "ready":
+                self.image_pool[name] = Path(img_path)
+
+        logger.info(
+            "stage_4: resolved %d image_plan entries (pool now has %d "
+            "entities cached)",
+            len(resolved), len(self.image_pool),
+        )
+        return resolved
+
+    def _dispatch_compose(
+        self,
+        raw_path: str,
+        image_path: str,
+        card_text: str,
+        out_path: str,
+        lang_font_basename: str,
+        lang_follow_text: str,
+    ) -> dict:
+        """Dispatch to the correct V1 compose function based on
+        ``self.frame_layout``. Returns the per-clip param dict
+        (card_params, split_params, follow_params) that V1 normally
+        stores in the editor_meta clip entry.
+
+        Calls into V1 verbatim with the exact arg bundle V1's
+        ``_compose_one`` uses (pipeline.py:4494-4565). Any deviation
+        from these defaults would break the byte-identical contract.
+        """
+        if self.frame_layout == "split_frame":
+            _v1_compose_split_frame(
+                raw_path, image_path, out_path, self.preset,
+                platform=self.platform,
+            )
+            return {
+                "card_params":  {"font_file": lang_font_basename},
+                "split_params": {"bg_color": "#1a0a2e"},
+                "follow_params": {},
+            }
+        if self.frame_layout == "clean_card":
+            compose_meta = _v1_compose_clean_card(
+                raw_path, image_path, card_text, out_path, self.preset,
+                font_size=80,
+                font_file=lang_font_basename,
+                bg_color="#c10000",
+                video_pct=0.50,
+                headline_pct=0.18,
+                image_h_pct=0.30,
+                image_w_pct=0.80,
+                image_border_px=14,
+                image_border_color="#ffffff",
+                platform=self.platform,
+            )
+            return {
+                "card_params": {
+                    "font_size": (compose_meta or {}).get("font_size", 80),
+                    "font_file": (compose_meta or {}).get("font_file", lang_font_basename),
+                    "bg_color":  "#c10000",
+                    "image_border_px":    14,
+                    "image_border_color": "#ffffff",
+                },
+                "split_params":  {},
+                "follow_params": {},
+            }
+        if self.frame_layout == "follow_bar":
+            velvet = {
+                "c-top":"#2d0a4e","c-bot":"#1a0a2e","c-vdark":"#0a001a",
+                "c-vlight":"#3d0060","patch-scale":80,"octaves":5,
+                "contrast":107,"brightness":35,"warp":55,"warp-scale":65,
+                "grain":14,"edge-dark":33,"c-dot":"#7b3fb8","dot-op":38,
+                "dot-r":5,"dot-sp":18,"dot-rows":5,"dot-cols":5,
+            }
+            _v1_compose_follow_bar(
+                raw_path, out_path, self.preset,
+                title_text=card_text,
+                font_file=lang_font_basename,
+                text_color="#ffff00",
+                bg_color="#1a0a2e",
+                follow_text=lang_follow_text,
+                velvet_style=velvet,
+                platform=self.platform,
+            )
+            return {
+                "card_params": {
+                    "font_file": lang_font_basename,
+                    "font_size": 60,
+                    "text_color": "#ffff00",
+                },
+                "split_params":  {},
+                "follow_params": {
+                    "bg_color": "#1a0a2e",
+                    "text_color": "#ffff00",
+                    "follow_text": lang_follow_text,
+                    "follow_text_color": "#ffffff",
+                    "social_logos": [],
+                    "velvet_style": velvet,
+                },
+            }
+        # Default: torn_card (V1's most common layout per D-9.10)
+        compose_meta = _v1_compose_clip(
+            raw_path, image_path, card_text, out_path, self.preset,
+            font_size=80,
+            font_file=lang_font_basename,
+            section_pct={"video": 0.4619, "text": 0.1691, "image": 0.3690},
+            card_style={
+                "card_c0": "#c10000", "card_c1": "#800000",
+                "edge": 9, "jag": 60, "seed": 7,
+                "vsid": 35, "vcor": 72, "vwid": 74, "overlap": 20,
+            },
+            platform=self.platform,
+        )
+        return {
+            "card_params": {
+                "font_size": (compose_meta or {}).get("font_size", 80),
+                "font_file": (compose_meta or {}).get("font_file", lang_font_basename),
+                "card_c0": "#c10000", "card_c1": "#800000",
+                "edge": 9, "jag": 60, "seed": 7,
+                "vsid": 35, "vcor": 72, "vwid": 74, "overlap": 20,
+            },
+            "split_params":  {},
+            "follow_params": {},
+        }
+
+    def _generate_thumbnail(self, composed_path: str, thumb_path: str) -> bool:
+        """Generate a one-frame thumbnail for a composed clip.
+
+        Returns True on success, False on FFmpeg failure (per V1's
+        defensive pattern at pipeline.py:4569-4575 -- thumbnail
+        failure is non-fatal; the clip still ships, the thumb_path
+        just ends up empty in editor_meta).
+        """
+        try:
+            subprocess.run(
+                [
+                    _v1_FFMPEG_BIN, "-y", "-i", composed_path,
+                    "-vframes", "1", "-q:v", "2", thumb_path,
+                ],
+                capture_output=True, check=True,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "stage_4: thumbnail generation failed for %s: %s",
+                composed_path, exc,
+            )
+            return False
+
+    def compose_shorts(
+        self,
+        clip_dicts: list[dict],
+        metadata: Metadata,
+        resolved_image_plan: list[dict],
+    ) -> list[dict]:
+        """Compose each shorts clip via V1's compose functions.
+
+        Inputs:
+          clip_dicts: post-raw-cut shorts clip dicts (have raw_path
+            + duration_sec populated by V1.cut_video_clips).
+          metadata: V2 Metadata (for headline, language).
+          resolved_image_plan: V1.resolve_image_plan output -- maps
+            each clip_index to a resolved image_path.
+
+        Per-clip failure handling (D-9.7):
+          - Each clip's compose runs in a try/except. On failure,
+            log a structured warning and skip the clip (don't add to
+            output).
+          - After processing all clips, if (failures / total) >
+            drop_ratio_threshold, raise RuntimeError -> Inngest
+            retries the step.
+
+        Returns:
+          list of clip dicts (subset of input) with these additional
+          keys populated by this method:
+            clip_path:     absolute path to the composed clip_NN.mp4
+            thumb_path:    absolute path to thumb_NN.jpg (or "")
+            image_path:    absolute path to the news image used
+            card_params, split_params, follow_params: render config
+        """
+        lang_cfg = _v1_languages.get(metadata.language.split("-", 1)[0])
+        # Resolve the font basename (V1 stores the full path; we want
+        # the basename for the editor_meta clip dict).
+        lang_font_basename = os.path.basename(lang_cfg.font_primary) if lang_cfg.font_primary else ""
+        lang_follow_text = lang_cfg.follow_bar_text
+
+        # Map clip_index -> image_path from resolved_image_plan.
+        # Fallback: if a clip has no image_plan entry, use the first
+        # available pool image; if pool is empty, skip the clip
+        # (counts toward failure ratio).
+        clip_image_map: dict[int, str] = {}
+        for r in resolved_image_plan:
+            if r.get("status") != "ready":
+                continue
+            clip_idx = r.get("clip_index", -1)
+            img_path = r.get("image_path", "")
+            if clip_idx >= 0 and img_path and clip_idx not in clip_image_map:
+                clip_image_map[clip_idx] = img_path
+
+        card_text = metadata.shorts_headline_native or "KAIZER NEWS"
+        composed: list[dict] = []
+        failures: list[dict] = []
+        total = len(clip_dicts)
+
+        for i, clip in enumerate(clip_dicts):
+            raw_path = clip.get("raw_path", "")
+            if not raw_path or not os.path.exists(raw_path):
+                failures.append({"i": i, "reason": "missing_raw_path"})
+                logger.warning(
+                    "stage_4: skipping clip %d -- raw_path missing or "
+                    "file not found: %s", i, raw_path,
+                )
+                continue
+
+            v2_idx = clip.get("v2_index", i)
+            image_path = clip_image_map.get(v2_idx, "")
+            if not image_path and self.image_pool:
+                # Fallback: any image from the pool. V1 uses
+                # ``images[-1]`` when the indexed slot is missing.
+                image_path = str(next(iter(self.image_pool.values())))
+            if not image_path:
+                failures.append({"i": i, "reason": "no_image_available"})
+                logger.warning(
+                    "stage_4: skipping clip %d -- no image available "
+                    "in resolved plan or pool", i,
+                )
+                continue
+
+            out_path = str(self.output_dir / f"clip_{i+1:02d}.mp4")
+            thumb_path = str(self.output_dir / f"thumb_{i+1:02d}.jpg")
+
+            try:
+                params = self._dispatch_compose(
+                    raw_path, image_path, card_text, out_path,
+                    lang_font_basename, lang_follow_text,
+                )
+            except Exception as exc:
+                failures.append({"i": i, "reason": f"compose_failed: {exc!r}"})
+                logger.warning(
+                    "stage_4: compose failed for clip %d (%s): %s",
+                    i, self.frame_layout, exc,
+                )
+                continue
+
+            thumb_ok = self._generate_thumbnail(out_path, thumb_path)
+            if not thumb_ok:
+                thumb_path = ""
+
+            # Enrich the clip dict with composed-output fields.
+            clip["clip_path"]  = os.path.abspath(out_path)
+            clip["thumb_path"] = os.path.abspath(thumb_path) if thumb_path else ""
+            clip["image_path"] = os.path.abspath(image_path)
+            clip.update(params)
+            composed.append(clip)
+
+        # Per D-9.7: >50% failure ratio -> raise so Inngest retries.
+        if total > 0 and (len(failures) / total) > self.drop_ratio_threshold:
+            raise RuntimeError(
+                f"Stage 4 compose_shorts: {len(failures)}/{total} clips "
+                f"failed "
+                f"({len(failures)/total:.0%} > "
+                f"{self.drop_ratio_threshold:.0%} threshold). Indicates "
+                f"systemic render failure. Failures: {failures!r}. "
+                f"Inngest will retry the step."
+            )
+
+        if failures:
+            logger.info(
+                "stage_4: composed %d/%d clips (skipped %d below the "
+                "%d%% threshold)",
+                len(composed), total, len(failures),
+                int(self.drop_ratio_threshold * 100),
+            )
+
+        return composed
+
+    # ---- Step 9.3: bulletin assembly (long-form pass) ----------------
+
+    @property
+    def bulletin_dir(self) -> Path:
+        """Bulletin subdirectory of ``output_dir``. Created lazily on
+        first access. V1's bulletin loop puts all assembly artifacts
+        (composed_story_NN.mp4, _sidebar_NN.mp4, _ticker.png, _bug.png,
+        takeover_NN.mp4, bulletin.mp4) under this dir.
+        """
+        d = self.output_dir / "bulletin"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _images_for_story(self, clip: dict) -> list[str]:
+        """Pull image paths usable for a single bulletin story.
+
+        For now we use the image_pool populated by ``resolve_images``
+        (which feeds both shorts and bulletin passes per D-9.5).
+        Returns up to 5 image paths -- the limit V1 uses for sidebar
+        carousels (``imgs[:5]``).
+
+        If we ever need per-story image generation distinct from the
+        global pool (V1 has _gen_for_story for this), add a separate
+        method; this default is correct for V2's design where Stage
+        3c's image_plan already selected the right images.
+        """
+        return [str(p) for p in list(self.image_pool.values())[:5]]
+
+    def render_bulletin(
+        self,
+        full_video_cuts: list[FullVideoCut],
+        metadata: Metadata,
+        entities: list[Entity],
+        image_plan: ImagePlan,
+        channel_name: str = "KAIZER NEWS",
+        logo_path: Optional[str] = None,
+    ) -> dict:
+        """Assemble the full-form bulletin video.
+
+        Sequence (matches V1's run_pipeline bulletin loop at
+        pipeline.py:4023-4316):
+
+          1. Cut raw segments from source (V1.cut_video_clips)
+          2. Resolve images into self.image_pool (V1.resolve_image_plan,
+             reuses pool from prior shorts pass per D-9.5)
+          3. Render shared overlays ONCE:
+               - ticker      (V1.render_ticker)
+               - channel bug (V1.render_channel_bug)
+          4. Per story:
+               - Build sidebar (V1.build_sidebar_carousel or
+                 make_sidebar_placeholder)
+               - Pick PiP source if use_pip (V1.pick_pip_source)
+               - Compose story (V1.compose_pip_story or
+                 compose_bulletin_story)
+               - compose_deps content-aware cache check at each step
+                 so a --resume-dir re-run skips already-built segments
+               - Optional inter-story takeover (V1.build_fullscreen_takeover)
+          5. Stitch story segments into bulletin.mp4 (V1.stitch_bulletin)
+          6. Apply image_plan overlays -> bulletin_with_overlays.mp4
+             (V1.overlay_image_plan)
+
+        Returns a dict with keys: bulletin_path (carousel-only),
+        overlay_path (with image_plan applied; same as bulletin_path
+        if no overlays applied), duration_s, stories_rendered,
+        stories_skipped, warnings.
+        """
+        lang_cfg = _v1_languages.get(metadata.language.split("-", 1)[0])
+        bulletin_dir = self.bulletin_dir
+
+        # ---- 1. Raw cut for the bulletin pass --------------------
+        clips = self.cut_raw_bulletin_stories(full_video_cuts, metadata)
+
+        # ---- 2. Image resolution (reuses image_pool per D-9.5) ----
+        # Stage 3c's image_plan already targets the bulletin's
+        # full_video_cuts -- pass them as kept_clips so V1's
+        # resolve_image_plan can validate boundaries the same way it
+        # did for shorts (the post-validate happened in Stage 3c
+        # already, but V1's resolver does its own checks).
+        resolved = self.resolve_images(
+            image_plan, entities,
+            kept_clip_dicts=clips,
+            full_metadata=metadata,
+        )
+
+        # ---- 3. Shared overlays (rendered ONCE for the bulletin) --
+        ticker_path = str(bulletin_dir / "_ticker.png")
+        ticker_inputs = [lang_cfg.font_primary] if lang_cfg.font_primary else []
+        ticker_headlines = list(metadata.bulletin_marquee_points) or ["KAIZER NEWS"]
+        ticker_extra = {
+            "headlines": ticker_headlines,
+            "lang": lang_cfg.code,
+        }
+        if _v1_compose_deps.is_fresh(ticker_path, ticker_inputs, ticker_extra, min_size=1000):
+            logger.info("stage_4: bulletin ticker cached (skipping)")
+        else:
+            try:
+                _v1_render_ticker(
+                    ticker_headlines, lang_cfg.code,
+                    lang_cfg.font_primary, ticker_path,
+                )
+                _v1_compose_deps.mark_built(ticker_path, ticker_inputs, ticker_extra)
+            except Exception as exc:
+                logger.warning("stage_4: ticker render failed: %s", exc)
+                ticker_path = ""
+
+        bug_path = str(bulletin_dir / "_bug.png")
+        bug_inputs = [logo_path] if logo_path else []
+        bug_extra = {"channel_name": channel_name}
+        if _v1_compose_deps.is_fresh(bug_path, bug_inputs, bug_extra, min_size=500):
+            logger.info("stage_4: bulletin channel bug cached (skipping)")
+        else:
+            try:
+                _v1_render_channel_bug(channel_name, logo_path, bug_path)
+                _v1_compose_deps.mark_built(bug_path, bug_inputs, bug_extra)
+            except Exception as exc:
+                logger.warning("stage_4: channel bug render failed: %s", exc)
+                bug_path = None
+
+        # ---- 4. Per-story compose -----------------------------------
+        story_paths: list[str] = []
+        failures: list[dict] = []
+        total = len(clips)
+
+        for i, clip in enumerate(clips):
+            raw_path = clip.get("raw_path", "")
+            if not raw_path or not os.path.isfile(raw_path):
+                failures.append({"i": i, "reason": "missing_raw_path"})
+                logger.warning(
+                    "stage_4: bulletin story %d skipped -- raw_path "
+                    "missing or empty: %s", i, raw_path,
+                )
+                continue
+
+            story_dur_s = float(clip.get("duration_sec") or 60.0)
+            imgs = self._images_for_story(clip)
+
+            # ---- 4a. Sidebar (carousel or placeholder) -----------
+            sidebar_path: Optional[str] = None
+            sidebar_is_video = False
+            if self.use_sidebar_carousel and len(imgs) >= 2:
+                sidebar_video = str(bulletin_dir / f"_sidebar_{i:02d}.mp4")
+                sidebar_inputs = list(imgs[:5])
+                sidebar_extra = {"duration_s": round(story_dur_s, 3)}
+                if _v1_compose_deps.is_fresh(sidebar_video, sidebar_inputs, sidebar_extra):
+                    logger.info("stage_4: sidebar story %d cached", i)
+                    sidebar_path = sidebar_video
+                    sidebar_is_video = True
+                else:
+                    try:
+                        _v1_build_sidebar_carousel(
+                            imgs[:5], story_dur_s, sidebar_video,
+                            work_dir=str(bulletin_dir / f"_sidebar_work_{i:02d}"),
+                        )
+                        _v1_compose_deps.mark_built(sidebar_video, sidebar_inputs, sidebar_extra)
+                        sidebar_path = sidebar_video
+                        sidebar_is_video = True
+                    except Exception as exc:
+                        logger.warning(
+                            "stage_4: sidebar carousel story %d failed: %s",
+                            i, exc,
+                        )
+                        sidebar_path = None
+            if sidebar_path is None:
+                # Fallback to static placeholder (V1's pattern, also
+                # used when use_sidebar_carousel=False)
+                sidebar_static = str(bulletin_dir / f"_sidebar_{i:02d}.png")
+                try:
+                    _v1_make_sidebar_placeholder(
+                        imgs[0] if imgs else None,
+                        sidebar_static,
+                    )
+                    sidebar_path = sidebar_static
+                except Exception as exc:
+                    logger.warning(
+                        "stage_4: sidebar placeholder story %d failed: %s",
+                        i, exc,
+                    )
+                    sidebar_path = None
+
+            # ---- 4b. StoryMeta + PiP source picking --------------
+            importance = int(clip.get("importance") or 5)
+            kicker = "BREAKING" if importance >= 8 else "NEWS"
+            story_meta = _V1StoryMeta(
+                title=(metadata.shorts_headline_native or "KAIZER NEWS")[:200],
+                kicker=kicker,
+                language=lang_cfg.code,
+                story_index=i,
+                total_stories=total,
+                importance=importance,
+            )
+
+            pip_src = _v1_pick_pip_source(clips, i) if self.use_pip else None
+
+            # ---- 4c. compose_deps fingerprint for this story -----
+            composed_path = str(bulletin_dir / f"composed_story_{i:02d}.mp4")
+            composed_inputs = [
+                raw_path, sidebar_path, ticker_path, bug_path,
+                lang_cfg.font_primary,
+            ]
+            if pip_src:
+                composed_inputs.append(pip_src[0])
+            composed_extra = {
+                "title":       story_meta.title,
+                "kicker":      story_meta.kicker,
+                "language":    story_meta.language,
+                "importance":  int(story_meta.importance),
+                "story_index": int(story_meta.story_index),
+                "total":       int(story_meta.total_stories),
+                "use_pip":     bool(pip_src),
+                "pip_start_s": round(float(pip_src[1]), 3) if pip_src else None,
+                "pip_dur_s":   round(float(pip_src[2]), 3) if pip_src else None,
+                "sidebar_is_video": bool(sidebar_is_video),
+            }
+
+            composed_ok = False
+            if _v1_compose_deps.is_fresh(composed_path, composed_inputs, composed_extra):
+                logger.info("stage_4: composed_story_%02d.mp4 cached", i)
+                composed_ok = True
+            else:
+                try:
+                    if pip_src and sidebar_path and ticker_path:
+                        pip_clip, pip_start, pip_dur = pip_src
+                        _v1_compose_pip_story(
+                            raw_path, story_meta, composed_path,
+                            pip_clip_path=pip_clip,
+                            pip_start_s=pip_start,
+                            pip_duration_s=pip_dur,
+                            sidebar_path=sidebar_path,
+                            ticker_path=ticker_path,
+                            channel_bug_path=bug_path,
+                            font_path=lang_cfg.font_primary,
+                            sidebar_is_video=sidebar_is_video,
+                            work_dir=str(bulletin_dir),
+                        )
+                        composed_ok = True
+                    elif sidebar_path and ticker_path:
+                        _v1_compose_bulletin_story(
+                            raw_path, story_meta, composed_path,
+                            sidebar_path=sidebar_path,
+                            ticker_path=ticker_path,
+                            channel_bug_path=bug_path,
+                            font_path=lang_cfg.font_primary,
+                            sidebar_is_video=sidebar_is_video,
+                            work_dir=str(bulletin_dir),
+                        )
+                        composed_ok = True
+                except Exception as exc:
+                    logger.warning(
+                        "stage_4: compose story %d failed: %s", i, exc,
+                    )
+
+            if composed_ok and os.path.isfile(composed_path):
+                _v1_compose_deps.mark_built(composed_path, composed_inputs, composed_extra)
+                story_paths.append(composed_path)
+            else:
+                # Fall back to raw slice so the story still ships
+                # (V1's pattern: pipeline.py:4290).
+                story_paths.append(raw_path)
+                failures.append({"i": i, "reason": "compose_fallback_to_raw"})
+                logger.warning(
+                    "stage_4: bulletin story %d fell back to raw slice",
+                    i,
+                )
+
+            # ---- 4d. Inter-story takeover (optional) -------------
+            if (
+                self.use_takeovers
+                and 0 < i < total - 1
+                and len(imgs) >= 2
+            ):
+                takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
+                takeover_path = str(bulletin_dir / f"takeover_{i:02d}.mp4")
+                takeover_inputs = list(imgs[:4])
+                takeover_extra = {"duration_s": round(takeover_dur, 3)}
+                if _v1_compose_deps.is_fresh(takeover_path, takeover_inputs, takeover_extra):
+                    logger.info("stage_4: takeover_%02d.mp4 cached", i)
+                    story_paths.append(takeover_path)
+                else:
+                    try:
+                        _v1_build_fullscreen_takeover(
+                            imgs[:4], takeover_dur, takeover_path,
+                            work_dir=str(bulletin_dir / f"_takeover_work_{i:02d}"),
+                        )
+                        _v1_compose_deps.mark_built(takeover_path, takeover_inputs, takeover_extra)
+                        story_paths.append(takeover_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "stage_4: takeover %d failed (skipping): %s",
+                            i, exc,
+                        )
+
+        # ---- 4.5. Per-story guardrail (D-9.7) ----------------------
+        if total > 0 and (len(failures) / total) > self.drop_ratio_threshold:
+            raise RuntimeError(
+                f"Stage 4 render_bulletin: {len(failures)}/{total} "
+                f"stories failed "
+                f"({len(failures)/total:.0%} > "
+                f"{self.drop_ratio_threshold:.0%} threshold). Indicates "
+                f"systemic bulletin compose failure. Failures: "
+                f"{failures!r}. Inngest will retry the step."
+            )
+
+        if not story_paths:
+            raise RuntimeError(
+                "Stage 4 render_bulletin: no story segments produced. "
+                "Bulletin cannot be stitched. Inngest will retry."
+            )
+
+        # ---- 5. Stitch story segments into bulletin.mp4 ------------
+        bulletin_out = str(bulletin_dir / "bulletin.mp4")
+        try:
+            stitch_result = _v1_stitch_bulletin(
+                story_paths,
+                bulletin_out,
+                work_dir=str(bulletin_dir),
+            )
+        except _V1BulletinStitchError as exc:
+            raise RuntimeError(
+                f"Stage 4 render_bulletin: stitch_bulletin failed: "
+                f"{exc!r}. Inngest will retry."
+            ) from exc
+
+        total_duration_s = float(getattr(stitch_result, "total_duration_s", 0.0) or 0.0)
+        stories_rendered = int(getattr(stitch_result, "stories_rendered", len(story_paths)))
+        stories_skipped = int(getattr(stitch_result, "stories_skipped", 0))
+        stitch_warnings = list(getattr(stitch_result, "warnings", []))
+
+        # ---- 6. Apply image_plan overlays --------------------------
+        overlay_out = str(bulletin_dir / "bulletin_with_overlays.mp4")
+        overlay_applied = False
+        if image_plan.entries:
+            ready_count = sum(1 for r in resolved if r.get("status") == "ready")
+            if ready_count > 0:
+                if (
+                    os.path.exists(overlay_out)
+                    and os.path.getsize(overlay_out) > 100_000
+                ):
+                    logger.info(
+                        "stage_4: bulletin_with_overlays.mp4 cached"
+                    )
+                    overlay_applied = True
+                else:
+                    try:
+                        _v1_overlay_image_plan(bulletin_out, resolved, overlay_out)
+                        overlay_applied = os.path.exists(overlay_out) and os.path.getsize(overlay_out) > 100_000
+                    except Exception as exc:
+                        logger.warning(
+                            "stage_4: overlay_image_plan failed "
+                            "(keeping un-overlaid bulletin): %s", exc,
+                        )
+
+        return {
+            "bulletin_path":     bulletin_out,
+            "overlay_path":      overlay_out if overlay_applied else bulletin_out,
+            "overlay_applied":   overlay_applied,
+            "duration_s":        total_duration_s,
+            "stories_rendered":  stories_rendered,
+            "stories_skipped":   stories_skipped,
+            "warnings":          stitch_warnings,
+        }
+
+    # ---- Step 9.4: top-level render() orchestrator ------------------
+
+    def render(
+        self,
+        job_output: JobOutput,
+        timestamp: str,
+        title_english: str = "",
+        channel_name: str = "KAIZER NEWS",
+        logo_path: Optional[str] = None,
+    ) -> RenderResult:
+        """End-to-end Stage 4: shorts pass + bulletin pass.
+
+        Sequence:
+          1. SHORTS pass:
+             a. Cut raw shorts segments
+             b. Resolve images (populates image_pool per D-9.5)
+             c. Compose each short via _dispatch_compose
+             d. Build shorts editor_meta.json via Step 8 adapter
+             e. Write {output_dir}/editor_meta.json
+          2. BULLETIN pass (image_pool reused from step 1):
+             a. render_bulletin -- the full long-form assembly
+             b. Build bulletin editor_meta.json via Step 8 adapter
+             c. Write {output_dir}/bulletin/editor_meta.json
+
+        Edge cases:
+          - 0 shorts_cuts: skip shorts pass; shorts_editor_meta_path
+            is None. Bulletin still runs.
+          - 0 full_video_cuts: skip bulletin pass;
+            bulletin_editor_meta_path is None. Shorts still runs.
+          - Both empty: returns RenderResult with both paths None and
+            empty composed_shorts -- unusual but legitimate.
+
+        Errors propagate (Inngest retries at outer step). Per-clip /
+        per-story 50% guardrails fire inside the sub-renders; this
+        method does not add additional guardrails.
+
+        Step 10.3 wrapper: classify exceptions via
+        ``_classify_render_error`` and convert known-permanent
+        conditions to ``PermanentRenderError`` so the orchestrator's
+        Stage 4 handler can map to Inngest ``NonRetriableError``.
+        Other exceptions propagate as-is for Inngest retry.
+        """
+        try:
+            return self._render_impl(
+                job_output, timestamp,
+                title_english=title_english,
+                channel_name=channel_name,
+                logo_path=logo_path,
+            )
+        except PermanentRenderError:
+            raise   # already classified; don't re-classify
+        except Exception as exc:
+            slug = _classify_render_error(exc)
+            if slug is not None:
+                raise PermanentRenderError(slug) from exc
+            raise
+
+    def _render_impl(
+        self,
+        job_output: JobOutput,
+        timestamp: str,
+        title_english: str = "",
+        channel_name: str = "KAIZER NEWS",
+        logo_path: Optional[str] = None,
+    ) -> RenderResult:
+        """Internal: the real render() body. Wrapped by render()'s
+        try/except to convert known-permanent failures into
+        PermanentRenderError.
+        """
+        shorts_cuts = job_output.shorts_cuts
+        full_video_cuts = job_output.stage_two.full_video_cuts
+        metadata = job_output.metadata
+        entities = list(job_output.canonical_entities)
+        image_plan = job_output.image_plan
+
+        composed_shorts: list[dict] = []
+        shorts_editor_meta_path: Optional[str] = None
+        bulletin_result: Optional[dict] = None
+        bulletin_editor_meta_path: Optional[str] = None
+
+        # ---- 1. SHORTS pass ------------------------------------------
+        if shorts_cuts:
+            shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata)
+            resolved_shorts = self.resolve_images(
+                image_plan, entities,
+                kept_clip_dicts=shorts_clips,
+                full_metadata=metadata,
+            )
+            composed_shorts = self.compose_shorts(
+                shorts_clips, metadata, resolved_shorts,
+            )
+
+            # Build ClipRenderArtifacts list (one per produced short).
+            # composed_shorts has clip_path / thumb_path / image_path
+            # populated by compose_shorts. The shorts adapter needs
+            # one ClipRenderArtifacts per ShortsCut in job_output --
+            # if any clip got dropped by the guardrail, the artifact
+            # count would mismatch.
+            artifacts = [
+                ClipRenderArtifacts(
+                    clip_path=c.get("clip_path", ""),
+                    raw_path=c.get("raw_path", ""),
+                    thumb_path=c.get("thumb_path", ""),
+                    image_path=c.get("image_path", ""),
+                    storage_url=c.get("storage_url", ""),
+                    storage_key=c.get("storage_key", ""),
+                    storage_backend=c.get("storage_backend", ""),
+                )
+                for c in composed_shorts
+            ]
+
+            # If clip count mismatch (compose_shorts dropped some),
+            # we'd violate the shorts adapter's contract. Re-shape
+            # job_output's shorts_cuts list to match the kept clips.
+            if len(artifacts) == len(shorts_cuts):
+                shorts_job_for_adapter = job_output
+            else:
+                kept_indices = {c["v2_index"] for c in composed_shorts}
+                kept_shorts = [c for c in shorts_cuts if c.index in kept_indices]
+                # Rebuild with 0-based contiguous indices to satisfy
+                # the adapter's D-8.12 contiguity guardrail.
+                renumbered = [
+                    ShortsCut(
+                        index=i,
+                        start_sec=c.start_sec, end_sec=c.end_sec,
+                        hook=c.hook, importance=c.importance,
+                    )
+                    for i, c in enumerate(kept_shorts)
+                ]
+                shorts_job_for_adapter = job_output.model_copy(
+                    update={"shorts_cuts": renumbered},
+                )
+
+            shorts_meta = build_v1_shorts_editor_meta(
+                shorts_job_for_adapter,
+                video_path=str(self.video_path),
+                platform=self.platform,
+                frame_layout=self.frame_layout,
+                preset=self.preset,
+                timestamp=timestamp,
+                clip_artifacts=artifacts,
+                title_english=title_english,
+            )
+            shorts_meta_path = self.output_dir / "editor_meta.json"
+            shorts_meta_path.write_text(
+                json.dumps(shorts_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            shorts_editor_meta_path = str(shorts_meta_path)
+            logger.info(
+                "stage_4: wrote shorts editor_meta -> %s (%d clips)",
+                shorts_editor_meta_path, len(composed_shorts),
+            )
+
+        # ---- 2. BULLETIN pass ----------------------------------------
+        if full_video_cuts:
+            bulletin_result = self.render_bulletin(
+                full_video_cuts=full_video_cuts,
+                metadata=metadata,
+                entities=entities,
+                image_plan=image_plan,
+                channel_name=channel_name,
+                logo_path=logo_path,
+            )
+
+            bulletin_artifacts = ClipRenderArtifacts(
+                clip_path=bulletin_result["overlay_path"],
+                clip_path_overlay=bulletin_result["overlay_path"]
+                                  if bulletin_result["overlay_applied"]
+                                  else "",
+                clip_path_carousel_only=bulletin_result["bulletin_path"]
+                                        if bulletin_result["overlay_applied"]
+                                        else "",
+            )
+
+            bulletin_meta = build_v1_bulletin_editor_meta(
+                job_output,
+                platform=self.platform,
+                bulletin_artifacts=bulletin_artifacts,
+                bulletin_duration_s=bulletin_result["duration_s"],
+            )
+            bulletin_meta_path = self.bulletin_dir / "editor_meta.json"
+            bulletin_meta_path.write_text(
+                json.dumps(bulletin_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            bulletin_editor_meta_path = str(bulletin_meta_path)
+            logger.info(
+                "stage_4: wrote bulletin editor_meta -> %s "
+                "(%d stories, %.1fs)",
+                bulletin_editor_meta_path,
+                bulletin_result["stories_rendered"],
+                bulletin_result["duration_s"],
+            )
+
+        return RenderResult(
+            shorts_editor_meta_path=shorts_editor_meta_path,
+            bulletin_editor_meta_path=bulletin_editor_meta_path,
+            composed_shorts=composed_shorts,
+            bulletin=bulletin_result,
+        )

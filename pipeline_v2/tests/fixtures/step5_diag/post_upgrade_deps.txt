@@ -1,0 +1,6 @@
+anyio==4.12.1
+google-auth==2.49.1
+google-genai==2.4.0
+httpx==0.28.1
+protobuf==5.29.6
+pydantic==2.12.5

@@ -78,6 +78,10 @@ def _migrate_schema():
             "started_at":       "DATETIME",
             "finished_at":      "DATETIME",
             "cancel_requested": _bool_false,
+            # Step 10 (V2 Inngest orchestrator): per-step progress
+            # for V2 jobs. NULL on V1 jobs (legacy subprocess path
+            # doesn't write progress). NULL at finalize.
+            "current_stage":    "VARCHAR(40)",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
@@ -570,7 +574,33 @@ PLATFORMS = {
         "compound":   True,
         "expands_to": ["youtube_full", "youtube_short"],
     },
+    # ── V2 platform (Step 11 — Inngest-orchestrated pipeline v2) ──
+    # Produces both bulletin + shorts via the V2 multi-stage pipeline
+    # (Deepgram STT -> Gemini Pro continuity -> Gemini Flash fan-out
+    # -> render). Unlike youtube_full_plus_shorts this produces ONE
+    # Job row -- the V2 Inngest function generates both output sets
+    # internally and runner._import_clips reads the editor_meta.json
+    # the V2 adapter writes.
+    #
+    # CRITICAL: do NOT add ``compound`` or ``expands_to`` markers here.
+    # create_job uses those to fan out into sibling Job rows; for V2
+    # that fan-out would create two pending jobs (one would never be
+    # picked up by the Inngest worker -> permanent stuck "pending").
+    # Step 11.1 has a regression test that pins this absence.
+    "full_video_shorts_v2": {
+        "label":  "Full Video + Shorts (V2 Beta)",
+        "width":  1080,
+        "height": 1920,
+    },
 }
+
+
+# Feature-flag gate (Step 11 D-11.12). When KAIZER_V2_ENABLED is "0"
+# / "false" / "no" the V2 platform is filtered out of the picker so
+# the 4 existing platforms ship unaffected. Default ON for Beta.
+def _v2_enabled() -> bool:
+    raw = os.environ.get("KAIZER_V2_ENABLED", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
 
 # Frame layouts — single source of truth lives in pipeline_core.pipeline
 # (the CLI's --frame argparse list is built from it). We keep human-friendly
@@ -608,7 +638,81 @@ def health():
 
 @app.get("/api/platforms/")
 def get_platforms():
-    return PLATFORMS
+    # D-11.12: gate the V2 entry behind KAIZER_V2_ENABLED so the
+    # rest of the picker is unaffected if Beta surfaces issues.
+    if _v2_enabled():
+        return PLATFORMS
+    return {
+        k: v for k, v in PLATFORMS.items()
+        if k != "full_video_shorts_v2"
+    }
+
+
+# Static catalog for the V2 STT picker (Step 11.2). The ``configured``
+# field is derived at request time from the corresponding API-key env
+# var; everything else is static metadata the UI shows in tooltips +
+# tier badges.
+_V2_STT_PROVIDER_CATALOG = [
+    {
+        "id":              "whisper-groq",
+        "display_name":    "Whisper (Groq)",
+        "tier":            "free",
+        "cost_per_min_usd": 0.0,
+        "_api_key_env":    "GROQ_API_KEY",
+        "description":     (
+            "Free tier (rate-limited). Good multilingual accuracy. "
+            "100 MB file cap on dev tier."
+        ),
+    },
+    {
+        "id":              "deepgram",
+        "display_name":    "Deepgram Nova-3",
+        "tier":            "premium",
+        "cost_per_min_usd": 0.0097,
+        "_api_key_env":    "DEEPGRAM_API_KEY",
+        "description":     (
+            "Premium tier. Per-word confidence + diarization. "
+            "Telugu single-language mode for V2 Telugu workloads."
+        ),
+    },
+    {
+        "id":              "assemblyai",
+        "display_name":    "AssemblyAI Universal-2",
+        "tier":            "mid",
+        "cost_per_min_usd": 0.0070,
+        "_api_key_env":    "ASSEMBLYAI_API_KEY",
+        "description":     (
+            "Mid-tier. Strong English accuracy; weaker on Indian "
+            "languages. Includes word-level timestamps."
+        ),
+    },
+]
+
+
+@app.get("/api/v2/stt/providers/")
+def get_v2_stt_providers():
+    """V2 STT provider catalog (Step 11.2).
+
+    Returns the full 3-provider list regardless of which API keys are
+    set, so the UI can show "Not configured" tooltips against the
+    disabled options instead of mysteriously hiding them. The
+    ``configured`` field is computed at request time so an operator
+    can rotate keys without restarting the API.
+
+    The internal ``_api_key_env`` field is stripped before returning.
+    """
+    out: list[dict] = []
+    for p in _V2_STT_PROVIDER_CATALOG:
+        api_key = os.environ.get(p["_api_key_env"], "").strip()
+        out.append({
+            "id":               p["id"],
+            "display_name":     p["display_name"],
+            "tier":             p["tier"],
+            "cost_per_min_usd": p["cost_per_min_usd"],
+            "configured":       bool(api_key),
+            "description":      p["description"],
+        })
+    return out
 
 @app.get("/api/frame-layouts/")
 def get_frame_layouts():
@@ -664,6 +768,10 @@ async def create_job(
     # Optional: pick which style-profile's logo to overlay.  Resolved to the
     # UserAsset.file_path at render time.  Absent / invalid = no logo.
     logo_channel_id: Optional[int] = Form(None),
+    # V2 only (Step 11.3): STT provider key from the wizard's
+    # "Choose STT" step. Ignored by V1 platforms; passed through to
+    # runner.run_pipeline which threads it into the Inngest event.
+    stt_provider: str = Form(""),
     # Bulletin pre-selected images. Comma-separated UserAsset IDs.
     # When present, the bulletin pass cycles through these instead of
     # calling OpenAI gpt-image-1. Only meaningful for platforms that
@@ -881,6 +989,8 @@ async def create_job(
         default_image=default_img_path,
         default_logo=default_logo_path,
         bulletin_images=bulletin_image_paths,
+        # V2 only (Step 11.4): ignored unless platform=full_video_shorts_v2.
+        stt_provider=stt_provider,
         db_session_factory=SessionLocal,
     )
 
@@ -1099,6 +1209,11 @@ def get_job_status(job_id: int, db: Session = Depends(get_db), user: models.User
         "started_at":  job.started_at.isoformat()  if job.started_at  else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "elapsed_seconds": _elapsed_seconds(job),
+        # V2 per-step progress (Step 10.7 / Step 11.5). NULL for V1
+        # jobs + V2 jobs at start/end. UI shows
+        # "Stage X of 7: <human label>" only when this is non-null.
+        "current_stage": job.current_stage,
+        "platform": job.platform,
     }
 
 

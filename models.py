@@ -77,6 +77,16 @@ class Job(Base):
     # resume it.
     cancel_requested = Column(Boolean, default=False, nullable=False)
 
+    # V2-only field (per Step 10 D-10.7): the orchestrator writes the
+    # current Inngest step name here at the start of each step so the
+    # UI can show "Stage 4 of 6: Rendering bulletin..." progress on
+    # long-running V2 jobs. Set to NULL at finalize. Stays NULL for
+    # the legacy V1 subprocess path (4 platforms before "Full Video +
+    # Shorts (V2)") which doesn't write progress mid-pipeline. Values:
+    # stage_0_ingest | stage_1_transcribe | stage_2_continuity |
+    # stage_2_5_entities | stage_3_fanout | stage_4_render | finalize
+    current_stage = Column(String(40), default=None, nullable=True)
+
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 
 
