@@ -3258,3 +3258,91 @@ class TestCollapseMicroFragments:
         )
         assert f.default == MICRO_FRAGMENT_THRESHOLD_S
         assert MICRO_FRAGMENT_THRESHOLD_S == 1.5
+
+
+# ======================================================================
+# Backlog item 105: silence trimming (gap > 1.5s between words)
+# ======================================================================
+#
+# detect_silence_trims runs over the source Stage 1 word array to find
+# long inter-word silences; apply_silence_trims_to_cuts splits any cut
+# containing a silence into halves around the silence range. Runs
+# after splice_cuts_minus_skipped (editorial drops already applied)
+# and before collapse_micro_fragments (so any silence-induced
+# fragment < 1.5s gets dropped).
+
+
+class TestSilenceTrimming:
+    """Item 105 -- 2 tests covering detection and application."""
+
+    def test_detect_silence_trims_finds_gaps_above_threshold(self):
+        """Inter-word gap > threshold -> emit a silence (start, end)
+        tuple. Gap == threshold (or below) is NOT a silence. Empty
+        / single-element input returns empty."""
+        from pipeline_v2.stages.stage_4_render import detect_silence_trims
+        from pipeline_v2.models import Word
+        # Three silences in the array: 0.4s (below), 2.0s (above),
+        # 1.5s (exactly equal -> NOT emitted, predicate is strictly >).
+        words = [
+            Word(w="hi",    s=0.0, e=0.5),
+            Word(w="there", s=0.9, e=1.2),    # 0.4s gap -> below threshold
+            Word(w="world", s=3.2, e=3.6),    # 2.0s gap -> SILENCE
+            Word(w="bye",   s=5.1, e=5.5),    # 1.5s gap -> at threshold, NOT emitted
+            Word(w="now",   s=8.0, e=8.4),    # 2.5s gap -> SILENCE
+        ]
+        trims = detect_silence_trims(words, threshold_s=1.5)
+        assert trims == [(1.2, 3.2), (5.5, 8.0)]
+        # Defensive: empty input returns empty list.
+        assert detect_silence_trims([], threshold_s=1.5) == []
+        # Single-element input returns empty (no pair to compare).
+        assert detect_silence_trims([words[0]], threshold_s=1.5) == []
+        # threshold_s <= 0 disables detection entirely (passthrough).
+        assert detect_silence_trims(words, threshold_s=0) == []
+        assert detect_silence_trims(words, threshold_s=-1) == []
+        # Tighter threshold catches the 0.4s gap too.
+        trims_tight = detect_silence_trims(words, threshold_s=0.3)
+        assert (0.5, 0.9) in trims_tight   # was below threshold=1.5
+        assert (1.2, 3.2) in trims_tight   # still caught
+        assert (5.5, 8.0) in trims_tight   # still caught
+
+    def test_apply_silence_trims_splits_cut_at_silence_boundary(self):
+        """A cut spanning a silence is split into two halves around
+        the silence. parent_v2_index is inherited on both halves.
+        Cuts that don't overlap any silence pass through unchanged.
+        """
+        from pipeline_v2.stages.stage_4_render import apply_silence_trims_to_cuts
+        # One cut spanning 0-30s with a 2s silence at 10-12s,
+        # plus an unrelated cut from 40-50s that has no silence.
+        cuts = [
+            _full_video_cut(idx=0, start=0.0,  end=30.0),
+            _full_video_cut(idx=1, start=40.0, end=50.0),
+        ]
+        parents = [7, 7]   # both sub-cuts share parent FullVideoCut[7]
+        silence_trims = [(10.0, 12.0), (45.0, 45.1)]  # last is BELOW any
+                                                       # threshold visually
+                                                       # but apply_ doesn't
+                                                       # re-threshold; it
+                                                       # just trims.
+        out_cuts, out_parents = apply_silence_trims_to_cuts(
+            cuts, parents, silence_trims,
+        )
+        # First cut becomes 2 halves around the 10-12s silence; second
+        # cut also gets split at 45.0-45.1s (3 halves total around
+        # the 45.0-45.1s silence: nope, just 2 -- before 45.0 and
+        # after 45.1). Total: 4 sub-cuts.
+        assert len(out_cuts) == 4
+        # Half 1: 0-10s (before silence).
+        assert (out_cuts[0].start_sec, out_cuts[0].end_sec) == (0.0, 10.0)
+        # Half 2: 12-30s (after silence).
+        assert (out_cuts[1].start_sec, out_cuts[1].end_sec) == (12.0, 30.0)
+        # Cut 1 sub-cuts: 40-45 and 45.1-50.
+        assert (out_cuts[2].start_sec, out_cuts[2].end_sec) == (40.0, 45.0)
+        assert (out_cuts[3].start_sec, out_cuts[3].end_sec) == (45.1, 50.0)
+        # All inherit parent 7.
+        assert out_parents == [7, 7, 7, 7]
+        # Index renumbered contiguously.
+        assert [c.index for c in out_cuts] == [0, 1, 2, 3]
+        # Empty silence_trims -> identity (length preserved).
+        out_identity, _ = apply_silence_trims_to_cuts(cuts, parents, [])
+        assert len(out_identity) == 2
+        assert (out_identity[0].start_sec, out_identity[0].end_sec) == (0.0, 30.0)

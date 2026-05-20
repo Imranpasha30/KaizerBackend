@@ -622,6 +622,120 @@ def collapse_micro_fragments(
     return out_cuts, out_parents
 
 
+# --- Item 105: silence trimming ----------------------------------------
+
+SILENCE_TRIM_THRESHOLD_S: float = 1.5
+
+
+def detect_silence_trims(
+    words: list[Word],
+    threshold_s: float = SILENCE_TRIM_THRESHOLD_S,
+) -> list[tuple[float, float]]:
+    """Find inter-word gaps longer than ``threshold_s`` in the source
+    word array. Returns a list of ``(silence_start_sec, silence_end_sec)``
+    tuples chronologically sorted.
+
+    Silence is defined as the time between ``words[i].e`` and
+    ``words[i+1].s`` when that gap exceeds ``threshold_s``.
+
+    Pure word-time arithmetic -- deterministic, no LLM call. The
+    threshold default (1.5s) matches the operator decision behind
+    item 103's micro-fragment threshold. Set to 0 (or negative) to
+    disable detection.
+    """
+    if not words or threshold_s <= 0 or len(words) < 2:
+        return []
+    out: list[tuple[float, float]] = []
+    for prev, curr in zip(words[:-1], words[1:]):
+        gap = float(curr.s) - float(prev.e)
+        if gap > threshold_s:
+            out.append((float(prev.e), float(curr.s)))
+    return out
+
+
+def apply_silence_trims_to_cuts(
+    cuts: list[FullVideoCut],
+    parent_v2_indexes: list[int],
+    silence_trims: list[tuple[float, float]],
+) -> tuple[list[FullVideoCut], list[int]]:
+    """Subtract silence time ranges from each cut's span.
+
+    For each silence range that falls inside a cut, the cut is split
+    into two halves: ``[cut.start, silence_start]`` and
+    ``[silence_end, cut.end]``. Both halves inherit the cut's
+    ``parent_v2_index``. Cuts unaffected by any silence pass through
+    unchanged.
+
+    Renumbers ``FullVideoCut.index`` to stay contiguous on output;
+    ``parent_v2_indexes`` is filtered/extended in parallel so every
+    output sub-cut has its parent.
+
+    Word-index bounds on new halves: ``start_word_idx`` / ``end_word_idx``
+    are PRESERVED from the source cut (the boundaries are time-only;
+    word indices on the source cut were already approximate after
+    splice_cuts_minus_skipped). Downstream renderers cut on ``start_sec`` /
+    ``end_sec`` so word-idx drift here is a telemetry concern only.
+
+    Runs AFTER ``splice_cuts_minus_skipped`` (cuts already sub-cut by
+    editorial drops) and BEFORE ``collapse_micro_fragments`` (so any
+    silence-induced fragment < 1.5s gets cleaned up by item 103).
+    """
+    if not silence_trims or not cuts:
+        return list(cuts), list(parent_v2_indexes)
+    if len(cuts) != len(parent_v2_indexes):
+        raise ValueError(
+            f"apply_silence_trims_to_cuts: length mismatch -- "
+            f"{len(cuts)} cuts vs {len(parent_v2_indexes)} parent_v2_indexes."
+        )
+
+    trims_sorted = sorted(silence_trims, key=lambda t: t[0])
+    out_cuts: list[FullVideoCut] = []
+    out_parents: list[int] = []
+    for cut, parent in zip(cuts, parent_v2_indexes):
+        # Silences inside this cut's time span (strict overlap).
+        relevant = [
+            t for t in trims_sorted
+            if t[1] > cut.start_sec and t[0] < cut.end_sec
+        ]
+        if not relevant:
+            out_cuts.append(FullVideoCut(
+                index=len(out_cuts),
+                start_word_idx=cut.start_word_idx,
+                end_word_idx=cut.end_word_idx,
+                start_sec=cut.start_sec,
+                end_sec=cut.end_sec,
+                importance=cut.importance,
+            ))
+            out_parents.append(parent)
+            continue
+        cursor = cut.start_sec
+        for (sil_start, sil_end) in relevant:
+            seg_start = max(sil_start, cut.start_sec)
+            seg_end = min(sil_end, cut.end_sec)
+            if seg_start > cursor:
+                out_cuts.append(FullVideoCut(
+                    index=len(out_cuts),
+                    start_word_idx=cut.start_word_idx,
+                    end_word_idx=cut.end_word_idx,
+                    start_sec=cursor,
+                    end_sec=seg_start,
+                    importance=cut.importance,
+                ))
+                out_parents.append(parent)
+            cursor = max(cursor, seg_end)
+        if cursor < cut.end_sec:
+            out_cuts.append(FullVideoCut(
+                index=len(out_cuts),
+                start_word_idx=cut.start_word_idx,
+                end_word_idx=cut.end_word_idx,
+                start_sec=cursor,
+                end_sec=cut.end_sec,
+                importance=cut.importance,
+            ))
+            out_parents.append(parent)
+    return out_cuts, out_parents
+
+
 def full_video_cuts_to_v1_clip_dicts(
     full_video_cuts: list[FullVideoCut],
     metadata: Metadata,
@@ -805,6 +919,18 @@ class Stage4Render:
     # selected entry is not yet implemented (one structured warning
     # logged per render so the operator sees the fallback).
     transition_style: str = "smart_cut"
+
+    # Item 105: subtract long inter-word silences (> threshold) from
+    # each kept cut's time range. Pure word-time arithmetic, runs
+    # after splice_cuts_minus_skipped + before collapse_micro_fragments.
+    # Set to 0.0 to disable silence trimming.
+    silence_trim_threshold_s: float = SILENCE_TRIM_THRESHOLD_S
+
+    # Item 105: source Stage 1 word array used by silence detection.
+    # The orchestrator populates this after constructing the renderer.
+    # When None or empty, silence trimming is a no-op (the renderer
+    # has no source-time references to compute gaps from).
+    original_words: Optional[list] = None
 
     # Instance-level cache, populated by Step 9.2 image resolution.
     # Maps canonical entity_name -> absolute path of resolved image
@@ -2044,6 +2170,40 @@ class Stage4Render:
                     "stage_4: transition resolution failed (non-fatal, "
                     "falling back to smart_cut): %s", _trans_exc,
                 )
+
+            # Item 105: silence trim. Subtract long inter-word silences
+            # detected in the Stage 1 word array from each kept cut.
+            # No-op when no original_words were plumbed through OR
+            # threshold is 0. Runs BEFORE collapse_micro_fragments so
+            # any silence-induced micro-fragments get cleaned up by
+            # item 103's drop pass.
+            if (
+                self.silence_trim_threshold_s > 0
+                and self.original_words
+                and spliced_cuts
+            ):
+                silence_trims = detect_silence_trims(
+                    list(self.original_words),
+                    threshold_s=self.silence_trim_threshold_s,
+                )
+                if silence_trims:
+                    pre_silence_count = len(spliced_cuts)
+                    pre_silence_dur = sum(
+                        c.end_sec - c.start_sec for c in spliced_cuts
+                    )
+                    spliced_cuts, parent_v2_indexes = apply_silence_trims_to_cuts(
+                        spliced_cuts, parent_v2_indexes, silence_trims,
+                    )
+                    post_silence_dur = sum(
+                        c.end_sec - c.start_sec for c in spliced_cuts
+                    )
+                    _p(
+                        f"  [silence-trim] removed "
+                        f"{pre_silence_dur - post_silence_dur:.2f}s "
+                        f"of silence > {self.silence_trim_threshold_s:.1f}s "
+                        f"(cuts {pre_silence_count} -> "
+                        f"{len(spliced_cuts)} after splits)"
+                    )
 
             # Item 103: drop micro-fragments < threshold (default 1.5s)
             # so the bulletin doesn't include tiny slivers between

@@ -732,6 +732,26 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
     # transitions.resolve_for_render -- no validation needed here.
     _transition_style = envelope.get("transition_style") or "smart_cut"
 
+    # Item 105: hand the Stage 1 word array to Stage 4 so its
+    # silence-trim pass has the source timestamps it needs. The
+    # envelope already carries stage_1 as a serialised dict (see
+    # the stage 1 handler that populated it).
+    _stage_1_words: list = []
+    try:
+        stage_1_dict = envelope.get("stage_1")
+        if stage_1_dict:
+            stage_1 = Stage1Output.model_validate(stage_1_dict)
+            _stage_1_words = list(stage_1.transcript.words)
+    except Exception as _s1_exc:
+        # Non-fatal: silence trim becomes a no-op when the array is
+        # empty. Log so the operator can spot the regression if the
+        # bulletin starts shipping with unexpected silences.
+        logger.warning(
+            "stage_4_handler: failed to reconstruct Stage 1 word array "
+            "for silence trim (silence-trim disabled for this render): "
+            "%s", _s1_exc,
+        )
+
     renderer = Stage4Render(
         output_dir=output_dir,
         video_path=envelope["video_path"],
@@ -739,6 +759,7 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
         frame_layout=envelope.get("frame_layout", "torn_card"),
         platform=envelope["platform"],
         transition_style=_transition_style,
+        original_words=_stage_1_words,
     )
 
     # Register the worker with _ACTIVE_PROCS BEFORE render starts.
