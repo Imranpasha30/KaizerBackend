@@ -2071,3 +2071,110 @@ class TestOnFailureHook:
             assert j.finished_at is not None
         finally:
             s.close()
+
+
+# ======================================================================
+# Backlog item 91 follow-up: finalize imports BOTH shorts + bulletin
+# ======================================================================
+
+
+class TestFinalizeImportsBulletinClip:
+    """``_finalize_handler`` must call ``runner._import_clips`` TWICE --
+    once with ``shorts_editor_meta_path`` and once with
+    ``bulletin_editor_meta_path``. Previously only shorts were
+    imported, leaving the rendered bulletin orphaned on disk with no
+    Clip row in the DB."""
+
+    @pytest.mark.asyncio
+    async def test_both_meta_paths_get_imported(self, monkeypatch, tmp_path):
+        _stub_stage_helpers(monkeypatch)
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        fake_session.query.return_value.filter.return_value.count.return_value = 9
+        monkeypatch.setattr(
+            orchestrator, "_open_db_session", lambda: fake_session,
+        )
+
+        # Capture every meta_override passed to _import_clips.
+        captured: list = []
+
+        def _capture_import(job, db, meta_override=None):
+            captured.append(meta_override)
+
+        import types
+        monkeypatch.setitem(sys.modules, "runner", types.SimpleNamespace(
+            _import_clips=_capture_import,
+        ))
+
+        env = _make_finalize_envelope(tmp_path, job_id=42)
+        shorts_p = env["stage_4"]["shorts_editor_meta_path"]
+        bulletin_p = env["stage_4"]["bulletin_editor_meta_path"]
+        await orchestrator._finalize_handler(env)
+
+        # Both passes were called, in shorts->bulletin order
+        assert captured == [shorts_p, bulletin_p], (
+            f"expected _import_clips called for both shorts THEN "
+            f"bulletin; got {captured}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bulletin_import_failure_does_not_block_shorts(
+        self, monkeypatch, tmp_path,
+    ):
+        _stub_stage_helpers(monkeypatch)
+        # A failure on the bulletin path must NOT take down the shorts
+        # import. Each pass is independently try-wrapped.
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        fake_session.query.return_value.filter.return_value.count.return_value = 8
+        monkeypatch.setattr(
+            orchestrator, "_open_db_session", lambda: fake_session,
+        )
+
+        calls = {"n": 0}
+
+        def _import(job, db, meta_override=None):
+            calls["n"] += 1
+            if "bulletin" in (meta_override or ""):
+                raise RuntimeError("simulated bulletin import failure")
+
+        import types
+        monkeypatch.setitem(sys.modules, "runner", types.SimpleNamespace(
+            _import_clips=_import,
+        ))
+
+        env = _make_finalize_envelope(tmp_path, job_id=43)
+        # Should not raise -- bulletin error gets swallowed + logged
+        out = await orchestrator._finalize_handler(env)
+        assert calls["n"] == 2, "both meta paths must still be attempted"
+        # status='done' still set
+        assert out["finalize"]["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_missing_bulletin_meta_path_no_op(
+        self, monkeypatch, tmp_path,
+    ):
+        _stub_stage_helpers(monkeypatch)
+        # When stage_4 didn't produce a bulletin (e.g. 0 full_video_cuts),
+        # the bulletin_editor_meta_path is empty -- finalize must skip
+        # the second import gracefully.
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        fake_session.query.return_value.filter.return_value.count.return_value = 5
+        monkeypatch.setattr(
+            orchestrator, "_open_db_session", lambda: fake_session,
+        )
+
+        captured: list = []
+        import types
+        monkeypatch.setitem(sys.modules, "runner", types.SimpleNamespace(
+            _import_clips=lambda j, d, meta_override=None: captured.append(meta_override),
+        ))
+
+        env = _make_finalize_envelope(tmp_path, job_id=44)
+        env["stage_4"]["bulletin_editor_meta_path"] = ""   # bulletin not produced
+        await orchestrator._finalize_handler(env)
+        assert len(captured) == 1, (
+            f"expected ONE import (shorts only) when bulletin_meta is "
+            f"empty; got {len(captured)} calls"
+        )

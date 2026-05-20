@@ -1250,7 +1250,15 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "started_at":  job.started_at.isoformat()  if job.started_at  else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "elapsed_seconds": _elapsed_seconds(job),
-        "clips": [_clip_dict(c) for c in job.clips],
+        # Bulletin clips render first (16:9 long-form takes the lead
+        # tile in the JobDetail grid), shorts follow in DB-insert
+        # order. Backlog item 91 follow-up.
+        "clips": [
+            _clip_dict(c) for c in sorted(
+                job.clips,
+                key=lambda c: (0 if c.frame_type == "bulletin" else 1, c.id),
+            )
+        ],
     }
 
 

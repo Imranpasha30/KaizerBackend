@@ -191,6 +191,19 @@ def _write_current_stage(job_id: int, stage_name: str) -> None:
         )
 
 
+def _format_mmss(sec: float) -> str:
+    """Backlog item 98: format a duration in seconds as MM:SS.mmm.
+    Mirrors V1's pipeline log format so the operator reads V2 cuts
+    in the same shape they're used to."""
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        return "??:??.???"
+    m = int(s // 60)
+    rem = s - m * 60
+    return f"{m:02d}:{rem:06.3f}"
+
+
 # Per-job in-memory clock so progress lines can show elapsed-since-start.
 # Survives only within one worker process; on Inngest retry the elapsed
 # resets, which is fine -- the UI already shows wall-clock from Job.started_at.
@@ -424,6 +437,38 @@ async def _stage_2_continuity_handler(envelope: dict) -> dict:
     envelope["stage_costs"][STAGE_2_CONTINUITY] = 0.0
     cuts_n = len(getattr(full, "full_video_cuts", None) or [])
     skip_n = len(getattr(decisions, "skipped_segments", None) or [])
+
+    # Backlog item 98 -- V1-style verbose progress. The previous
+    # "Stage 2/7 done (N cuts, M skipped)" summary line was thin.
+    # Surface each clip boundary + a per-category skipped breakdown
+    # so the operator can read the editor's reasoning while it's
+    # still on screen.
+    try:
+        from collections import Counter
+        skipped_by_cat = Counter(
+            (s.category if isinstance(getattr(s, "category", None), str)
+             else getattr(s.category, "value", str(s.category)))
+            for s in (decisions.skipped_segments or [])
+        )
+        cat_summary = ", ".join(f"{n} {cat}" for cat, n in skipped_by_cat.most_common())
+        _append_progress_log(
+            job_id,
+            f"Stage 2/7 found {skip_n} skipped"
+            + (f": {cat_summary}" if cat_summary else ""),
+        )
+        for c in (full.full_video_cuts or []):
+            _append_progress_log(
+                job_id,
+                f"  [cut {c.index}] {_format_mmss(c.start_sec)} -> "
+                f"{_format_mmss(c.end_sec)} "
+                f"({c.end_sec - c.start_sec:.1f}s | importance: {c.importance})",
+            )
+    except Exception as detail_exc:
+        logger.warning(
+            "stage_2 verbose progress detail failed (non-fatal): %s",
+            detail_exc,
+        )
+
     _append_progress_log(
         job_id,
         f"Stage 2/7 done ({cuts_n} cuts, {skip_n} skipped segments)",
@@ -499,6 +544,38 @@ async def _stage_3_fanout_handler(envelope: dict) -> dict:
     envelope["stage_costs"][STAGE_3_FANOUT] = 0.0
     shorts_n = len(result.shorts_cuts)
     img_n = len(getattr(result.image_plan, "entries", None) or [])
+
+    # Backlog item 98 -- per-short verbose detail. Without this the
+    # operator only sees the aggregate count.
+    try:
+        # Stage 3a's shorts_cuts carries (index, start_sec, end_sec,
+        # hook, importance). The full per-short metadata (native
+        # headlines etc.) lives in result.metadata.shorts_meta.
+        per_short_meta = getattr(result.metadata, "shorts_meta", None) or []
+        for sc in (result.shorts_cuts or []):
+            dur = sc.end_sec - sc.start_sec
+            # Try to find the matching shorts_meta entry by index for the headline.
+            head = ""
+            for m in per_short_meta:
+                if getattr(m, "index", None) == sc.index:
+                    head = (getattr(m, "shorts_headline_native", None)
+                            or getattr(m, "shorts_headline_en", None)
+                            or "")
+                    break
+            head_preview = (head[:60] + "…") if len(head) > 60 else head
+            _append_progress_log(
+                job_id,
+                f"  [short {sc.index}] {_format_mmss(sc.start_sec)} -> "
+                f"{_format_mmss(sc.end_sec)} ({dur:.1f}s | "
+                f"importance: {sc.importance})"
+                + (f"  | {head_preview}" if head_preview else ""),
+            )
+    except Exception as detail_exc:
+        logger.warning(
+            "stage_3 verbose progress detail failed (non-fatal): %s",
+            detail_exc,
+        )
+
     _append_progress_log(
         job_id,
         f"Stage 4/7 done ({shorts_n} shorts planned, "

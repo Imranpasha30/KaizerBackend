@@ -1560,24 +1560,50 @@ class Stage4Render:
             if cancel_check is not None:
                 cancel_check()
             _p(f"Stage 5/7 cutting {len(shorts_cuts)} raw shorts segments")
+            # Backlog item 98 -- emit one line per short cut so the V1
+            # "Cutting clip N: HH:MM:SS -> HH:MM:SS (Xs)" verbosity is
+            # preserved on V2 too.
+            for sc in shorts_cuts:
+                dur = sc.end_sec - sc.start_sec
+                _p(
+                    f"  Cutting short {sc.index + 1}/{len(shorts_cuts)}: "
+                    f"{_format_mmss_mmm(sc.start_sec)} -> "
+                    f"{_format_mmss_mmm(sc.end_sec)} ({dur:.1f}s)"
+                )
             shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata)
             _p(f"Stage 5/7 raw shorts cut ({len(shorts_clips)} clips on disk)")
             if cancel_check is not None:
                 cancel_check()
             entity_count = len(entities)
-            _p(f"Stage 6/7 sourcing images for {entity_count} entities")
+            _p(
+                f"Stage 6/7 sourcing images for {entity_count} entities: "
+                + ", ".join(e.canonical_name for e in entities[:6])
+                + (" …" if len(entities) > 6 else "")
+            )
             resolved_shorts = self.resolve_images(
                 image_plan, entities,
                 kept_clip_dicts=shorts_clips,
                 full_metadata=metadata,
             )
-            _p(f"Stage 6/7 images resolved")
+            # Surface what got sourced (entity_name -> path basename +
+            # provider tag derived from the synth filename pattern).
+            for ent_name, img_path in (self.image_pool or {}).items():
+                try:
+                    basename = Path(img_path).name
+                    _p(f"  [image] {ent_name} -> {basename}")
+                except Exception:
+                    pass
+            _p(f"Stage 6/7 images resolved ({len(self.image_pool)} sourced)")
             if cancel_check is not None:
                 cancel_check()
             _p(f"Stage 6/7 composing {len(shorts_clips)} shorts with overlays")
             composed_shorts = self.compose_shorts(
                 shorts_clips, metadata, resolved_shorts,
             )
+            for cs in composed_shorts:
+                clip_name = Path(cs.get("clip_path", "")).name or "<unknown>"
+                v2_idx = cs.get("v2_index", "?")
+                _p(f"  [short {v2_idx}] composed {clip_name}")
             _p(f"Stage 6/7 shorts composed ({len(composed_shorts)} produced)")
 
             # Build ClipRenderArtifacts list (one per produced short).
@@ -1666,6 +1692,15 @@ class Stage4Render:
                 f"keep sub-segments after splicing "
                 f"{len(skipped_segments)} skipped; trimmed {trimmed_s:.1f}s)"
             )
+            # Backlog item 98: list each sub-cut so the operator can see
+            # exactly which spans got stitched together.
+            for sc in spliced_cuts:
+                dur = sc.end_sec - sc.start_sec
+                _p(
+                    f"  [bulletin sub {sc.index}] "
+                    f"{_format_mmss_mmm(sc.start_sec)} -> "
+                    f"{_format_mmss_mmm(sc.end_sec)} ({dur:.1f}s)"
+                )
             bulletin_result = self.render_bulletin(
                 full_video_cuts=spliced_cuts,
                 metadata=metadata,
