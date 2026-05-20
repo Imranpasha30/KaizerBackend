@@ -370,11 +370,19 @@ def _process_redis(consumer: str, msg_id: str, job_id: int, priority: str) -> No
                 elif outcome == "cancelled":
                     ack_upload_job(msg_id, priority)
                 elif outcome == "queued":
+                    # Backlog item 94: do NOT auto-re-enqueue here.
+                    # The previous code did `enqueue_upload_job(...)`
+                    # immediately on every 'queued' outcome, which created
+                    # a tight no-backoff loop whenever _process() skipped
+                    # because of a status race (cancelled, claim collision,
+                    # quota-exhausted reset to queued). With 8 publish
+                    # requests open, the worker ballooned the Redis stream
+                    # from 8 entries to 619 000 in minutes. The DB-poll
+                    # fallback at line ~401 still claims legit queued rows
+                    # every poll cycle with a 5-second backoff filter, so
+                    # truly queued work continues to flow -- just not in a
+                    # tight retry loop.
                     ack_upload_job(msg_id, priority)
-                    try:
-                        enqueue_upload_job(job_id, priority=priority)
-                    except Exception as exc:
-                        _worker_logger.warning("re-enqueue failed for job %s: %s", job_id, exc)
                 else:
                     outcome = f"unfinished:{outcome}"
                 _emit_metric("process_end", job_id=job_id, ms=proc_ms,
@@ -503,11 +511,33 @@ def _process(job_id: int) -> None:
     print(f"[worker DBG] _process({job_id}) entered")
     db = SessionLocal()
     try:
+        # Backlog 94: atomic claim. The DB-poll fallback (line ~401) and
+        # the Redis-direct path both ultimately call _process(job_id); a
+        # 'queued' row may still be sitting in the Redis stream after the
+        # DB-poll claimed it, OR two consumers may race on the same row.
+        # The previous logic just read+checked status, which left no
+        # idempotency: two concurrent _process calls would both proceed
+        # past the check if status='uploading' (and a stale Redis msg
+        # for a cancelled/done job would skip without state change).
+        # Now: atomic UPDATE flips queued->uploading and returns the
+        # affected row count. We only proceed if WE claimed it; another
+        # status (cancelled, done, failed, already-uploading) is left
+        # alone and the caller's Phase C will ACK without re-enqueue.
+        rows_updated = db.query(models.UploadJob).filter(
+            models.UploadJob.id == job_id,
+            models.UploadJob.status == "queued",
+        ).update({"status": "uploading"}, synchronize_session=False)
+        db.commit()
+
         job = db.query(models.UploadJob).filter(models.UploadJob.id == job_id).first()
         if not job:
             print(f"[worker DBG] _process({job_id}): job missing")
             return
         if job.status != "uploading":
+            # Either we lost the claim race (another worker took it) OR the
+            # job moved to a terminal state between enqueue and dequeue
+            # (cancelled, failed, done). Either way, don't process and
+            # don't fight; Phase C ACKs based on the real terminal status.
             print(f"[worker DBG] _process({job_id}): status={job.status} (not 'uploading') — skipping")
             return
 
