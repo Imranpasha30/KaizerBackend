@@ -136,6 +136,8 @@ from pipeline_v2.models import (
     JobOutput,
     Metadata,
     ShortsCut,
+    SkippedSegment,
+    Word,
 )
 from pipeline_v2.stages.stage_4_image_source import ImageSourcer
 
@@ -620,6 +622,132 @@ def collapse_micro_fragments(
         ))
         out_parents.append(parent_v2_indexes[orig_i])
     return out_cuts, out_parents
+
+
+# --- Item 106: defensive guardrails (monotonic, repeat-word, precision)
+
+CUT_PRECISION_DECIMALS: int = 3   # 3 decimals = 1ms (ffmpeg's tick)
+
+
+def assert_cuts_monotonic(cuts: list[FullVideoCut]) -> None:
+    """Item 106 / Bug B: verify cuts are sorted by ``start_sec`` and
+    do not overlap each other.
+
+    Raises ``ValueError`` with a descriptive message naming the
+    offending pair (index + start/end times) so the operator can
+    locate the upstream bug. Empty / single-element lists are
+    trivially monotonic.
+
+    Called at the END of the transform chain (splice + silence +
+    micro-fragments) right before the renderer hands cuts to ffmpeg.
+    A non-monotonic list would render time-traveled / duplicated
+    content -- failing loudly here saves a confusing visual bug
+    later.
+    """
+    for i in range(1, len(cuts)):
+        prev, curr = cuts[i - 1], cuts[i]
+        if curr.start_sec < prev.end_sec:
+            raise ValueError(
+                f"Cuts not monotonic: cut[{i - 1}] ends at "
+                f"{prev.end_sec:.3f}s but cut[{i}] starts at "
+                f"{curr.start_sec:.3f}s (overlap of "
+                f"{prev.end_sec - curr.start_sec:.3f}s). Cut indexes: "
+                f"prev.index={prev.index} curr.index={curr.index}."
+            )
+
+
+def collapse_repeated_words(
+    words: list[Word],
+    *,
+    case_insensitive: bool = True,
+    strip_punctuation: bool = True,
+) -> list[Word]:
+    """Item 106 / Bug A: collapse consecutive identical words.
+
+    A common Stage 2 / Deepgram artefact: the same word appears
+    twice in a row ("the the", "ఈరోజు ఈరోజు") -- usually a stutter
+    that wasn't large enough to register as a hesitation segment.
+    Renders as awkward repetition in the bulletin audio.
+
+    Compares each word to its predecessor after optional lowercasing
+    + trailing-punctuation strip. When they match, the SECOND copy
+    is dropped (the earlier word's start_sec is kept; if the dropped
+    word extended the time range, the kept word's end_sec is updated
+    to the dropped word's end_sec so the audio span is preserved).
+
+    Non-adjacent duplicates (e.g. ``"the cat the dog"``) are left
+    alone -- only consecutive matches collapse.
+    """
+    if not words:
+        return []
+    out: list[Word] = []
+
+    def _norm(w: str) -> str:
+        s = w.lower() if case_insensitive else w
+        if strip_punctuation:
+            # Strip a single trailing punctuation mark if present.
+            # Devanagari "।" and Telugu sentence-final marks are
+            # treated the same as ASCII ".,!?;:".
+            s = s.rstrip(".,!?;:।.")
+        return s
+
+    for w in words:
+        if out and _norm(out[-1].w) == _norm(w.w):
+            # Extend the kept word's range to swallow the duplicate
+            # (preserves the audio span; e.g. if the duplicate was
+            # 0.5s long, the kept word's end_sec moves forward by
+            # that amount).
+            kept = out[-1]
+            out[-1] = Word(
+                w=kept.w,
+                s=kept.s,
+                e=max(kept.e, w.e),
+                speaker=kept.speaker,
+                confidence=kept.confidence,
+            )
+            continue
+        out.append(w)
+    return out
+
+
+def round_cut_precision(
+    cuts: list[FullVideoCut],
+    decimals: int = CUT_PRECISION_DECIMALS,
+) -> list[FullVideoCut]:
+    """Item 106 / Bug C: round ``start_sec`` / ``end_sec`` to a
+    consistent precision (default 3 decimals = 1ms).
+
+    Float accumulation across splice + silence + micro-fragment
+    transforms can produce 4.999999...s instead of 5.000s. ffmpeg
+    accepts the long-form value but downstream consumers (editor
+    metadata JSON, manifest writers) render the long form back to
+    the operator -- noisy and hard to compare against the spec.
+
+    Raises ``ValueError`` if rounding produces a zero-length or
+    negative-duration cut (defensive: the input chain shouldn't
+    contain such cuts but if it does we surface immediately rather
+    than silently rendering a broken segment).
+    """
+    out: list[FullVideoCut] = []
+    for cut in cuts:
+        new_start = round(float(cut.start_sec), decimals)
+        new_end = round(float(cut.end_sec), decimals)
+        if new_end <= new_start:
+            raise ValueError(
+                f"round_cut_precision: cut index={cut.index} has "
+                f"zero/negative duration after rounding to {decimals} "
+                f"decimals: start={new_start} end={new_end} "
+                f"(pre-round: {cut.start_sec} -> {cut.end_sec})."
+            )
+        out.append(FullVideoCut(
+            index=cut.index,
+            start_word_idx=cut.start_word_idx,
+            end_word_idx=cut.end_word_idx,
+            start_sec=new_start,
+            end_sec=new_end,
+            importance=cut.importance,
+        ))
+    return out
 
 
 # --- Item 105: silence trimming ----------------------------------------
@@ -2224,6 +2352,18 @@ class Stage4Render:
                         f"< {self.micro_fragment_threshold_s:.1f}s "
                         f"(removed {pre_dur - post_dur:.2f}s)"
                     )
+
+            # Item 106: defensive guardrails. Round to ms precision
+            # (Bug C) then verify the chain produced a sorted,
+            # non-overlapping cut list (Bug B). round_cut_precision
+            # raises on zero/negative-duration cuts; assert_cuts_monotonic
+            # raises on overlap. Both surface upstream regressions
+            # at render time rather than via a broken bulletin.
+            if spliced_cuts:
+                spliced_cuts = round_cut_precision(
+                    spliced_cuts, decimals=CUT_PRECISION_DECIMALS,
+                )
+                assert_cuts_monotonic(spliced_cuts)
             # Backlog item 98: list each sub-cut so the operator can see
             # exactly which spans got stitched together.
             for sc in spliced_cuts:

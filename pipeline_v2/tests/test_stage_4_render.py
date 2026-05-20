@@ -3346,3 +3346,213 @@ class TestSilenceTrimming:
         out_identity, _ = apply_silence_trims_to_cuts(cuts, parents, [])
         assert len(out_identity) == 2
         assert (out_identity[0].start_sec, out_identity[0].end_sec) == (0.0, 30.0)
+
+
+# ======================================================================
+# Backlog item 106: defensive guardrails (monotonic / repeat-word / precision)
+# ======================================================================
+#
+# Three pure helpers + 12 tests covering both branches of each
+# guardrail. Wired into _render_impl at the END of the transform
+# chain (splice + silence + micro-fragments) so any upstream
+# regression surfaces at render time rather than via a broken
+# bulletin.
+
+
+class TestMonotonicCuts:
+    """Item 106 / Bug B: ``assert_cuts_monotonic`` rejects overlaps."""
+
+    def test_empty_and_singleton_pass(self):
+        """0 or 1 cut is trivially monotonic (no pairs to compare)."""
+        from pipeline_v2.stages.stage_4_render import assert_cuts_monotonic
+        assert_cuts_monotonic([])
+        assert_cuts_monotonic([_full_video_cut(idx=0, start=0.0, end=10.0)])
+
+    def test_sorted_non_overlapping_passes(self):
+        """Standard happy-path: cuts sorted by start_sec with gaps
+        between them (or exactly back-to-back, no overlap)."""
+        from pipeline_v2.stages.stage_4_render import assert_cuts_monotonic
+        cuts = [
+            _full_video_cut(idx=0, start=0.0,  end=10.0),
+            _full_video_cut(idx=1, start=12.0, end=20.0),
+            _full_video_cut(idx=2, start=20.0, end=30.0),  # back-to-back: OK
+        ]
+        assert_cuts_monotonic(cuts)
+
+    def test_overlap_raises_with_descriptive_message(self):
+        """The Bug B case: a later cut starts BEFORE the previous
+        one ended. Must raise with both cut indexes + overlap span
+        in the message so the operator can locate the upstream
+        producer."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import assert_cuts_monotonic
+        cuts = [
+            _full_video_cut(idx=5, start=0.0,  end=10.0),
+            _full_video_cut(idx=7, start=8.0,  end=15.0),   # overlaps by 2s
+        ]
+        with _pytest.raises(ValueError) as exc_info:
+            assert_cuts_monotonic(cuts)
+        msg = str(exc_info.value)
+        assert "monotonic" in msg.lower()
+        assert "10.000" in msg  # prev.end
+        assert "8.000" in msg   # curr.start
+        # Cut indexes named so the operator can locate the source.
+        assert "index=5" in msg or "5" in msg
+        assert "index=7" in msg or "7" in msg
+
+    def test_out_of_order_raises(self):
+        """A later cut starts WAY before the previous one (cuts list
+        not sorted by start_sec). Also a violation: prev.end_sec >
+        curr.start_sec."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import assert_cuts_monotonic
+        cuts = [
+            _full_video_cut(idx=0, start=100.0, end=110.0),
+            _full_video_cut(idx=1, start=0.0,   end=10.0),
+        ]
+        with _pytest.raises(ValueError, match="monotonic"):
+            assert_cuts_monotonic(cuts)
+
+
+class TestCollapseRepeatedWords:
+    """Item 106 / Bug A: collapse consecutive identical words."""
+
+    def test_no_repeats_passthrough(self):
+        from pipeline_v2.stages.stage_4_render import collapse_repeated_words
+        from pipeline_v2.models import Word
+        words = [
+            Word(w="the", s=0.0, e=0.2),
+            Word(w="cat", s=0.3, e=0.6),
+            Word(w="sat", s=0.7, e=0.9),
+        ]
+        out = collapse_repeated_words(words)
+        assert [w.w for w in out] == ["the", "cat", "sat"]
+
+    def test_single_repeat_collapsed_and_range_extended(self):
+        """The classic 'the the' stutter case. The kept word's end_sec
+        extends to the dropped word's end_sec so the audio span is
+        preserved (the renderer cuts on time)."""
+        from pipeline_v2.stages.stage_4_render import collapse_repeated_words
+        from pipeline_v2.models import Word
+        words = [
+            Word(w="the", s=0.0, e=0.2),
+            Word(w="the", s=0.3, e=0.5),    # duplicate
+            Word(w="cat", s=0.6, e=0.9),
+        ]
+        out = collapse_repeated_words(words)
+        assert [w.w for w in out] == ["the", "cat"]
+        # First survivor keeps its start; end moves forward to swallow
+        # the duplicate's range (0.5s).
+        assert out[0].s == 0.0
+        assert out[0].e == 0.5
+
+    def test_case_insensitive_match(self):
+        """'The the' should collapse the same as 'the the' --
+        Deepgram inconsistency between sentence-initial and
+        sentence-internal capitalisation must not cause leakage."""
+        from pipeline_v2.stages.stage_4_render import collapse_repeated_words
+        from pipeline_v2.models import Word
+        words = [
+            Word(w="The", s=0.0, e=0.2),
+            Word(w="the", s=0.3, e=0.5),
+        ]
+        out = collapse_repeated_words(words)
+        assert len(out) == 1
+
+    def test_trailing_punctuation_stripped_for_match(self):
+        """'hello' + 'hello.' should collapse even though the second
+        carries an end-of-sentence period. Devanagari '।' and Telugu
+        sentence marks treated the same as ASCII '.'."""
+        from pipeline_v2.stages.stage_4_render import collapse_repeated_words
+        from pipeline_v2.models import Word
+        words = [
+            Word(w="hello", s=0.0, e=0.3),
+            Word(w="hello.", s=0.4, e=0.7),
+        ]
+        out = collapse_repeated_words(words)
+        assert len(out) == 1
+        # Devanagari sentence-final mark also matches.
+        words_dev = [
+            Word(w="नमस्ते", s=0.0, e=0.4),
+            Word(w="नमस्ते।", s=0.5, e=0.9),
+        ]
+        out_dev = collapse_repeated_words(words_dev)
+        assert len(out_dev) == 1
+
+    def test_non_adjacent_same_words_preserved(self):
+        """'the cat the dog' -> kept verbatim. Only CONSECUTIVE
+        duplicates collapse."""
+        from pipeline_v2.stages.stage_4_render import collapse_repeated_words
+        from pipeline_v2.models import Word
+        words = [
+            Word(w="the", s=0.0, e=0.2),
+            Word(w="cat", s=0.3, e=0.5),
+            Word(w="the", s=0.6, e=0.8),
+            Word(w="dog", s=0.9, e=1.1),
+        ]
+        out = collapse_repeated_words(words)
+        assert [w.w for w in out] == ["the", "cat", "the", "dog"]
+
+
+class TestRoundCutPrecision:
+    """Item 106 / Bug C: round timestamps to 3 decimals."""
+
+    def test_rounds_to_three_decimals_by_default(self):
+        from pipeline_v2.stages.stage_4_render import (
+            round_cut_precision, CUT_PRECISION_DECIMALS,
+        )
+        assert CUT_PRECISION_DECIMALS == 3
+        cuts = [
+            _full_video_cut(idx=0, start=4.999999, end=10.000123),
+            _full_video_cut(idx=1, start=12.345678, end=20.987654),
+        ]
+        out = round_cut_precision(cuts)
+        assert (out[0].start_sec, out[0].end_sec) == (5.0, 10.0)
+        assert (out[1].start_sec, out[1].end_sec) == (12.346, 20.988)
+        # index / importance / word_idx preserved.
+        assert out[0].index == 0
+        assert out[1].index == 1
+
+    def test_already_rounded_values_unchanged(self):
+        """No spurious change to values that are already clean."""
+        from pipeline_v2.stages.stage_4_render import round_cut_precision
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=5.0),
+            _full_video_cut(idx=1, start=5.0, end=10.0),
+        ]
+        out = round_cut_precision(cuts)
+        assert (out[0].start_sec, out[0].end_sec) == (0.0, 5.0)
+        assert (out[1].start_sec, out[1].end_sec) == (5.0, 10.0)
+
+    def test_zero_or_negative_duration_after_rounding_raises(self):
+        """A cut whose post-rounding end_sec <= start_sec is
+        degenerate -- raise so the renderer doesn't ship a broken
+        segment."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import round_cut_precision
+        # Two values that round to the same 3-decimal number.
+        cuts = [
+            _full_video_cut(idx=0, start=5.0001, end=5.0003),
+        ]
+        with _pytest.raises(ValueError, match="zero/negative duration"):
+            round_cut_precision(cuts)
+        # Explicit negative-duration case also raises.
+        cuts_neg = [
+            _full_video_cut(idx=0, start=10.0, end=5.0),
+        ]
+        with _pytest.raises(ValueError, match="zero/negative duration"):
+            round_cut_precision(cuts_neg)
+
+    def test_custom_decimals_honoured(self):
+        """Caller can ask for 1-decimal rounding (used by tests / log
+        formatting). Default stays at 3 (ms precision for ffmpeg)."""
+        from pipeline_v2.stages.stage_4_render import round_cut_precision
+        cuts = [
+            _full_video_cut(idx=0, start=4.876, end=10.123),
+        ]
+        out = round_cut_precision(cuts, decimals=1)
+        assert (out[0].start_sec, out[0].end_sec) == (4.9, 10.1)
+        # 0-decimal rounding (integer seconds).
+        out0 = round_cut_precision(cuts, decimals=0)
+        assert (out0[0].start_sec, out0[0].end_sec) == (5.0, 10.0)
+
