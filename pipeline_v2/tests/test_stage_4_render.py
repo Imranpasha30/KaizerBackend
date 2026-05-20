@@ -2699,3 +2699,111 @@ class TestRealV1ResolveImagePlanContract:
             full_metadata=_metadata(),
             video_duration_sec=120.0,
         )
+
+
+# ======================================================================
+# Backlog item 97: splice_cuts_minus_skipped -- bulletin trim regression
+# ======================================================================
+
+
+class TestSpliceCutsMinusSkipped:
+    """``splice_cuts_minus_skipped`` subtracts SkippedSegment ranges
+    from FullVideoCuts so the bulletin renderer drops retake / filler /
+    dead-air spans. Before this helper, the V2 bulletin was rendered
+    over the entire cut span = no trim applied (jobs 35/36/40 had
+    <1s trim on 12-min sources).
+    """
+
+    @staticmethod
+    def _cut(idx, sw, ew, ss, es, imp=5):
+        from pipeline_v2.models import FullVideoCut
+        return FullVideoCut(
+            index=idx, start_word_idx=sw, end_word_idx=ew,
+            start_sec=ss, end_sec=es, importance=imp,
+        )
+
+    @staticmethod
+    def _skip(sw, ew, ss, es, cat="warm_up"):
+        from pipeline_v2.models import SkippedSegment
+        return SkippedSegment(
+            start_word_idx=sw, end_word_idx=ew,
+            start_sec=ss, end_sec=es,
+            category=cat, reason="test",
+        )
+
+    def test_no_skipped_returns_input_unchanged(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 0.0, 600.0)]
+        out = splice_cuts_minus_skipped(cuts, [])
+        assert len(out) == 1
+        assert out[0].start_sec == 0.0
+        assert out[0].end_sec == 600.0
+
+    def test_single_skip_in_middle_yields_two_sub_cuts(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 0.0, 600.0)]
+        skipped = [self._skip(40, 60, 100.0, 150.0)]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 2
+        assert out[0].start_sec == 0.0 and out[0].end_sec == 100.0
+        assert out[1].start_sec == 150.0 and out[1].end_sec == 600.0
+        kept = sum(c.end_sec - c.start_sec for c in out)
+        assert kept == 550.0
+
+    def test_multiple_skips_per_cut(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 0.0, 600.0)]
+        skipped = [
+            self._skip(10, 15, 30.0, 45.0),
+            self._skip(40, 60, 100.0, 150.0),
+            self._skip(70, 75, 400.0, 410.0),
+        ]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 4
+        bounds = [(c.start_sec, c.end_sec) for c in out]
+        assert bounds == [
+            (0.0, 30.0), (45.0, 100.0), (150.0, 400.0), (410.0, 600.0),
+        ]
+
+    def test_skip_at_start_of_cut(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 100.0, 600.0)]
+        skipped = [self._skip(0, 5, 100.0, 110.0)]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 1
+        assert out[0].start_sec == 110.0 and out[0].end_sec == 600.0
+
+    def test_skip_at_end_of_cut(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 0.0, 500.0)]
+        skipped = [self._skip(95, 99, 480.0, 500.0)]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 1
+        assert out[0].start_sec == 0.0 and out[0].end_sec == 480.0
+
+    def test_skip_outside_cut_is_ignored(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [self._cut(0, 0, 99, 100.0, 200.0)]
+        skipped = [self._skip(200, 205, 300.0, 310.0)]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 1
+        assert out[0].start_sec == 100.0 and out[0].end_sec == 200.0
+
+    def test_multiple_cuts_each_with_their_own_skips(self):
+        from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
+        cuts = [
+            self._cut(0, 0, 50, 0.0, 100.0),
+            self._cut(1, 60, 120, 150.0, 300.0),
+        ]
+        skipped = [
+            self._skip(10, 20, 20.0, 40.0),
+            self._skip(80, 90, 200.0, 230.0),
+        ]
+        out = splice_cuts_minus_skipped(cuts, skipped)
+        assert len(out) == 4
+        assert [c.index for c in out] == [0, 1, 2, 3]
+        bounds = [(c.start_sec, c.end_sec) for c in out]
+        assert bounds == [
+            (0.0, 20.0), (40.0, 100.0),
+            (150.0, 200.0), (230.0, 300.0),
+        ]

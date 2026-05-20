@@ -320,6 +320,76 @@ def shorts_cuts_to_v1_clip_dicts(
     ]
 
 
+def splice_cuts_minus_skipped(
+    full_video_cuts: list[FullVideoCut],
+    skipped_segments: list[SkippedSegment],
+) -> list[FullVideoCut]:
+    """Backlog item 97: subtract SkippedSegment time-ranges from each
+    FullVideoCut, producing a flat list of sub-cuts that EXCLUDE the
+    retake / filler / dead-air spans Stage 2 identified.
+
+    Per the Stage 2 prompt's design (stage_2_prompt.md, rule #6):
+    `full_video_cuts` may span across skipped regions; the RENDERER
+    is responsible for splicing the skipped span out. Previously the
+    V2 renderer never did the splice -- it just handed FullVideoCut
+    start/end seconds to V1's cut_video_clips as a single ffmpeg cut.
+    Empirically every bulletin came out at ~100% of mezzanine
+    duration (jobs 35, 36, 40 had <1s trim on 12-min sources).
+
+    Algorithm (per cut):
+      1. Sort overlapping skipped spans by start_sec.
+      2. Walk left-to-right, emitting a sub-cut for each gap between
+         skipped spans within the cut's bounds.
+      3. Each sub-cut inherits the parent's importance and v2_index
+         (the index field gets re-numbered globally so downstream
+         contiguity guardrails are satisfied).
+
+    Returns the expanded list. If no skipped_segments overlap, returns
+    the input unchanged (identity case).
+    """
+    if not skipped_segments:
+        return list(full_video_cuts)
+
+    skipped_sorted = sorted(skipped_segments, key=lambda s: s.start_sec)
+    out: list[FullVideoCut] = []
+    new_idx = 0
+    for cut in full_video_cuts:
+        relevant = [
+            s for s in skipped_sorted
+            if s.end_sec > cut.start_sec and s.start_sec < cut.end_sec
+        ]
+        cursor = cut.start_sec
+        cursor_word = cut.start_word_idx
+        for sk in relevant:
+            sk_start = max(sk.start_sec, cut.start_sec)
+            sk_end = min(sk.end_sec, cut.end_sec)
+            sk_word_start = max(sk.start_word_idx, cut.start_word_idx)
+            sk_word_end = min(sk.end_word_idx, cut.end_word_idx)
+            if sk_start > cursor:
+                out.append(FullVideoCut(
+                    index=new_idx,
+                    start_word_idx=cursor_word,
+                    end_word_idx=max(sk_word_start - 1, cursor_word),
+                    start_sec=cursor,
+                    end_sec=sk_start,
+                    importance=cut.importance,
+                ))
+                new_idx += 1
+            cursor = sk_end
+            cursor_word = sk_word_end + 1
+        if cursor < cut.end_sec:
+            out.append(FullVideoCut(
+                index=new_idx,
+                start_word_idx=min(cursor_word, cut.end_word_idx),
+                end_word_idx=cut.end_word_idx,
+                start_sec=cursor,
+                end_sec=cut.end_sec,
+                importance=cut.importance,
+            ))
+            new_idx += 1
+    return out
+
+
 def full_video_cuts_to_v1_clip_dicts(
     full_video_cuts: list[FullVideoCut],
     metadata: Metadata,
@@ -1576,12 +1646,28 @@ class Stage4Render:
         if full_video_cuts:
             if cancel_check is not None:
                 cancel_check()
+            # Backlog item 97: splice out the SkippedSegments before
+            # handing cuts to the renderer. Stage 2's prompt
+            # explicitly lets FullVideoCuts span over skipped regions
+            # and expects the renderer to do the splice. Previously
+            # we passed the raw cuts to V1's cut_video_clips, which
+            # cut ONE contiguous segment per cut = bulletin matched
+            # mezzanine duration with zero trim.
+            skipped_segments = job_output.stage_two.skipped_segments
+            spliced_cuts = splice_cuts_minus_skipped(
+                full_video_cuts, skipped_segments,
+            )
+            original_kept_dur = sum(c.end_sec - c.start_sec for c in full_video_cuts)
+            spliced_dur = sum(c.end_sec - c.start_sec for c in spliced_cuts)
+            trimmed_s = max(0.0, original_kept_dur - spliced_dur)
             _p(
                 f"Stage 6/7 rendering bulletin "
-                f"({len(full_video_cuts)} story segments)"
+                f"({len(full_video_cuts)} cut span -> {len(spliced_cuts)} "
+                f"keep sub-segments after splicing "
+                f"{len(skipped_segments)} skipped; trimmed {trimmed_s:.1f}s)"
             )
             bulletin_result = self.render_bulletin(
-                full_video_cuts=full_video_cuts,
+                full_video_cuts=spliced_cuts,
                 metadata=metadata,
                 entities=entities,
                 image_plan=image_plan,
