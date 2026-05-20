@@ -1032,3 +1032,113 @@ Indian-language coverage
      - **Per-pattern fine-tune** of a smaller model (Flash) trained
        on a few hundred labelled examples once a labelled corpus
        exists.
+
+### Item 108 (COMPLETED): Real smart_cut crossfade
+
+- **Shipped**: 2026-05-20 in commit 5fb77c0
+- **Scope**: replace V1's concat-demuxer hard-cut stitcher with an
+  ffmpeg crossfade pipeline for V2.
+- **Spec**:
+  - ``smart_cut`` -> 80 ms audio + 40 ms video crossfade
+  - ``crossfade`` -> 500 ms audio + 500 ms video
+  - All other catalog entries still fall back to ``smart_cut`` via
+    ``transitions.resolve_for_render``
+- **Module**: new ``pipeline_v2/pipeline_v2/bulletin_crossfade_stitcher.py``
+  - 3 pure helpers (``compute_xfade_offsets``,
+    ``compute_total_duration``, ``build_crossfade_filter_graph``)
+  - 1 ffmpeg wrapper (``stitch_bulletin_with_crossfade``)
+  - Bypass on N=1; logged fallback to V1 concat if any segment is
+    shorter than the overlap window.
+- **Tests**: 22 new in ``test_bulletin_crossfade_stitcher.py``.
+- **Empirical effect (item 110 verification)**: resolved Gemini's
+  "ambient audio spike at 05:45" finding.
+
+### Item 109 (COMPLETED): End-frame trim after last spoken word
+
+- **Shipped**: 2026-05-20 in commit bc76d27
+- **Scope**: trim the bulletin so it ends 0.5 s after the last
+  spoken word (when the trailing slack exceeds 1.0 s).
+- **Helpers in stage_4_render.py**:
+  - ``compute_end_frame_trim_target(bulletin_dur, spliced_cuts,
+    clean_words, buffer_s=0.5, min_slack_s=1.0) -> Optional[float]``
+  - ``apply_end_frame_trim(in_path, out_path, trim_target_s)`` --
+    ``ffmpeg -t -c copy`` (no re-encode).
+- **A/V invariant extension**: ``_validate_av_invariant`` now
+  accepts ``crossfade_savings_s`` and ``tail_trim_s`` kwargs;
+  ``expected = narration + transitions - crossfade - tail_trim``.
+- **Tests**: 9 new (7 trim + 2 invariant extension).
+- **Empirical effect (item 110 verification)**: resolved Gemini's
+  "video ends abruptly on anchor reaching for camera" finding.
+
+### Item 110 (COMPLETED): V2 iteration-2 verification
+
+- **Date**: 2026-05-20
+- **Source**: ChatGPT-as-judge (Gemini Pro quota exhausted for the
+  day; ChatGPT used as alternate audit judge -- the user has
+  accepted ChatGPT as an equivalent grader for bulletin quality).
+- **Grade**: **8.1/10** (up from iteration-1 baseline of 7.5/10
+  and pre-iteration-1 baseline of 4/10).
+- **Confirmed working**:
+  - Audio crossfade smoothing (item 108) -- Gemini's 05:45
+    ambient spike resolved
+  - End-frame trim (item 109) -- anchor camera-reach artifact
+    resolved
+  - All 7 V1 phrase retakes still removed after the iter-2 prompt
+    revert (item 107) -- no regression from iter-1
+  - No new artifacts introduced by item 108 / item 109
+- **Remaining known gaps** (per item 107):
+  - 07:11, 07:33, 08:02, 08:12 partial-restart spots still present
+  - Operator QC of 07:00-08:15 region required for production
+    until item 107 implementation lands
+- **Production decision**: SHIP. 8.1/10 meets the production-
+  deployable threshold; the four remaining partial-restart spots
+  are an isolated 75-second region the operator can review
+  manually for now.
+- **Tagged**: ``v2-iter2-ship`` on commit ``bc76d27`` (item 109's
+  commit, which is the head of the iter-2 chain).
+
+### Item 107 implementation plan (deferred to next session)
+
+Documenting the locked-in approach so the next session can pick it
+up without re-deciding:
+
+- **Approach**: deterministic post-processor, NOT another Stage 2
+  prompt iteration. The iter-2 prompt attempt regressed iter-1's
+  V1 baseline (7/7 -> 5/7) and only caught 1/4 of the new spots --
+  the prompt-tuning path has diminishing returns for these
+  mechanical patterns.
+- **File**: extend ``pipeline_v2/pipeline_v2/stages/stage_4_render.py``
+  with a new helper, OR new module
+  ``pipeline_v2/pipeline_v2/dedupe_post_processor.py`` if the
+  helper grows past ~80 lines. Decision deferred to implementation
+  time.
+- **Pipeline position**: AFTER Stage 2 / ``assemble_stage_two_output``
+  + BEFORE ``splice_cuts_minus_skipped``. Operates on the
+  ``CleanTranscript.words`` array; emits additional
+  ``SkippedSegment`` entries that get folded into the existing
+  splice flow.
+- **Detection rule (Pattern A + Pattern C-narrow)**:
+  - Walk the clean-words array. For each consecutive pair
+    ``(words[i], words[i+1])``:
+    - If ``words[i].w == words[i+1].w`` (after lowercase + strip
+      trailing punctuation) AND
+      ``words[i+1].s - words[i].e <= 1.5`` seconds:
+    - Drop the LOWER-confidence of the two (or the first if
+      confidence is None / equal).
+- **Patterns this WILL catch (mechanical)**:
+  - Pattern A: ``"మరి" "మరి"`` -> drop the first
+  - Pattern C-narrow: ``"నాకు బండి సంజయ్"`` repeated -- the
+    individual repeated words inside the phrase get caught even
+    if the phrase as a whole isn't recognised
+- **Patterns this WON'T catch** (still need a future LLM polish):
+  - Pattern B: triple-take with different attempts (the deduper
+    only collapses consecutive duplicates of the SAME word, not
+    a 3-way phrase restart)
+  - Pattern D: partial restart with divergent completion
+    (``"X Y A"`` then ``"X Y B C"`` -- the dedupe would catch the
+    X+Y duplicates but not the abandoned A)
+- **Tests planned**: 5-7 unit tests for the deduper helper plus
+  1-2 integration tests confirming the additional SkippedSegments
+  flow through splice + render.
+- **Estimated implementation**: 1-2 hours next session.
+- **Expected grade lift**: 8.1 -> 8.5-8.7/10.
