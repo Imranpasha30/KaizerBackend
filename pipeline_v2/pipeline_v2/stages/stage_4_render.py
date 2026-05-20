@@ -535,6 +535,93 @@ def splice_cuts_minus_skipped(
     return out, parents
 
 
+# --- Item 103: micro-fragment collapse ---------------------------------
+
+MICRO_FRAGMENT_THRESHOLD_S: float = 1.5
+
+
+def collapse_micro_fragments(
+    sub_cuts: list[FullVideoCut],
+    parent_v2_indexes: list[int],
+    threshold_s: float = MICRO_FRAGMENT_THRESHOLD_S,
+) -> tuple[list[FullVideoCut], list[int]]:
+    """Drop sub-cuts shorter than ``threshold_s`` (default 1.5s).
+
+    After ``splice_cuts_minus_skipped`` runs, the bulletin can
+    contain sub-cuts spanning < 1.5s -- e.g. a 0.3s sliver of
+    on-air content sandwiched between two consecutive retake
+    skipped_segments. These micro-fragments cause:
+
+      1. Perceptible chop in the rendered bulletin (each fragment
+         is a hard cut point with no smoothing).
+      2. Wasted ffmpeg seek work on near-zero-length segments.
+      3. Operator-visible clutter in the editor timeline.
+
+    Policy: **drop, never merge**.
+
+    Merging is tempting but unsafe: every adjacent pair of sub-cuts
+    within one parent is, by construction, separated by a skipped
+    span (otherwise they would have been one sub-cut). Merging
+    would extend a sub-cut's time range across the skipped span,
+    re-including the very retake content the splice was meant to
+    remove.
+
+    Per-parent safety: if dropping leaves a parent (one
+    FullVideoCut) with ZERO sub-cuts, keep its LONGEST sub-cut so
+    the story doesn't disappear entirely from the bulletin.
+
+    Renumbers ``FullVideoCut.index`` to stay contiguous on the
+    output; ``parent_v2_indexes`` is filtered in parallel.
+    """
+    if not sub_cuts:
+        return [], []
+    if len(sub_cuts) != len(parent_v2_indexes):
+        raise ValueError(
+            f"collapse_micro_fragments: length mismatch -- "
+            f"{len(sub_cuts)} sub_cuts vs "
+            f"{len(parent_v2_indexes)} parent_v2_indexes."
+        )
+
+    # Group sub-cut positions by parent_v2_index for per-parent safety.
+    per_parent: dict[int, list[int]] = {}
+    for i, p in enumerate(parent_v2_indexes):
+        per_parent.setdefault(p, []).append(i)
+
+    keep_set: set[int] = set()
+    for parent_id, idxs in per_parent.items():
+        kept_above = [
+            i for i in idxs
+            if (sub_cuts[i].end_sec - sub_cuts[i].start_sec) >= threshold_s
+        ]
+        if kept_above:
+            keep_set.update(kept_above)
+        else:
+            # Every sub-cut from this parent is below threshold --
+            # keep the longest so the story survives.
+            longest = max(
+                idxs,
+                key=lambda i: sub_cuts[i].end_sec - sub_cuts[i].start_sec,
+            )
+            keep_set.add(longest)
+
+    # Emit in original chronological order; renumber index field.
+    out_cuts: list[FullVideoCut] = []
+    out_parents: list[int] = []
+    for orig_i, src in enumerate(sub_cuts):
+        if orig_i not in keep_set:
+            continue
+        out_cuts.append(FullVideoCut(
+            index=len(out_cuts),
+            start_word_idx=src.start_word_idx,
+            end_word_idx=src.end_word_idx,
+            start_sec=src.start_sec,
+            end_sec=src.end_sec,
+            importance=src.importance,
+        ))
+        out_parents.append(parent_v2_indexes[orig_i])
+    return out_cuts, out_parents
+
+
 def full_video_cuts_to_v1_clip_dicts(
     full_video_cuts: list[FullVideoCut],
     metadata: Metadata,
@@ -702,6 +789,14 @@ class Stage4Render:
     use_sidebar_carousel: bool = True
     use_pip: bool = True
     use_takeovers: bool = False
+
+    # Item 103: drop sub-cuts shorter than this threshold after the
+    # splice_cuts_minus_skipped pass. 1.5s is the default per
+    # operator decision -- short enough to keep an intentional
+    # one-word reaction, long enough to drop a 0.3s sliver between
+    # consecutive retakes that otherwise produces visible chop in
+    # the bulletin. Set to 0.0 to disable micro-fragment dropping.
+    micro_fragment_threshold_s: float = MICRO_FRAGMENT_THRESHOLD_S
 
     # Instance-level cache, populated by Step 9.2 image resolution.
     # Maps canonical entity_name -> absolute path of resolved image
@@ -1911,6 +2006,26 @@ class Stage4Render:
                 f"keep sub-segments after splicing "
                 f"{len(skipped_segments)} skipped; trimmed {trimmed_s:.1f}s)"
             )
+
+            # Item 103: drop micro-fragments < threshold (default 1.5s)
+            # so the bulletin doesn't include tiny slivers between
+            # consecutive retakes that produce visible chop.
+            if self.micro_fragment_threshold_s > 0 and spliced_cuts:
+                pre_count = len(spliced_cuts)
+                pre_dur = sum(c.end_sec - c.start_sec for c in spliced_cuts)
+                spliced_cuts, parent_v2_indexes = collapse_micro_fragments(
+                    spliced_cuts, parent_v2_indexes,
+                    threshold_s=self.micro_fragment_threshold_s,
+                )
+                post_count = len(spliced_cuts)
+                post_dur = sum(c.end_sec - c.start_sec for c in spliced_cuts)
+                if post_count != pre_count:
+                    _p(
+                        f"  [micro-fragments] dropped "
+                        f"{pre_count - post_count} sub-cut(s) "
+                        f"< {self.micro_fragment_threshold_s:.1f}s "
+                        f"(removed {pre_dur - post_dur:.2f}s)"
+                    )
             # Backlog item 98: list each sub-cut so the operator can see
             # exactly which spans got stitched together.
             for sc in spliced_cuts:

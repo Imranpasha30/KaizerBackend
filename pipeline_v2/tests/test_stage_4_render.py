@@ -3104,3 +3104,157 @@ class TestAVInvariantGuardrail:
         # Tightened tolerance rejects the same drift.
         with _pytest.raises(RuntimeError):
             _validate_av_invariant(100.5, 80.0, 20.0, tolerance_s=0.1)
+
+
+# ======================================================================
+# Backlog item 103: micro-fragment drop (< 1.5s)
+# ======================================================================
+#
+# After splice_cuts_minus_skipped runs, the bulletin can contain
+# sub-cuts < 1.5s -- e.g. a 0.3s sliver between two consecutive
+# retakes. ``collapse_micro_fragments`` drops these so the bulletin
+# doesn't chop on near-zero-length segments. Drop (not merge): merging
+# across an already-spliced skipped span would re-include the retake.
+
+
+class TestCollapseMicroFragments:
+    """Item 103 -- 5 behavioural tests for ``collapse_micro_fragments``."""
+
+    def test_no_fragments_passes_through_unchanged(self):
+        """All sub-cuts >= threshold -> identity (after index renumber)."""
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=10.0),
+            _full_video_cut(idx=1, start=12.0, end=20.0),
+            _full_video_cut(idx=2, start=22.0, end=30.0),
+        ]
+        parents = [0, 0, 1]
+        out_cuts, out_parents = collapse_micro_fragments(cuts, parents)
+        assert len(out_cuts) == 3
+        assert [c.start_sec for c in out_cuts] == [0.0, 12.0, 22.0]
+        assert [c.end_sec for c in out_cuts] == [10.0, 20.0, 30.0]
+        # Indexes renumbered contiguously starting at 0.
+        assert [c.index for c in out_cuts] == [0, 1, 2]
+        # Parents preserved in parallel.
+        assert out_parents == [0, 0, 1]
+
+    def test_micro_fragment_between_long_subcuts_is_dropped(self):
+        """Job-42-style case: 0.3s sliver between two long retakes
+        gets dropped; the long siblings survive."""
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=10.0),  # 10s -- keep
+            _full_video_cut(idx=1, start=10.5, end=10.8),  # 0.3s -- DROP
+            _full_video_cut(idx=2, start=11.0, end=21.0),  # 10s -- keep
+        ]
+        parents = [0, 0, 0]  # all sub-cuts share one FullVideoCut parent
+        out_cuts, out_parents = collapse_micro_fragments(cuts, parents)
+        assert len(out_cuts) == 2
+        assert [c.start_sec for c in out_cuts] == [0.0, 11.0]
+        assert [c.end_sec for c in out_cuts] == [10.0, 21.0]
+        # Renumbered contiguously after the drop.
+        assert [c.index for c in out_cuts] == [0, 1]
+        # Parent list filtered in parallel.
+        assert out_parents == [0, 0]
+
+    def test_multiple_micro_fragments_are_all_dropped(self):
+        """Multiple slivers in one parent -- all dropped, longs kept."""
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=5.0),   # 5s
+            _full_video_cut(idx=1, start=5.2, end=5.5),   # 0.3s
+            _full_video_cut(idx=2, start=6.0, end=12.0),  # 6s
+            _full_video_cut(idx=3, start=12.5, end=13.0), # 0.5s
+            _full_video_cut(idx=4, start=13.5, end=14.0), # 0.5s
+            _full_video_cut(idx=5, start=15.0, end=20.0), # 5s
+        ]
+        parents = [0, 0, 0, 0, 0, 0]
+        out_cuts, out_parents = collapse_micro_fragments(cuts, parents)
+        assert len(out_cuts) == 3
+        assert [c.start_sec for c in out_cuts] == [0.0, 6.0, 15.0]
+        assert [c.index for c in out_cuts] == [0, 1, 2]
+
+    def test_per_parent_safety_keeps_longest_when_all_below_threshold(self):
+        """If a parent's every sub-cut is below threshold, KEEP the
+        longest -- otherwise an entire story would vanish from the
+        bulletin. Other parents still get their micro-fragments dropped.
+        """
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            # Parent 7 (story A): all three sub-cuts < 1.5s -> keep the longest
+            _full_video_cut(idx=0, start=0.0, end=0.5),   # 0.5s
+            _full_video_cut(idx=1, start=1.0, end=2.2),   # 1.2s (longest)
+            _full_video_cut(idx=2, start=2.5, end=3.0),   # 0.5s
+            # Parent 8 (story B): one long sub-cut + one fragment -> drop fragment
+            _full_video_cut(idx=3, start=5.0, end=12.0),  # 7s -- keep
+            _full_video_cut(idx=4, start=12.2, end=12.5), # 0.3s -- drop
+        ]
+        parents = [7, 7, 7, 8, 8]
+        out_cuts, out_parents = collapse_micro_fragments(cuts, parents)
+        # Expect 2 sub-cuts: the longest of parent 7 (1.0-2.2s) + the
+        # long sub-cut of parent 8.
+        assert len(out_cuts) == 2
+        assert (out_cuts[0].start_sec, out_cuts[0].end_sec) == (1.0, 2.2)
+        assert (out_cuts[1].start_sec, out_cuts[1].end_sec) == (5.0, 12.0)
+        # Parents preserved in parallel.
+        assert out_parents == [7, 8]
+
+    def test_configurable_threshold_and_disable_via_zero(self):
+        """The threshold_s kwarg lets callers tighten or loosen the
+        drop; threshold_s=0 effectively disables dropping (every
+        sub-cut >= 0.0)."""
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=2.0),  # 2s
+            _full_video_cut(idx=1, start=3.0, end=3.5),  # 0.5s
+            _full_video_cut(idx=2, start=4.0, end=4.4),  # 0.4s
+        ]
+        parents = [0, 0, 0]
+        # Tighter threshold drops more (still keep 2s; drop 0.5s + 0.4s).
+        out_strict, _ = collapse_micro_fragments(cuts, parents, threshold_s=1.0)
+        assert len(out_strict) == 1
+        assert (out_strict[0].start_sec, out_strict[0].end_sec) == (0.0, 2.0)
+        # Looser threshold keeps more.
+        out_loose, _ = collapse_micro_fragments(cuts, parents, threshold_s=0.45)
+        # 2.0s >= 0.45 keep, 0.5s >= 0.45 keep, 0.4s < 0.45 drop.
+        assert len(out_loose) == 2
+        assert {(c.start_sec, c.end_sec) for c in out_loose} == {
+            (0.0, 2.0), (3.0, 3.5),
+        }
+        # threshold=0 -> all sub-cuts kept (passthrough).
+        out_disabled, _ = collapse_micro_fragments(cuts, parents, threshold_s=0.0)
+        assert len(out_disabled) == 3
+
+    def test_empty_input_returns_empty(self):
+        """Defensive: empty list in, empty list out (no exception)."""
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        out_cuts, out_parents = collapse_micro_fragments([], [])
+        assert out_cuts == []
+        assert out_parents == []
+
+    def test_length_mismatch_raises(self):
+        """Defensive: caller-error guard. sub_cuts and parent_v2_indexes
+        must be parallel lists (one parent per sub-cut)."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import collapse_micro_fragments
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=5.0),
+            _full_video_cut(idx=1, start=6.0, end=10.0),
+        ]
+        with _pytest.raises(ValueError, match="length mismatch"):
+            collapse_micro_fragments(cuts, [0])  # 2 cuts vs 1 parent
+
+    def test_stage4render_micro_fragment_threshold_default_is_one_point_five(self):
+        """Wire-level check: the dataclass default matches the
+        module-level constant so the operator can edit one place if
+        the threshold ever needs tuning."""
+        from dataclasses import fields
+        from pipeline_v2.stages.stage_4_render import (
+            Stage4Render, MICRO_FRAGMENT_THRESHOLD_S,
+        )
+        f = next(
+            f for f in fields(Stage4Render)
+            if f.name == "micro_fragment_threshold_s"
+        )
+        assert f.default == MICRO_FRAGMENT_THRESHOLD_S
+        assert MICRO_FRAGMENT_THRESHOLD_S == 1.5
