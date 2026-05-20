@@ -66,12 +66,14 @@ def test_02_default_transition_name_resolves_to_real_catalog_entry():
     assert TRANSITIONS[DEFAULT_TRANSITION_NAME] is SMART_CUT
 
 
-def test_03_smart_cut_is_implemented_with_zero_duration():
-    """Smart cut is a hard cut: no overlap window, no re-encode cost,
-    fully implemented today. The other six are reserved slots."""
+def test_03_smart_cut_is_implemented_with_80ms_duration():
+    """Smart cut is the default and item-108's primary ship: 80 ms
+    audio crossfade. Item 104 originally specced this as duration_s=0
+    (hard cut); item 108 upgraded it to a real ffmpeg crossfade with
+    duration_s=0.08."""
     from pipeline_v2.transitions import SMART_CUT
     assert SMART_CUT.implemented is True
-    assert SMART_CUT.duration_s == 0.0
+    assert SMART_CUT.duration_s == 0.08
     assert SMART_CUT.name == "smart_cut"
     assert SMART_CUT.display_name == "Smart Cut"
     # description is non-empty (used by the UI tooltip).
@@ -129,14 +131,20 @@ def test_08_resolve_for_render_falls_back_for_non_implemented():
     """The renderer-side resolver returns smart_cut whenever the
     selected transition is not yet ffmpeg-backed. This is distinct
     from get_transition which preserves the operator's choice for
-    UI display."""
+    UI display.
+
+    Item 108 promoted CROSSFADE.implemented to True, so the
+    non-implemented set shrunk from {6 entries} to {5 entries}:
+    fade_to_black / dip_to_white / slide_left / wipe_right / dissolve.
+    """
     from pipeline_v2.transitions import (
-        resolve_for_render, get_transition, SMART_CUT,
+        resolve_for_render, get_transition, SMART_CUT, CROSSFADE,
     )
-    # smart_cut is implemented -> resolve returns it.
+    # smart_cut + crossfade are both implemented after item 108.
     assert resolve_for_render("smart_cut") is SMART_CUT
-    # Other six entries are not yet implemented -> resolve falls back.
-    for name in ("crossfade", "fade_to_black", "dip_to_white",
+    assert resolve_for_render("crossfade") is CROSSFADE
+    # The remaining five catalog entries are still reserved slots.
+    for name in ("fade_to_black", "dip_to_white",
                  "slide_left", "wipe_right", "dissolve"):
         sel = get_transition(name)
         assert sel.implemented is False

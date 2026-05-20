@@ -1962,13 +1962,43 @@ class Stage4Render:
             )
 
         # ---- 5. Stitch story segments into bulletin.mp4 ------------
+        # Item 108: dispatch to the crossfade stitcher when the
+        # operator's transition has a nonzero overlap window. For
+        # smart_cut that's 80ms audio + 40ms video; for crossfade
+        # 500ms both. All other catalog entries resolve to smart_cut
+        # via transitions.resolve_for_render (already happens
+        # earlier in this method).
         bulletin_out = str(bulletin_dir / "bulletin.mp4")
         try:
-            stitch_result = _v1_stitch_bulletin(
-                story_paths,
-                bulletin_out,
-                work_dir=str(bulletin_dir),
-            )
+            from pipeline_v2.transitions import overlap_for_render as _overlap
+            audio_overlap_s, video_overlap_s = _overlap(self.transition_style)
+        except Exception:
+            audio_overlap_s, video_overlap_s = 0.0, 0.0
+        try:
+            if audio_overlap_s > 0 or video_overlap_s > 0:
+                from pipeline_v2.bulletin_crossfade_stitcher import (
+                    stitch_bulletin_with_crossfade,
+                    BulletinCrossfadeError,
+                )
+                try:
+                    stitch_result = stitch_bulletin_with_crossfade(
+                        story_paths,
+                        bulletin_out,
+                        audio_overlap_s=audio_overlap_s,
+                        video_overlap_s=video_overlap_s,
+                        work_dir=str(bulletin_dir),
+                    )
+                except BulletinCrossfadeError as exc:
+                    raise RuntimeError(
+                        f"Stage 4 render_bulletin: crossfade stitcher "
+                        f"failed: {exc!r}. Inngest will retry."
+                    ) from exc
+            else:
+                stitch_result = _v1_stitch_bulletin(
+                    story_paths,
+                    bulletin_out,
+                    work_dir=str(bulletin_dir),
+                )
         except _V1BulletinStitchError as exc:
             raise RuntimeError(
                 f"Stage 4 render_bulletin: stitch_bulletin failed: "
