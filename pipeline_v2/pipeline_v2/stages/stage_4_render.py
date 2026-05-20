@@ -1594,6 +1594,48 @@ class Stage4Render:
                 f"applying overlays now)"
             )
 
+            # Backlog item 96: write bulletin/_generated_images.json so
+            # routers/bulletin_images.py's editor "Images" panel can
+            # surface the sourced images for the operator's
+            # replace/recompose feature. V2 stores its entity images
+            # in <out>/v2_images/<entity>__<source>_NN.jpg; the panel
+            # scans bulletin/ for either a manifest OR the V1-shape
+            # story_NN_assets/ / _job_pool/ layouts -- so without a
+            # manifest pointing back at v2_images, the panel showed
+            # "No bulletin images on disk yet."
+            try:
+                v2_images_dir = self.output_dir / "v2_images"
+                if v2_images_dir.is_dir():
+                    img_entries = []
+                    for i, p in enumerate(sorted(v2_images_dir.iterdir()), start=1):
+                        if not p.is_file():
+                            continue
+                        if p.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                            continue
+                        img_entries.append({
+                            "path":        str(p.resolve()),
+                            "filename":    f"news_{i:02d}{p.suffix.lower()}",
+                            "story_index": 0,
+                        })
+                    if img_entries:
+                        manifest_path = self.bulletin_dir / "_generated_images.json"
+                        manifest_path.write_text(
+                            json.dumps(img_entries, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        logger.info(
+                            "stage_4: wrote bulletin image manifest -> %s "
+                            "(%d entries)",
+                            manifest_path, len(img_entries),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "stage_4: bulletin image manifest write failed (non-"
+                    "fatal -- the Images panel will fall through to "
+                    "filesystem-scan and may not see V2 entity images): %s",
+                    exc,
+                )
+
             bulletin_artifacts = ClipRenderArtifacts(
                 clip_path=bulletin_result["overlay_path"],
                 clip_path_overlay=bulletin_result["overlay_path"]
