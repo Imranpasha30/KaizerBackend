@@ -1027,7 +1027,7 @@ class Stage4Render:
         metadata: Metadata,
         entities: list[Entity],
         image_plan: ImagePlan,
-        channel_name: str = "KAIZER NEWS",
+        channel_name: str = "",
         logo_path: Optional[str] = None,
     ) -> dict:
         """Assemble the full-form bulletin video.
@@ -1098,18 +1098,32 @@ class Stage4Render:
                 logger.warning("stage_4: ticker render failed: %s", exc)
                 ticker_path = ""
 
-        bug_path = str(bulletin_dir / "_bug.png")
-        bug_inputs = [logo_path] if logo_path else []
-        bug_extra = {"channel_name": channel_name}
-        if _v1_compose_deps.is_fresh(bug_path, bug_inputs, bug_extra, min_size=500):
-            logger.info("stage_4: bulletin channel bug cached (skipping)")
+        # Backlog item 92: when channel_name is empty (the V2 default),
+        # skip the channel bug entirely so the bulletin renders as a
+        # CLEAN MASTER. V1's pattern is to overlay the destination
+        # logo at upload/publish time per-destination
+        # (youtube/logo_overlay.py); baking a fixed "KAIZER NEWS" pill
+        # at render time both duplicates that step and forces the
+        # same brand mark across every channel a clip is published to.
+        if not channel_name:
+            logger.info(
+                "stage_4: channel bug skipped (clean master -- channel "
+                "logo applied at upload time per destination)"
+            )
+            bug_path = None
         else:
-            try:
-                _v1_render_channel_bug(channel_name, logo_path, bug_path)
-                _v1_compose_deps.mark_built(bug_path, bug_inputs, bug_extra)
-            except Exception as exc:
-                logger.warning("stage_4: channel bug render failed: %s", exc)
-                bug_path = None
+            bug_path = str(bulletin_dir / "_bug.png")
+            bug_inputs = [logo_path] if logo_path else []
+            bug_extra = {"channel_name": channel_name}
+            if _v1_compose_deps.is_fresh(bug_path, bug_inputs, bug_extra, min_size=500):
+                logger.info("stage_4: bulletin channel bug cached (skipping)")
+            else:
+                try:
+                    _v1_render_channel_bug(channel_name, logo_path, bug_path)
+                    _v1_compose_deps.mark_built(bug_path, bug_inputs, bug_extra)
+                except Exception as exc:
+                    logger.warning("stage_4: channel bug render failed: %s", exc)
+                    bug_path = None
 
         # ---- 4. Per-story compose -----------------------------------
         story_paths: list[str] = []
@@ -1361,7 +1375,7 @@ class Stage4Render:
         job_output: JobOutput,
         timestamp: str,
         title_english: str = "",
-        channel_name: str = "KAIZER NEWS",
+        channel_name: str = "",
         logo_path: Optional[str] = None,
         cancel_check: Optional[callable] = None,
         progress_cb: Optional[callable] = None,
@@ -1433,7 +1447,7 @@ class Stage4Render:
         job_output: JobOutput,
         timestamp: str,
         title_english: str = "",
-        channel_name: str = "KAIZER NEWS",
+        channel_name: str = "",
         logo_path: Optional[str] = None,
         cancel_check: Optional[callable] = None,
         progress_cb: Optional[callable] = None,

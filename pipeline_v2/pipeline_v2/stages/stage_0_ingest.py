@@ -60,6 +60,7 @@ async def run_stage_0(
     out_dir: str,
     *,
     encoder: Optional[EncoderName] = None,
+    progress_cb: Optional[callable] = None,
 ) -> Stage0Output:
     """Run Stage 0 end-to-end.
 
@@ -69,6 +70,12 @@ async def run_stage_0(
             into. Created if missing.
         encoder: Optionally pin the encoder name. When None (default),
             ``detect_encoder()`` chooses based on local hardware.
+        progress_cb: Optional callable that takes a single str message.
+            Called at sub-phase boundaries (probe done, encoder chosen,
+            transcode started) AND on a 30s heartbeat during the long
+            parallel transcode+audio gather so the V2 UI log panel
+            doesn't go silent for 5-15 min on slow encodes. Backlog
+            item 93.
 
     Returns:
         Stage0Output Pydantic model with output paths + telemetry.
@@ -78,6 +85,15 @@ async def run_stage_0(
             ffmpeg / ffprobe aren't on PATH.
         RuntimeError: if ffprobe or ffmpeg exit non-zero.
     """
+    def _p(msg: str) -> None:
+        # Defensive: callback errors must never abort Stage 0.
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(msg)
+        except Exception as cb_exc:
+            logger.warning("stage_0 progress_cb raised (ignored): %s", cb_exc)
+
     src = Path(src_path)
     out = Path(out_dir)
 
@@ -87,12 +103,18 @@ async def run_stage_0(
     out.mkdir(parents=True, exist_ok=True)
 
     # -- Probe ----------------------------------------------------------
+    _p(f"Stage 0 probing source ({src.name})")
     p = probe(str(src))
     logger.info(
         "stage_0: source=%s codec=%s fps=%s (nominal=%s, vfr=%s) "
         "%sx%s duration=%.2fs",
         src.name, p.video_codec, p.fps, p.nominal_fps, p.is_vfr,
         p.width, p.height, p.duration_sec,
+    )
+    _p(
+        f"Stage 0 probed: {p.width}x{p.height} "
+        f"{p.video_codec} @ {p.fps}fps{'  (VFR)' if p.is_vfr else ''}, "
+        f"duration {p.duration_sec:.1f}s"
     )
 
     if p.duration_sec <= 0:
@@ -106,28 +128,65 @@ async def run_stage_0(
 
     # -- Encoder choice -------------------------------------------------
     chosen = encoder or detect_encoder()
+    if chosen == "h264_nvenc":
+        _p("Stage 0 encoder: h264_nvenc (NVIDIA GPU; fast path)")
+    else:
+        _p(
+            f"Stage 0 encoder: {chosen} (CPU fallback; transcode will "
+            f"take ~5-15 min on long sources)"
+        )
 
     mezz = out / "mezzanine.mp4"
     audio = out / "source.mp3"
 
     # -- Parallel transcode + audio extract -----------------------------
+    _p(
+        f"Stage 0 transcoding mezzanine ({chosen}) + extracting audio "
+        f"in parallel"
+    )
     wall_start = time.perf_counter()
 
-    transcode_secs, audio_secs = await asyncio.gather(
-        _timed(
-            transcode_to_mezzanine(str(src), str(mezz), encoder=chosen),
-            "transcode",
-        ),
-        _timed(
-            extract_audio(str(src), str(audio)),
-            "audio extract",
-        ),
-    )
+    # Heartbeat: while the gather is in flight, emit a "still working"
+    # progress line every 30s so the UI panel shows life. The heartbeat
+    # task is cancelled as soon as gather returns (success or fail).
+    async def _heartbeat() -> None:
+        i = 0
+        try:
+            while True:
+                await asyncio.sleep(30)
+                i += 30
+                _p(f"Stage 0 still encoding (+{i}s, encoder={chosen})")
+        except asyncio.CancelledError:
+            return
+
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        transcode_secs, audio_secs = await asyncio.gather(
+            _timed(
+                transcode_to_mezzanine(str(src), str(mezz), encoder=chosen),
+                "transcode",
+            ),
+            _timed(
+                extract_audio(str(src), str(audio)),
+                "audio extract",
+            ),
+        )
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     wall_secs = time.perf_counter() - wall_start
 
     logger.info(
         "stage_0: complete. encoder=%s wall=%.2fs (transcode=%.2fs, audio=%.2fs)",
         chosen, wall_secs, transcode_secs, audio_secs,
+    )
+    _p(
+        f"Stage 0 transcode done (wall {wall_secs:.0f}s, "
+        f"transcode {transcode_secs:.0f}s, audio {audio_secs:.0f}s)"
     )
 
     return Stage0Output(

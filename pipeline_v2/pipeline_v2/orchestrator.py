@@ -309,7 +309,7 @@ async def _stage_0_ingest_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_0_INGEST)
-    _append_progress_log(job_id, "Stage 0/7 ingest started (ffprobe + NVENC mezzanine)")
+    _append_progress_log(job_id, "Stage 0/7 ingest started")
 
     video_path = envelope["video_path"]
     out_dir = envelope.get("out_dir") or ""
@@ -321,7 +321,15 @@ async def _stage_0_ingest_handler(envelope: dict) -> dict:
             / f"job_{job_id}"
         )
 
-    stage_0: Stage0Output = await run_stage_0(video_path, out_dir)
+    # Stage 0 sub-phase progress (item 93): probe / encoder choice /
+    # transcode heartbeat every 30s. Without this the UI panel was
+    # silent for 5-15 min on slow encodes.
+    def _stage_0_progress(msg: str) -> None:
+        _append_progress_log(job_id, msg)
+
+    stage_0: Stage0Output = await run_stage_0(
+        video_path, out_dir, progress_cb=_stage_0_progress,
+    )
 
     envelope["out_dir"] = out_dir   # propagate to downstream stages
     envelope["stage_0"] = stage_0.model_dump()
@@ -329,7 +337,8 @@ async def _stage_0_ingest_handler(envelope: dict) -> dict:
     envelope["stage_costs"][STAGE_0_INGEST] = 0.0
     _append_progress_log(
         job_id,
-        f"Stage 0/7 ingest done (mezzanine + audio extracted)",
+        f"Stage 0/7 ingest done (mezzanine + audio extracted; "
+        f"encoder={stage_0.encoder_used})",
     )
     return envelope
 
