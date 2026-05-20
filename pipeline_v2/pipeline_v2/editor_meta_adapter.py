@@ -277,18 +277,26 @@ def build_v1_shorts_editor_meta(
 
     clips_out = []
     for cut, art in zip(sorted_cuts, clip_artifacts):
+        # Backlog item 99: per-short card text comes from cut.hook
+        # (Stage 3a generates a distinct 3-10 word hook for every
+        # ShortsCut, explicitly designed for on-screen rendering --
+        # see stage_3a_prompt.md: "on-screen text can render either
+        # language; we pick the most universal form"). Falling back
+        # to the global headline only when the hook is empty (defensive,
+        # should never happen on a valid Stage 3a output).
+        per_clip_text = (cut.hook or "").strip() or title_native
         clips_out.append({
             "clip_path":      art.clip_path,
             "raw_path":       art.raw_path,
             "thumb_path":     art.thumb_path,
             "image_path":     art.image_path,
-            # text: global headline burned on every short (D-8.x).
-            "text":           title_native,
+            # text: per-short hook (was: global headline -- item 99).
+            "text":           per_clip_text,
             "language":       lang_code,
-            "title_native":   title_native,
+            "title_native":   per_clip_text,
             # title_telugu: legacy alias for title_native -- V1 emits
             # both for backwards-compat with older editor UI code.
-            "title_telugu":   title_native,
+            "title_telugu":   per_clip_text,
             "title_english":  title_english,
             "start":          _format_mmss_mmm(cut.start_sec),
             "end":            _format_mmss_mmm(cut.end_sec),

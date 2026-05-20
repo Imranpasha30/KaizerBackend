@@ -546,10 +546,13 @@ class TestShortsAdapterPerClipStructure:
         assert clip["thumb_path"] == "/x/thumb.jpg"
         assert clip["image_path"] == "/x/img.jpg"
 
-    def test_clip_text_is_global_headline(self):
+    def test_clip_text_is_per_short_hook(self):
+        # Backlog item 99 superseded the original "every clip's text =
+        # global headline" contract. Per-short hook is used now.
         meta = _metadata(headline="GLOBAL HEADLINE")
+        cuts = [_shorts_cut(0, 10.0, 28.0, hook="unique per-short hook")]
         out = build_v1_shorts_editor_meta(
-            _job_output(metadata=meta),
+            _job_output(shorts_cuts=cuts, metadata=meta),
             video_path="/abs/v.mp4",
             platform="youtube_short",
             frame_layout="torn_card",
@@ -557,8 +560,10 @@ class TestShortsAdapterPerClipStructure:
             timestamp="20260518_140000",
             clip_artifacts=[_artifact(0)],
         )
-        # Every clip's "text" = global headline
-        assert out["clips"][0]["text"] == "GLOBAL HEADLINE"
+        assert out["clips"][0]["text"] == "unique per-short hook"
+        # Top-level title_native still has the global headline (job-
+        # level field; not per-clip).
+        assert out["title_native"] == "GLOBAL HEADLINE"
 
     def test_clip_start_end_formatted_d85(self):
         # D-8.5: MM:SS.mmm format.
@@ -1076,3 +1081,108 @@ class TestEmptyListEmission:
             bulletin_duration_s=100.0,
         )
         assert out["clips"][0]["entities"] == []
+
+
+# ======================================================================
+# Backlog item 99: per-short card text comes from cut.hook
+# ======================================================================
+
+
+class TestPerShortText:
+    """Each short's burned-in card text must come from its own
+    ShortsCut.hook (Stage 3a produces a distinct 3-10 word hook for
+    every cut). The previous adapter burned the GLOBAL
+    Metadata.shorts_headline_native onto every short, making all 8
+    cards identical (job 40 surfaced the issue empirically).
+    """
+
+    def test_each_short_uses_its_own_hook_for_text(self):
+        # 4 shorts each with a distinct hook.
+        cuts = [
+            _shorts_cut(0, 10.0, 28.0, hook="First moment hook"),
+            _shorts_cut(1, 40.0, 58.0, hook="Second moment hook"),
+            _shorts_cut(2, 70.0, 88.0, hook="Third moment hook"),
+            _shorts_cut(3, 100.0, 118.0, hook="Fourth moment hook"),
+        ]
+        meta = _metadata(headline="GLOBAL HEADLINE — must not appear on per-clip text")
+        out = build_v1_shorts_editor_meta(
+            _job_output(shorts_cuts=cuts, metadata=meta),
+            video_path="/abs/v.mp4",
+            platform="youtube_short",
+            frame_layout="torn_card",
+            preset=_preset(),
+            timestamp="20260518_140000",
+            clip_artifacts=[_artifact(i) for i in range(4)],
+        )
+        texts = [c["text"] for c in out["clips"]]
+        # Each clip's text matches its own hook -- not the global headline.
+        assert texts == [
+            "First moment hook",
+            "Second moment hook",
+            "Third moment hook",
+            "Fourth moment hook",
+        ]
+        # Top-level title_native is still the GLOBAL headline (job-level
+        # V1 backwards-compat — see backlog 99).
+        assert out["title_native"] == "GLOBAL HEADLINE — must not appear on per-clip text"
+
+    def test_title_native_and_title_telugu_also_use_hook(self):
+        cuts = [
+            _shorts_cut(0, 10.0, 28.0, hook="HOOK ONE"),
+            _shorts_cut(1, 40.0, 58.0, hook="HOOK TWO"),
+        ]
+        out = build_v1_shorts_editor_meta(
+            _job_output(shorts_cuts=cuts),
+            video_path="/abs/v.mp4",
+            platform="youtube_short",
+            frame_layout="torn_card",
+            preset=_preset(),
+            timestamp="20260518_140000",
+            clip_artifacts=[_artifact(0), _artifact(1)],
+        )
+        # title_native + title_telugu (legacy alias) -- both derived from
+        # cut.hook so the V1 editor surfaces per-clip headlines wherever
+        # it reads either field.
+        assert out["clips"][0]["title_native"] == "HOOK ONE"
+        assert out["clips"][0]["title_telugu"] == "HOOK ONE"
+        assert out["clips"][1]["title_native"] == "HOOK TWO"
+        assert out["clips"][1]["title_telugu"] == "HOOK TWO"
+
+    def test_empty_hook_falls_back_to_global_headline(self):
+        # Defensive: if Stage 3a ever ships a cut with an empty hook
+        # (shouldn't happen on valid output -- Pydantic doesn't enforce
+        # min_length on hook), fall back to the global title so the
+        # card isn't blank.
+        cuts = [
+            _shorts_cut(0, 10.0, 28.0, hook=""),
+            _shorts_cut(1, 40.0, 58.0, hook="real hook"),
+        ]
+        meta = _metadata(headline="FALLBACK HEADLINE")
+        out = build_v1_shorts_editor_meta(
+            _job_output(shorts_cuts=cuts, metadata=meta),
+            video_path="/abs/v.mp4",
+            platform="youtube_short",
+            frame_layout="torn_card",
+            preset=_preset(),
+            timestamp="20260518_140000",
+            clip_artifacts=[_artifact(0), _artifact(1)],
+        )
+        assert out["clips"][0]["text"] == "FALLBACK HEADLINE"
+        assert out["clips"][1]["text"] == "real hook"
+
+    def test_summary_still_carries_hook_too(self):
+        # The 'summary' field has been hook-based since D-8.9; ensure
+        # the item-99 text change didn't disturb it.
+        cuts = [_shorts_cut(0, 10.0, 28.0, hook="THE HOOK")]
+        out = build_v1_shorts_editor_meta(
+            _job_output(shorts_cuts=cuts),
+            video_path="/abs/v.mp4",
+            platform="youtube_short",
+            frame_layout="torn_card",
+            preset=_preset(),
+            timestamp="20260518_140000",
+            clip_artifacts=[_artifact(0)],
+        )
+        assert out["clips"][0]["summary"] == "THE HOOK"
+        # text == summary == hook -- they're allowed to coincide.
+        assert out["clips"][0]["text"] == "THE HOOK"
