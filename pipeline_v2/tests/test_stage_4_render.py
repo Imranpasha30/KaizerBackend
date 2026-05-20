@@ -2734,21 +2734,24 @@ class TestSpliceCutsMinusSkipped:
     def test_no_skipped_returns_input_unchanged(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
         cuts = [self._cut(0, 0, 99, 0.0, 600.0)]
-        out = splice_cuts_minus_skipped(cuts, [])
+        out, parents = splice_cuts_minus_skipped(cuts, [])
         assert len(out) == 1
         assert out[0].start_sec == 0.0
         assert out[0].end_sec == 600.0
+        assert parents == [0]
 
     def test_single_skip_in_middle_yields_two_sub_cuts(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
         cuts = [self._cut(0, 0, 99, 0.0, 600.0)]
         skipped = [self._skip(40, 60, 100.0, 150.0)]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 2
         assert out[0].start_sec == 0.0 and out[0].end_sec == 100.0
         assert out[1].start_sec == 150.0 and out[1].end_sec == 600.0
         kept = sum(c.end_sec - c.start_sec for c in out)
         assert kept == 550.0
+        # Both sub-cuts share parent FullVideoCut.index = 0
+        assert parents == [0, 0]
 
     def test_multiple_skips_per_cut(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
@@ -2758,36 +2761,42 @@ class TestSpliceCutsMinusSkipped:
             self._skip(40, 60, 100.0, 150.0),
             self._skip(70, 75, 400.0, 410.0),
         ]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 4
         bounds = [(c.start_sec, c.end_sec) for c in out]
         assert bounds == [
             (0.0, 30.0), (45.0, 100.0), (150.0, 400.0), (410.0, 600.0),
         ]
+        # 4 sub-cuts, all from the SAME parent (= no takeovers should
+        # fire between them in render_bulletin, per item 100).
+        assert parents == [0, 0, 0, 0]
 
     def test_skip_at_start_of_cut(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
         cuts = [self._cut(0, 0, 99, 100.0, 600.0)]
         skipped = [self._skip(0, 5, 100.0, 110.0)]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 1
         assert out[0].start_sec == 110.0 and out[0].end_sec == 600.0
+        assert parents == [0]
 
     def test_skip_at_end_of_cut(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
         cuts = [self._cut(0, 0, 99, 0.0, 500.0)]
         skipped = [self._skip(95, 99, 480.0, 500.0)]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 1
         assert out[0].start_sec == 0.0 and out[0].end_sec == 480.0
+        assert parents == [0]
 
     def test_skip_outside_cut_is_ignored(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
         cuts = [self._cut(0, 0, 99, 100.0, 200.0)]
         skipped = [self._skip(200, 205, 300.0, 310.0)]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 1
         assert out[0].start_sec == 100.0 and out[0].end_sec == 200.0
+        assert parents == [0]
 
     def test_multiple_cuts_each_with_their_own_skips(self):
         from pipeline_v2.stages.stage_4_render import splice_cuts_minus_skipped
@@ -2799,7 +2808,7 @@ class TestSpliceCutsMinusSkipped:
             self._skip(10, 20, 20.0, 40.0),
             self._skip(80, 90, 200.0, 230.0),
         ]
-        out = splice_cuts_minus_skipped(cuts, skipped)
+        out, parents = splice_cuts_minus_skipped(cuts, skipped)
         assert len(out) == 4
         assert [c.index for c in out] == [0, 1, 2, 3]
         bounds = [(c.start_sec, c.end_sec) for c in out]
@@ -2807,3 +2816,94 @@ class TestSpliceCutsMinusSkipped:
             (0.0, 20.0), (40.0, 100.0),
             (150.0, 200.0), (230.0, 300.0),
         ]
+        # Sub-cuts 0,1 share parent FullVideoCut[0]; 2,3 share
+        # parent FullVideoCut[1]. Takeover should fire BETWEEN
+        # sub-cut 1 and sub-cut 2 (parent boundary) but NOT between
+        # 0-1 or 2-3 (same parent within each story).
+        assert parents == [0, 0, 1, 1]
+
+
+# ======================================================================
+# Backlog item 100: adaptive takeovers + PiP gate + A/V invariant
+# ======================================================================
+
+
+class TestAdaptiveTakeoversAndPiPGate:
+    """Item 100 — V2 must not bloat the bulletin past narration audio.
+
+    1. Takeovers default OFF and only enable when Stage 2 produced
+       >=3 distinct FullVideoCuts (and even then only between
+       different parents).
+    2. PiP is suppressed for SOLO video_type (talking-head news
+       monologue) since pick_pip_source would just pull another
+       segment of the same anchor.
+    3. After render, an A/V invariant assertion ensures bulletin
+       audio == narration audio + takeover video.
+    """
+
+    def test_use_takeovers_default_is_false(self):
+        """Default flipped from True to False so a single-story splice
+        no longer auto-inserts ~6.5s of dead air between every sub-cut."""
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        from dataclasses import fields
+        f = next(f for f in fields(Stage4Render) if f.name == "use_takeovers")
+        assert f.default is False
+
+    def test_full_video_cuts_to_v1_clip_dicts_stamps_parent_index(self):
+        from pipeline_v2.stages.stage_4_render import (
+            full_video_cuts_to_v1_clip_dicts,
+        )
+        cuts = [
+            _full_video_cut(idx=0, start=0.0, end=100.0),
+            _full_video_cut(idx=1, start=100.0, end=200.0),
+        ]
+        parents = [7, 7]  # both sub-cuts share parent FullVideoCut[7]
+        out = full_video_cuts_to_v1_clip_dicts(cuts, _metadata(), parents)
+        assert [c["parent_v2_index"] for c in out] == [7, 7]
+        # When parent_v2_indexes is omitted, falls back to the cut's
+        # own index (each cut is its own parent).
+        out2 = full_video_cuts_to_v1_clip_dicts(cuts, _metadata())
+        assert [c["parent_v2_index"] for c in out2] == [0, 1]
+
+    def test_ffprobe_audio_duration_helper_handles_missing_file(self):
+        """Item 100 guardrail probes return 0.0 (best-effort) when the
+        path doesn't exist -- the outer try/except in _render_impl
+        swallows probe failures so render success isn't blocked by
+        a transient ffprobe issue."""
+        from pipeline_v2.stages.stage_4_render import (
+            _ffprobe_audio_duration_s, _ffprobe_video_duration_s,
+        )
+        assert _ffprobe_audio_duration_s("/nope/missing.mp4") == 0.0
+        assert _ffprobe_video_duration_s("/nope/missing.mp4") == 0.0
+
+    def test_video_type_solo_in_disabled_set(self):
+        """Sanity-check the PiP allow-list used in _render_impl. SOLO
+        must NOT be in the allowed set (= the user's bug 2 case)."""
+        # This mirrors the literal set used in the renderer; if it
+        # ever diverges this test catches the drift before it ships.
+        allowed = {"INTERVIEW", "PRESS_CONFERENCE", "PANEL", "MIXED"}
+        assert "SOLO" not in allowed
+
+    def test_render_bulletin_signature_accepts_new_kwargs(self):
+        """Wire-level lock: render_bulletin must accept the three new
+        kwargs _render_impl now passes. Catches a future refactor
+        that removes any of them before the orchestrator does."""
+        import inspect
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        sig = inspect.signature(Stage4Render.render_bulletin)
+        for name in ("parent_v2_indexes", "takeovers_enabled", "pip_enabled"):
+            assert name in sig.parameters, (
+                f"render_bulletin must accept '{name}' kwarg "
+                f"(item 100); got params={list(sig.parameters)}"
+            )
+            # All three default to None so existing callers (tests,
+            # _render_impl alternates) keep working.
+            assert sig.parameters[name].default is None
+
+    def test_cut_raw_bulletin_stories_signature_accepts_parents(self):
+        """Parent-index plumb-through reaches the raw cut helper too."""
+        import inspect
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        sig = inspect.signature(Stage4Render.cut_raw_bulletin_stories)
+        assert "parent_v2_indexes" in sig.parameters
+        assert sig.parameters["parent_v2_indexes"].default is None

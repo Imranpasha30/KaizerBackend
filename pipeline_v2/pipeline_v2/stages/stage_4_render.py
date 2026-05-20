@@ -257,6 +257,44 @@ class RenderResult:
 # ====================================================================== #
 
 
+def _ffprobe_audio_duration_s(path: str) -> float:
+    """Backlog item 100: return the AUDIO stream duration of *path*
+    in seconds (float). Returns 0.0 when path has no audio stream
+    OR when ffprobe fails (best-effort -- the invariant check uses
+    this and tolerates probe failures via its outer try/except).
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or "").strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
+
+
+def _ffprobe_video_duration_s(path: str) -> float:
+    """Backlog item 100: same as ``_ffprobe_audio_duration_s`` but for
+    the VIDEO stream. Used to size takeover transitions which have
+    no audio of their own."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or "").strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
+
+
 def _format_mmss_mmm(seconds: float) -> str:
     """Format float-second to MM:SS.mmm.
 
@@ -323,35 +361,34 @@ def shorts_cuts_to_v1_clip_dicts(
 def splice_cuts_minus_skipped(
     full_video_cuts: list[FullVideoCut],
     skipped_segments: list[SkippedSegment],
-) -> list[FullVideoCut]:
+) -> tuple[list[FullVideoCut], list[int]]:
     """Backlog item 97: subtract SkippedSegment time-ranges from each
     FullVideoCut, producing a flat list of sub-cuts that EXCLUDE the
     retake / filler / dead-air spans Stage 2 identified.
 
+    Item 100: also returns a parallel list of ``parent_v2_index`` (one
+    per emitted sub-cut). The renderer uses this to decide whether to
+    insert an inter-story TV-style takeover transition: takeovers
+    only fire BETWEEN different parents (true story boundaries), not
+    BETWEEN spliced sub-cuts of the same FullVideoCut (which together
+    form one continuous narrative thread). Without this, item 97's
+    splice fix accidentally created 21 takeovers between 22 sub-cuts
+    of a single story = ~132s of dead-air padding (Bug 1).
+
     Per the Stage 2 prompt's design (stage_2_prompt.md, rule #6):
-    `full_video_cuts` may span across skipped regions; the RENDERER
-    is responsible for splicing the skipped span out. Previously the
-    V2 renderer never did the splice -- it just handed FullVideoCut
-    start/end seconds to V1's cut_video_clips as a single ffmpeg cut.
-    Empirically every bulletin came out at ~100% of mezzanine
-    duration (jobs 35, 36, 40 had <1s trim on 12-min sources).
+    ``full_video_cuts`` may span across skipped regions; the RENDERER
+    is responsible for splicing the skipped span out.
 
-    Algorithm (per cut):
-      1. Sort overlapping skipped spans by start_sec.
-      2. Walk left-to-right, emitting a sub-cut for each gap between
-         skipped spans within the cut's bounds.
-      3. Each sub-cut inherits the parent's importance and v2_index
-         (the index field gets re-numbered globally so downstream
-         contiguity guardrails are satisfied).
-
-    Returns the expanded list. If no skipped_segments overlap, returns
-    the input unchanged (identity case).
+    Returns ``(expanded_cuts, parent_v2_indexes)``. If no
+    skipped_segments overlap, returns the input unchanged + each cut's
+    own index as parent (identity).
     """
     if not skipped_segments:
-        return list(full_video_cuts)
+        return list(full_video_cuts), [c.index for c in full_video_cuts]
 
     skipped_sorted = sorted(skipped_segments, key=lambda s: s.start_sec)
     out: list[FullVideoCut] = []
+    parents: list[int] = []
     new_idx = 0
     for cut in full_video_cuts:
         relevant = [
@@ -374,6 +411,7 @@ def splice_cuts_minus_skipped(
                     end_sec=sk_start,
                     importance=cut.importance,
                 ))
+                parents.append(cut.index)
                 new_idx += 1
             cursor = sk_end
             cursor_word = sk_word_end + 1
@@ -386,13 +424,15 @@ def splice_cuts_minus_skipped(
                 end_sec=cut.end_sec,
                 importance=cut.importance,
             ))
+            parents.append(cut.index)
             new_idx += 1
-    return out
+    return out, parents
 
 
 def full_video_cuts_to_v1_clip_dicts(
     full_video_cuts: list[FullVideoCut],
     metadata: Metadata,
+    parent_v2_indexes: Optional[list[int]] = None,
 ) -> list[dict]:
     """V2 FullVideoCut list -> V1-compatible clip dict list.
 
@@ -401,20 +441,30 @@ def full_video_cuts_to_v1_clip_dicts(
     bulletin uses the overall headline). ``summary`` is empty string
     for compatibility with V1's bulletin path which doesn't read
     per-clip summaries.
+
+    Item 100: when ``parent_v2_indexes`` is provided (one int per
+    cut), each dict gets a ``parent_v2_index`` field used by the
+    bulletin compositor to decide whether to insert a takeover
+    transition between this clip and the next (takeovers only fire
+    between DIFFERENT parents). When omitted, ``parent_v2_index``
+    defaults to the cut's own index (each cut is its own parent).
     """
+    if parent_v2_indexes is None:
+        parent_v2_indexes = [c.index for c in full_video_cuts]
     return [
         {
-            "start":      _format_mmss_mmm(c.start_sec),
-            "end":        _format_mmss_mmm(c.end_sec),
-            "start_sec":  c.start_sec,   # see shorts converter for rationale
-            "end_sec":    c.end_sec,
-            "summary":    "",
-            "mood":       "",
-            "importance": c.importance,
-            "video_type": metadata.video_type,
-            "v2_index":   c.index,
+            "start":            _format_mmss_mmm(c.start_sec),
+            "end":              _format_mmss_mmm(c.end_sec),
+            "start_sec":        c.start_sec,   # see shorts converter for rationale
+            "end_sec":          c.end_sec,
+            "summary":          "",
+            "mood":             "",
+            "importance":       c.importance,
+            "video_type":       metadata.video_type,
+            "v2_index":         c.index,
+            "parent_v2_index":  parent_v2_indexes[i],
         }
-        for c in full_video_cuts
+        for i, c in enumerate(full_video_cuts)
     ]
 
 
@@ -525,12 +575,27 @@ class Stage4Render:
     platform: str = DEFAULT_PLATFORM
     drop_ratio_threshold: float = DEFAULT_DROP_RATIO_THRESHOLD
 
-    # Bulletin feature toggles (default ON, matching V1 production).
-    # Toggle off via constructor kwarg if a specific feature surfaces
-    # issues in production.
+    # Bulletin feature toggles. Item 100 changes the defaults so V2
+    # honours the "bulletin video duration must equal narration audio
+    # duration" invariant out of the box:
+    #
+    #   use_takeovers default flipped True -> False. The previous
+    #     default created ~6.5s of dead-air video between every story
+    #     segment. After item 97's splice fix produces N sub-cuts of a
+    #     single story, that meant N-1 takeovers per story = up to
+    #     +130s of fake silent audio. _render_impl now also adaptively
+    #     enables takeovers ONLY when Stage 2 produced >= 3 distinct
+    #     FullVideoCuts (TV-style multi-story bulletins).
+    #
+    #   use_pip stays True -- but _render_impl gates the actual PiP
+    #     source pick on metadata.video_type so SOLO talking-head
+    #     videos don't end up with a corner inset of the same anchor.
+    #
+    #   use_sidebar_carousel stays True (the entity-image carousel is
+    #     a pure overlay; doesn't extend bulletin duration).
     use_sidebar_carousel: bool = True
     use_pip: bool = True
-    use_takeovers: bool = True
+    use_takeovers: bool = False
 
     # Instance-level cache, populated by Step 9.2 image resolution.
     # Maps canonical entity_name -> absolute path of resolved image
@@ -583,6 +648,7 @@ class Stage4Render:
         self,
         full_video_cuts: list[FullVideoCut],
         metadata: Metadata,
+        parent_v2_indexes: Optional[list[int]] = None,
     ) -> list[dict]:
         """Cut the source video into per-story raw segments for the
         bulletin pass.
@@ -590,6 +656,11 @@ class Stage4Render:
         Same wiring as ``cut_raw_shorts`` but with full_video_cuts and
         a SEPARATE output directory (``bulletin_dir`` instead of
         ``output_dir``).
+
+        ``parent_v2_indexes`` (item 100) is the parallel list returned
+        by ``splice_cuts_minus_skipped`` -- it stamps each V1 clip
+        dict with ``parent_v2_index`` so the compositor only inserts
+        takeover transitions between DIFFERENT parent FullVideoCuts.
 
         Why bulletin_dir, not output_dir (Step 12.2a re-run #4 fix):
         V1's ``cut_video_clips`` is path-cache idempotent -- if
@@ -607,7 +678,10 @@ class Stage4Render:
         bulletin pass a dedicated namespace so V1's cache check
         never collides with the shorts pass.
         """
-        v1_clips = full_video_cuts_to_v1_clip_dicts(full_video_cuts, metadata)
+        v1_clips = full_video_cuts_to_v1_clip_dicts(
+            full_video_cuts, metadata,
+            parent_v2_indexes=parent_v2_indexes,
+        )
         _v1_cut_video_clips(
             str(self.video_path),
             v1_clips,
@@ -1099,6 +1173,9 @@ class Stage4Render:
         image_plan: ImagePlan,
         channel_name: str = "",
         logo_path: Optional[str] = None,
+        parent_v2_indexes: Optional[list[int]] = None,
+        takeovers_enabled: Optional[bool] = None,
+        pip_enabled: Optional[bool] = None,
     ) -> dict:
         """Assemble the full-form bulletin video.
 
@@ -1132,8 +1209,24 @@ class Stage4Render:
         lang_cfg = _v1_languages.get(metadata.language.split("-", 1)[0])
         bulletin_dir = self.bulletin_dir
 
+        # Item 100: resolve effective takeovers / pip toggles. Callers
+        # (i.e. _render_impl) can override via explicit args; if not
+        # provided fall back to the instance defaults (False / True
+        # respectively).
+        effective_takeovers = (
+            takeovers_enabled if takeovers_enabled is not None
+            else self.use_takeovers
+        )
+        effective_pip = (
+            pip_enabled if pip_enabled is not None
+            else self.use_pip
+        )
+
         # ---- 1. Raw cut for the bulletin pass --------------------
-        clips = self.cut_raw_bulletin_stories(full_video_cuts, metadata)
+        clips = self.cut_raw_bulletin_stories(
+            full_video_cuts, metadata,
+            parent_v2_indexes=parent_v2_indexes,
+        )
 
         # ---- 2. Image resolution (reuses image_pool per D-9.5) ----
         # Stage 3c's image_plan already targets the bulletin's
@@ -1268,7 +1361,9 @@ class Stage4Render:
                 importance=importance,
             )
 
-            pip_src = _v1_pick_pip_source(clips, i) if self.use_pip else None
+            # Item 100: PiP source picker is gated on effective_pip
+            # (which _render_impl sets to False for SOLO video_type).
+            pip_src = _v1_pick_pip_source(clips, i) if effective_pip else None
 
             # ---- 4c. compose_deps fingerprint for this story -----
             composed_path = str(bulletin_dir / f"composed_story_{i:02d}.mp4")
@@ -1342,8 +1437,26 @@ class Stage4Render:
                 )
 
             # ---- 4d. Inter-story takeover (optional) -------------
+            # Item 100: gate on effective_takeovers (caller controls
+            # globally via _render_impl: only ON when Stage 2 produced
+            # >=3 distinct FullVideoCuts). Additionally, within the
+            # enabled case, ONLY insert a takeover when this story
+            # belongs to a DIFFERENT parent_v2_index than the next
+            # one -- so spliced sub-cuts of the same narrative thread
+            # concat seamlessly (no dead-air silence between them).
+            this_parent = clip.get("parent_v2_index", clip.get("v2_index"))
+            next_parent = None
+            if i + 1 < total:
+                next_clip = clips[i + 1]
+                next_parent = next_clip.get(
+                    "parent_v2_index", next_clip.get("v2_index")
+                )
+            inter_story_boundary = (
+                next_parent is not None and this_parent != next_parent
+            )
             if (
-                self.use_takeovers
+                effective_takeovers
+                and inter_story_boundary
                 and 0 < i < total - 1
                 and len(imgs) >= 2
             ):
@@ -1680,7 +1793,7 @@ class Stage4Render:
             # cut ONE contiguous segment per cut = bulletin matched
             # mezzanine duration with zero trim.
             skipped_segments = job_output.stage_two.skipped_segments
-            spliced_cuts = splice_cuts_minus_skipped(
+            spliced_cuts, parent_v2_indexes = splice_cuts_minus_skipped(
                 full_video_cuts, skipped_segments,
             )
             original_kept_dur = sum(c.end_sec - c.start_sec for c in full_video_cuts)
@@ -1701,6 +1814,42 @@ class Stage4Render:
                     f"{_format_mmss_mmm(sc.start_sec)} -> "
                     f"{_format_mmss_mmm(sc.end_sec)} ({dur:.1f}s)"
                 )
+
+            # Item 100: adaptive takeovers. Takeovers (~6.5s branded
+            # transitions with no audio) make sense between distinct
+            # stories in a TV-style multi-story bulletin -- but for
+            # a typical news monologue (1 FullVideoCut split into N
+            # spliced sub-cuts) they add up to +130s of dead-air
+            # silence between sub-cuts of THE SAME story. Enable
+            # only when Stage 2 produced >= 3 distinct FullVideoCuts.
+            takeovers_enabled = (
+                self.use_takeovers and len(full_video_cuts) >= 3
+            )
+            _p(
+                f"  [takeovers] enabled={takeovers_enabled} "
+                f"(use_takeovers={self.use_takeovers}, "
+                f"full_video_cuts={len(full_video_cuts)} -- "
+                f"need >=3 distinct stories)"
+            )
+
+            # Item 100: PiP gate. V1's pick_pip_source picks 'next
+            # story's first 8s' from the SOURCE VIDEO as a B-roll
+            # inset. For INTERVIEW / PRESS_CONFERENCE / PANEL /
+            # MIXED that's another speaker / angle = useful. For
+            # SOLO it's just the same anchor in the corner = bug.
+            pip_video_types_allowed = {
+                "INTERVIEW", "PRESS_CONFERENCE", "PANEL", "MIXED",
+            }
+            pip_enabled = (
+                self.use_pip
+                and metadata.video_type in pip_video_types_allowed
+            )
+            _p(
+                f"  [pip] enabled={pip_enabled} "
+                f"(use_pip={self.use_pip}, "
+                f"video_type={metadata.video_type})"
+            )
+
             bulletin_result = self.render_bulletin(
                 full_video_cuts=spliced_cuts,
                 metadata=metadata,
@@ -1708,6 +1857,9 @@ class Stage4Render:
                 image_plan=image_plan,
                 channel_name=channel_name,
                 logo_path=logo_path,
+                parent_v2_indexes=parent_v2_indexes,
+                takeovers_enabled=takeovers_enabled,
+                pip_enabled=pip_enabled,
             )
             _p(
                 f"Stage 6/7 bulletin assembled "
@@ -1754,6 +1906,64 @@ class Stage4Render:
                     "stage_4: bulletin image manifest write failed (non-"
                     "fatal -- the Images panel will fall through to "
                     "filesystem-scan and may not see V2 entity images): %s",
+                    exc,
+                )
+
+            # Item 100: A/V invariant guardrail. The bulletin's audio
+            # duration MUST equal the sum of composed_story audio
+            # durations PLUS the sum of takeover VIDEO durations
+            # (takeovers have no audio of their own, so the concat
+            # step pads them with silence -- that's intentional
+            # padding when takeovers are enabled at story boundaries).
+            # Any larger delta indicates an UNINTENDED source of
+            # video-without-audio is bloating the bulletin -- a
+            # future intro/outro insertion, a stray ffmpeg filter
+            # that pads, etc. We raise a hard error so the operator
+            # sees the regression immediately rather than discovering
+            # it via a "bulletin is 25% too long" support ticket.
+            try:
+                bulletin_to_check = (
+                    bulletin_result.get("overlay_path")
+                    or bulletin_result.get("bulletin_path")
+                )
+                if bulletin_to_check and os.path.isfile(bulletin_to_check):
+                    actual_audio = _ffprobe_audio_duration_s(bulletin_to_check)
+                    composed_audio_total = sum(
+                        _ffprobe_audio_duration_s(p) for p in story_paths
+                        if os.path.isfile(p) and "takeover_" not in os.path.basename(p)
+                    )
+                    takeover_video_total = sum(
+                        _ffprobe_video_duration_s(p) for p in story_paths
+                        if os.path.isfile(p) and "takeover_" in os.path.basename(p)
+                    )
+                    expected = composed_audio_total + takeover_video_total
+                    delta = actual_audio - expected
+                    _p(
+                        f"Stage 6/7 A/V invariant check: "
+                        f"bulletin audio {actual_audio:.1f}s == "
+                        f"narration {composed_audio_total:.1f}s + "
+                        f"transitions {takeover_video_total:.1f}s "
+                        f"(delta {delta:+.1f}s)"
+                        + (" OK" if abs(delta) <= 1.0 else " ❌ FAIL")
+                    )
+                    if abs(delta) > 1.0:
+                        raise RuntimeError(
+                            f"A/V invariant violated: bulletin audio "
+                            f"{actual_audio:.2f}s != narration "
+                            f"{composed_audio_total:.2f}s + transitions "
+                            f"{takeover_video_total:.2f}s (delta "
+                            f"{delta:+.2f}s). Some component added fake "
+                            f"audio padding. Check takeovers, intro, "
+                            f"outro, or any new pre-stitch insertion."
+                        )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                # Probing failures shouldn't crash the render -- log and
+                # continue. Only invariant violations (RuntimeError
+                # above) are hard.
+                logger.warning(
+                    "stage_4: A/V invariant probe failed (non-fatal): %s",
                     exc,
                 )
 
