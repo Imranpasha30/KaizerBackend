@@ -972,3 +972,63 @@ Indian-language coverage
     on_failure as a sub-function with this naming convention).
   - ``TestOnFailureHook::test_mark_job_failed_from_event_writes_failed_status``
     -- direct unit test of the on_failure DB write path.
+
+### Item 107 (DEFERRED): Partial-restart detection patterns
+
+- **Surfaced**: 2026-05-20 during Iteration 2 of the V2 quality push.
+  Gemini Pro's audit of Job 44 (V2 verification rerun, graded 7.5/10)
+  flagged 4 remaining partial-restart spots not caught by Stage 2:
+  - 07:11 -- rapid single-content-word repeat (`దాంట్లో దాంట్లో`,
+    0.34s gap)
+  - 07:33 -- partial short-phrase restart with divergent completion
+  - 08:02 -- back-to-back subject-phrase repeat (`వాళ్ళకి ఆ
+    భరోసా ఇవ్వండి` then `వాళ్ళకి తప్పు`)
+  - 08:12 -- 3-word phrase repeated within 1s (`నాకు బండి సంజయ్`)
+- **Iteration 2 attempt (REGRESSED)**: extended
+  ``stage_2_prompt.md`` with a "PARTIAL RESTART DETECTION (Phase 2
+  patterns)" section + 3 new few-shot examples covering Patterns
+  A/B/C/D (mid-word cutoff, triple-take, rapid back-to-back, partial
+  short-phrase restart). Prompt grew from 425 -> 840 lines.
+- **Empirical result on the 11-spot harness** (Job 44 transcript,
+  gemini-2.5-pro, T=0.2):
+  - Iteration-1 baseline (7 spots): 7/7 -> 5/7 (regression on V1
+    spots 04:27 and 05:25/34)
+  - Iteration-2 new spots (4 spots): 1/4 caught (only the cleanest
+    Pattern-A single-word repeat at 07:11)
+  - Total: 6/11 caught (target was >= 8/11). Skipped-segment count
+    dropped from 33 -> 17 -- the longer prompt made the model more
+    conservative overall.
+- **Root-cause hypothesis** (three contributors):
+  1. **Prompt length doubled**. Long structured prompts dilute LLM
+     attention; each rule gets less weight.
+  2. **"Distinguishing from legitimate speech" subsection** added 4
+     explicit "DON'T skip these" examples (natural emphasis, listing,
+     quotation echo, repeated noun phrase across clauses) -- gave the
+     model strong false-keep precedent.
+  3. **Synthetic few-shot examples** (Few-shot 11's triple-take
+     ``ఇక్కడ నేను ఏదో`` was fabricated for the prompt). The model
+     may pattern-match on the literal text instead of the structure.
+- **Decision**: reverted to commit f194932's prompt. Captured in
+  ``pipeline_v2/scripts/job44_partial_restart_check.py`` +
+  ``job44_partial_restart_result.json`` so the failed iteration is
+  reproducible.
+- **Lesson learned**: ``gemini-2.5-pro`` at temperature 0.2 is also
+  meaningfully NON-DETERMINISTIC on this task -- the same iter-1
+  prompt produced 7/7 in one session and 5/7 in another. Future
+  prompt-evaluation should run the harness 3-5x and report the
+  distribution, not a single trial.
+- **Deferred approach for the 4 Phase-2 patterns**:
+  1. **Deterministic post-processor in Stage 4** for Pattern A
+     (single-content-word consecutive repeats within 1.5s) -- this
+     pattern is mechanically detectable: same ``Word.w`` (after
+     punctuation strip) repeated within ``threshold_s`` gap. Plug
+     into the existing collapse_micro_fragments / silence_trim
+     pipeline.
+  2. Patterns B/C/D require semantic judgement (is the second
+     occurrence a continuation or an emphasis?). Two ship-paths:
+     - **Separate "retake_polish" LLM call** with a tight prompt
+       focused ONLY on these patterns, run on Stage 2's output. Keeps
+       Stage 2's main prompt small.
+     - **Per-pattern fine-tune** of a smaller model (Flash) trained
+       on a few hundred labelled examples once a labelled corpus
+       exists.

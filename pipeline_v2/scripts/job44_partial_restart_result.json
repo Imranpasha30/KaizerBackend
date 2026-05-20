@@ -1,0 +1,268 @@
+{
+  "verdict_any": "FAIL",
+  "verdict_retake": "FAIL",
+  "caught_any": 6,
+  "caught_retake": 5,
+  "target_any": 9,
+  "target_retake": 7,
+  "tolerance_sec": 5.0,
+  "matches": [
+    {
+      "label": "i1: 00:24",
+      "spot_sec": [
+        24.0
+      ],
+      "caught_any": true,
+      "caught_retake": true,
+      "matched_any_span": "26.46-27.11s",
+      "matched_any_category": "retake"
+    },
+    {
+      "label": "i1: 01:27",
+      "spot_sec": [
+        87.0
+      ],
+      "caught_any": true,
+      "caught_retake": true,
+      "matched_any_span": "84.16-84.56s",
+      "matched_any_category": "retake"
+    },
+    {
+      "label": "i1: 01:44",
+      "spot_sec": [
+        104.0
+      ],
+      "caught_any": true,
+      "caught_retake": true,
+      "matched_any_span": "92.96-110.29s",
+      "matched_any_category": "retake"
+    },
+    {
+      "label": "i1: 02:08",
+      "spot_sec": [
+        128.0
+      ],
+      "caught_any": true,
+      "caught_retake": true,
+      "matched_any_span": "124.37-125.65s",
+      "matched_any_category": "retake"
+    },
+    {
+      "label": "i1: 04:10",
+      "spot_sec": [
+        250.0
+      ],
+      "caught_any": true,
+      "caught_retake": false,
+      "matched_any_span": "249.62-254.74s",
+      "matched_any_category": "aside"
+    },
+    {
+      "label": "i1: 04:27",
+      "spot_sec": [
+        267.0
+      ],
+      "caught_any": false,
+      "caught_retake": false,
+      "matched_any_span": null,
+      "matched_any_category": null
+    },
+    {
+      "label": "i1: 05:25/34",
+      "spot_sec": [
+        325.0,
+        334.0
+      ],
+      "caught_any": false,
+      "caught_retake": false,
+      "matched_any_span": null,
+      "matched_any_category": null
+    },
+    {
+      "label": "i2: 07:11",
+      "spot_sec": [
+        431.0
+      ],
+      "caught_any": true,
+      "caught_retake": true,
+      "matched_any_span": "429.36-430.00s",
+      "matched_any_category": "retake"
+    },
+    {
+      "label": "i2: 07:33",
+      "spot_sec": [
+        453.0
+      ],
+      "caught_any": false,
+      "caught_retake": false,
+      "matched_any_span": null,
+      "matched_any_category": null
+    },
+    {
+      "label": "i2: 08:02",
+      "spot_sec": [
+        482.0
+      ],
+      "caught_any": false,
+      "caught_retake": false,
+      "matched_any_span": null,
+      "matched_any_category": null
+    },
+    {
+      "label": "i2: 08:12",
+      "spot_sec": [
+        492.0
+      ],
+      "caught_any": false,
+      "caught_retake": false,
+      "matched_any_span": null,
+      "matched_any_category": null
+    }
+  ],
+  "n_cuts": 1,
+  "n_skipped": 17,
+  "by_category": {
+    "retake": 11,
+    "hesitation": 4,
+    "aside": 2
+  },
+  "retake_audit": "Skipped multiple phrase-level retakes, hesitations, and asides throughout the monologue, including a significant retake around 93s concerning the NEET exam and another around 370s where the speaker clarified their neutral stance.",
+  "skipped_segments": [
+    {
+      "category": "retake",
+      "start_sec": 26.465,
+      "end_sec": 27.105,
+      "start_word_idx": 61,
+      "end_word_idx": 62,
+      "reason": "Speaker mispronounces 'సంచలనం' as 'సంచూన్', then immediately restarts the phrase correctly."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 60.79,
+      "end_sec": 61.35,
+      "start_word_idx": 126,
+      "end_word_idx": 126,
+      "reason": "The word 'ఎందరో' is repeated after a short pause, which acts as a filler before continuing the sentence."
+    },
+    {
+      "category": "retake",
+      "start_sec": 84.16,
+      "end_sec": 84.56,
+      "start_word_idx": 168,
+      "end_word_idx": 168,
+      "reason": "The word 'కమర్షియల్' is repeated after a brief pause before the phrase continues, indicating a stall and restart."
+    },
+    {
+      "category": "retake",
+      "start_sec": 92.96,
+      "end_sec": 110.29,
+      "start_word_idx": 180,
+      "end_word_idx": 201,
+      "reason": "Speaker makes multiple confusing and incomplete attempts to phrase the NEET paper leak issue before settling on a clearer statement at word 202."
+    },
+    {
+      "category": "retake",
+      "start_sec": 124.37,
+      "end_sec": 125.65,
+      "start_word_idx": 220,
+      "end_word_idx": 220,
+      "reason": "The word 'దీనిలో' is repeated back-to-back, indicating a brief stall before continuing the thought."
+    },
+    {
+      "category": "retake",
+      "start_sec": 179.54,
+      "end_sec": 182.735,
+      "start_word_idx": 280,
+      "end_word_idx": 283,
+      "reason": "The phrase 'మన అందరి' is repeated twice before the speaker successfully completes the thought with 'మన అందరి తోడు సపోర్ట్'."
+    },
+    {
+      "category": "retake",
+      "start_sec": 190.175,
+      "end_sec": 195.455,
+      "start_word_idx": 295,
+      "end_word_idx": 300,
+      "reason": "An initial, slightly garbled attempt to introduce a topic is abandoned and immediately followed by a clearer sentence."
+    },
+    {
+      "category": "retake",
+      "start_sec": 208.455,
+      "end_sec": 211.015,
+      "start_word_idx": 307,
+      "end_word_idx": 309,
+      "reason": "Speaker starts with a name fragment 'భగీ', hesitates with 'ఎక్కడ ఎక్కడ', then restarts cleanly."
+    },
+    {
+      "category": "aside",
+      "start_sec": 249.62,
+      "end_sec": 254.74,
+      "start_word_idx": 350,
+      "end_word_idx": 356,
+      "reason": "The speaker trails off into a series of rhetorical questions and incomplete thoughts before pausing and restarting the main point."
+    },
+    {
+      "category": "retake",
+      "start_sec": 370.4,
+      "end_sec": 399.79,
+      "start_word_idx": 380,
+      "end_word_idx": 400,
+      "reason": "The speaker makes a long, repetitive, and convoluted attempt to state they are not supporting a specific person, before restarting with a much clearer version at word 401."
+    },
+    {
+      "category": "retake",
+      "start_sec": 401.79,
+      "end_sec": 402.91,
+      "start_word_idx": 403,
+      "end_word_idx": 405,
+      "reason": "A rapid triple-repetition of 'నాకు బండి' indicates a stutter or stall before completing the phrase."
+    },
+    {
+      "category": "retake",
+      "start_sec": 429.36,
+      "end_sec": 430.0,
+      "start_word_idx": 481,
+      "end_word_idx": 481,
+      "reason": "The content word 'దాంట్లో' is repeated after a short pause, a classic sign of a mid-sentence stall and restart."
+    },
+    {
+      "category": "aside",
+      "start_sec": 513.925,
+      "end_sec": 534.45,
+      "start_word_idx": 514,
+      "end_word_idx": 540,
+      "reason": "The speaker breaks the flow to express reluctance to comment further for fear of legal repercussions, before returning to the main topic."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 540.53,
+      "end_sec": 541.41,
+      "start_word_idx": 544,
+      "end_word_idx": 545,
+      "reason": "A triple repetition of the word 'బండి' serves as a filler/stutter before continuing the sentence."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 556.19,
+      "end_sec": 556.67,
+      "start_word_idx": 561,
+      "end_word_idx": 561,
+      "reason": "The word 'నో' is used as a filler word during a pause in thought."
+    },
+    {
+      "category": "retake",
+      "start_sec": 561.79,
+      "end_sec": 562.35,
+      "start_word_idx": 570,
+      "end_word_idx": 570,
+      "reason": "The word 'అబ్బాయి' is repeated back-to-back, indicating a stall before the speaker continues their point."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 571.355,
+      "end_sec": 571.835,
+      "start_word_idx": 600,
+      "end_word_idx": 600,
+      "reason": "The speaker uses 'సో' as a filler word to bridge thoughts."
+    }
+  ]
+}
