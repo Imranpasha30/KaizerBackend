@@ -835,3 +835,140 @@ Indian-language coverage
   4. Confirm ``.env*`` remains in ``.gitignore`` (already true).
 - **No production impact today** -- keys still work; only rotation
   hygiene is at stake. Treat as background work.
+
+### Item 88: V2 Stage 4 blocks the uvicorn worker (P1 user-visible UX bug)
+
+- **Surfaced**: 2026-05-20, during the first real V2 office-LAN
+  submission (job 36, 12-min Telugu source).
+- **Symptom**: while V2's Stage 4 render is in flight, the uvicorn
+  worker that's executing the step handler is **completely blocked**
+  by synchronous ``subprocess.run`` / ``Popen.wait`` calls against
+  ffmpeg. With ``--workers 1`` (the previous default), this makes
+  every other HTTP request -- crucially ``/api/jobs/{id}/status/``
+  -- time out for the entire duration of Stage 4 (5-15 min on a
+  typical bulletin). The frontend's V2StagePill polls every 2 s;
+  every poll fails; React keeps showing whatever ``current_stage``
+  was set on first mount (typically ``stage_0_ingest`` = "Stage 1 of
+  7: Ingesting video"). User-visible effect: **the pipeline appears
+  frozen on Stage 1 for the entire run**, even though the backend
+  is rendering correctly and produces the expected output.
+- **Confirmed via**: ffmpeg pid 19756 had ParentProcessId = 20868
+  (the uvicorn worker). ``/api/jobs/36/status/`` requests timed
+  out via curl + Invoke-WebRequest while ffmpeg was running. Output
+  dir (``output/full_video_shorts_v2/job_36/``) showed Stage 4
+  artifacts being produced in real time -- shorts at 11:21,
+  bulletin.mp4 at 11:29 -- confirming the orchestrator was past
+  Stage 1 by minute 11.
+- **Immediate config mitigation (LANDED in start_all.ps1)**:
+  ``uvicorn ... --workers 4``. With 4 workers, even when Stage 4 is
+  consuming one of them, the other three keep ``/api/jobs/*/status``
+  + Inngest's ``POST /api/inngest`` invocation endpoint responsive.
+  This restores the live stage pill. Verified empirically by the
+  next V2 job after restart (item 88 follow-up).
+- **Trade-offs of the config mitigation**:
+  - Memory: 4 × uvicorn workers means 4 × Python interpreter +
+    Pydantic models + SQLAlchemy session pool. On the office
+    machine (32 GB RAM) negligible (~300 MB total).
+  - SQLite locking: the V1 dev DB is SQLite-by-default;
+    concurrent writes from 4 workers could trigger SQLITE_BUSY.
+    Postgres (production) is unaffected.
+  - V2 idempotency: Inngest's ``Event.id`` keying is per-event,
+    not per-worker. Multiple workers picking up step invocations
+    is the expected design and works correctly.
+  - Inngest serve mount: registers once per worker. The dev
+    server identifies apps by URL not by process; multiple
+    workers all advertising the same ``/api/inngest`` is the
+    documented pattern.
+- **Real production fix (RECOMMENDED, pending operator approval)**:
+  wrap Stage 4's ffmpeg invocations in ``await asyncio.to_thread(
+  subprocess.run, ...)`` so the asyncio event loop stays
+  responsive while ffmpeg runs. Touches ~3 call sites in
+  ``pipeline_v2/pipeline_v2/stages/stage_4_render.py``. Once
+  applied, ``--workers 1`` is sufficient again. The same fix should
+  be applied to any V2 step that shells out to a long-running
+  subprocess (Stage 0 ingest's NVENC transcode is the other
+  candidate).
+- **Alternative architectural fix (bigger lift)**: move the V2
+  worker out of the uvicorn process entirely -- a separate Python
+  process running an Inngest worker that owns ``process_video_v2``,
+  while uvicorn only handles HTTP. Cleanest separation but ~1 day
+  of work. Defer past initial Beta.
+- **Why it didn't surface in Step 12 testing**: the e2e tests
+  call the orchestrator directly (not via uvicorn) or use a
+  TestClient that runs sync. Neither path exercises the
+  ``uvicorn-worker-blocked-by-step`` race. **Add a regression
+  test**: start a real uvicorn worker, fire a V2 event, poll
+  ``/api/jobs/{id}/status/`` during Stage 4 -- assert the request
+  doesn't time out. Belongs in
+  ``pipeline_v2/tests/test_e2e_v2_pipeline.py``.
+
+### Item 89: Windows asyncio loop + StepError unpacking + on_failure (FIXED)
+
+- **Surfaced**: 2026-05-20 during the first live V2 office-LAN
+  submission (job 37, ``test.mp4``).
+- **Symptom**: Stage 0 retried 3 times then died with
+  ``NotImplementedError`` from ``asyncio.create_subprocess_exec``.
+  Job.error was empty. Job.status stayed at ``running``/``done``
+  instead of ``failed``. UI log panel showed
+  ``PIPELINE FAILED: StepError:`` with nothing after the colon.
+- **Three intertwined causes**:
+  1. ``uvicorn --workers 4`` on Windows runs each child on
+     ``SelectorEventLoop``, which does not implement
+     ``subprocess_exec`` -- Stage 0's first ffmpeg call crashes
+     with ``NotImplementedError`` from
+     ``loop._make_subprocess_transport``. I introduced this when I
+     bumped ``--workers`` from 1 to 4 to fix item 88's UI-blocking
+     issue. Reverted to ``--workers 1`` in
+     ``kaizer/scripts/start_all.ps1`` because Stage 4's
+     ``asyncio.to_thread`` wrap (item 88) already keeps the API
+     responsive on a single worker.
+  2. Inngest SDK 0.5.x's ``StepError`` wrapper has
+     ``__str__`` == ``self._message``, which is ``""`` when the
+     underlying userland error (e.g. ``NotImplementedError()``)
+     has no message. ``Job.error`` ended up blank because
+     ``str(exc)`` returned ``""``. Fix: new
+     ``_format_error_text(exc)`` helper detects StepError and
+     unpacks ``.name`` / ``.message`` / ``.stack`` for a
+     meaningful Job.error string.
+  3. The orchestrator's ``except Exception`` terminal-failure
+     catch is bypassed on every retry-cycle invocation because
+     the SDK's flow-control sentinels are BaseException
+     subclasses (intentional -- see item 74). Only the FINAL
+     retry-exhausted attempt surfaces a regular Exception. If
+     that final attempt is interrupted (worker crash, DB lock,
+     concurrent re-entry), ``_mark_job_failed`` never runs and
+     Job.status stays whatever it was. Fix: add Inngest's
+     ``on_failure=_on_v2_failure`` parameter to
+     ``@create_function``. Inngest invokes this hook as a
+     SEPARATE function after the main function terminates,
+     passing an ``inngest/function.failed`` event with the
+     original event data + structured error dict. The hook
+     unpacks ``job_id`` from the original event and writes
+     ``status='failed'`` + meaningful ``Job.error``
+     unconditionally. This is the canonical
+     "guaranteed-to-fire" terminal-failure path.
+- **Belt-and-suspenders** in ``main.py``: explicit
+  ``asyncio.set_event_loop_policy(WindowsProactorEventLoopPolicy())``
+  at the top of the module so even if uvicorn or some dep tries to
+  pin Selector, we override.
+- **Regression tests** in
+  ``pipeline_v2/tests/test_orchestrator.py``:
+  - ``TestWindowsProactorEventLoopPolicy::test_main_module_pins_proactor_policy_on_windows``
+    -- imports main.py, asserts the policy is Proactor. Skip on Linux.
+  - ``TestWindowsProactorEventLoopPolicy::test_create_subprocess_exec_works_with_proactor_loop``
+    -- empirical: spawns ``cmd.exe /c exit 0`` via
+    ``asyncio.create_subprocess_exec``. Catches a future regression
+    where someone unpins the policy. Skip on Linux.
+  - ``TestStepErrorUnpacking::test_stepError_with_empty_message_still_yields_useful_text``
+    -- the exact job-37 case (empty message); error text starts
+    with the underlying error's name.
+  - ``TestStepErrorUnpacking::test_stepError_with_nonempty_message``
+    -- happy path.
+  - ``TestStepErrorUnpacking::test_regular_exception_unaffected``
+    -- non-StepError exceptions get traceback-format like before.
+  - ``TestOnFailureHook::test_create_function_has_on_failure_set``
+    -- asserts ``process_video_v2._on_failure_fn_id`` is the
+    expected ``kaizer-v2-process-video-v2-failure`` (Inngest stores
+    on_failure as a sub-function with this naming convention).
+  - ``TestOnFailureHook::test_mark_job_failed_from_event_writes_failed_status``
+    -- direct unit test of the on_failure DB write path.

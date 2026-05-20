@@ -4,8 +4,21 @@ import time
 import shutil
 import mimetypes
 import asyncio
+import sys
 from pathlib import Path
 from typing import Optional
+
+# Windows asyncio subprocess support requires ProactorEventLoop.
+# uvicorn (>= 0.18) sets SelectorEventLoop on Windows when running with
+# --workers > 1 (or even single-worker in some configurations), which
+# does NOT implement subprocess_exec -- ``run_ffmpeg`` dies with
+# ``NotImplementedError`` inside Stage 0's first transcode call.
+# Force the policy explicitly BEFORE any code touches asyncio. Safe
+# no-op on Linux (the attribute only exists on Windows builds).
+if sys.platform == "win32" and hasattr(
+    asyncio, "WindowsProactorEventLoopPolicy"
+):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware

@@ -1364,6 +1364,7 @@ class Stage4Render:
         channel_name: str = "KAIZER NEWS",
         logo_path: Optional[str] = None,
         cancel_check: Optional[callable] = None,
+        progress_cb: Optional[callable] = None,
     ) -> RenderResult:
         """End-to-end Stage 4: shorts pass + bulletin pass.
 
@@ -1417,6 +1418,7 @@ class Stage4Render:
                 channel_name=channel_name,
                 logo_path=logo_path,
                 cancel_check=cancel_check,
+                progress_cb=progress_cb,
             )
         except PermanentRenderError:
             raise   # already classified; don't re-classify
@@ -1434,6 +1436,7 @@ class Stage4Render:
         channel_name: str = "KAIZER NEWS",
         logo_path: Optional[str] = None,
         cancel_check: Optional[callable] = None,
+        progress_cb: Optional[callable] = None,
     ) -> RenderResult:
         """Internal: the real render() body. Wrapped by render()'s
         try/except to convert known-permanent failures into
@@ -1457,23 +1460,41 @@ class Stage4Render:
         bulletin_result: Optional[dict] = None
         bulletin_editor_meta_path: Optional[str] = None
 
+        # Tiny helper: invoke progress_cb defensively (callback errors
+        # MUST NOT take down a render). Backlog item 88.
+        def _p(msg: str) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(msg)
+                except Exception as exc:
+                    logger.warning(
+                        "stage_4 progress_cb raised (ignored): %s", exc,
+                    )
+
         # ---- 1. SHORTS pass ------------------------------------------
         if shorts_cuts:
             if cancel_check is not None:
                 cancel_check()
+            _p(f"Stage 5/7 cutting {len(shorts_cuts)} raw shorts segments")
             shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata)
+            _p(f"Stage 5/7 raw shorts cut ({len(shorts_clips)} clips on disk)")
             if cancel_check is not None:
                 cancel_check()
+            entity_count = len(entities)
+            _p(f"Stage 6/7 sourcing images for {entity_count} entities")
             resolved_shorts = self.resolve_images(
                 image_plan, entities,
                 kept_clip_dicts=shorts_clips,
                 full_metadata=metadata,
             )
+            _p(f"Stage 6/7 images resolved")
             if cancel_check is not None:
                 cancel_check()
+            _p(f"Stage 6/7 composing {len(shorts_clips)} shorts with overlays")
             composed_shorts = self.compose_shorts(
                 shorts_clips, metadata, resolved_shorts,
             )
+            _p(f"Stage 6/7 shorts composed ({len(composed_shorts)} produced)")
 
             # Build ClipRenderArtifacts list (one per produced short).
             # composed_shorts has clip_path / thumb_path / image_path
@@ -1541,6 +1562,10 @@ class Stage4Render:
         if full_video_cuts:
             if cancel_check is not None:
                 cancel_check()
+            _p(
+                f"Stage 6/7 rendering bulletin "
+                f"({len(full_video_cuts)} story segments)"
+            )
             bulletin_result = self.render_bulletin(
                 full_video_cuts=full_video_cuts,
                 metadata=metadata,
@@ -1548,6 +1573,11 @@ class Stage4Render:
                 image_plan=image_plan,
                 channel_name=channel_name,
                 logo_path=logo_path,
+            )
+            _p(
+                f"Stage 6/7 bulletin assembled "
+                f"({bulletin_result.get('duration_s', 0):.0f}s; "
+                f"applying overlays now)"
             )
 
             bulletin_artifacts = ClipRenderArtifacts(

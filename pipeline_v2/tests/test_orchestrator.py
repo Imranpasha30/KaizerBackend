@@ -1734,3 +1734,340 @@ class TestProcessVideoV2OuterExceptionPath:
         sig = inspect.signature(orchestrator._mark_job_failed)
         params = list(sig.parameters)
         assert params == ["job_id", "exc"]
+
+
+# ====================================================================== #
+# Backlog item 88: live progress UI parity with V1 (Job.log writes)      #
+# ====================================================================== #
+
+
+class TestAppendProgressLog:
+    """``_append_progress_log`` appends a single ``STEP``-prefixed line
+    to Job.log per call so the V1-style log panel surfaces V2 progress
+    live. Failure modes (DB down, no such job, etc.) are non-fatal."""
+
+    def _make_session_and_job(self):
+        """Build an isolated in-memory SQLite session + one Job row.
+        Returns (SessionLocal, job_id)."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        import models
+        from database import Base
+        engine = create_engine(
+            "sqlite:///file:kaizer_appendlog_test?mode=memory&cache=shared&uri=true",
+            future=True,
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(engine)
+        Local = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        s = Local()
+        try:
+            job = models.Job(
+                user_id=None,
+                status="running",
+                platform="full_video_shorts_v2",
+                video_name="t.mp4",
+                language="te",
+                log="",
+            )
+            s.add(job)
+            s.commit()
+            s.refresh(job)
+            return Local, job.id
+        finally:
+            s.close()
+
+    def _patch_db_session(self, monkeypatch, SessionFactory):
+        """Make orchestrator._open_db_session() return the test factory's
+        session so _append_progress_log writes hit our in-memory DB."""
+        monkeypatch.setattr(
+            orchestrator, "_open_db_session", lambda: SessionFactory(),
+        )
+
+    def test_appends_step_line_with_timestamp(self, monkeypatch):
+        S, job_id = self._make_session_and_job()
+        self._patch_db_session(monkeypatch, S)
+        # Clear the per-job clock so elapsed starts at 0.
+        orchestrator._PROGRESS_START_TS.pop(job_id, None)
+        orchestrator._append_progress_log(job_id, "Stage 0/7 ingest started")
+        s = S()
+        try:
+            import models
+            j = s.query(models.Job).filter(models.Job.id == job_id).first()
+            assert "STEP" in j.log
+            assert "Stage 0/7 ingest started" in j.log
+            # [HH:MM:SS] timestamp prefix
+            assert j.log.startswith("[")
+        finally:
+            s.close()
+
+    def test_two_calls_produce_two_lines(self, monkeypatch):
+        S, job_id = self._make_session_and_job()
+        self._patch_db_session(monkeypatch, S)
+        orchestrator._PROGRESS_START_TS.pop(job_id, None)
+        orchestrator._append_progress_log(job_id, "first")
+        orchestrator._append_progress_log(job_id, "second")
+        s = S()
+        try:
+            import models
+            j = s.query(models.Job).filter(models.Job.id == job_id).first()
+            lines = [ln for ln in (j.log or "").splitlines() if ln.strip()]
+            assert len(lines) == 2
+            assert "first" in lines[0]
+            assert "second" in lines[1]
+        finally:
+            s.close()
+
+    def test_nonexistent_job_is_noop(self, monkeypatch):
+        S, _ = self._make_session_and_job()
+        self._patch_db_session(monkeypatch, S)
+        # Should not raise -- silently no-ops when the job row is missing.
+        orchestrator._append_progress_log(9999, "no such job")
+
+    def test_zero_or_negative_job_id_short_circuits(self):
+        # Should not even open a DB session; we'd notice if it tried to.
+        orchestrator._append_progress_log(0, "noop")
+        orchestrator._append_progress_log(-1, "noop")
+        orchestrator._append_progress_log(None, "noop")
+
+    def test_log_capped_at_max_bytes(self, monkeypatch):
+        S, job_id = self._make_session_and_job()
+        self._patch_db_session(monkeypatch, S)
+        orchestrator._PROGRESS_START_TS.pop(job_id, None)
+        # Write enough lines to bust the cap. _MAX_LOG_BYTES = 50 KB;
+        # each line ~70 bytes -> ~720 lines to overflow once.
+        for i in range(900):
+            orchestrator._append_progress_log(job_id, f"line {i}")
+        s = S()
+        try:
+            import models
+            j = s.query(models.Job).filter(models.Job.id == job_id).first()
+            assert len(j.log.encode("utf-8")) <= orchestrator._MAX_LOG_BYTES, (
+                f"log grew to {len(j.log)} bytes, cap is "
+                f"{orchestrator._MAX_LOG_BYTES}"
+            )
+            # And the MOST RECENT line should still be present after the
+            # truncation (we keep the tail, not the head).
+            assert "line 899" in j.log
+        finally:
+            s.close()
+
+    def test_db_write_failure_is_swallowed(self, monkeypatch):
+        # If the DB session blows up, _append_progress_log must NOT raise --
+        # progress writes are UX, not data integrity.
+        def boom():
+            raise RuntimeError("simulated DB outage")
+        monkeypatch.setattr(orchestrator, "_open_db_session", boom)
+        # Should not raise.
+        orchestrator._append_progress_log(1, "should be swallowed")
+
+
+class TestStage4RenderProgressCb:
+    """Stage4Render.render() and ._render_impl() must accept a
+    progress_cb callable so the orchestrator can wire live updates
+    into Job.log during the long Stage 4 render. The callable is
+    invoked at sub-phase boundaries. Per backlog item 88."""
+
+    def test_render_signature_accepts_progress_cb(self):
+        import inspect
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        sig = inspect.signature(Stage4Render.render)
+        assert "progress_cb" in sig.parameters
+        # Default None so existing call sites (V1 unit tests) keep working.
+        assert sig.parameters["progress_cb"].default is None
+
+    def test_render_impl_signature_accepts_progress_cb(self):
+        import inspect
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        sig = inspect.signature(Stage4Render._render_impl)
+        assert "progress_cb" in sig.parameters
+        assert sig.parameters["progress_cb"].default is None
+
+
+# ====================================================================== #
+# Backlog item 89: Windows asyncio Proactor policy regression guard      #
+# + StepError-aware error unpacking + on_failure hook                    #
+# ====================================================================== #
+
+
+class TestWindowsProactorEventLoopPolicy:
+    """Stage 0's ``run_stage_0`` calls ``asyncio.create_subprocess_exec``
+    which on Windows REQUIRES ``ProactorEventLoop``. ``SelectorEventLoop``
+    raises ``NotImplementedError`` from ``_make_subprocess_transport``,
+    which historically (job 37, 2026-05-20) cascaded into an
+    Inngest-StepError-with-empty-message + Job.error blank +
+    Job.status not flipping to 'failed'. Backlog item 89.
+
+    These tests are Windows-only; on Linux/macOS the policy class
+    doesn't exist and the underlying ``asyncio`` already supports
+    subprocess regardless of loop type, so we skip cleanly."""
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only asyncio policy regression guard",
+    )
+    def test_main_module_pins_proactor_policy_on_windows(self):
+        """``main.py`` MUST set ``WindowsProactorEventLoopPolicy`` at
+        import time BEFORE any code touches asyncio. Without this, a
+        uvicorn worker spun up on Windows would fall back to
+        SelectorEventLoop and Stage 0's first ffmpeg call would crash
+        with ``NotImplementedError``."""
+        import asyncio
+        import importlib
+        # Importing main is heavy; only do it once per process.
+        if "main" not in sys.modules:
+            importlib.import_module("main")
+        policy = asyncio.get_event_loop_policy()
+        assert type(policy).__name__ == "WindowsProactorEventLoopPolicy", (
+            f"Expected WindowsProactorEventLoopPolicy after main.py "
+            f"import; got {type(policy).__name__}. Without this, "
+            f"asyncio.create_subprocess_exec raises NotImplementedError "
+            f"on Windows -- Stage 0 ingest dies on the first ffmpeg call."
+        )
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only subprocess loop check",
+    )
+    def test_create_subprocess_exec_works_with_proactor_loop(self):
+        """Direct empirical guard: with the Proactor policy pinned,
+        ``asyncio.create_subprocess_exec`` actually succeeds on a
+        trivial command. Catches future regressions where someone
+        flips the policy back or a dep installs its own."""
+        import asyncio
+        # Ensure Proactor explicitly for this test (don't rely on
+        # main.py being imported first in this run).
+        asyncio.set_event_loop_policy(
+            asyncio.WindowsProactorEventLoopPolicy()
+        )
+
+        async def _spawn():
+            proc = await asyncio.create_subprocess_exec(
+                "cmd.exe", "/c", "exit", "0",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return await proc.wait()
+
+        loop = asyncio.new_event_loop()
+        try:
+            rc = loop.run_until_complete(_spawn())
+        finally:
+            loop.close()
+        assert rc == 0, (
+            f"create_subprocess_exec exit code != 0 (got {rc}). If a "
+            f"NotImplementedError landed here instead, the loop is "
+            f"Selector, not Proactor -- Stage 0 will crash with the "
+            f"same failure mode as job 37."
+        )
+
+
+class TestStepErrorUnpacking:
+    """``_format_error_text`` must surface a meaningful Job.error
+    string even when the failure is wrapped in Inngest's StepError
+    with empty ``__str__``. Backlog item 89."""
+
+    def test_stepError_with_empty_message_still_yields_useful_text(self):
+        from inngest import StepError
+        # Simulates the job-37 case: NotImplementedError() with no msg,
+        # wrapped by SDK into StepError(message="", name="NotImplementedError").
+        exc = StepError(message="", name="NotImplementedError", stack="<tb>")
+        text = orchestrator._format_error_text(exc)
+        # Useful prefix uses .name not type(exc).__name__
+        assert text.startswith("NotImplementedError:"), (
+            f"_format_error_text should surface StepError.name, got "
+            f"first line: {text.splitlines()[0]!r}"
+        )
+        # Stack is included
+        assert "<tb>" in text
+
+    def test_stepError_with_nonempty_message(self):
+        from inngest import StepError
+        exc = StepError(
+            message="permanent: empty_file",
+            name="PermanentSTTError",
+            stack="trace",
+        )
+        text = orchestrator._format_error_text(exc)
+        assert "PermanentSTTError: permanent: empty_file" in text
+
+    def test_regular_exception_unaffected(self):
+        try:
+            raise ValueError("regular py error")
+        except ValueError as e:
+            text = orchestrator._format_error_text(e)
+        assert text.startswith("ValueError: regular py error")
+        # Includes traceback for normal exceptions
+        assert "Traceback" in text or "raise" in text
+
+
+class TestOnFailureHook:
+    """The ``on_failure`` decorator parameter is wired to
+    ``_on_v2_failure`` so terminal failures ALWAYS flip
+    Job.status='failed' even when the main function body's
+    ``except Exception`` catch doesn't fire. Backlog item 89."""
+
+    def test_create_function_has_on_failure_set(self):
+        """The decorator MUST pass ``on_failure=_on_v2_failure``
+        otherwise the safety net is disabled.
+
+        Inngest 0.5.18 stores the failure handler as a SEPARATE
+        sub-function whose id is exposed via ``_on_failure_fn_id``.
+        When ``on_failure=None`` the attribute is ``None``; when set,
+        it's ``"<parent_fn_id>-failure"``."""
+        from pipeline_v2.orchestrator import process_video_v2
+        fn_id = getattr(process_video_v2, "_on_failure_fn_id", None)
+        assert fn_id == "kaizer-v2-process-video-v2-failure", (
+            f"expected on_failure handler registered as "
+            f"'kaizer-v2-process-video-v2-failure'; got {fn_id!r}. "
+            f"Without this, the Job.status='failed' safety net is "
+            f"disabled (backlog item 89)."
+        )
+
+    def test_mark_job_failed_from_event_writes_failed_status(self, monkeypatch):
+        """Direct unit test of the on_failure code path: given a
+        failure event payload, it must UPDATE Job.status='failed' +
+        Job.error=<unpacked> + finished_at + current_stage=None."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        import models
+        from database import Base
+        engine = create_engine(
+            "sqlite:///file:kaizer_onfailure_test?mode=memory&cache=shared&uri=true",
+            future=True,
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(engine)
+        Local = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        s = Local()
+        try:
+            j = models.Job(
+                status="running",
+                platform="full_video_shorts_v2",
+                video_name="t.mp4",
+                language="te",
+                current_stage="stage_0_ingest",
+            )
+            s.add(j); s.commit(); s.refresh(j)
+            job_id = j.id
+        finally:
+            s.close()
+
+        monkeypatch.setattr(
+            orchestrator, "_open_db_session", lambda: Local(),
+        )
+        orchestrator._mark_job_failed_from_event(
+            job_id,
+            {"name": "NotImplementedError", "message": "", "stack": "<tb>"},
+        )
+        s = Local()
+        try:
+            j = s.query(models.Job).filter(models.Job.id == job_id).first()
+            assert j.status == "failed", (
+                f"expected status='failed', got {j.status!r}"
+            )
+            assert "NotImplementedError" in (j.error or "")
+            assert j.current_stage is None
+            assert j.finished_at is not None
+        finally:
+            s.close()

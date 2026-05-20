@@ -191,6 +191,64 @@ def _write_current_stage(job_id: int, stage_name: str) -> None:
         )
 
 
+# Per-job in-memory clock so progress lines can show elapsed-since-start.
+# Survives only within one worker process; on Inngest retry the elapsed
+# resets, which is fine -- the UI already shows wall-clock from Job.started_at.
+_PROGRESS_START_TS: dict[int, float] = {}
+
+# Hard cap on Job.log size for V2 jobs so a runaway loop can't fill
+# the disk. ~50 KB = ~500 progress lines; well past any healthy run.
+_MAX_LOG_BYTES = 50 * 1024
+
+
+def _append_progress_log(job_id: int, message: str) -> None:
+    """Append one progress line to ``Job.log`` so the V1-style UI log
+    panel surfaces V2 progress in real time. Backlog item 88 (live
+    progress UI parity with V1).
+
+    Format mirrors V1's pipeline output: ``[HH:MM:SS] STEP: <text>``
+    so the existing ``_estimate_progress`` heuristic (counts ``STEP``
+    markers) gives V2 jobs a non-zero progress bar too. Write is
+    synchronous fire-and-forget; failures log a warning and continue
+    (this is UX, not data integrity). Caps the log at ``_MAX_LOG_BYTES``
+    to prevent runaway growth on retry storms.
+    """
+    if job_id is None or job_id <= 0:
+        return
+    try:
+        from datetime import datetime
+        from models import Job
+        session = _open_db_session()
+        try:
+            job = session.query(Job).filter(Job.id == job_id).first()
+            if job is None:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            # Show elapsed-since-handler-start in seconds so the
+            # operator sees "Stage 4 started 240s ago" without
+            # mental math.
+            import time as _time
+            start = _PROGRESS_START_TS.setdefault(job_id, _time.time())
+            elapsed_s = int(_time.time() - start)
+            line = f"[{ts}] STEP (+{elapsed_s}s): {message}\n"
+            existing = job.log or ""
+            new_log = existing + line
+            if len(new_log) > _MAX_LOG_BYTES:
+                # Drop the oldest ~1/3 so we keep the recent half +
+                # don't blow the cap. Cheap O(N) slice; runs at most
+                # once per ~500 progress lines.
+                new_log = new_log[-int(_MAX_LOG_BYTES * 2 // 3):]
+            job.log = new_log
+            session.commit()
+        finally:
+            session.close()
+    except Exception as exc:
+        logger.warning(
+            "_append_progress_log failed for job %s (continuing): %s",
+            job_id, exc,
+        )
+
+
 def _envelope_init(event_data: dict) -> dict:
     """Build the initial step envelope from incoming Inngest event data.
 
@@ -251,6 +309,7 @@ async def _stage_0_ingest_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_0_INGEST)
+    _append_progress_log(job_id, "Stage 0/7 ingest started (ffprobe + NVENC mezzanine)")
 
     video_path = envelope["video_path"]
     out_dir = envelope.get("out_dir") or ""
@@ -268,6 +327,10 @@ async def _stage_0_ingest_handler(envelope: dict) -> dict:
     envelope["stage_0"] = stage_0.model_dump()
     # Stage 0 has no LLM cost; ffmpeg/ffprobe is free compute.
     envelope["stage_costs"][STAGE_0_INGEST] = 0.0
+    _append_progress_log(
+        job_id,
+        f"Stage 0/7 ingest done (mezzanine + audio extracted)",
+    )
     return envelope
 
 
@@ -290,6 +353,9 @@ async def _stage_1_transcribe_handler(envelope: dict) -> dict:
     provider = os.environ.get(
         "KAIZER_STT_PROVIDER", DEFAULT_STT_PROVIDER,
     ).strip() or DEFAULT_STT_PROVIDER
+    _append_progress_log(
+        job_id, f"Stage 1/7 transcription started ({provider})",
+    )
 
     try:
         stage_1: Stage1Output = await run_stage_1(
@@ -305,10 +371,16 @@ async def _stage_1_transcribe_handler(envelope: dict) -> dict:
         logger.warning(
             "stage_1: PermanentSTTError (no Inngest retry): %s", exc,
         )
+        _append_progress_log(job_id, f"Stage 1/7 FAILED (permanent): {exc}")
         raise NonRetriableError(f"permanent: {exc}") from exc
 
     envelope["stage_1"] = stage_1.model_dump()
     envelope["stage_costs"][STAGE_1_TRANSCRIBE] = float(stage_1.stt_cost_usd)
+    word_count = len(getattr(stage_1, "words", None) or [])
+    _append_progress_log(
+        job_id,
+        f"Stage 1/7 done ({word_count} words, ${stage_1.stt_cost_usd:.4f})",
+    )
     return envelope
 
 
@@ -322,6 +394,9 @@ async def _stage_2_continuity_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_2_CONTINUITY)
+    _append_progress_log(
+        job_id, "Stage 2/7 continuity editor started (Gemini 2.5 Pro)",
+    )
 
     stage_1 = Stage1Output.model_validate(envelope["stage_1"])
     editor = Stage2ContinuityEditor()
@@ -333,6 +408,12 @@ async def _stage_2_continuity_handler(envelope: dict) -> dict:
     # response only if available. For Beta we log $0.0 here; Step 12
     # can plumb usage_metadata through Stage 2's return.
     envelope["stage_costs"][STAGE_2_CONTINUITY] = 0.0
+    cuts_n = len(getattr(full, "full_video_cuts", None) or [])
+    skip_n = len(getattr(decisions, "skipped_segments", None) or [])
+    _append_progress_log(
+        job_id,
+        f"Stage 2/7 done ({cuts_n} cuts, {skip_n} skipped segments)",
+    )
     return envelope
 
 
@@ -345,6 +426,9 @@ async def _stage_2_5_entities_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_2_5_ENTITIES)
+    _append_progress_log(
+        job_id, "Stage 3/7 entity canonicalization started (Gemini Flash)",
+    )
 
     stage_2 = StageTwoOutput.model_validate(envelope["stage_2"])
     canonicalizer = Stage2_5EntityCanonicalizer()
@@ -354,6 +438,10 @@ async def _stage_2_5_entities_handler(envelope: dict) -> dict:
 
     envelope["stage_2_5"] = stage_2_5.model_dump()
     envelope["stage_costs"][STAGE_2_5_ENTITIES] = 0.0
+    ent_n = len(getattr(stage_2_5, "entities", None) or [])
+    _append_progress_log(
+        job_id, f"Stage 3/7 done ({ent_n} canonical entities)",
+    )
     return envelope
 
 
@@ -369,6 +457,11 @@ async def _stage_3_fanout_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_3_FANOUT)
+    _append_progress_log(
+        job_id,
+        "Stage 4/7 parallel fan-out started "
+        "(shorts + metadata + image plan via Gemini Flash)",
+    )
 
     stage_2 = StageTwoOutput.model_validate(envelope["stage_2"])
     stage_2_5 = Stage2_5Output.model_validate(envelope["stage_2_5"])
@@ -390,6 +483,13 @@ async def _stage_3_fanout_handler(envelope: dict) -> dict:
     }
     # Gemini cost accounting deferred to Step 12.5; log 0.0 for Beta.
     envelope["stage_costs"][STAGE_3_FANOUT] = 0.0
+    shorts_n = len(result.shorts_cuts)
+    img_n = len(getattr(result.image_plan, "entries", None) or [])
+    _append_progress_log(
+        job_id,
+        f"Stage 4/7 done ({shorts_n} shorts planned, "
+        f"{img_n} image-plan entries, metadata ready)",
+    )
     return envelope
 
 
@@ -507,6 +607,11 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_4_RENDER)
+    _append_progress_log(
+        job_id,
+        "Stage 5/7 raw shorts cut + Stage 6/7 render started "
+        "(this is the longest stage; expect 5-15 min on long bulletins)",
+    )
 
     # Reconstruct JobOutput from the per-stage envelope dicts. The
     # Stage 4 render() takes a JobOutput at its public surface.
@@ -562,13 +667,39 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
         def _stage_4_cancel_check() -> None:
             _check_cancelled(job_id)
 
-        result: RenderResult = renderer.render(
-            job_output, timestamp=timestamp,
+        # Progress callback (item 88): Stage4Render.render() invokes
+        # this at every sub-phase boundary so the UI log panel sees
+        # cut/compose/bulletin progression in real time.
+        def _stage_4_progress(msg: str) -> None:
+            _append_progress_log(job_id, msg)
+
+        # asyncio.to_thread (item 88 production fix): Stage4Render.render()
+        # invokes ffmpeg via blocking subprocess.run all the way down.
+        # On Windows uvicorn's --workers flag is a no-op (no fork()), so
+        # a single worker process holds the asyncio event loop hostage
+        # for the entire 5-15 min render -- /api/jobs/N/status polls
+        # time out, /api/inngest invocations queue, the UI freezes.
+        # Off-thread it: the event loop stays free, the SDK keeps
+        # servicing inbound POST /api/inngest from inngest dev, and the
+        # frontend's 2s status poll sees live current_stage + Job.log
+        # updates throughout the render. progress_cb + cancel_check
+        # are both called from the worker thread; both helpers open
+        # fresh SessionLocal()s per call so SQLAlchemy thread-safety
+        # is satisfied.
+        import asyncio as _asyncio
+        result: RenderResult = await _asyncio.to_thread(
+            renderer.render,
+            job_output,
+            timestamp=timestamp,
             cancel_check=_stage_4_cancel_check,
+            progress_cb=_stage_4_progress,
         )
     except PermanentRenderError as exc:
         logger.warning(
             "stage_4: PermanentRenderError (no Inngest retry): %s", exc,
+        )
+        _append_progress_log(
+            job_id, f"Stage 5-6/7 FAILED (permanent): {exc}",
         )
         raise NonRetriableError(f"permanent render: {exc}") from exc
     finally:
@@ -583,6 +714,11 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
     # Stage 4 has no LLM cost; render compute is "free" in the cost
     # ledger sense (it's the cost of the worker, not API).
     envelope["stage_costs"][STAGE_4_RENDER] = 0.0
+    _append_progress_log(
+        job_id,
+        f"Stage 5-6/7 render done "
+        f"({len(result.composed_shorts)} shorts + bulletin)",
+    )
     return envelope
 
 
@@ -610,6 +746,9 @@ async def _finalize_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, FINALIZE)
+    _append_progress_log(
+        job_id, "Stage 7/7 finalize started (importing clips + cost ledger)",
+    )
 
     stage_4 = envelope.get("stage_4") or {}
     output_dir = envelope.get("out_dir", "")
@@ -704,6 +843,15 @@ async def _finalize_handler(envelope: dict) -> dict:
         job_id, stage_4.get("composed_shorts_count", 0),
         imported_clip_count, total_cost,
     )
+    _append_progress_log(
+        job_id,
+        f"Stage 7/7 finalize done -- pipeline complete "
+        f"({imported_clip_count} clips, ${total_cost:.2f})",
+    )
+    # Drop the per-job clock so a future re-submission with the same
+    # job_id starts fresh (not strictly needed because job_ids are
+    # monotonic, but harmless and tidies up memory).
+    _PROGRESS_START_TS.pop(job_id, None)
     return envelope
 
 
@@ -717,10 +865,71 @@ async def _finalize_handler(envelope: dict) -> dict:
 _inngest = get_client()
 
 
+async def _on_v2_failure(ctx: Context) -> None:
+    """Inngest ``on_failure`` hook (backlog item 89).
+
+    Fires after ``process_video_v2`` exhausts all retries. This is the
+    canonical place to flip ``Job.status='failed'`` because:
+
+      1. The SDK's flow-control BaseException sentinels exit the main
+         function body cleanly on retry without my ``except Exception``
+         block ever firing -- so the main body's terminal-failure path
+         is unreliable on Windows + Selector-loop NotImplementedError-
+         style failures (the case that surfaced job 37's empty
+         ``Job.error`` + lingering ``status='running'``).
+      2. ``on_failure`` runs as a SEPARATE Inngest invocation AFTER
+         the main function has terminated. Inngest passes the
+         ``inngest/function.failed`` event whose data carries the
+         original triggering event + a structured error dict.
+
+    Defensive: swallows ALL exceptions (we are the LAST line of
+    defense; if THIS fails the user will see status='running' forever,
+    but at least the worker doesn't crash and other jobs continue).
+    """
+    try:
+        evt = getattr(ctx, "event", None)
+        if evt is None:
+            return
+        data = getattr(evt, "data", None) or {}
+        # Inngest's failure event nests the original event under "event"
+        # and the error under "error". Both fields are dicts.
+        orig_event = data.get("event") or {}
+        orig_data = (orig_event.get("data") if isinstance(orig_event, dict) else {}) or {}
+        job_id = orig_data.get("job_id")
+        # Fall back to top-level data["job_id"] if the failure event
+        # shape is flat (some SDK versions don't nest).
+        if job_id is None:
+            job_id = data.get("job_id")
+        if job_id is None:
+            logger.warning(
+                "_on_v2_failure: could not extract job_id from event data; "
+                "keys=%s",
+                list(data.keys())[:10] if isinstance(data, dict) else None,
+            )
+            return
+        error_dict = data.get("error") or {}
+        # Also surface in the progress log so the user sees a clear
+        # terminal line in the UI panel.
+        _append_progress_log(
+            int(job_id),
+            f"PIPELINE FAILED: "
+            f"{(error_dict.get('name') if isinstance(error_dict, dict) else None) or 'Error'}"
+            f": "
+            f"{(error_dict.get('message') if isinstance(error_dict, dict) else None) or '(no message)'}",
+        )
+        _mark_job_failed_from_event(int(job_id), error_dict)
+    except Exception as exc:
+        logger.error(
+            "_on_v2_failure last-resort hook crashed (Job.status may not "
+            "flip to failed): %s", exc,
+        )
+
+
 @_inngest.create_function(
     fn_id="process-video-v2",
     trigger=TriggerEvent(event="video/v2/uploaded"),
     retries=2,
+    on_failure=_on_v2_failure,
 )
 async def process_video_v2(ctx: Context) -> dict:
     """Top-level orchestrator: 7 sequential Inngest steps.
@@ -810,6 +1019,9 @@ async def process_video_v2(ctx: Context) -> dict:
     except Exception as exc:
         # Terminal failure path. Write Job.status='failed' + Job.error
         # then RE-RAISE so Inngest's retry policy + UI see the failure.
+        _append_progress_log(
+            job_id, f"PIPELINE FAILED: {type(exc).__name__}: {exc}",
+        )
         _mark_job_failed(job_id, exc)
         raise
 
@@ -819,15 +1031,55 @@ async def process_video_v2(ctx: Context) -> dict:
     return envelope
 
 
+def _format_error_text(exc: BaseException) -> str:
+    """Build the Job.error text for a terminal-failure exception.
+
+    Inngest's ``StepError`` is a userland-error WRAPPER -- its public
+    ``__str__`` returns just ``.message`` which the original exception
+    may have left empty (e.g. ``NotImplementedError()`` from
+    asyncio on Windows + Selector loop). The ``.name`` + ``.stack``
+    properties carry the useful diagnostic info. Unpack them when
+    present; fall back to the regular format otherwise. Capped at
+    4 KB so the TEXT column stays sane.
+    """
+    import traceback
+    max_total = 4000
+    # Inngest StepError -- pull richer fields
+    if (type(exc).__module__.startswith("inngest")
+            and type(exc).__name__ in {"StepError", "Error"}):
+        name = getattr(exc, "name", None) or "UnknownStepError"
+        msg = getattr(exc, "message", None)
+        if msg is None:
+            msg = str(exc)
+        stack = getattr(exc, "stack", None) or ""
+        prefix = f"{name}: {msg}\n"
+        tb = stack
+    else:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        prefix = f"{type(exc).__name__}: {exc}\n"
+    if len(prefix) + len(tb) > max_total:
+        allowed_tb = max_total - len(prefix) - len("... [truncated]\n")
+        if allowed_tb > 0:
+            tb = "... [truncated]\n" + tb[-allowed_tb:]
+        else:
+            tb = ""
+    return (prefix + tb)[:max_total]
+
+
 def _mark_job_failed(job_id: int, exc: BaseException) -> None:
     """Per D-10.15: synchronous DB write on terminal failure.
 
-    Truncates the traceback to a fixed budget (4KB) so it fits in
-    ``Job.error`` (TEXT column; reasonable bound). Sets:
+    Sets:
       ``Job.status = 'failed'``
       ``Job.error  = "<exc_class>: <message>\\n<traceback truncated>"``
       ``Job.finished_at = now()``
       ``Job.current_stage = None``    (clear progress on failure too)
+
+    For ``inngest.StepError`` (the SDK's retry-exhausted wrapper), the
+    helper unpacks the underlying userland error's ``name`` /
+    ``message`` / ``stack`` so the user-facing ``Job.error`` is
+    meaningful instead of an empty ``StepError:`` line. See backlog
+    item 89.
 
     Best-effort: DB write failures here log a warning and continue
     (re-raise above takes care of Inngest's path).
@@ -835,22 +1087,9 @@ def _mark_job_failed(job_id: int, exc: BaseException) -> None:
     if job_id is None or job_id <= 0:
         return
     try:
-        import traceback
         from datetime import datetime, timezone
         from models import Job
-        # Build the error text. Reserve last 4KB.
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        prefix = f"{type(exc).__name__}: {exc}\n"
-        # Truncate from the BEGINNING of the traceback (the deepest
-        # frame is most useful for debugging).
-        max_total = 4000
-        if len(prefix) + len(tb) > max_total:
-            allowed_tb = max_total - len(prefix) - len("... [truncated]\n")
-            if allowed_tb > 0:
-                tb = "... [truncated]\n" + tb[-allowed_tb:]
-            else:
-                tb = ""
-        error_text = (prefix + tb)[:max_total]
+        error_text = _format_error_text(exc)
 
         session = _open_db_session()
         try:
@@ -875,4 +1114,50 @@ def _mark_job_failed(job_id: int, exc: BaseException) -> None:
             "_mark_job_failed: DB write failed for job %s (non-fatal "
             "-- Inngest will still surface the original failure): %s",
             job_id, db_exc,
+        )
+
+
+def _mark_job_failed_from_event(job_id: int, error_dict: dict) -> None:
+    """Inngest ``on_failure`` hook variant: takes the failure payload
+    Inngest's ``inngest/function.failed`` event carries (a dict with
+    ``name`` / ``message`` / ``stack``) instead of a live exception.
+
+    Backlog item 89: even when my ``except Exception`` inside
+    process_video_v2 doesn't fire (because the SDK's flow-control
+    BaseException exits cleanly without reaching my catch), Inngest
+    still calls ``on_failure`` after retries exhaust. This is the
+    LAST-RESORT hook that guarantees ``Job.status='failed'`` regardless
+    of what happens inside the function body.
+    """
+    if job_id is None or job_id <= 0:
+        return
+    name = (error_dict.get("name") or "UnknownError") if isinstance(error_dict, dict) else "UnknownError"
+    msg = (error_dict.get("message") or "") if isinstance(error_dict, dict) else ""
+    stack = (error_dict.get("stack") or "") if isinstance(error_dict, dict) else ""
+    error_text = (f"{name}: {msg}\n{stack}")[:4000]
+    try:
+        from datetime import datetime, timezone
+        from models import Job
+        session = _open_db_session()
+        try:
+            session.query(Job).filter(Job.id == job_id).update(
+                {
+                    "status":        "failed",
+                    "error":         error_text,
+                    "finished_at":   datetime.now(timezone.utc),
+                    "current_stage": None,
+                },
+                synchronize_session=False,
+            )
+            session.commit()
+            logger.error(
+                "v2 on_failure marked job failed: job_id=%s name=%s",
+                job_id, name,
+            )
+        finally:
+            session.close()
+    except Exception as db_exc:
+        logger.warning(
+            "_mark_job_failed_from_event: DB write failed for job %s "
+            "(non-fatal): %s", job_id, db_exc,
         )
