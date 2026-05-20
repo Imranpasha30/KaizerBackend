@@ -811,3 +811,27 @@ Indian-language coverage
   copy of the app instead of the singleton, or move to
   ``starlette.testclient.TestClient`` with a per-test app factory.
   ~30 min refactor. No active production impact.
+
+### Item 87: Post-testing secret rotation pass
+
+- **Surfaced**: 2026-05-20 during office-LAN bring-up inventory.
+- **Context**: ``kaizer/KaizerBackend/.env.testrun`` and
+  ``.env.testrun_12_2b`` (both gitignored, never reached git) carry
+  real Gemini / Groq / Deepgram / R2 / Postgres / Inngest Cloud
+  prod credentials from Step 12 test runs. They surfaced in tool
+  output during inventory because the IDE had ``.env.testrun``
+  open.
+- **Why deferred**: office-LAN access is gated by the Cloudflare
+  Tunnel so the live blast radius today is limited; the operator
+  chose to rotate post-stabilization rather than mid-bring-up.
+- **Recommended action (when V2 office-LAN phase is stable)**:
+  1. Rotate every key visible in ``.env.testrun*``: Gemini,
+     Groq, Deepgram, R2 access key + secret, Inngest Cloud
+     EVENT_KEY + SIGNING_KEY, Postgres password.
+  2. Replace the values in ``kaizer/KaizerBackend/.env`` (the
+     active one).
+  3. Delete the test-run env files OR scrub them to placeholder
+     values.
+  4. Confirm ``.env*`` remains in ``.gitignore`` (already true).
+- **No production impact today** -- keys still work; only rotation
+  hygiene is at stake. Treat as background work.
