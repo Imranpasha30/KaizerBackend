@@ -379,28 +379,150 @@ def _validate_av_invariant(
     composed_narration_s: float,
     takeover_video_s: float,
     tolerance_s: float = AV_INVARIANT_TOLERANCE_S,
+    crossfade_savings_s: float = 0.0,
+    tail_trim_s: float = 0.0,
 ) -> None:
-    """Item 102: hard A/V invariant.
+    """Item 102 + 108 + 109: hard A/V invariant.
 
-    Bulletin audio duration MUST equal ``narration + takeover_video``
-    within ``tolerance_s`` seconds. Larger deltas indicate an
-    unintended source of video-without-audio bloating the bulletin
-    (a new intro/outro insertion, stray ffmpeg filter, etc).
-    Raises ``RuntimeError`` on violation so the operator sees the
-    regression at render time rather than via a support ticket.
+    Bulletin audio duration MUST equal::
+
+        narration + takeover_video - crossfade_savings - tail_trim
+
+    within ``tolerance_s`` seconds. Item 102 introduced the basic
+    invariant. Item 108 added ``crossfade_savings_s`` for the smart_cut
+    / crossfade overlap window the crossfade stitcher subtracts from
+    every splice point ((N-1) * audio_overlap_s). Item 109 added
+    ``tail_trim_s`` for the end-frame trim pass.
+
+    Larger deltas indicate an unintended source of video-without-audio
+    bloating the bulletin (a new intro/outro insertion, stray ffmpeg
+    filter, etc). Raises ``RuntimeError`` on violation so the operator
+    sees the regression at render time rather than via a support
+    ticket.
     """
-    expected = composed_narration_s + takeover_video_s
+    expected = (
+        composed_narration_s
+        + takeover_video_s
+        - crossfade_savings_s
+        - tail_trim_s
+    )
     delta = actual_audio_s - expected
     if abs(delta) > tolerance_s:
         raise RuntimeError(
             f"A/V invariant violated: bulletin audio "
             f"{actual_audio_s:.2f}s != narration "
             f"{composed_narration_s:.2f}s + transitions "
-            f"{takeover_video_s:.2f}s (delta {delta:+.2f}s, "
+            f"{takeover_video_s:.2f}s - crossfade "
+            f"{crossfade_savings_s:.2f}s - tail_trim "
+            f"{tail_trim_s:.2f}s (delta {delta:+.2f}s, "
             f"tolerance +/-{tolerance_s:.2f}s). Some component "
             f"added fake audio padding. Check takeovers, intro, "
             f"outro, or any new pre-stitch insertion."
         )
+
+
+# --- Item 109: end-frame trim -----------------------------------------
+
+END_FRAME_TRIM_BUFFER_S: float = 0.5
+END_FRAME_TRIM_MIN_SLACK_S: float = 1.0
+
+
+def compute_end_frame_trim_target(
+    bulletin_duration_s: float,
+    spliced_cuts: list,
+    clean_words: list,
+    buffer_s: float = END_FRAME_TRIM_BUFFER_S,
+    min_slack_s: float = END_FRAME_TRIM_MIN_SLACK_S,
+) -> Optional[float]:
+    """Item 109 / Gemini-Pro audit fix: return the bulletin-time
+    wallclock to trim to so the rendered video ends ``buffer_s``
+    after the LAST spoken word.
+
+    Addresses the "video ends abruptly on anchor reaching for camera"
+    finding: the source recording usually has 1-5 seconds of dead
+    video after the last spoken word (the anchor reaching to stop the
+    recorder, etc). That tail makes it into the spliced bulletin and
+    looks unprofessional.
+
+    Logic:
+      1. Find the highest ``Word.e`` among ``clean_words`` that falls
+         INSIDE the LAST kept cut's time span. This is the bulletin's
+         last spoken-word end (in source time).
+      2. Compute the source-time slack between the last word's end
+         and the last cut's end: ``slack = last_cut.end_sec -
+         last_word.e``.
+      3. If ``slack <= min_slack_s``, the tail is short enough that
+         trimming wouldn't be a meaningful improvement -- return
+         ``None`` (no trim).
+      4. Otherwise, the bulletin's last word lands at bulletin time
+         ``bulletin_duration - slack``. Return
+         ``bulletin_duration - slack + buffer_s`` as the trim target.
+
+    Returns ``None`` when no trim is appropriate (no cuts, no words,
+    no word in last cut, slack below threshold, or trim target would
+    extend the bulletin).
+    """
+    if not spliced_cuts or not clean_words:
+        return None
+    if bulletin_duration_s <= 0:
+        return None
+    last_cut = spliced_cuts[-1]
+    # Highest word.e that ends within last_cut's source time span.
+    last_word_e: Optional[float] = None
+    for w in clean_words:
+        w_s = float(w.s)
+        w_e = float(w.e)
+        if last_cut.start_sec <= w_s and w_e <= last_cut.end_sec + 1e-3:
+            if last_word_e is None or w_e > last_word_e:
+                last_word_e = w_e
+    if last_word_e is None:
+        return None
+    source_slack = float(last_cut.end_sec) - last_word_e
+    if source_slack <= min_slack_s:
+        return None
+    trim_target = bulletin_duration_s - source_slack + buffer_s
+    if trim_target >= bulletin_duration_s:
+        return None
+    if trim_target <= 0:
+        return None
+    return trim_target
+
+
+def apply_end_frame_trim(
+    in_path: str,
+    out_path: str,
+    trim_target_s: float,
+    ffmpeg_bin: Optional[str] = None,
+) -> bool:
+    """Trim ``in_path`` to ``trim_target_s`` and write to ``out_path``.
+
+    Uses ``ffmpeg -t <trim_target_s> -c copy`` (no re-encode -- fast,
+    lossless). Returns True on success. Raises ``RuntimeError`` on
+    ffmpeg failure so the renderer's wrapper can decide whether to
+    fall back to the un-trimmed bulletin.
+    """
+    import subprocess as _sp
+    if ffmpeg_bin is None:
+        try:
+            from pipeline_core.pipeline import FFMPEG_BIN as _FF
+            ffmpeg_bin = _FF
+        except Exception:
+            ffmpeg_bin = "ffmpeg"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    cmd = [
+        ffmpeg_bin, "-y", "-i", in_path,
+        "-t", f"{trim_target_s:.3f}",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    r = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"apply_end_frame_trim: ffmpeg failed (rc={r.returncode}): "
+            f"{(r.stderr or '')[-400:]}"
+        )
+    return True
 
 
 def _format_mmss_mmm(seconds: float) -> str:
@@ -2499,6 +2621,65 @@ class Stage4Render:
             # that pads, etc. We raise a hard error so the operator
             # sees the regression immediately rather than discovering
             # it via a "bulletin is 25% too long" support ticket.
+            # Item 109: end-frame trim. Probe the bulletin's actual
+            # duration, compute how much trailing slack lives after
+            # the last spoken word, and trim if > 1s. Runs BEFORE
+            # the A/V invariant so the invariant sees the trimmed
+            # bulletin (and gets the tail_trim_s adjustment).
+            tail_trim_s = 0.0
+            try:
+                bulletin_to_check = (
+                    bulletin_result.get("overlay_path")
+                    or bulletin_result.get("bulletin_path")
+                )
+                if bulletin_to_check and os.path.isfile(bulletin_to_check):
+                    pre_trim_audio = _ffprobe_audio_duration_s(bulletin_to_check)
+                    clean_words = list(
+                        job_output.stage_two.clean_transcript.words
+                    )
+                    trim_target = compute_end_frame_trim_target(
+                        bulletin_duration_s=pre_trim_audio,
+                        spliced_cuts=spliced_cuts,
+                        clean_words=clean_words,
+                    )
+                    if trim_target is not None and pre_trim_audio > trim_target:
+                        trimmed_path = str(
+                            self.bulletin_dir / "bulletin_trimmed.mp4"
+                        )
+                        try:
+                            apply_end_frame_trim(
+                                bulletin_to_check, trimmed_path, trim_target,
+                            )
+                            # Atomically replace the original with
+                            # the trimmed file so downstream
+                            # consumers don't need to know it changed.
+                            try:
+                                os.replace(trimmed_path, bulletin_to_check)
+                            except Exception:
+                                # Atomic-replace failed (file lock,
+                                # cross-device, etc). Leave both
+                                # files in place; the overlay path
+                                # still points at the original.
+                                pass
+                            tail_trim_s = pre_trim_audio - trim_target
+                            _p(
+                                f"  [end-frame-trim] removed "
+                                f"{tail_trim_s:.2f}s of trailing slack "
+                                f"after the last spoken word (buffer "
+                                f"{END_FRAME_TRIM_BUFFER_S:.1f}s)"
+                            )
+                        except Exception as trim_exc:
+                            logger.warning(
+                                "stage_4: end-frame trim failed (non-"
+                                "fatal, shipping un-trimmed): %s",
+                                trim_exc,
+                            )
+            except Exception as exc:
+                logger.warning(
+                    "stage_4: end-frame trim computation failed (non-"
+                    "fatal): %s", exc,
+                )
+
             try:
                 bulletin_to_check = (
                     bulletin_result.get("overlay_path")
@@ -2514,23 +2695,48 @@ class Stage4Render:
                         _ffprobe_video_duration_s(p) for p in story_paths
                         if os.path.isfile(p) and "takeover_" in os.path.basename(p)
                     )
-                    expected = composed_audio_total + takeover_video_total
+                    # Item 108: subtract crossfade savings if the
+                    # crossfade stitcher was used. We re-derive
+                    # rather than threading state through render_*.
+                    crossfade_savings_s = 0.0
+                    try:
+                        from pipeline_v2.transitions import (
+                            overlap_for_render as _ovr,
+                        )
+                        audio_overlap_s, _v = _ovr(self.transition_style)
+                        if audio_overlap_s > 0 and len(story_paths) > 1:
+                            # Only count splices between narration
+                            # segments (takeovers don't crossfade).
+                            narration_count = sum(
+                                1 for p in story_paths
+                                if "takeover_" not in os.path.basename(p)
+                            )
+                            crossfade_savings_s = max(
+                                0, narration_count - 1
+                            ) * audio_overlap_s
+                    except Exception:
+                        pass
+                    expected = (
+                        composed_audio_total + takeover_video_total
+                        - crossfade_savings_s - tail_trim_s
+                    )
                     delta = actual_audio - expected
                     _p(
                         f"Stage 6/7 A/V invariant check: "
                         f"bulletin audio {actual_audio:.1f}s == "
                         f"narration {composed_audio_total:.1f}s + "
                         f"transitions {takeover_video_total:.1f}s "
+                        f"- crossfade {crossfade_savings_s:.2f}s "
+                        f"- tail_trim {tail_trim_s:.2f}s "
                         f"(delta {delta:+.1f}s)"
                         + (" OK" if abs(delta) <= AV_INVARIANT_TOLERANCE_S else " FAIL")
                     )
-                    # Item 102: delegate the threshold check to the
-                    # pure helper so the violation branch has direct
-                    # unit-test coverage.
                     _validate_av_invariant(
                         actual_audio_s=actual_audio,
                         composed_narration_s=composed_audio_total,
                         takeover_video_s=takeover_video_total,
+                        crossfade_savings_s=crossfade_savings_s,
+                        tail_trim_s=tail_trim_s,
                     )
             except RuntimeError:
                 raise

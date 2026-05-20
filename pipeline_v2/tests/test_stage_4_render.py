@@ -1397,6 +1397,15 @@ def bulletin_v1_patches():
             f"{base}._v1_stitch_bulletin",
             return_value=_stub_stitch_result(),
         ),
+        # Item 108: the crossfade stitcher is dispatched whenever
+        # transition_style has nonzero overlap (smart_cut default ->
+        # 80ms). Patch the lookup to return (0, 0) so the V1 path
+        # still wins; tests that exercise the crossfade dispatch use
+        # their own targeted patches.
+        "overlap_for_render": patch(
+            "pipeline_v2.transitions.overlap_for_render",
+            return_value=(0.0, 0.0),
+        ),
         "overlay_image_plan": patch(f"{base}._v1_overlay_image_plan"),
         # compose_deps: default to "not fresh" so the cache misses
         # and each helper IS called. Individual tests can override.
@@ -3555,4 +3564,190 @@ class TestRoundCutPrecision:
         # 0-decimal rounding (integer seconds).
         out0 = round_cut_precision(cuts, decimals=0)
         assert (out0[0].start_sec, out0[0].end_sec) == (5.0, 10.0)
+
+
+# ======================================================================
+# Backlog item 109: end-frame trim (iteration 2 Issue 3)
+# ======================================================================
+#
+# Addresses Gemini Pro's "video ends abruptly on anchor reaching for
+# camera" finding. After the bulletin is stitched, we probe the last
+# kept cut's source-time span, find the highest clean_word.e inside
+# that span, and trim the bulletin so it ends `buffer_s` (default
+# 0.5s) after the last spoken word -- IF the trailing slack exceeds
+# `min_slack_s` (default 1.0s).
+
+
+class TestComputeEndFrameTrimTarget:
+    """Item 109 -- 3 tests as per the user spec, plus 4 edge cases."""
+
+    def test_trim_target_when_slack_above_threshold(self):
+        """Last cut ends 100s of bulletin time; last spoken word
+        ends 95s (5s slack). Trim target = 95 + 0.5 buffer = 95.5s."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        cuts = [_full_video_cut(idx=0, start=0.0, end=100.0)]
+        # The last word ends at 95s -- 5s of post-word slack.
+        words = [
+            Word(w="hello", s=0.0, e=1.0),
+            Word(w="world", s=94.0, e=95.0),   # the LAST word
+        ]
+        target = compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+        )
+        assert target == 95.5   # 95 (last word.e) + 0.5 buffer
+
+    def test_no_trim_when_slack_below_min(self):
+        """0.3s slack < 1.0s min_slack_s -> no trim (return None)."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        cuts = [_full_video_cut(idx=0, start=0.0, end=100.0)]
+        words = [Word(w="word", s=0.0, e=99.7)]   # 0.3s slack
+        assert compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+        ) is None
+
+    def test_no_trim_when_no_clean_words(self):
+        """Defensive: empty clean_words -> None (no trim, log the
+        weirdness via logger.warning at the call site)."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        cuts = [_full_video_cut(idx=0, start=0.0, end=100.0)]
+        assert compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=[],
+        ) is None
+
+    def test_no_trim_when_no_cuts(self):
+        """Defensive: empty cuts -> None."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        assert compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=[],
+            clean_words=[Word(w="x", s=0.0, e=1.0)],
+        ) is None
+
+    def test_no_trim_when_no_word_in_last_cut(self):
+        """All clean_words fall outside the last cut's source-time
+        span. Bulletin couldn't have heard them, so we don't know
+        where the last spoken word landed -- skip the trim."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        cuts = [_full_video_cut(idx=0, start=500.0, end=600.0)]
+        words = [Word(w="word", s=0.0, e=1.0)]   # outside last cut
+        assert compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+        ) is None
+
+    def test_custom_buffer_and_min_slack(self):
+        """Caller can tighten the buffer (smaller trailing cushion)
+        and tighten min_slack_s (trim even on small slack)."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        cuts = [_full_video_cut(idx=0, start=0.0, end=100.0)]
+        words = [Word(w="word", s=0.0, e=99.5)]   # 0.5s slack
+        # Default min_slack=1.0 -> no trim.
+        assert compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+        ) is None
+        # Tightened min_slack=0.2 + tiny buffer -> trim target = 99.5 + 0.1 = 99.6
+        target = compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+            buffer_s=0.1,
+            min_slack_s=0.2,
+        )
+        assert target == 99.6
+
+    def test_picks_highest_word_end_in_last_cut(self):
+        """When multiple kept words fall inside the last cut, the
+        highest .e is the bulletin's last spoken word."""
+        from pipeline_v2.stages.stage_4_render import (
+            compute_end_frame_trim_target,
+        )
+        from pipeline_v2.models import Word
+        cuts = [_full_video_cut(idx=0, start=0.0, end=100.0)]
+        words = [
+            Word(w="early", s=10.0, e=11.0),
+            Word(w="middle", s=50.0, e=51.0),
+            Word(w="late", s=90.0, e=92.0),     # this one is the "last word"
+            Word(w="earlier", s=20.0, e=21.0),  # earlier in time despite
+                                                # being later in the list
+        ]
+        # Slack = 100 - 92 = 8s -> trim to 92 + 0.5 = 92.5s.
+        target = compute_end_frame_trim_target(
+            bulletin_duration_s=100.0,
+            spliced_cuts=cuts,
+            clean_words=words,
+        )
+        assert target == 92.5
+
+
+class TestAVInvariantAcceptsTailTrimAndCrossfade:
+    """Item 108 + 109 extended ``_validate_av_invariant`` with two
+    new adjustment args: ``crossfade_savings_s`` (subtracted from
+    expected) and ``tail_trim_s`` (subtracted from expected). These
+    tests pin that contract so a future refactor can't silently
+    drop them."""
+
+    def test_invariant_passes_when_actual_matches_expected_after_adjustments(self):
+        """5 segments + 4 crossfades of 0.08s (savings = 0.32s) +
+        trim of 3s; bulletin audio should be sum - 0.32 - 3.0."""
+        from pipeline_v2.stages.stage_4_render import _validate_av_invariant
+        # narration = 100s, transitions = 0s, savings = 0.32s, trim = 3s
+        # expected = 100 + 0 - 0.32 - 3.0 = 96.68
+        _validate_av_invariant(
+            actual_audio_s=96.68,
+            composed_narration_s=100.0,
+            takeover_video_s=0.0,
+            crossfade_savings_s=0.32,
+            tail_trim_s=3.0,
+        )
+        # Within tolerance (±1.0).
+        _validate_av_invariant(
+            actual_audio_s=97.5,
+            composed_narration_s=100.0,
+            takeover_video_s=0.0,
+            crossfade_savings_s=0.32,
+            tail_trim_s=3.0,
+        )
+
+    def test_invariant_raises_when_actual_misses_adjusted_expected(self):
+        """Same inputs as above but actual_audio is 5s longer than
+        expected -> violation."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import _validate_av_invariant
+        with _pytest.raises(RuntimeError) as exc_info:
+            _validate_av_invariant(
+                actual_audio_s=101.7,     # expected ~96.68, delta +5.02
+                composed_narration_s=100.0,
+                takeover_video_s=0.0,
+                crossfade_savings_s=0.32,
+                tail_trim_s=3.0,
+            )
+        msg = str(exc_info.value)
+        assert "crossfade" in msg
+        assert "tail_trim" in msg
 
