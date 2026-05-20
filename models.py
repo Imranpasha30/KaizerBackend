@@ -92,6 +92,14 @@ class Job(Base):
     # stage_2_5_entities | stage_3_fanout | stage_4_render | finalize
     current_stage = Column(String(40), default=None, nullable=True)
 
+    # Item 104 (Transition library): operator's chosen inter-clip
+    # transition for the bulletin pass. Catalog defined in
+    # pipeline_v2.transitions. NULL on pre-item-104 rows; the renderer
+    # falls back to "smart_cut" (the default + only implemented entry
+    # at item-104 ship time) when this field is NULL or names a
+    # not-yet-implemented entry. Stays NULL for V1 platforms.
+    transition_style = Column(String(20), default="smart_cut", nullable=True)
+
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 
 

@@ -43,6 +43,7 @@ def _dispatch_v2_inngest_event(
     frame: str,
     stt_provider: str,
     db_session_factory,
+    transition_style: str = "smart_cut",
 ) -> None:
     """Fire ``video/v2/uploaded`` so the Inngest V2 worker picks up.
 
@@ -104,6 +105,10 @@ def _dispatch_v2_inngest_event(
         "platform":     platform,
         "frame_layout": frame or "torn_card",
         "stt_provider": stt_provider or "",
+        # Item 104: operator's bulletin transition selection. Catalog
+        # validated in main.create_job; the worker re-validates via
+        # resolve_for_render so a stale event survives a catalog edit.
+        "transition_style": transition_style or "smart_cut",
         # preset is caller-supplied via Stage 4; we ship the PLATFORMS
         # entry shape from main.py for the V2 platform. Looking it up
         # here avoids pulling main into runner's import graph (would
@@ -233,7 +238,8 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  default_image: str = "",
                  default_logo: str = "",
                  bulletin_images: Optional[list] = None,
-                 stt_provider: str = ""):
+                 stt_provider: str = "",
+                 transition_style: str = "smart_cut"):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -267,6 +273,7 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             platform=platform,
             frame=frame,
             stt_provider=stt_provider,
+            transition_style=transition_style,
             db_session_factory=db_session_factory,
         )
         return   # V2 worker takes over; no subprocess spawn

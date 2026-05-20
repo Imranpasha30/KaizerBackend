@@ -99,6 +99,10 @@ def _migrate_schema():
             # NULL on pre-Phase-14 rows; create endpoint defaults to
             # first 80 chars of video_name when caller omits the field.
             "name":             "VARCHAR(120)",
+            # Item 104 (Transition library): per-job transition choice.
+            # Catalog lives in pipeline_v2.transitions. NULL on pre-
+            # item-104 rows; renderer falls back to "smart_cut".
+            "transition_style": "VARCHAR(20) DEFAULT 'smart_cut'",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
@@ -806,6 +810,9 @@ def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.cu
             "language": j.language or "te",
             "created_at": j.created_at,
             "clip_count": len(j.clips),
+            # Item 104: surface the transition choice so the UI can
+            # show a chip on the job card.
+            "transition_style": (j.transition_style or "smart_cut"),
         }
         for j in jobs
     ]
@@ -834,6 +841,13 @@ async def create_job(
     # 120 chars (DB column width); blank/missing defaults to first 80
     # chars of the source filename so the list never shows "(unnamed)".
     name: str = Form(""),
+    # Item 104 (Transition library): operator's chosen inter-clip
+    # transition for the V2 bulletin pass. One of the catalog names
+    # in pipeline_v2.transitions (smart_cut / crossfade / fade_to_black
+    # / dip_to_white / slide_left / wipe_right / dissolve). Blank or
+    # unknown -> "smart_cut" (the default + only one implemented at
+    # ship time). Ignored by V1 platforms.
+    transition_style: str = Form("smart_cut"),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -916,6 +930,32 @@ async def create_job(
     # runner can detect it and run TWO pipeline passes internally —
     # one bulletin pass + one shorts pass — both importing clips into
     # THIS same job. UI shows it as one job with mixed-aspect clips.
+    # Item 104: validate transition_style against the catalog; unknown
+    # values get coerced to "smart_cut" rather than rejected so a stale
+    # frontend can't 400 the user. The log line surfaces the coercion.
+    try:
+        from pipeline_v2.transitions import (
+            is_valid_transition as _is_valid_transition,
+            DEFAULT_TRANSITION_NAME as _DEFAULT_TRANSITION,
+        )
+        _ts = (transition_style or "").strip()
+        if not _ts or not _is_valid_transition(_ts):
+            if _ts and _ts != _DEFAULT_TRANSITION:
+                _warning_prefix = (_warning_prefix or "") + (
+                    f"[transition_style] unknown value {_ts!r} coerced "
+                    f"to {_DEFAULT_TRANSITION!r}.\n"
+                )
+            _ts = _DEFAULT_TRANSITION
+    except Exception as _trans_exc:
+        # Import failure or unexpected error: fall back to the literal
+        # default so create-job never breaks on a missing catalog.
+        import logging as _logging
+        _logging.getLogger("kaizer.transitions").warning(
+            "create_job: transition catalog lookup failed (non-fatal): %s",
+            _trans_exc,
+        )
+        _ts = "smart_cut"
+
     job = models.Job(
         user_id=user.id,
         platform=platform,
@@ -926,6 +966,7 @@ async def create_job(
         status="pending",
         log=_warning_prefix,
         output_dir=str(OUTPUT_ROOT),
+        transition_style=_ts,
     )
     db.add(job)
     db.commit()
@@ -1052,6 +1093,8 @@ async def create_job(
         bulletin_images=bulletin_image_paths,
         # V2 only (Step 11.4): ignored unless platform=full_video_shorts_v2.
         stt_provider=stt_provider,
+        # Item 104: V2 only. V1 paths ignore.
+        transition_style=_ts,
         db_session_factory=SessionLocal,
     )
 
@@ -1250,6 +1293,8 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "started_at":  job.started_at.isoformat()  if job.started_at  else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "elapsed_seconds": _elapsed_seconds(job),
+        # Item 104: surface the operator's transition selection.
+        "transition_style": (job.transition_style or "smart_cut"),
         # Bulletin clips render first (16:9 long-form takes the lead
         # tile in the JobDetail grid), shorts follow in DB-insert
         # order. Backlog item 91 follow-up.

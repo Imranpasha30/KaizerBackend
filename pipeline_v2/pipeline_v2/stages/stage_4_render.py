@@ -798,6 +798,14 @@ class Stage4Render:
     # the bulletin. Set to 0.0 to disable micro-fragment dropping.
     micro_fragment_threshold_s: float = MICRO_FRAGMENT_THRESHOLD_S
 
+    # Item 104: operator's bulletin transition selection. One of the
+    # catalog names in pipeline_v2.transitions. Stored verbatim so
+    # the UI can echo the operator's original choice; the renderer
+    # falls back to "smart_cut" via resolve_for_render when the
+    # selected entry is not yet implemented (one structured warning
+    # logged per render so the operator sees the fallback).
+    transition_style: str = "smart_cut"
+
     # Instance-level cache, populated by Step 9.2 image resolution.
     # Maps canonical entity_name -> absolute path of resolved image
     # file. Shared between shorts and bulletin passes so the same
@@ -2006,6 +2014,36 @@ class Stage4Render:
                 f"keep sub-segments after splicing "
                 f"{len(skipped_segments)} skipped; trimmed {trimmed_s:.1f}s)"
             )
+
+            # Item 104: resolve operator's transition selection -> what
+            # the renderer will actually apply. Today only smart_cut is
+            # implemented; other catalog entries fall back to smart_cut
+            # with a single structured progress line so the operator
+            # sees their choice didn't take effect (no silent fallback).
+            try:
+                from pipeline_v2.transitions import (
+                    resolve_for_render as _resolve_transition,
+                    get_transition as _get_transition,
+                )
+                _selected = _get_transition(self.transition_style)
+                _effective = _resolve_transition(self.transition_style)
+                _p(
+                    f"  [transition] selected={_selected.name!r} "
+                    f"effective={_effective.name!r} "
+                    f"(implemented={_selected.implemented})"
+                )
+                if _effective.name != _selected.name:
+                    _p(
+                        f"  [transition] NOTE: {_selected.name!r} is not "
+                        f"yet implemented; falling back to "
+                        f"{_effective.name!r}. Operator's choice is "
+                        f"preserved on the Job row for UI display."
+                    )
+            except Exception as _trans_exc:
+                logger.warning(
+                    "stage_4: transition resolution failed (non-fatal, "
+                    "falling back to smart_cut): %s", _trans_exc,
+                )
 
             # Item 103: drop micro-fragments < threshold (default 1.5s)
             # so the bulletin doesn't include tiny slivers between

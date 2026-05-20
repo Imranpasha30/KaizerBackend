@@ -726,12 +726,19 @@ async def _stage_4_render_handler(envelope: dict) -> dict:
         _KAIZER_BACKEND / "output" / envelope["platform"]
         / f"job_{job_id}"
     )
+    # Item 104: extract operator's transition selection from the
+    # event envelope (set by runner._dispatch_v2_inngest_event).
+    # Blank / unknown values resolve to "smart_cut" downstream via
+    # transitions.resolve_for_render -- no validation needed here.
+    _transition_style = envelope.get("transition_style") or "smart_cut"
+
     renderer = Stage4Render(
         output_dir=output_dir,
         video_path=envelope["video_path"],
         preset=envelope["preset"],
         frame_layout=envelope.get("frame_layout", "torn_card"),
         platform=envelope["platform"],
+        transition_style=_transition_style,
     )
 
     # Register the worker with _ACTIVE_PROCS BEFORE render starts.
