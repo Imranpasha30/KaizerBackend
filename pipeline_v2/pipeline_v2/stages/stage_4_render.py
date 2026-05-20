@@ -295,6 +295,112 @@ def _ffprobe_video_duration_s(path: str) -> float:
         return 0.0
 
 
+# --- Item 102: extracted gating helpers for test coverage --------------
+#
+# Item 100 introduced three guardrails as inline expressions in
+# _render_impl and render_bulletin. Item 102 extracts each one to a
+# pure function so the behaviour can be unit-tested without spinning
+# up the full render pipeline. Behaviour is preserved 1:1; the
+# extraction is purely a testability refactor.
+
+
+# Single literal source of truth for which video_types benefit from
+# a picture-in-picture inset. SOLO (talking-head news monologue) is
+# deliberately absent: V1's pick_pip_source would just pull another
+# segment of the same anchor.
+PIP_ALLOWED_VIDEO_TYPES: frozenset[str] = frozenset({
+    "INTERVIEW", "PRESS_CONFERENCE", "PANEL", "MIXED",
+})
+
+# Minimum distinct FullVideoCuts before adaptive takeovers may fire.
+# Below this floor the bulletin is one narrative thread split into
+# spliced sub-cuts; takeovers between sub-cuts produce ~6.5s of dead
+# air per boundary (item 100's 132-second bloat bug).
+TAKEOVER_MIN_DISTINCT_CUTS: int = 3
+
+# A/V invariant: bulletin audio duration may differ from the
+# expected sum (narration audio + takeover video) by at most this
+# many seconds. Larger deltas indicate an unintended source of
+# video-without-audio (intro/outro padding, stray ffmpeg filter,
+# new pre-stitch insertion).
+AV_INVARIANT_TOLERANCE_S: float = 1.0
+
+
+def _compute_takeovers_enabled(
+    use_takeovers: bool, full_video_cuts: list,
+) -> bool:
+    """Item 102: adaptive takeover gate.
+
+    Takeovers are enabled only when the operator opted in AND
+    Stage 2 produced enough distinct stories to warrant TV-style
+    inter-story transitions. Single-story monologues split by
+    splicing must concat seamlessly -- inserting takeovers between
+    sub-cuts of one narrative thread adds dead air between what
+    the listener perceives as one continuous statement.
+    """
+    return bool(use_takeovers) and len(full_video_cuts) >= TAKEOVER_MIN_DISTINCT_CUTS
+
+
+def _compute_pip_enabled(use_pip: bool, video_type: str) -> bool:
+    """Item 102: PiP gate.
+
+    PiP shows ``next story's first 8s`` as a B-roll inset. For
+    multi-source video types (INTERVIEW / PRESS_CONFERENCE / PANEL /
+    MIXED) the next story usually means a different speaker or
+    angle -- useful inset. For SOLO it would just be the same
+    anchor talking-head in the corner.
+    """
+    return bool(use_pip) and (video_type or "") in PIP_ALLOWED_VIDEO_TYPES
+
+
+def _should_insert_takeover_between(
+    this_parent: Optional[int], next_parent: Optional[int],
+) -> bool:
+    """Item 102: splice-group-aware boundary check.
+
+    A takeover transition only belongs between two clips that come
+    from DIFFERENT FullVideoCut parents. Two adjacent clips sharing
+    the same ``parent_v2_index`` are spliced sub-cuts of one parent
+    -- the audience perceives them as one statement, so a 6.5s
+    branded transition between them would be the dead-air bug.
+
+    ``None`` for ``next_parent`` means there is no next clip (the
+    current clip is the last) -- no takeover after the final story.
+    """
+    if next_parent is None:
+        return False
+    return this_parent != next_parent
+
+
+def _validate_av_invariant(
+    actual_audio_s: float,
+    composed_narration_s: float,
+    takeover_video_s: float,
+    tolerance_s: float = AV_INVARIANT_TOLERANCE_S,
+) -> None:
+    """Item 102: hard A/V invariant.
+
+    Bulletin audio duration MUST equal ``narration + takeover_video``
+    within ``tolerance_s`` seconds. Larger deltas indicate an
+    unintended source of video-without-audio bloating the bulletin
+    (a new intro/outro insertion, stray ffmpeg filter, etc).
+    Raises ``RuntimeError`` on violation so the operator sees the
+    regression at render time rather than via a support ticket.
+    """
+    expected = composed_narration_s + takeover_video_s
+    delta = actual_audio_s - expected
+    if abs(delta) > tolerance_s:
+        raise RuntimeError(
+            f"A/V invariant violated: bulletin audio "
+            f"{actual_audio_s:.2f}s != narration "
+            f"{composed_narration_s:.2f}s + transitions "
+            f"{takeover_video_s:.2f}s (delta {delta:+.2f}s, "
+            f"tolerance +/-{tolerance_s:.2f}s). Some component "
+            f"added fake audio padding. Check takeovers, intro, "
+            f"outro, or any new pre-stitch insertion."
+        )
+
+
 def _format_mmss_mmm(seconds: float) -> str:
     """Format float-second to MM:SS.mmm.
 
@@ -1451,8 +1557,8 @@ class Stage4Render:
                 next_parent = next_clip.get(
                     "parent_v2_index", next_clip.get("v2_index")
                 )
-            inter_story_boundary = (
-                next_parent is not None and this_parent != next_parent
+            inter_story_boundary = _should_insert_takeover_between(
+                this_parent, next_parent,
             )
             if (
                 effective_takeovers
@@ -1815,34 +1921,23 @@ class Stage4Render:
                     f"{_format_mmss_mmm(sc.end_sec)} ({dur:.1f}s)"
                 )
 
-            # Item 100: adaptive takeovers. Takeovers (~6.5s branded
-            # transitions with no audio) make sense between distinct
-            # stories in a TV-style multi-story bulletin -- but for
-            # a typical news monologue (1 FullVideoCut split into N
-            # spliced sub-cuts) they add up to +130s of dead-air
-            # silence between sub-cuts of THE SAME story. Enable
-            # only when Stage 2 produced >= 3 distinct FullVideoCuts.
-            takeovers_enabled = (
-                self.use_takeovers and len(full_video_cuts) >= 3
+            # Item 100/102: adaptive takeovers + PiP gate via pure
+            # helpers. Behaviour identical to the inline expressions
+            # the old code used; extracted so both branches have
+            # direct unit-test coverage (TestAdaptiveTakeoverGate /
+            # TestPiPGate in test_stage_4_render.py).
+            takeovers_enabled = _compute_takeovers_enabled(
+                self.use_takeovers, full_video_cuts,
             )
             _p(
                 f"  [takeovers] enabled={takeovers_enabled} "
                 f"(use_takeovers={self.use_takeovers}, "
                 f"full_video_cuts={len(full_video_cuts)} -- "
-                f"need >=3 distinct stories)"
+                f"need >={TAKEOVER_MIN_DISTINCT_CUTS} distinct stories)"
             )
 
-            # Item 100: PiP gate. V1's pick_pip_source picks 'next
-            # story's first 8s' from the SOURCE VIDEO as a B-roll
-            # inset. For INTERVIEW / PRESS_CONFERENCE / PANEL /
-            # MIXED that's another speaker / angle = useful. For
-            # SOLO it's just the same anchor in the corner = bug.
-            pip_video_types_allowed = {
-                "INTERVIEW", "PRESS_CONFERENCE", "PANEL", "MIXED",
-            }
-            pip_enabled = (
-                self.use_pip
-                and metadata.video_type in pip_video_types_allowed
+            pip_enabled = _compute_pip_enabled(
+                self.use_pip, metadata.video_type,
             )
             _p(
                 f"  [pip] enabled={pip_enabled} "
@@ -1944,18 +2039,16 @@ class Stage4Render:
                         f"narration {composed_audio_total:.1f}s + "
                         f"transitions {takeover_video_total:.1f}s "
                         f"(delta {delta:+.1f}s)"
-                        + (" OK" if abs(delta) <= 1.0 else " ❌ FAIL")
+                        + (" OK" if abs(delta) <= AV_INVARIANT_TOLERANCE_S else " FAIL")
                     )
-                    if abs(delta) > 1.0:
-                        raise RuntimeError(
-                            f"A/V invariant violated: bulletin audio "
-                            f"{actual_audio:.2f}s != narration "
-                            f"{composed_audio_total:.2f}s + transitions "
-                            f"{takeover_video_total:.2f}s (delta "
-                            f"{delta:+.2f}s). Some component added fake "
-                            f"audio padding. Check takeovers, intro, "
-                            f"outro, or any new pre-stitch insertion."
-                        )
+                    # Item 102: delegate the threshold check to the
+                    # pure helper so the violation branch has direct
+                    # unit-test coverage.
+                    _validate_av_invariant(
+                        actual_audio_s=actual_audio,
+                        composed_narration_s=composed_audio_total,
+                        takeover_video_s=takeover_video_total,
+                    )
             except RuntimeError:
                 raise
             except Exception as exc:

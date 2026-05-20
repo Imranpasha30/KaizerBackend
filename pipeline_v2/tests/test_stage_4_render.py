@@ -2907,3 +2907,200 @@ class TestAdaptiveTakeoversAndPiPGate:
         sig = inspect.signature(Stage4Render.cut_raw_bulletin_stories)
         assert "parent_v2_indexes" in sig.parameters
         assert sig.parameters["parent_v2_indexes"].default is None
+
+
+# ======================================================================
+# Backlog item 102: behavioural coverage of item 100's adaptive gates
+# ======================================================================
+#
+# Item 100 introduced the three guardrails inline in _render_impl /
+# render_bulletin. Item 102 extracts them to pure helpers
+# (_compute_takeovers_enabled / _compute_pip_enabled /
+# _should_insert_takeover_between / _validate_av_invariant) so the
+# branch behaviour can be tested without spinning up the full render
+# pipeline. The 6 tests below cover both branches of each gate plus
+# the violation path.
+
+
+class TestAdaptiveTakeoverGate:
+    """Item 102 test 1-3: ``_compute_takeovers_enabled`` truth table.
+
+    Takeovers enabled only when the operator opted in AND Stage 2
+    produced >= TAKEOVER_MIN_DISTINCT_CUTS distinct FullVideoCuts.
+    """
+
+    def test_disabled_when_use_takeovers_false_regardless_of_count(self):
+        """User opt-out wins over story count -- if use_takeovers=False
+        the gate stays closed even with 10 stories."""
+        from pipeline_v2.stages.stage_4_render import (
+            _compute_takeovers_enabled,
+        )
+        # Use a synthetic list of the right length; the helper only
+        # inspects len() so contents don't matter.
+        cuts_10 = [None] * 10
+        assert _compute_takeovers_enabled(False, cuts_10) is False
+        assert _compute_takeovers_enabled(False, []) is False
+
+    def test_disabled_when_fewer_than_three_cuts_even_if_opted_in(self):
+        """The 132s-bloat bug case: opted in but only one or two
+        narrative threads -> gate stays closed because all sub-cuts
+        belong to the same parent and would just produce dead air."""
+        from pipeline_v2.stages.stage_4_render import (
+            _compute_takeovers_enabled, TAKEOVER_MIN_DISTINCT_CUTS,
+        )
+        assert TAKEOVER_MIN_DISTINCT_CUTS == 3, (
+            "Test pins floor at 3; if you change "
+            "TAKEOVER_MIN_DISTINCT_CUTS, update this assertion."
+        )
+        assert _compute_takeovers_enabled(True, []) is False
+        assert _compute_takeovers_enabled(True, [None]) is False
+        assert _compute_takeovers_enabled(True, [None, None]) is False
+
+    def test_enabled_when_opted_in_and_three_or_more_cuts(self):
+        """The legitimate multi-story TV bulletin case."""
+        from pipeline_v2.stages.stage_4_render import (
+            _compute_takeovers_enabled,
+        )
+        assert _compute_takeovers_enabled(True, [None, None, None]) is True
+        assert _compute_takeovers_enabled(True, [None] * 5) is True
+
+
+class TestSpliceGroupTakeoverBoundary:
+    """Item 102 test 4: ``_should_insert_takeover_between``.
+
+    The boundary check is the second line of defence after the
+    coarse 3-cut gate. Even when takeovers are enabled, two
+    adjacent clips that share the same ``parent_v2_index`` are
+    spliced sub-cuts of the same story -- no takeover between
+    them, or we recreate the 132s dead-air bug at a finer
+    granularity.
+    """
+
+    def test_boundary_logic_matches_splice_group_semantics(self):
+        """Same parent => no takeover; different parents => takeover;
+        last clip (next_parent is None) => no takeover."""
+        from pipeline_v2.stages.stage_4_render import (
+            _should_insert_takeover_between,
+        )
+        # Same FullVideoCut parent -- spliced sub-cuts of one
+        # narrative thread. Must concat seamlessly.
+        assert _should_insert_takeover_between(0, 0) is False
+        assert _should_insert_takeover_between(7, 7) is False
+        # Different parents -- legitimate inter-story boundary.
+        assert _should_insert_takeover_between(0, 1) is True
+        assert _should_insert_takeover_between(7, 3) is True
+        # Final clip in the bulletin -- there is no "next story" to
+        # transition into, so no takeover.
+        assert _should_insert_takeover_between(0, None) is False
+        assert _should_insert_takeover_between(7, None) is False
+
+
+class TestPiPGateForSOLO:
+    """Item 102 test 5: ``_compute_pip_enabled`` excludes SOLO.
+
+    SOLO talking-head monologue must NOT get PiP. V1's
+    ``pick_pip_source`` would pull the same anchor from the next
+    story slot -> meaningless inset of the same face in the corner.
+    """
+
+    def test_pip_disabled_for_solo_enabled_for_multi_source(self):
+        from pipeline_v2.stages.stage_4_render import (
+            _compute_pip_enabled, PIP_ALLOWED_VIDEO_TYPES,
+        )
+        # SOLO is the explicit exclusion the user flagged.
+        assert _compute_pip_enabled(True, "SOLO") is False
+        # Allowed video types -- enabled when opted in.
+        for vt in ("INTERVIEW", "PRESS_CONFERENCE", "PANEL", "MIXED"):
+            assert vt in PIP_ALLOWED_VIDEO_TYPES
+            assert _compute_pip_enabled(True, vt) is True
+        # Operator opt-out always wins.
+        assert _compute_pip_enabled(False, "INTERVIEW") is False
+        # Unknown / empty video_type -- treated as "not allowed"
+        # (fail-closed). Matches the inline expression's behaviour
+        # via set membership.
+        assert _compute_pip_enabled(True, "") is False
+        assert _compute_pip_enabled(True, "UNKNOWN") is False
+
+
+class TestAVInvariantGuardrail:
+    """Item 102 test 6: ``_validate_av_invariant`` raises on bloat.
+
+    The Job 42 incident: bulletin audio was 132s longer than
+    narration audio because takeovers added silent video padding.
+    The guardrail catches this at render time and surfaces a
+    descriptive RuntimeError so the operator sees the regression
+    rather than discovering it via a support ticket.
+    """
+
+    def test_within_tolerance_does_not_raise(self):
+        """Sub-second drift from ffmpeg rounding / sample boundaries
+        must not trigger the guardrail. AV_INVARIANT_TOLERANCE_S
+        defaults to 1.0s for exactly this reason."""
+        from pipeline_v2.stages.stage_4_render import (
+            _validate_av_invariant, AV_INVARIANT_TOLERANCE_S,
+        )
+        assert AV_INVARIANT_TOLERANCE_S == 1.0
+        # Exact match.
+        _validate_av_invariant(100.0, 80.0, 20.0)
+        # Within tolerance on both signs.
+        _validate_av_invariant(100.5, 80.0, 20.0)
+        _validate_av_invariant(99.5, 80.0, 20.0)
+        # Exactly at the boundary -- abs(delta) == tolerance, so still
+        # accepted (the violation predicate is ``abs > tolerance``).
+        _validate_av_invariant(101.0, 80.0, 20.0)
+
+    def test_audio_longer_than_expected_raises_with_descriptive_message(self):
+        """The Job 42 bug case: bulletin audio bloated by silent
+        padding. The guardrail must raise and the message must name
+        all three measured durations so the operator can debug."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import (
+            _validate_av_invariant,
+        )
+        # +132s delta (the Job 42 case): audio 633s vs expected 501s.
+        with _pytest.raises(RuntimeError) as exc_info:
+            _validate_av_invariant(
+                actual_audio_s=633.0,
+                composed_narration_s=481.0,
+                takeover_video_s=20.0,
+            )
+        msg = str(exc_info.value)
+        # Must name all three measured durations.
+        assert "633" in msg
+        assert "481" in msg
+        assert "20" in msg
+        # Must report the delta with sign.
+        assert "+132" in msg
+        # Must hint at root cause for the operator.
+        assert "takeover" in msg.lower() or "intro" in msg.lower()
+
+    def test_audio_shorter_than_expected_also_raises(self):
+        """Negative delta is also a violation -- bulletin can't be
+        shorter than narration+transitions. Belt-and-suspenders for
+        a stitch step that silently truncated audio."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import (
+            _validate_av_invariant,
+        )
+        with _pytest.raises(RuntimeError) as exc_info:
+            _validate_av_invariant(
+                actual_audio_s=50.0,
+                composed_narration_s=80.0,
+                takeover_video_s=20.0,
+            )
+        # Delta should be -50s and surface with sign in the message.
+        assert "-50" in str(exc_info.value)
+
+    def test_custom_tolerance_is_honoured(self):
+        """The tolerance kwarg lets callers tighten the bar for
+        fixture-style tests (e.g. a sub-second-precision render
+        regression check)."""
+        import pytest as _pytest
+        from pipeline_v2.stages.stage_4_render import (
+            _validate_av_invariant,
+        )
+        # Default tolerance accepts 0.5s drift.
+        _validate_av_invariant(100.5, 80.0, 20.0)
+        # Tightened tolerance rejects the same drift.
+        with _pytest.raises(RuntimeError):
+            _validate_av_invariant(100.5, 80.0, 20.0, tolerance_s=0.1)
