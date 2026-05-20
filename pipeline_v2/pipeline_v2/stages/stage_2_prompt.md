@@ -84,8 +84,15 @@ The `category` field must be one of these six literal strings:
 
 - `warm_up` — equipment / recording chatter before the on-camera
   greeting. Mic checks, "okay recording", "ready start" cues.
-- `retake` — anchor says something, then explicitly redoes it
-  ("wait, let me say that again"). The first attempt is dropped.
+- `retake` — anchor says something, then redoes it. Includes both
+  **explicit** retakes ("wait, let me say that again", "sorry sorry")
+  AND **implicit phrase-level restarts** where the anchor begins a
+  phrase, breaks off abruptly, pauses briefly, then restarts the same
+  or similar phrase with a clean continuation. No verbal signal
+  ("sorry", "wait") is required — a brief pause followed by a near-
+  identical phrase opening IS the signal. The earlier abrupt attempt
+  is dropped, the cleaner redo is kept. See "Phrase-level retake
+  detection" section below for heuristics and patterns.
 - `crew_talk` — off-camera voice gives a cue, asks a question, or
   interrupts. Anchor pauses then resumes.
 - `hesitation` — filler words / stalling with no semantic content:
@@ -107,6 +114,84 @@ The `category` field must be one of these six literal strings:
 
 If still unsure between two categories, prefer `retake` (most common
 case in raw footage).
+
+---
+
+## Phrase-level retake detection
+
+The single most common Stage 2 failure mode is **missing implicit
+phrase-level retakes**. Raw journalist footage is full of false
+starts where the anchor begins a phrase, halts mid-stream, pauses
+briefly, then restarts the same or near-identical phrase cleanly.
+Unlike Few-shot 5 (which has an explicit "sorry sorry" signal),
+these restarts have NO verbal signal — they are detected purely by
+the pattern: **abrupt halt + brief pause + matching phrase opening
+that this time continues to completion**.
+
+### Detection criteria
+
+A phrase-level retake exists at words `[i..j]` when ALL of the
+following hold:
+
+1. **Matching opening**: words `[i..j]` and a nearby later range
+   `[k..l]` share an opening phrase (first 1-5 content words are
+   identical or near-identical after stripping fillers). The match
+   may be **full** (whole earlier phrase repeats verbatim) or
+   **partial** (only the opening N words match, then the redo
+   diverges into a different completion).
+2. **Earlier attempt halts abruptly**: the earlier range `[i..j]`
+   ends without semantic completion — a noun/topic-marker hanging
+   in the air, no verb closure, or a clause that just stops.
+3. **Brief recovery pause**: gap between `words[j].e` and
+   `words[k].s` is roughly **0.3s–3.0s**. Longer gaps (>3.0s) are
+   usually a new thought, not a retake. Zero pause (<0.3s) is
+   usually a stutter, not a retake.
+4. **Later attempt continues to completion**: words `[k..l..]`
+   form a complete clause (subject + predicate, or full statement
+   that the earlier attempt failed to deliver).
+
+When all four hold, skip `[i..j]` as `category: "retake"` and keep
+the later, completed version.
+
+### Key heuristics
+
+1. **No verbal signal required.** "Sorry", "wait", "again" are
+   nice-to-have but NOT mandatory. Pause + repeated opening is the
+   signal. Most real-world phrase retakes are silent.
+2. **Match the OPENING, not the whole phrase.** Anchors often
+   restart with the same 2-4 opening words then diverge into a
+   different completion. "ఈరోజు మనం చర్చిద్దాం... ఈరోజు మనం చూద్దాం..."
+   is a retake even though `చర్చిద్దాం` ≠ `చూద్దాం`. The shared
+   opening "ఈరోజు మనం" plus the abrupt break before completion is
+   the signal.
+3. **Hesitation fillers between attempts are part of the skip.**
+   If the gap contains "uh", "అ", "మరి", absorb them into the
+   skipped span — don't split into separate `hesitation` +
+   `retake` segments. One contiguous `retake` covering both
+   attempts' abandoned half is cleaner.
+4. **Single-word repetitions are stutters, not retakes.** "the
+   the the" is a hesitation/stutter, not a retake. Phrase retakes
+   are at least 2 content words long on both sides.
+5. **Be aggressive on raw monologue.** A 5-minute uncut journalist
+   recording typically has **5-15 phrase-level retakes**. If you
+   find only 0-2 retakes in a multi-minute transcript, you are
+   almost certainly under-detecting. Re-sweep the array looking
+   for repeated phrase openings.
+
+### Patterns to recognize
+
+- **Full restart**: `"X Y Z. [pause] X Y Z W..."` — same opening,
+  earlier attempt didn't reach W, later one does. Skip the earlier.
+- **Partial restart**: `"X Y A. [pause] X Y B C..."` — same opening
+  two words, divergent completion. Skip the earlier `X Y A`.
+- **Fragment + redo**: `"X Y. [pause] X Y Z W V..."` — earlier
+  attempt is just a noun phrase hanging, later one is a full clause.
+- **Abandoned subject + restart**: `"the minister, [pause] the
+  minister said yesterday..."` — subject named, halted, restated
+  with the verb this time.
+- **Code-switched restart**: `"ఈ news ఈరోజు [pause] ఈ news ఈరోజు
+  morning చాలా important..."` — restart with same code-mixed
+  opening plus a clarifier.
 
 ---
 
@@ -412,6 +497,131 @@ continuous clip.
     {"start_word_idx": 4, "end_word_idx": 6, "start_sec": 146.40, "end_sec": 147.70, "category": "self_correction", "reason": "Anchor mid-sentence misattributed the press-meet statement to KTR (word 4), instantly caught the factual error, signaled correction with 'కాదు కాదు' (words 5-6), then inserted the correct name 'Revanth రెడ్డి గారు' (words 7-9) before continuing. The wrong attribution + signal is dropped; the sentence buildup (0-3) and corrected continuation (7-10) stitch into one continuous clip."}
   ],
   "retake_audit": "Skipped 1 self_correction at 146.40-147.70s (wrong attribution to KTR + 'కాదు కాదు' negation signal before correct name Revanth Reddy)."
+}
+```
+
+---
+
+### Few-shot 7 — phrase-level `retake` (implicit, full restart, no verbal signal)
+
+Anchor begins a phrase, halts abruptly mid-thought (no semantic
+completion), pauses for ~0.9s, then restarts with the **same opening
+phrase** that this time continues to completion. There is NO "sorry"
+or "again" signal — the pause + matching opening IS the retake
+signal. Words 0-3 are the abandoned first attempt; words 4-10 are
+the cleaner redo. This is the most common Stage 2 miss in raw
+footage.
+
+**Input:**
+```json
+[
+  {"w":"ఈరోజు","s":24.10,"e":24.45},
+  {"w":"మనం","s":24.45,"e":24.70},
+  {"w":"చర్చిద్దాం","s":24.70,"e":25.20},
+  {"w":"ఏంటంటే","s":25.20,"e":25.65},
+  {"w":"ఈరోజు","s":26.55,"e":26.90},
+  {"w":"మనం","s":26.90,"e":27.15},
+  {"w":"చూద్దాం","s":27.15,"e":27.60},
+  {"w":"హైదరాబాద్","s":27.60,"e":28.05},
+  {"w":"లో","s":28.05,"e":28.15},
+  {"w":"జరిగిన","s":28.15,"e":28.55},
+  {"w":"సంఘటన","s":28.55,"e":29.00}
+]
+```
+
+**Output:**
+```json
+{
+  "full_video_cuts": [
+    {"index": 0, "start_word_idx": 0, "end_word_idx": 10, "start_sec": 24.10, "end_sec": 29.00, "importance": 7}
+  ],
+  "skipped_segments": [
+    {"start_word_idx": 0, "end_word_idx": 3, "start_sec": 24.10, "end_sec": 25.65, "category": "retake", "reason": "Anchor began 'ఈరోజు మనం చర్చిద్దాం ఏంటంటే' (today we will discuss what) but halted before naming the topic, paused ~0.9s, then restarted with the same opening 'ఈరోజు మనం' followed by 'చూద్దాం హైదరాబాద్ లో జరిగిన సంఘటన' (let us see the incident that happened in Hyderabad). No verbal retake signal; the matching opening + pause + completed redo is the signal."}
+  ],
+  "retake_audit": "Skipped 1 retake at 24.10-25.65s (phrase-level restart with same opening 'ఈరోజు మనం', no verbal signal)."
+}
+```
+
+---
+
+### Few-shot 8 — phrase-level `retake` (partial restart, divergent completion)
+
+Anchor names a subject ("ముఖ్యమంత్రి రేవంత్ రెడ్డి") then halts mid-clause,
+pauses ~0.7s, restarts with **the same subject** plus a different,
+fuller completion. The first attempt failed to deliver any
+predicate; the redo completes the statement. Words 0-4 are the
+abandoned attempt; words 5-13 are the completed redo.
+
+**Input:**
+```json
+[
+  {"w":"ముఖ్యమంత్రి","s":87.20,"e":87.85},
+  {"w":"రేవంత్","s":87.85,"e":88.20},
+  {"w":"రెడ్డి","s":88.20,"e":88.60},
+  {"w":"గారు","s":88.60,"e":88.85},
+  {"w":"ఇవాళ","s":88.85,"e":89.20},
+  {"w":"ముఖ్యమంత్రి","s":89.90,"e":90.45},
+  {"w":"రేవంత్","s":90.45,"e":90.80},
+  {"w":"రెడ్డి","s":90.80,"e":91.20},
+  {"w":"గారు","s":91.20,"e":91.45},
+  {"w":"ఇవాళ","s":91.45,"e":91.80},
+  {"w":"ప్రెస్","s":91.80,"e":92.10},
+  {"w":"మీట్","s":92.10,"e":92.40},
+  {"w":"లో","s":92.40,"e":92.55},
+  {"w":"మాట్లాడారు","s":92.55,"e":93.10}
+]
+```
+
+**Output:**
+```json
+{
+  "full_video_cuts": [
+    {"index": 0, "start_word_idx": 0, "end_word_idx": 13, "start_sec": 87.20, "end_sec": 93.10, "importance": 8}
+  ],
+  "skipped_segments": [
+    {"start_word_idx": 0, "end_word_idx": 4, "start_sec": 87.20, "end_sec": 89.20, "category": "retake", "reason": "Anchor named the subject 'ముఖ్యమంత్రి రేవంత్ రెడ్డి గారు ఇవాళ' (CM Revanth Reddy garu today) but halted before delivering any verb/predicate. After a ~0.7s pause, anchor restarted with the identical 5-word opening and this time completed the clause: 'ప్రెస్ మీట్ లో మాట్లాడారు' (spoke at the press meet). Earlier abandoned attempt (0-4) is dropped; the completed redo (5-13) is kept."}
+  ],
+  "retake_audit": "Skipped 1 retake at 87.20-89.20s (phrase-level restart with same 5-word subject opening; first attempt had no predicate, redo completes the clause)."
+}
+```
+
+---
+
+### Few-shot 9 — phrase-level `retake` with hesitation absorbed
+
+Anchor begins a phrase, halts, emits a filler "అ" during the
+recovery pause, then restarts with the same opening. The hesitation
+filler between attempts is absorbed into ONE contiguous `retake`
+skip (NOT split into separate `hesitation` + `retake` segments).
+Words 0-2 = first attempt; word 3 = filler in the pause; words 4-9
+= the completed redo. Skip 0-3 as one `retake`.
+
+**Input:**
+```json
+[
+  {"w":"పోలీసులు","s":210.30,"e":210.85},
+  {"w":"ఆ","s":210.85,"e":211.00},
+  {"w":"నిందితుడిని","s":211.00,"e":211.60},
+  {"w":"అ","s":212.10,"e":212.25},
+  {"w":"పోలీసులు","s":212.85,"e":213.40},
+  {"w":"నిందితుడిని","s":213.40,"e":214.00},
+  {"w":"నిన్న","s":214.00,"e":214.30},
+  {"w":"రాత్రి","s":214.30,"e":214.65},
+  {"w":"అరెస్ట్","s":214.65,"e":215.05},
+  {"w":"చేశారు","s":215.05,"e":215.55}
+]
+```
+
+**Output:**
+```json
+{
+  "full_video_cuts": [
+    {"index": 0, "start_word_idx": 0, "end_word_idx": 9, "start_sec": 210.30, "end_sec": 215.55, "importance": 8}
+  ],
+  "skipped_segments": [
+    {"start_word_idx": 0, "end_word_idx": 3, "start_sec": 210.30, "end_sec": 212.25, "category": "retake", "reason": "Anchor began 'పోలీసులు ఆ నిందితుడిని' (police, that accused) but halted before delivering the verb. The recovery gap contained one filler 'అ' (word 3). Anchor then restarted with 'పోలీసులు నిందితుడిని' (police the accused) and completed the clause with 'నిన్న రాత్రి అరెస్ట్ చేశారు' (arrested last night). The abandoned attempt + intervening filler is absorbed into ONE contiguous retake skip; the completed redo is kept."}
+  ],
+  "retake_audit": "Skipped 1 retake at 210.30-212.25s (phrase-level restart with same 'పోలీసులు నిందితుడిని' opening, hesitation filler 'అ' absorbed into the skip)."
 }
 ```
 
