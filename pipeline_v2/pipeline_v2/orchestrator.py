@@ -801,24 +801,49 @@ async def _finalize_handler(envelope: dict) -> dict:
     # _import_clips: reuse V1's editor_meta.json reader to create
     # Clip rows in the DB. The Stage 8 adapter wrote a V1-compatible
     # editor_meta.json; this importer doesn't need V2 awareness.
+    #
+    # V2's compound platform produces TWO editor_metas (shorts pass +
+    # bulletin pass). The original Step 10 finalize only imported the
+    # shorts side, leaving the rendered bulletin orphaned on disk with
+    # no Clip row. Backlog item 91: import BOTH passes so the bulletin
+    # appears in JobDetail's clips grid alongside the shorts.
     imported_clip_count = 0
     try:
         import runner       # V1 module on sys.path
-        from models import Job
+        from models import Job, Clip
         session = _open_db_session()
         try:
             job = session.query(Job).filter(Job.id == job_id).first()
             if job is not None:
-                meta_override = stage_4.get("shorts_editor_meta_path")
-                # _import_clips signature: (job, db, meta_override)
-                _result = runner._import_clips(
-                    job, session,
-                    meta_override=meta_override,
-                )
-                # _import_clips commits inside; result may include
-                # the number of imported clips (signature varies).
-                # Best-effort: count clips on the job after import.
-                from models import Clip
+                # Pass 1 of 2: shorts editor_meta -> N short Clip rows
+                shorts_meta = stage_4.get("shorts_editor_meta_path")
+                if shorts_meta:
+                    try:
+                        runner._import_clips(
+                            job, session, meta_override=shorts_meta,
+                        )
+                    except Exception as e_short:
+                        logger.warning(
+                            "finalize: shorts _import_clips failed for "
+                            "job %s (continuing to bulletin): %s",
+                            job_id, e_short,
+                        )
+
+                # Pass 2 of 2: bulletin editor_meta -> 1 bulletin Clip row
+                bulletin_meta = stage_4.get("bulletin_editor_meta_path")
+                if bulletin_meta:
+                    try:
+                        runner._import_clips(
+                            job, session, meta_override=bulletin_meta,
+                        )
+                    except Exception as e_bull:
+                        logger.warning(
+                            "finalize: bulletin _import_clips failed for "
+                            "job %s (continuing): %s",
+                            job_id, e_bull,
+                        )
+
+                # Count after both passes.
                 imported_clip_count = (
                     session.query(Clip).filter(Clip.job_id == job_id).count()
                 )

@@ -75,10 +75,17 @@ def nvenc_runtime_ok(timeout_s: float = 15.0) -> bool:
 
     Returns False rather than raising for any non-success outcome,
     including timeout — caller is expected to fall back to libx264.
+
+    NB on frame size: 256x256 is large enough to clear EVERY modern
+    NVENC generation's minimum-dimension requirement. Earlier versions
+    of this probe used 64x64 which Blackwell-era cards (RTX 50-series)
+    reject with "Frame Dimension less than the minimum supported value"
+    -- the probe then returned False and Stage 0 fell back to libx264
+    on machines that actually had a healthy NVENC. Backlog item 90.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-v", "error",
-        "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+        "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
         "-c:v", "h264_nvenc", "-frames:v", "1",
         "-f", "null", "-",
     ]
