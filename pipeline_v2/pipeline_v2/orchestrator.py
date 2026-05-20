@@ -385,7 +385,12 @@ async def _stage_1_transcribe_handler(envelope: dict) -> dict:
 
     envelope["stage_1"] = stage_1.model_dump()
     envelope["stage_costs"][STAGE_1_TRANSCRIBE] = float(stage_1.stt_cost_usd)
-    word_count = len(getattr(stage_1, "words", None) or [])
+    # Backlog item 95: Stage1Output doesn't have a top-level `words`
+    # field -- the count lives on `stt_word_count`. Previously the
+    # progress log always reported "0 words" regardless of what
+    # Deepgram returned, causing operator confusion (job 40 in
+    # particular: 1488 words actually transcribed; log said 0).
+    word_count = int(getattr(stage_1, "stt_word_count", 0) or 0)
     _append_progress_log(
         job_id,
         f"Stage 1/7 done ({word_count} words, ${stage_1.stt_cost_usd:.4f})",
