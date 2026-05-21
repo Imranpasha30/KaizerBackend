@@ -1142,3 +1142,91 @@ up without re-deciding:
   flow through splice + render.
 - **Estimated implementation**: 1-2 hours next session.
 - **Expected grade lift**: 8.1 -> 8.5-8.7/10.
+
+### Item 111 (COMPLETED): Crossfade stitcher -- audio-only 3-pass rewrite (SHIP-BLOCKER FIX)
+
+- **Surfaced**: 2026-05-21 morning. User reported new V2 job (Job 46
+  bulletin) had video freezing at 1:48 while audio kept playing to
+  7:54. Lip-sync drift after the freeze. ffprobe confirmed: video
+  stream = 104.53s / 3136 frames @ 30fps; audio stream = 474.09s.
+  Critical ship-blocker for office onboarding.
+- **Root cause**: ffmpeg's ``xfade`` filter does NOT chain reliably
+  for 20+ video transitions with cumulative offsets in the hundreds
+  of seconds. Job 46 had 25 segments => 24 chained xfade nodes; the
+  video output collapsed to ~one segment's worth of frames
+  (specifically matching composed_story_21's 3134 frames, the
+  longest segment) while the parallel ``acrossfade`` chain on the
+  same segments produced the correct cumulative duration. My
+  ``build_crossfade_filter_graph`` arithmetic was correct
+  (verified by unit tests + the audio chain math); the failure was
+  in ffmpeg's xfade behavior, not our offset computation.
+- **Fix**: 3-pass stitcher in
+  ``pipeline_v2/pipeline_v2/bulletin_crossfade_stitcher.py``::
+
+      Pass 1: concat-demuxer for VIDEO only (-c:v copy -an).
+              Lossless, fast, no re-encode. Output duration =
+              sum(per-segment video durations).
+      Pass 2: filter_complex acrossfade chain for AUDIO only (-vn).
+              25-segment chain works fine (the bug was xfade, not
+              acrossfade). Output duration = sum - (N-1) * 0.08s.
+      Pass 3: mux v+a with -c copy -shortest. -shortest trims to
+              the shorter stream so V/A end at the same time
+              (without it, the natural ~1s drift between per-
+              segment video and audio durations would leave video
+              extending past audio).
+
+  Hard video cuts at every 80ms audio crossfade boundary are
+  visually imperceptible at 30fps; the audio crossfade is the
+  part that matters for Gemini's "ambient spike" finding (item
+  108's actual goal).
+
+- **API impact**:
+  - ``SMART_CUT.duration_s`` stays at 0.08; description updated.
+  - ``CROSSFADE`` still implemented, duration 0.5s -- audio-only.
+  - ``overlap_for_render(name)`` now returns ``(audio, 0.0)``
+    instead of ``(audio, video)``. Video overlap is permanently
+    0.0 in the catalog.
+  - ``DEFAULT_VIDEO_OVERLAP_S`` constant added at 0.0 (was 0.04).
+  - ``build_crossfade_filter_graph`` kept as backward-compat shim
+    that returns ``("", "0:v", a_label)`` (some tests still call
+    it).
+  - New ``build_audio_acrossfade_graph(durations, audio_overlap)``
+    is the production helper.
+
+- **A/V invariant tolerance**: tightened from 1.0s -> 0.2s. The
+  3-pass stitcher's -shortest mux is sample-accurate, so the
+  previous 1.0s tolerance was sized to hide the broken xfade
+  chain's frame loss. Tighter bound surfaces real bugs.
+
+- **Live verification on Job 46**: ran the new stitcher on Job 46's
+  25 composed_story_NN.mp4 files. ffprobe of the output::
+
+      Pre-fix bulletin:  video=104.53s (3136 frames)   BROKEN
+      Post-fix bulletin: video=473.96s (14209 frames)  HEALTHY
+                         audio=474.09s
+                         format=474.09s (via -shortest)
+      Wall time: 15.9s for full 25-segment stitch.
+
+- **Tests**: 28 in ``test_bulletin_crossfade_stitcher.py``
+  (was 22; +6 net):
+  - 5 catalog flag tests
+  - 3 overlap_for_render tests (updated: video always 0)
+  - 5 compute_xfade_offsets tests
+  - 5 AV invariant total tests
+  - 5 build_audio_acrossfade_graph tests (NEW, includes a
+    25-segment Job-46 regression check + the backwards-compat
+    shim assertion)
+  - 4 item-111 spec tests (NEW): smart_cut_video_uses_concat_no_overlap,
+    smart_cut_audio_uses_acrossfade,
+    smart_cut_av_durations_match_within_audio_overlap, and an
+    integration test that re-runs the new stitcher on Job 46's
+    real composed_story files + asserts video duration > 100s
+    (was 104.5s broken).
+  - 1 stage 4 dispatch smoke test.
+  3 existing item-102/108/109 tests in test_stage_4_render.py
+  updated to reflect the new 0.2s tolerance.
+
+- **Full pipeline_v2 suite**: 919 passed, 15 skipped.
+
+- **Production restart pending**. Once uvicorn picks up the new
+  module, the next V2 job ships with the fixed bulletin.

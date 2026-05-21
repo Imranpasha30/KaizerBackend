@@ -3043,20 +3043,23 @@ class TestAVInvariantGuardrail:
 
     def test_within_tolerance_does_not_raise(self):
         """Sub-second drift from ffmpeg rounding / sample boundaries
-        must not trigger the guardrail. AV_INVARIANT_TOLERANCE_S
-        defaults to 1.0s for exactly this reason."""
+        must not trigger the guardrail. Item 111 tightened the
+        default tolerance from 1.0s -> 0.2s (the 3-pass stitcher's
+        -shortest mux is sample-accurate; sizes above 0.2s are real
+        bugs worth surfacing)."""
         from pipeline_v2.stages.stage_4_render import (
             _validate_av_invariant, AV_INVARIANT_TOLERANCE_S,
         )
-        assert AV_INVARIANT_TOLERANCE_S == 1.0
+        assert AV_INVARIANT_TOLERANCE_S == 0.2
         # Exact match.
         _validate_av_invariant(100.0, 80.0, 20.0)
         # Within tolerance on both signs.
-        _validate_av_invariant(100.5, 80.0, 20.0)
-        _validate_av_invariant(99.5, 80.0, 20.0)
-        # Exactly at the boundary -- abs(delta) == tolerance, so still
-        # accepted (the violation predicate is ``abs > tolerance``).
-        _validate_av_invariant(101.0, 80.0, 20.0)
+        _validate_av_invariant(100.1, 80.0, 20.0)
+        _validate_av_invariant(99.9, 80.0, 20.0)
+        # Just inside the boundary (0.19s drift; float ulp keeps the
+        # exact-0.2 case unreliable across platforms because the
+        # subtraction can land at 0.20000000000000284).
+        _validate_av_invariant(100.19, 80.0, 20.0)
 
     def test_audio_longer_than_expected_raises_with_descriptive_message(self):
         """The Job 42 bug case: bulletin audio bloated by silent
@@ -3101,16 +3104,21 @@ class TestAVInvariantGuardrail:
         assert "-50" in str(exc_info.value)
 
     def test_custom_tolerance_is_honoured(self):
-        """The tolerance kwarg lets callers tighten the bar for
-        fixture-style tests (e.g. a sub-second-precision render
-        regression check)."""
+        """The tolerance kwarg lets callers tighten or loosen the
+        bar for fixture-style tests. Item 111 dropped the default
+        from 1.0 -> 0.2 so the test below explicitly opts INTO 1.0
+        to verify the kwarg flows through, then verifies a tightened
+        0.1 rejects the same drift the loose 1.0 accepted."""
         import pytest as _pytest
         from pipeline_v2.stages.stage_4_render import (
             _validate_av_invariant,
         )
-        # Default tolerance accepts 0.5s drift.
-        _validate_av_invariant(100.5, 80.0, 20.0)
-        # Tightened tolerance rejects the same drift.
+        # Looser tolerance accepts 0.5s drift.
+        _validate_av_invariant(100.5, 80.0, 20.0, tolerance_s=1.0)
+        # Default (0.2) rejects 0.5s drift.
+        with _pytest.raises(RuntimeError):
+            _validate_av_invariant(100.5, 80.0, 20.0)
+        # Tightened tolerance also rejects 0.5s drift.
         with _pytest.raises(RuntimeError):
             _validate_av_invariant(100.5, 80.0, 20.0, tolerance_s=0.1)
 
@@ -3714,7 +3722,11 @@ class TestAVInvariantAcceptsTailTrimAndCrossfade:
 
     def test_invariant_passes_when_actual_matches_expected_after_adjustments(self):
         """5 segments + 4 crossfades of 0.08s (savings = 0.32s) +
-        trim of 3s; bulletin audio should be sum - 0.32 - 3.0."""
+        trim of 3s; bulletin audio should be sum - 0.32 - 3.0.
+
+        Item 111: tolerance is now 0.2s (was 1.0s). The exact-match
+        case still passes; the within-tolerance case uses a 0.15s
+        drift instead of the previous 0.82s."""
         from pipeline_v2.stages.stage_4_render import _validate_av_invariant
         # narration = 100s, transitions = 0s, savings = 0.32s, trim = 3s
         # expected = 100 + 0 - 0.32 - 3.0 = 96.68
@@ -3725,9 +3737,9 @@ class TestAVInvariantAcceptsTailTrimAndCrossfade:
             crossfade_savings_s=0.32,
             tail_trim_s=3.0,
         )
-        # Within tolerance (±1.0).
+        # Within tolerance (±0.2 after item 111).
         _validate_av_invariant(
-            actual_audio_s=97.5,
+            actual_audio_s=96.83,    # delta = +0.15 (was 97.5 / +0.82)
             composed_narration_s=100.0,
             takeover_video_s=0.0,
             crossfade_savings_s=0.32,

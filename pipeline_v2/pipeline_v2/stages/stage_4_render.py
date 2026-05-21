@@ -321,11 +321,18 @@ PIP_ALLOWED_VIDEO_TYPES: frozenset[str] = frozenset({
 TAKEOVER_MIN_DISTINCT_CUTS: int = 3
 
 # A/V invariant: bulletin audio duration may differ from the
-# expected sum (narration audio + takeover video) by at most this
-# many seconds. Larger deltas indicate an unintended source of
-# video-without-audio (intro/outro padding, stray ffmpeg filter,
-# new pre-stitch insertion).
-AV_INVARIANT_TOLERANCE_S: float = 1.0
+# expected sum (narration audio + takeover video - crossfade -
+# tail_trim) by at most this many seconds. Larger deltas indicate
+# an unintended source of video-without-audio (intro/outro padding,
+# stray ffmpeg filter, new pre-stitch insertion).
+#
+# Item 111 tightened this from 1.0s -> 0.2s. The 3-pass stitcher's
+# -shortest mux makes the V/A drift sample-accurate (well under
+# 50ms in practice). The previous 1.0s tolerance was sized to hide
+# the broken xfade chain's frame-loss; now that we hard-cut video
+# and crossfade audio only, a delta over 0.2s is a real bug worth
+# surfacing.
+AV_INVARIANT_TOLERANCE_S: float = 0.2
 
 
 def _compute_takeovers_enabled(

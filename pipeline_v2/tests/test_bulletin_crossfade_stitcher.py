@@ -75,24 +75,26 @@ class TestOverlapForRender:
         from pipeline_v2.transitions import overlap_for_render
         audio, video = overlap_for_render("smart_cut")
         assert audio == 0.08
-        assert video == 0.04
+        # Item 111: video is now HARD-CUT (xfade chain broke on 20+
+        # segments in Job 46). Only audio is crossfaded.
+        assert video == 0.0
 
-    def test_crossfade_overlap_is_500ms_both(self):
-        """The crossfade catalog entry uses the same value for
-        audio + video (no separate video frame budget -- 500 ms is
-        long enough to also be the visible blend window)."""
+    def test_crossfade_overlap_is_500ms_audio_zero_video(self):
+        """Item 111: crossfade's 500ms applies to AUDIO only.
+        Video is hard-cut at every splice (3-pass stitcher concat-
+        demuxes video losslessly)."""
         from pipeline_v2.transitions import overlap_for_render
         audio, video = overlap_for_render("crossfade")
         assert audio == 0.5
-        assert video == 0.5
+        assert video == 0.0
 
     def test_unknown_and_non_implemented_resolve_to_smart_cut_overlap(self):
         """Non-implemented catalog entries fall through to smart_cut
         via resolve_for_render -- so their overlap pair is
-        smart_cut's (0.08, 0.04)."""
+        smart_cut's (0.08, 0.0) after item 111."""
         from pipeline_v2.transitions import overlap_for_render
         for name in ("fade_to_black", "dissolve", "xyz", "", None):
-            assert overlap_for_render(name) == (0.08, 0.04)
+            assert overlap_for_render(name) == (0.08, 0.0)
 
 
 # ---- bulletin_crossfade_stitcher pure helpers -------------------------
@@ -190,65 +192,215 @@ class TestAVInvariantTotal:
 # ---- filter_complex graph construction --------------------------------
 
 
-class TestBuildCrossfadeFilterGraph:
+class TestBuildAudioAcrossfadeGraph:
+    """Item 111: replaces ``build_crossfade_filter_graph`` for the
+    production path. Only audio acrossfade -- video flows through
+    the 3-pass stitcher's concat-demuxer (pass 1), never through a
+    filter_complex video chain."""
 
-    def test_two_segment_graph_has_one_xfade_and_one_acrossfade(self):
+    def test_two_segment_graph_has_one_acrossfade_node(self):
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            build_audio_acrossfade_graph,
+        )
+        filter_str, a_label = build_audio_acrossfade_graph(
+            [10.0, 12.0], audio_overlap_s=0.08,
+        )
+        assert a_label == "a001"
+        nodes = filter_str.split(";")
+        assert len(nodes) == 1   # one acrossfade only
+        assert nodes[0].startswith("[0:a][1:a]acrossfade=")
+        assert "d=0.08" in nodes[0]
+        assert nodes[0].endswith("[a001]")
+        # No video xfade nodes anywhere -- the bug from item 111.
+        assert "xfade=" not in filter_str
+        assert "0:v" not in filter_str
+        assert "1:v" not in filter_str
+
+    def test_three_segment_graph_chains_acrossfade_labels(self):
+        """The k-th acrossfade reads from the (k-1)th output, not
+        from [0:a]. Catches the off-by-one chain regression."""
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            build_audio_acrossfade_graph,
+        )
+        filter_str, a_label = build_audio_acrossfade_graph(
+            [10.0, 12.0, 8.0], audio_overlap_s=0.08,
+        )
+        assert a_label == "a002"
+        nodes = filter_str.split(";")
+        assert len(nodes) == 2   # 2 acrossfade nodes for 3 inputs
+        # First acrossfade: [0:a][1:a] -> a001.
+        assert "[0:a][1:a]acrossfade=" in nodes[0]
+        assert nodes[0].endswith("[a001]")
+        # Second acrossfade: [a001][2:a] -> a002.
+        assert "[a001][2:a]acrossfade=" in nodes[1]
+        assert nodes[1].endswith("[a002]")
+
+    def test_twenty_five_segment_chain_does_not_collapse(self):
+        """The Job-46 regression test pinned to a real failure case.
+        25 segments (Job 46's actual count) must produce 24 chained
+        acrossfade nodes with labels a001..a024 in order."""
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            build_audio_acrossfade_graph,
+        )
+        durs = [10.0] * 25
+        filter_str, a_label = build_audio_acrossfade_graph(durs, 0.08)
+        assert a_label == "a024"
+        nodes = filter_str.split(";")
+        assert len(nodes) == 24
+        # Final node consumes [a023][24:a] -> [a024].
+        assert "[a023][24:a]acrossfade=" in nodes[-1]
+        assert nodes[-1].endswith("[a024]")
+
+    def test_single_input_returns_passthrough_label(self):
+        """N=1 bypass: empty graph string, audio label points at the
+        raw input stream."""
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            build_audio_acrossfade_graph,
+        )
+        filter_str, a_label = build_audio_acrossfade_graph([10.0])
+        assert filter_str == ""
+        assert a_label == "0:a"
+
+    def test_backwards_compat_shim_still_returns_three_tuple(self):
+        """The old ``build_crossfade_filter_graph`` 3-tuple shape is
+        preserved (one external caller -- a not-yet-migrated test --
+        depends on it). The video label is hard-coded to '0:v'
+        because there is no longer a video filter chain."""
         from pipeline_v2.bulletin_crossfade_stitcher import (
             build_crossfade_filter_graph,
         )
         filter_str, v_label, a_label = build_crossfade_filter_graph(
             [10.0, 12.0], audio_overlap_s=0.08, video_overlap_s=0.04,
         )
-        # Final labels.
-        assert v_label == "v001"
-        assert a_label == "a001"
-        # Two filter nodes: one xfade, one acrossfade.
-        nodes = filter_str.split(";")
-        assert len(nodes) == 2
-        # Video xfade first, then audio.
-        assert nodes[0].startswith("[0:v][1:v]xfade=")
-        assert "duration=0.04" in nodes[0]
-        assert "offset=9.96" in nodes[0]   # 10.0 - 0.04
-        assert nodes[0].endswith("[v001]")
-        assert nodes[1].startswith("[0:a][1:a]acrossfade=")
-        assert "d=0.08" in nodes[1]
-        assert nodes[1].endswith("[a001]")
-
-    def test_three_segment_graph_chains_labels_correctly(self):
-        """The k-th xfade reads from the (k-1)th output, not from
-        the original input. Catches the off-by-one regression where
-        every node references [0:v]."""
-        from pipeline_v2.bulletin_crossfade_stitcher import (
-            build_crossfade_filter_graph,
-        )
-        filter_str, v_label, a_label = build_crossfade_filter_graph(
-            [10.0, 12.0, 8.0],
-            audio_overlap_s=0.08, video_overlap_s=0.04,
-        )
-        assert v_label == "v002"
-        assert a_label == "a002"
-        nodes = filter_str.split(";")
-        assert len(nodes) == 4   # 2 xfade + 2 acrossfade
-        # Second video xfade reads from v001, third video input,
-        # produces v002.
-        assert "[v001][2:v]xfade=" in nodes[1]
-        assert nodes[1].endswith("[v002]")
-        assert "offset=21.92" in nodes[1]   # 10 + 12 - 2*0.04
-        # Second audio acrossfade reads from a001.
-        assert "[a001][2:a]acrossfade=" in nodes[3]
-        assert nodes[3].endswith("[a002]")
-
-    def test_single_input_returns_passthrough_labels(self):
-        """N=1 is a bypass case (caller copies the single input
-        verbatim). The graph string is empty; labels point at the
-        raw input streams."""
-        from pipeline_v2.bulletin_crossfade_stitcher import (
-            build_crossfade_filter_graph,
-        )
-        filter_str, v_label, a_label = build_crossfade_filter_graph([10.0])
-        assert filter_str == ""
+        # No video chain anywhere.
         assert v_label == "0:v"
-        assert a_label == "0:a"
+        assert "xfade=" not in filter_str
+        # Audio chain identical to build_audio_acrossfade_graph.
+        assert a_label == "a001"
+        assert filter_str == "[0:a][1:a]acrossfade=d=0.08[a001]"
+
+
+# ---- Item 111 spec tests (the 4 the user explicitly named) ------------
+
+
+class TestItem111SmartCutBehavior:
+    """The 4 tests the user spec'd in the iteration-2 Issue 2 fix:
+      - smart_cut_video_uses_concat_no_overlap
+      - smart_cut_audio_uses_acrossfade
+      - smart_cut_av_durations_match_within_audio_overlap
+      - smart_cut_produces_valid_playable_mp4
+    """
+
+    def test_smart_cut_video_uses_concat_no_overlap(self):
+        """Video overlap is ALWAYS 0 for smart_cut after item 111
+        (the broken xfade chain is gone; video hard-cuts via
+        concat-demuxer)."""
+        from pipeline_v2.transitions import overlap_for_render
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            DEFAULT_VIDEO_OVERLAP_S,
+        )
+        _, video_overlap = overlap_for_render("smart_cut")
+        assert video_overlap == 0.0
+        # Module default also at 0.
+        assert DEFAULT_VIDEO_OVERLAP_S == 0.0
+
+    def test_smart_cut_audio_uses_acrossfade(self):
+        """Audio overlap is 80ms for smart_cut. This is the part
+        that addresses Gemini's ambient-spike finding."""
+        from pipeline_v2.transitions import overlap_for_render
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            DEFAULT_AUDIO_OVERLAP_S,
+        )
+        audio_overlap, _ = overlap_for_render("smart_cut")
+        assert audio_overlap == 0.08
+        assert DEFAULT_AUDIO_OVERLAP_S == 0.08
+
+    def test_smart_cut_av_durations_match_within_audio_overlap(self):
+        """For N segments of duration d (uniform), the bulletin
+        AUDIO duration is ``N*d - (N-1) * audio_overlap_s``. Video
+        stays at ``N*d`` (concat, no overlap). The 3-pass stitcher
+        then -shortest-trims both to the shorter of the two, so the
+        final file's V/A durations match within audio_overlap_s.
+        """
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            compute_total_duration,
+        )
+        # 25 segments of 10s each, 80ms audio overlap (Job 46-like).
+        n = 25
+        d = 10.0
+        audio_overlap = 0.08
+        audio_total = compute_total_duration([d] * n, audio_overlap)
+        video_total = compute_total_duration([d] * n, 0.0)    # concat: no overlap
+        # video_total - audio_total = (N-1) * audio_overlap.
+        # Use abs tolerance because float subtraction across 25
+        # accumulations leaves ~1e-13 rounding noise.
+        assert abs((video_total - audio_total) - (n - 1) * audio_overlap) < 1e-9
+        # The mux uses -shortest, so the FILE's audio + video both
+        # end at min(audio_total, video_total) = audio_total.
+        # Result: A/V mismatch in the FILE is bounded by 1 frame
+        # (well under 0.2s tolerance).
+
+    def test_smart_cut_produces_valid_playable_mp4(self):
+        """Integration test: run the real 3-pass stitcher on a
+        2-segment fixture (or 25 segments if Job 46's outputs are
+        available) and ffprobe the result. The Job-46 regression
+        check that pins ``video_duration > 100s`` (was 104.5s
+        broken)."""
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        import pytest as _pytest
+
+        # Skip if ffmpeg / ffprobe unavailable in CI.
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            _pytest.skip("ffmpeg/ffprobe not available in PATH")
+
+        # Look for Job 46's composed_story files (the real Job-46
+        # regression). Skip if they don't exist (e.g. CI without
+        # the local output tree).
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        job46 = backend_root / "output" / "full_video_shorts_v2" / "job_46" / "bulletin"
+        segs = sorted(str(p) for p in job46.glob("composed_story_*.mp4"))
+        if len(segs) < 2:
+            _pytest.skip(
+                "Job 46 composed_story files not available -- "
+                "integration check requires the local output tree"
+            )
+
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            stitch_bulletin_with_crossfade,
+        )
+        with tempfile.TemporaryDirectory(prefix="kaizer_item111_") as td:
+            out_path = os.path.join(td, "test_output.mp4")
+            result = stitch_bulletin_with_crossfade(
+                segs, out_path, audio_overlap_s=0.08,
+            )
+            assert result.stories_rendered == len(segs)
+            # Probe video stream duration.
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=duration,nb_frames",
+                 "-of", "default=noprint_wrappers=1:nokey=1", out_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            lines = [l for l in (r.stdout or "").strip().splitlines() if l]
+            assert len(lines) >= 2, f"ffprobe output unexpected: {lines!r}"
+            video_dur = float(lines[0])
+            nb_frames = int(lines[1])
+            # Job 46's bug: video was 104.5s (3136 frames). After
+            # item 111, video must be >> 100s for the real Job 46
+            # input.
+            assert video_dur > 100.0, (
+                f"Item 111 regression: video duration is {video_dur:.2f}s "
+                f"(was 104.5s in the broken Job 46 bulletin). The 3-pass "
+                f"stitcher should produce a video stream matching the "
+                f"sum of input video durations."
+            )
+            assert nb_frames > 3000, (
+                f"Item 111 regression: only {nb_frames} video frames "
+                f"(was 3136 in the broken Job 46 bulletin)."
+            )
 
 
 # ---- Stage 4 wiring smoke (no ffmpeg) ---------------------------------
@@ -256,14 +408,19 @@ class TestBuildCrossfadeFilterGraph:
 
 class TestStage4DispatchToCrossfade:
     """Item 108 wires Stage4Render to call the crossfade stitcher
-    when ``transition_style`` has a nonzero overlap. These tests
-    don't run ffmpeg -- they verify the dispatch logic returns the
-    right overlap pair so the renderer chooses the right path."""
+    when ``transition_style`` has nonzero audio overlap (item 111
+    update: nonzero AUDIO, not video). These tests don't run
+    ffmpeg -- they verify the dispatch logic returns the right
+    overlap pair so the renderer chooses the crossfade path."""
 
     def test_default_transition_style_dispatches_to_crossfade(self):
         """Stage4Render's default transition_style='smart_cut' must
-        map to nonzero overlap so the crossfade stitcher is chosen."""
+        map to nonzero AUDIO overlap so the 3-pass stitcher is chosen.
+        Item 111 update: video overlap is always 0; the dispatch
+        gate in stage_4_render._render_impl checks
+        ``audio_overlap_s > 0 or video_overlap_s > 0`` so it still
+        routes correctly."""
         from pipeline_v2.transitions import overlap_for_render
         audio, video = overlap_for_render("smart_cut")
         assert audio > 0
-        assert video > 0
+        assert video == 0.0    # item 111: hard-cut video

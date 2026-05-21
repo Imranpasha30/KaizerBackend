@@ -51,9 +51,10 @@ SMART_CUT = Transition(
     name="smart_cut",
     display_name="Smart Cut",
     description=(
-        "80ms audio crossfade + ~2-frame video crossfade between "
-        "clips. Smooths splice-point audio clicks without a visible "
-        "video transition. Default for news bulletins (item 108)."
+        "80ms audio crossfade at every splice; video uses hard cuts "
+        "(imperceptible at 30fps). Smooths splice-point audio "
+        "spikes without a visible video transition. Default for "
+        "news bulletins (item 108/111)."
     ),
     duration_s=0.08,
     implemented=True,
@@ -63,9 +64,9 @@ CROSSFADE = Transition(
     name="crossfade",
     display_name="Crossfade",
     description=(
-        "500ms video + audio crossfade between clips. Visible blend "
-        "between stories; smooth feel suited to feature-style "
-        "bulletins (item 108)."
+        "500ms audio crossfade at every splice; video uses hard "
+        "cuts. Pronounced audio blend suited to feature-style "
+        "bulletins (item 108/111)."
     ),
     duration_s=0.5,
     implemented=True,
@@ -181,23 +182,31 @@ def resolve_for_render(name: Optional[str]) -> Transition:
 def overlap_for_render(name: Optional[str]) -> tuple[float, float]:
     """Return ``(audio_overlap_s, video_overlap_s)`` for a transition.
 
-    Used by Stage 4 to dispatch into the crossfade stitcher:
-      - smart_cut -> (0.08, 0.04)   80ms audio, ~2-frame video
-      - crossfade -> (0.50, 0.50)   half-second blend
-      - any other implemented entry uses ``Transition.duration_s``
-        for both audio + video
-      - non-implemented (resolves to smart_cut) -> (0.08, 0.04)
+    Used by Stage 4 to dispatch into the crossfade stitcher.
+
+    Item 111 update: video overlap is now ALWAYS 0.0 (hard cut at
+    every splice). ffmpeg's xfade filter does not chain reliably
+    for 20+ video transitions; the audio acrossfade chain works
+    fine. The 3-pass stitcher concat-demuxes video losslessly and
+    only acrossfades audio. Hard video cuts at 80ms boundaries are
+    visually imperceptible.
+
+      - smart_cut -> (0.08, 0.0)    80ms audio, hard-cut video
+      - crossfade -> (0.50, 0.0)    half-second audio blend
+      - any other implemented entry: audio = ``Transition.duration_s``,
+        video = 0.0
+      - non-implemented (resolves to smart_cut) -> (0.08, 0.0)
 
     Returns ``(0.0, 0.0)`` only when the resolver returns a
     Transition with ``duration_s == 0`` (a "true hard cut" entry,
-    none in the catalog at item-108 ship time but reserved for
-    future fast-cut variants).
+    none in the catalog today but reserved for future fast-cut
+    variants).
     """
     sel = resolve_for_render(name)
     if sel.name == "smart_cut":
-        return 0.08, 0.04
+        return 0.08, 0.0
     if sel.name == "crossfade":
-        return 0.50, 0.50
+        return 0.50, 0.0
     if sel.duration_s <= 0:
         return 0.0, 0.0
-    return float(sel.duration_s), float(sel.duration_s)
+    return float(sel.duration_s), 0.0
