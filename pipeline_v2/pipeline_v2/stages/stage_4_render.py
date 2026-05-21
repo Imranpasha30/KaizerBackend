@@ -297,6 +297,116 @@ def _ffprobe_video_duration_s(path: str) -> float:
         return 0.0
 
 
+# --- Item 115: per-segment a/v alignment post-pass --------------------
+#
+# The V1 compose helpers (compose_bulletin_story / compose_pip_story /
+# build_fullscreen_takeover) re-encode audio to AAC with -shortest +
+# CFR video. AAC encodes in 1024-sample frames @ 48 kHz = 21.33ms per
+# frame. The encoder rounds the final encoded audio length UP to the
+# next AAC frame boundary, leaving each composed_story_NN.mp4 with
+# audio 7-18ms LONGER than video. Over a 26-segment bulletin this
+# accumulates to +256ms of audio-vs-video drift (drift_measure_v2 on
+# job 49: -92.7ms global, +256ms cumul intra-segment).
+#
+# This helper runs a fast post-compose remux that:
+#   1. Probes the exact video stream duration (CFR 30fps -> nb_frames
+#      / 30 is sample-accurate).
+#   2. Trims audio to that duration via ``atrim=end=V`` and pads any
+#      shortfall via ``apad=whole_dur=V``.
+#   3. Re-encodes audio to AAC. The encoder still emits a final
+#      partial frame, but with trim+pad bounding the input to V the
+#      output audio ends within <1ms of V.
+#
+# Empirical: on job 49's composed_story files this reduces per-segment
+# drift from +7..18ms to <=1ms (verified on segments 00/01/03/25).
+# Video stream is `-c:v copy` so no quality loss; cost is ~200-500ms
+# of ffmpeg time per segment.
+
+
+def _align_composed_audio_to_video(
+    composed_path: str,
+    *,
+    ffmpeg_bin: Optional[str] = None,
+) -> bool:
+    """Post-pass: trim+pad audio to match video duration exactly.
+
+    Operates in-place: writes a sibling ``.aligned.mp4`` then renames
+    over the original on success. On failure (probe error, ffmpeg
+    error, missing stream) leaves the original file untouched and
+    returns False so the caller can continue without retrying.
+
+    Returns True when alignment succeeded.
+    """
+    import subprocess as _sp
+
+    if not composed_path or not os.path.isfile(composed_path):
+        return False
+
+    v_dur = _ffprobe_video_duration_s(composed_path)
+    if v_dur <= 0:
+        logger.warning(
+            "stage_4: a/v alignment skipped (no video duration): %s",
+            composed_path,
+        )
+        return False
+
+    ffmpeg = ffmpeg_bin or _v1_FFMPEG_BIN or "ffmpeg"
+    aligned_path = composed_path + ".aligned.mp4"
+    v_dur_str = f"{v_dur:.6f}"
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", composed_path,
+        "-map", "0:v",
+        "-c:v", "copy",
+        "-map", "0:a",
+        "-af",
+        f"atrim=end={v_dur_str},apad=whole_dur={v_dur_str},asetpts=PTS-STARTPTS",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-shortest",
+        "-movflags", "+faststart",
+        aligned_path,
+    ]
+    try:
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as exc:
+        logger.warning(
+            "stage_4: a/v alignment ffmpeg crashed for %s: %s",
+            composed_path, exc,
+        )
+        try:
+            os.remove(aligned_path)
+        except Exception:
+            pass
+        return False
+
+    if r.returncode != 0:
+        tail = "\n".join((r.stderr or "").splitlines()[-10:])
+        logger.warning(
+            "stage_4: a/v alignment ffmpeg rc=%d for %s: %s",
+            r.returncode, composed_path, tail,
+        )
+        try:
+            os.remove(aligned_path)
+        except Exception:
+            pass
+        return False
+
+    try:
+        os.replace(aligned_path, composed_path)
+    except OSError as exc:
+        logger.warning(
+            "stage_4: a/v alignment rename failed for %s: %s",
+            composed_path, exc,
+        )
+        try:
+            os.remove(aligned_path)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 # --- Item 102: extracted gating helpers for test coverage --------------
 #
 # Item 100 introduced three guardrails as inline expressions in
@@ -2301,6 +2411,10 @@ class Stage4Render:
                 "pip_start_s": round(float(pip_src[1]), 3) if pip_src else None,
                 "pip_dur_s":   round(float(pip_src[2]), 3) if pip_src else None,
                 "sidebar_is_video": bool(sidebar_is_video),
+                # Item 115: cache-buster -- forces re-compose on jobs
+                # that produced unaligned composed_story files before
+                # the AAC-residue fix shipped.
+                "av_align_v": 1,
             }
 
             composed_ok = False
@@ -2341,6 +2455,15 @@ class Stage4Render:
                     )
 
             if composed_ok and os.path.isfile(composed_path):
+                # Item 115: align audio EOF to video EOF so AAC
+                # frame-boundary residue (7-18ms / segment) doesn't
+                # accumulate into bulletin-scale lip-sync drift. Safe
+                # to skip when already cached -- the alignment pass
+                # is idempotent.
+                if not _v1_compose_deps.is_fresh(
+                    composed_path, composed_inputs, composed_extra,
+                ):
+                    _align_composed_audio_to_video(composed_path)
                 _v1_compose_deps.mark_built(composed_path, composed_inputs, composed_extra)
                 story_paths.append(composed_path)
             else:
@@ -2380,7 +2503,11 @@ class Stage4Render:
                 takeover_dur = max(4.0, min(8.0, story_dur_s * 0.10))
                 takeover_path = str(bulletin_dir / f"takeover_{i:02d}.mp4")
                 takeover_inputs = list(imgs[:4])
-                takeover_extra = {"duration_s": round(takeover_dur, 3)}
+                takeover_extra = {
+                    "duration_s": round(takeover_dur, 3),
+                    # Item 115: cache-buster (see composed_extra).
+                    "av_align_v": 1,
+                }
                 if _v1_compose_deps.is_fresh(takeover_path, takeover_inputs, takeover_extra):
                     logger.info("stage_4: takeover_%02d.mp4 cached", i)
                     story_paths.append(takeover_path)
@@ -2390,6 +2517,10 @@ class Stage4Render:
                             imgs[:4], takeover_dur, takeover_path,
                             work_dir=str(bulletin_dir / f"_takeover_work_{i:02d}"),
                         )
+                        # Item 115: takeovers re-encode audio (silent
+                        # track + image carousel video) and accumulate
+                        # the same AAC residue. Align before caching.
+                        _align_composed_audio_to_video(takeover_path)
                         _v1_compose_deps.mark_built(takeover_path, takeover_inputs, takeover_extra)
                         story_paths.append(takeover_path)
                     except Exception as exc:

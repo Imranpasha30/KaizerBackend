@@ -443,12 +443,19 @@ def stitch_bulletin_with_crossfade(
         )
 
     # ---- Pass 3: mux video + audio with -shortest ----
+    # Item 115: re-encode AUDIO (not -c copy) so -shortest can trim
+    # sample-accurately to the video EOF. With -c:a copy the demuxer
+    # could not split an AAC packet at video EOF, leaving up to one
+    # AAC frame (~21ms) of audio extending past the last video frame
+    # -- the residual lip-sync drift that survived item 112's cut
+    # fix. -c:v copy still gives lossless video.
     cmd3 = [
         ffmpeg_bin, "-y",
         "-i", video_only_path,
         "-i", audio_only_path,
         "-map", "0:v", "-map", "1:a",
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest",
         "-movflags", "+faststart",
         output_path,

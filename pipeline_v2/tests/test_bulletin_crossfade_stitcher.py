@@ -340,6 +340,42 @@ class TestItem111SmartCutBehavior:
         # Result: A/V mismatch in the FILE is bounded by 1 frame
         # (well under 0.2s tolerance).
 
+    def test_item115_pass3_reencodes_audio_for_sample_accurate_shortest(self):
+        """Item 115 lip-sync fix: Pass 3 mux must re-encode audio
+        (``-c:a aac``), NOT stream-copy. With ``-c:a copy`` the
+        demuxer cannot split an AAC packet at the video EOF, so
+        ``-shortest`` leaks up to one AAC frame (~21ms) of audio
+        past the last video frame -- that's the bulletin-scale
+        lip-sync drift we localized on job 49.
+
+        Re-encoding lets ``-shortest`` truncate sample-accurately.
+        Video stays ``-c:v copy`` so quality is preserved.
+        """
+        import inspect
+        import re
+        from pipeline_v2 import bulletin_crossfade_stitcher
+        src = inspect.getsource(
+            bulletin_crossfade_stitcher.stitch_bulletin_with_crossfade,
+        )
+        # Isolate the Pass 3 cmd3 block (between "cmd3 = [" and the
+        # next "]" at the same indentation level). Cheaper than
+        # parsing AST and tightly couples the assertion to the
+        # Pass 3 mux, not the N==1 bypass which legitimately uses
+        # blanket -c copy.
+        m = re.search(
+            r"cmd3\s*=\s*\[(.*?)\n\s*\]",
+            src, re.DOTALL,
+        )
+        assert m, "could not locate cmd3 list in stitch_bulletin_with_crossfade"
+        cmd3_src = m.group(1)
+        assert '"-c", "copy"' not in cmd3_src, (
+            "Pass 3 cmd3 must not use blanket -c copy (item 115); "
+            "audio needs re-encode for sample-accurate -shortest"
+        )
+        assert '"-c:v", "copy"' in cmd3_src
+        assert '"-c:a", "aac"' in cmd3_src
+        assert '"-shortest"' in cmd3_src
+
     def test_smart_cut_produces_valid_playable_mp4(self):
         """Integration test: run the real 3-pass stitcher on a
         2-segment fixture (or 25 segments if Job 46's outputs are

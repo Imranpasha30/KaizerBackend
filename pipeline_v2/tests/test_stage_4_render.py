@@ -2902,6 +2902,75 @@ class TestAdaptiveTakeoversAndPiPGate:
         assert _ffprobe_audio_duration_s("/nope/missing.mp4") == 0.0
         assert _ffprobe_video_duration_s("/nope/missing.mp4") == 0.0
 
+    def test_align_composed_audio_to_video_missing_file(self):
+        """Item 115: alignment helper returns False on missing input
+        rather than raising -- the bulletin compose loop calls it
+        opportunistically and a missing file shouldn't crash render."""
+        from pipeline_v2.stages.stage_4_render import (
+            _align_composed_audio_to_video,
+        )
+        assert _align_composed_audio_to_video("/nope/missing.mp4") is False
+
+    def test_align_composed_audio_to_video_invokes_ffmpeg_with_atrim_apad(
+        self, monkeypatch, tmp_path,
+    ):
+        """Item 115: verify the helper builds the right ffmpeg cmd.
+
+        The cmd must:
+          - copy video (`-c:v copy`) -- no quality loss
+          - re-encode audio (`-c:a aac`) so -shortest can sample-trim
+          - apply ``atrim=end=V,apad=whole_dur=V`` to enforce a == v
+
+        We mock subprocess.run so no real ffmpeg is required; the
+        focus is on the cmd shape.
+        """
+        from pipeline_v2.stages import stage_4_render
+        import subprocess as _sp
+
+        # Fake the input file so the os.path.isfile guard passes.
+        fake_input = tmp_path / "composed.mp4"
+        fake_input.write_bytes(b"dummy")
+
+        # Mock _ffprobe_video_duration_s to return a fixed duration.
+        monkeypatch.setattr(
+            stage_4_render, "_ffprobe_video_duration_s",
+            lambda _p: 24.866667,
+        )
+
+        captured_cmd = {}
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(cmd, *args, **kwargs):
+            captured_cmd["cmd"] = cmd
+            # Pretend ffmpeg wrote the .aligned.mp4 so os.replace works.
+            out = cmd[-1]
+            with open(out, "wb") as f:
+                f.write(b"aligned")
+            return _Result()
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        # _align_composed_audio_to_video imports subprocess inside the
+        # function -- also patch its module reference.
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        result = stage_4_render._align_composed_audio_to_video(str(fake_input))
+        assert result is True
+
+        cmd = captured_cmd["cmd"]
+        assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "copy"
+        assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "aac"
+        assert "-shortest" in cmd
+        # The audio filter must include atrim=end and apad=whole_dur.
+        af_idx = cmd.index("-af")
+        af_value = cmd[af_idx + 1]
+        assert "atrim=end=24.866667" in af_value
+        assert "apad=whole_dur=24.866667" in af_value
+
     def test_video_type_solo_in_disabled_set(self):
         """Sanity-check the PiP allow-list used in _render_impl. SOLO
         must NOT be in the allowed set (= the user's bug 2 case)."""

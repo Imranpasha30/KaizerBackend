@@ -1476,3 +1476,92 @@ above the 1,024-token minimum for Claude ephemeral cache).
   the box -- worth measuring in the A/B bake-off.
 
 Full pipeline_v2 suite: 945 passed (was 943; +2 regression tests).
+
+### Item 115 (COMPLETED): per-segment a/v alignment + Pass 3 audio re-encode
+
+**User report on 2026-05-21**: "still lip sync issue is there" after
+item 112's frame-aligned cut step shipped. drift_measure_v2 on job 49
+(post-restart, item 112 + 114 active) revealed the real culprit was
+NOT the cut step (per-clip a/v drift was 0.0-0.3ms, perfect) but two
+downstream sources of AAC frame-quantization residue:
+
+  - **Compose step** (V1 ``compose_bulletin_story`` /
+    ``compose_pip_story`` / ``build_fullscreen_takeover``): every
+    composed_story_NN.mp4 came out with audio 7-18ms LONGER than
+    video. Cause: ``-c:a aac -ar 48000 -shortest`` re-encodes audio,
+    and AAC rounds the encoded length UP to the next 1024-sample
+    frame (21.33ms quantum). Over 26 segments this accumulated to
+    **+256ms** of audio-vs-video drift.
+
+  - **Stitcher Pass 3 mux** (item 111's 3-pass stitcher): the final
+    mux used ``-c copy -shortest``. With ``-c:a copy`` the demuxer
+    cannot split an AAC packet at the video EOF, so ``-shortest``
+    leaks up to one AAC frame (~21ms) of audio past the last video
+    frame. Bulletin-level global delta: **-92.7ms** (audio extends
+    past video by 92ms on the 484s job-49 bulletin).
+
+User-visible symptom: audio progressively drifts ~10ms LATER per
+segment relative to mouth movements. Watchable for the first minute,
+visibly off by minute 5+, jarring by the end of an 8-minute bulletin.
+
+FIX 1 -- post-compose a/v alignment helper
+  pipeline_v2/pipeline_v2/stages/stage_4_render.py:
+  - New helper ``_align_composed_audio_to_video(composed_path)``.
+    Probes the exact video stream duration, then runs a fast remux:
+    ``-c:v copy`` + audio re-encode with
+    ``-af "atrim=end=V,apad=whole_dur=V,asetpts=PTS-STARTPTS"``.
+    Result: audio EOF aligns to video EOF within <1ms (was +7-18ms).
+  - Called from the bulletin compose loop AFTER each fresh
+    ``composed_story_NN.mp4`` and AFTER each ``takeover_NN.mp4``.
+    Skipped when the file came from cache (already-aligned).
+  - ``composed_extra`` + ``takeover_extra`` gain a ``"av_align_v":
+    1`` cache-buster key so jobs that produced UNaligned files
+    pre-fix get re-composed on the next run.
+
+FIX 2 -- stitcher Pass 3 audio re-encode
+  pipeline_v2/pipeline_v2/bulletin_crossfade_stitcher.py:
+  - Pass 3 changed from ``-c copy -shortest`` to
+    ``-c:v copy -c:a aac -b:a 192k -ar 48000 -shortest``. Video is
+    still stream-copied (lossless, fast). Audio is re-encoded so
+    ``-shortest`` can truncate sample-accurately at video EOF.
+  - Expected residual end-of-file delta: <1 AAC frame at the very
+    last position, ie <=21ms (down from the unbounded -c copy
+    behaviour). In practice will be near zero because the source
+    audio for Pass 3 (``_pass2_audio.m4a``) is itself end-aligned
+    to the cumulative acrossfade total.
+
+EMPIRICAL VERIFICATION
+  Experimental alignment pass run on 4 composed_story files from
+  job 49 (representative spread of original drift):
+
+    composed_story_00: was +7.3ms  ->  -0.7ms  (10x improvement)
+    composed_story_01: was +7.7ms  ->  -0.3ms  (25x improvement)
+    composed_story_03: was +17.0ms ->  +0.0ms  (perfect)
+    composed_story_25: was +17.0ms ->  +0.0ms  (perfect)
+
+  Projected bulletin-level: cumul intra drift drops from +256ms to
+  <5ms total. Combined with FIX 2's sample-accurate Pass 3 trim, the
+  global delta moves from -92.7ms to within 1 AAC frame (<=21ms).
+
+TESTS: +3 in pipeline_v2 suite
+  test_stage_4_render.py:
+    - ``test_align_composed_audio_to_video_missing_file``: helper
+      returns False (not raise) on missing input.
+    - ``test_align_composed_audio_to_video_invokes_ffmpeg_with_atrim_apad``:
+      verifies the cmd shape (-c:v copy, -c:a aac, atrim+apad with
+      V_DURATION, -shortest).
+
+  test_bulletin_crossfade_stitcher.py:
+    - ``test_item115_pass3_reencodes_audio_for_sample_accurate_shortest``:
+      AST-greps the stitcher's cmd3 to lock in
+      -c:v copy + -c:a aac (NOT blanket -c copy).
+
+  Plus the N==1 bypass path retains blanket ``-c copy`` (it has only
+  one input and no Pass 3 mux to perform); the regex assertion is
+  scoped specifically to the multi-segment ``cmd3`` block.
+
+COST: +~200-500ms per composed segment for the alignment pass.
+On a 26-segment bulletin that's ~10s additional render time. Well
+worth the lip-sync fix.
+
+Full pipeline_v2 suite: 948 passed (was 945; +3 new tests).
