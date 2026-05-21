@@ -103,6 +103,11 @@ def _migrate_schema():
             # Catalog lives in pipeline_v2.transitions. NULL on pre-
             # item-104 rows; renderer falls back to "smart_cut".
             "transition_style": "VARCHAR(20) DEFAULT 'smart_cut'",
+            # Item 114 (Stage 2 provider catalog): per-job LLM choice
+            # for Stage 2 editorial decisions. One of {"gemini",
+            # "claude"}. NULL on pre-item-114 rows; dispatcher falls
+            # back to "gemini".
+            "stage_2_provider":  "VARCHAR(20) DEFAULT 'gemini'",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
@@ -813,6 +818,9 @@ def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.cu
             # Item 104: surface the transition choice so the UI can
             # show a chip on the job card.
             "transition_style": (j.transition_style or "smart_cut"),
+            # Item 114: surface the Stage 2 provider choice so the
+            # UI can show a chip on the job card.
+            "stage_2_provider": (j.stage_2_provider or "gemini"),
         }
         for j in jobs
     ]
@@ -848,6 +856,10 @@ async def create_job(
     # unknown -> "smart_cut" (the default + only one implemented at
     # ship time). Ignored by V1 platforms.
     transition_style: str = Form("smart_cut"),
+    # Item 114 (Stage 2 provider catalog): operator's chosen LLM for
+    # the editorial-decision stage. One of {"gemini", "claude"}. Blank
+    # or unknown -> "gemini" (the default). Ignored by V1 platforms.
+    stage_2_provider: str = Form("gemini"),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -956,6 +968,28 @@ async def create_job(
         )
         _ts = "smart_cut"
 
+    # Item 114: same coerce-on-unknown pattern as transition_style.
+    try:
+        from pipeline_v2.stages.stage_2_providers import (
+            is_valid_provider as _is_valid_provider,
+            DEFAULT_PROVIDER as _DEFAULT_S2P,
+        )
+        _s2p = (stage_2_provider or "").strip()
+        if not _s2p or not _is_valid_provider(_s2p):
+            if _s2p and _s2p != _DEFAULT_S2P:
+                _warning_prefix = (_warning_prefix or "") + (
+                    f"[stage_2_provider] unknown value {_s2p!r} coerced "
+                    f"to {_DEFAULT_S2P!r}.\n"
+                )
+            _s2p = _DEFAULT_S2P
+    except Exception as _s2p_exc:
+        import logging as _logging
+        _logging.getLogger("kaizer.stage_2_provider").warning(
+            "create_job: provider catalog lookup failed (non-fatal): %s",
+            _s2p_exc,
+        )
+        _s2p = "gemini"
+
     job = models.Job(
         user_id=user.id,
         platform=platform,
@@ -967,6 +1001,7 @@ async def create_job(
         log=_warning_prefix,
         output_dir=str(OUTPUT_ROOT),
         transition_style=_ts,
+        stage_2_provider=_s2p,
     )
     db.add(job)
     db.commit()
@@ -1095,6 +1130,8 @@ async def create_job(
         stt_provider=stt_provider,
         # Item 104: V2 only. V1 paths ignore.
         transition_style=_ts,
+        # Item 114: V2 only. V1 paths ignore.
+        stage_2_provider=_s2p,
         db_session_factory=SessionLocal,
     )
 
@@ -1295,6 +1332,8 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "elapsed_seconds": _elapsed_seconds(job),
         # Item 104: surface the operator's transition selection.
         "transition_style": (job.transition_style or "smart_cut"),
+        # Item 114: surface the Stage 2 provider selection.
+        "stage_2_provider": (job.stage_2_provider or "gemini"),
         # Bulletin clips render first (16:9 long-form takes the lead
         # tile in the JobDetail grid), shorts follow in DB-insert
         # order. Backlog item 91 follow-up.

@@ -1317,3 +1317,101 @@ up without re-deciding:
 - **Production restart pending**: once uvicorn picks up the new
   cut path, next V2 job should show per-segment drift < 1ms and
   cumulative drift < 25ms.
+
+### Item 114 (COMPLETED): Claude Sonnet 4.6 as alternative Stage 2 provider
+
+- **Shipped**: 2026-05-21 alongside item 112. Co-authored, but
+  separate concerns: item 112 fixes lip-sync drift (cut step);
+  item 114 adds an LLM A/B alternative (Stage 2 editorial).
+- **Rationale**: Gemini Pro is non-deterministic at T=0.2; per-job
+  catch rates vary. The user wants an empirical bake-off to see if
+  Claude Sonnet 4.6 produces tighter, more consistent editorial
+  decisions for Telugu news content.
+- **Design**: provider abstraction at the SDK boundary; everything
+  else (retry policy, downstream consumers, orchestrator) stays
+  identical regardless of which LLM is selected. Gemini remains the
+  default -- no behaviour change for existing users.
+
+NEW: pipeline_v2/pipeline_v2/stages/stage_2_providers.py
+  - ``Stage2Provider`` ABC with single ``decide(stage1,
+    correction_note)`` async method.
+  - ``GeminiStage2Provider`` (lift-and-shift of the original Gemini
+    code path).
+  - ``ClaudeStage2Provider`` -- claude-sonnet-4-6, temperature=0,
+    thinking=disabled, prompt caching enabled on the system block.
+  - ``create_provider(name)`` factory: returns the right subclass,
+    falls back to Gemini for unknown / blank names.
+  - ``is_valid_provider(name)`` strict check used by main.create_job.
+  - Cost calculation per provider:
+      Gemini: input * $1.25/M + output * $10/M
+      Claude: input * $3/M + output * $15/M
+              + cache_write * $3.75/M + cache_read * $0.30/M
+    (Claude's cache discount kicks in after the first job with the
+    same system prompt -- substantial saving on the static template.)
+
+REFACTORED: pipeline_v2/pipeline_v2/stages/stage_2_continuity.py
+  - ``Stage2ContinuityEditor`` becomes a thin dispatcher around
+    ``Stage2Provider`` instances. The retry policy (one corrective
+    retry on JSON/validation failure) stays in the dispatcher;
+    providers are stateless single-call objects.
+  - Backwards compatible: existing callers / tests that imported
+    helpers (``_serialize_words_for_prompt``, ``_strip_markdown_fences``)
+    from this module continue to work via re-exports.
+  - ``editor.last_cost_usd`` + ``editor.last_usage`` delegate to the
+    provider's recorded values so the orchestrator's cost ledger
+    is provider-agnostic.
+
+DB + ENDPOINT + RUNNER + ORCHESTRATOR:
+  - models.py: ``Job.stage_2_provider = Column(String(20),
+    default="gemini", nullable=True)``.
+  - main.py ``_migrate_schema``: ``ALTER TABLE jobs ADD COLUMN
+    stage_2_provider VARCHAR(20) DEFAULT 'gemini'``.
+  - main.py ``create_job``: new ``stage_2_provider: str = Form("gemini")``
+    field; coerces unknown values to "gemini" (logged in job.log
+    via _warning_prefix); persists on Job row + threads to runner.
+  - main.py ``GET /api/jobs/`` + ``GET /api/jobs/{id}``: surface
+    ``stage_2_provider`` in responses for the UI chip.
+  - runner.py: ``run_pipeline`` + ``_dispatch_v2_inngest_event`` take
+    a ``stage_2_provider`` kwarg; event_data carries it through.
+  - orchestrator.py ``_stage_2_continuity_handler``: reads
+    envelope["stage_2_provider"], constructs
+    ``Stage2ContinuityEditor(provider_name=_s2p)``. Cost ledger
+    now records the provider's actual ``last_cost_usd`` instead of
+    the placeholder $0. Progress log shows
+    ``"Stage 2/7 done (N cuts, M skipped, provider: claude, $0.23)"``.
+
+FRONTEND:
+  - NewJob.jsx: inline ``STAGE_2_PROVIDER_CATALOG`` mirror; new
+    ``stage2Provider`` state defaulting to "gemini"; Confirm-step
+    dropdown ("Editorial AI") shown only for V2; submit() appends
+    only on non-default.
+  - JobDetail.jsx: new chip in the header line showing
+    "Gemini 2.5 Pro" or "Claude Sonnet 4.6" for V2 jobs.
+
+REQUIREMENTS: ``anthropic>=0.103.0`` added to requirements.txt.
+
+TESTS: 13 new in test_stage_2_providers.py:
+  - 4 catalog/factory tests (membership, default fallback,
+    strict validity check, dispatch to correct subclass)
+  - 2 Claude construction tests (model + temp + cache enabled;
+    lazy client raises without key)
+  - 2 Claude SDK shape tests (model=claude-sonnet-4-6,
+    temperature=0, thinking=disabled, system block carries
+    cache_control; cost calculation includes all 4 token classes)
+  - 2 dispatcher tests (defaults to Gemini, routes to Claude on
+    explicit provider_name)
+  - 3 wiring tests (Job ORM column, create_job Form field,
+    runner event_data carries stage_2_provider)
+
+Existing test suites updated for the new constructor signature:
+  - test_stage_2_continuity.py: all ``patch(...stage_2_continuity.genai.Client)``
+    sites updated to ``stage_2_providers.genai.Client``.
+  - test_orchestrator.py + test_orchestrator_e2e.py: three
+    ``_FakeEditor`` test doubles updated to accept the new
+    ``provider_name`` kwarg + expose ``last_cost_usd`` /
+    ``last_usage``.
+
+Full pipeline_v2 suite: 943 passed (was 930; +13 new).
+
+NOTE: production restart pending; current uvicorn is on item 112
+without item 114. The next stack restart picks up both.

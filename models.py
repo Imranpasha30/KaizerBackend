@@ -100,6 +100,13 @@ class Job(Base):
     # not-yet-implemented entry. Stays NULL for V1 platforms.
     transition_style = Column(String(20), default="smart_cut", nullable=True)
 
+    # Item 114 (Stage 2 provider catalog): operator's chosen LLM
+    # for Stage 2 editorial decisions. One of {"gemini", "claude"}.
+    # NULL on pre-item-114 rows; the dispatcher falls back to
+    # "gemini" (the default) when this field is NULL or names an
+    # unknown provider. Stays NULL for V1 platforms.
+    stage_2_provider = Column(String(20), default="gemini", nullable=True)
+
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 
 

@@ -214,6 +214,15 @@ def _install_stage_mocks(monkeypatch, tmp_path: Path, *, call_order: list):
     decisions, full = _stage_2_output_models()
 
     class _FakeEditor:
+        # Item 114: accept the new provider_name kwarg the orchestrator
+        # passes (so the dispatcher can route per-job between Gemini
+        # and Claude). The fake records it and exposes last_cost_usd /
+        # last_usage for the cost-ledger code path.
+        def __init__(self, *args, **kwargs):
+            self.provider_name = kwargs.get("provider_name", "gemini")
+            self.last_cost_usd = 0.0
+            self.last_usage = {}
+
         async def transcribe_to_decisions(self, s1):
             call_order.append(STAGE_2_CONTINUITY)
             return decisions

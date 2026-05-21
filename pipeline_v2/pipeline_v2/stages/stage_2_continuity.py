@@ -1,4 +1,4 @@
-"""Stage 2 -- Continuity Editor (Gemini 2.5 Pro).
+"""Stage 2 -- Continuity Editor (provider-agnostic dispatcher).
 
 Takes Stage 1's word-level transcript and emits cut decisions: which
 ranges become bulletin clips, which ranges are skipped (retakes /
@@ -10,17 +10,23 @@ LLM does NOT emit ``clean_transcript`` -- that's reconstructed
 deterministically client-side in Step 5.4 from the original word
 array minus skipped spans.
 
-SDK-level gotchas defended against (per Step 5 research):
+Item 114: the actual SDK call lives in ``stage_2_providers.py``
+behind a ``Stage2Provider`` abstraction. ``Stage2ContinuityEditor``
+keeps the corrective-retry policy and is the only thing the
+orchestrator calls. Provider selection is per-job via the
+``provider_name`` constructor arg (defaults to "gemini").
+
+Retry policy (unchanged from the Gemini-only era):
 
   - ``response.parsed`` silently swallows ``json.JSONDecodeError`` and
-    ``pydantic.ValidationError`` and returns ``None``. We use
-    ``response.text`` + ``json.loads`` + ``Stage2Output.model_validate``
-    so validation errors surface explicitly.
-  - 1.x had a markdown-fence wrapping bug (``\`\`\`json ... \`\`\```).
-    2.x is mostly fixed but we strip defensively.
-  - Thinking mode shares the ``max_output_tokens`` budget. We cap
-    thinking at 2048 (per Step 5 decision) so it doesn't silently
-    eat output tokens and truncate the JSON.
+    ``pydantic.ValidationError`` and returns ``None``. The Gemini
+    provider uses ``response.text`` + ``json.loads`` +
+    ``Stage2Output.model_validate`` so validation errors surface.
+  - Markdown-fence wrapping bug (``\`\`\`json ... \`\`\```): both
+    providers strip defensively.
+  - Thinking mode shares the ``max_output_tokens`` budget. The Gemini
+    provider caps thinking at 2048; the Claude provider disables
+    thinking entirely for first ship.
   - No SDK-level retry. We do 1 corrective retry with the validation
     error appended to the prompt; second failure raises so Inngest's
     exponential backoff is the outer retry layer.
@@ -30,15 +36,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
-# Eager imports. If the SDK isn't installed, the module fails to
-# import -- there's no graceful degradation here (Stage 2 IS the
-# Gemini step).
-from google import genai
-from google.genai import types
 from pydantic import ValidationError
 
 from pipeline_v2.models import (
@@ -50,214 +50,152 @@ from pipeline_v2.models import (
     StageTwoOutput,
     Word,
 )
+from pipeline_v2.stages.stage_2_providers import (
+    DEFAULT_PROVIDER,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_CLAUDE_MODEL,
+    PROVIDER_CLAUDE,
+    PROVIDER_GEMINI,
+    Stage2Provider,
+    create_provider,
+    # Backward-compat aliases for older callers / tests that imported
+    # these helpers from stage_2_continuity directly. They moved to
+    # stage_2_providers in item 114; re-export so import sites
+    # don't have to change in lockstep.
+    _serialize_words_for_prompt,   # noqa: F401
+    _strip_markdown_fences,        # noqa: F401
+)
 
 logger = logging.getLogger("pipeline_v2.stage_2")
 
 
 # --- Defaults (locked at top of file so a future reader sees them) ----
 
+# Backward-compat aliases used by older tests + the orchestrator.
 DEFAULT_MODEL = "gemini-2.5-pro"
 DEFAULT_TEMPERATURE = 0.2
-DEFAULT_THINKING_BUDGET = 2048      # cap thinking; large output is the priority
+DEFAULT_THINKING_BUDGET = 2048      # Gemini-only
 DEFAULT_MAX_OUTPUT_TOKENS = 16384   # well under 65k Gemini cap
 
 DEFAULT_PROMPT_PATH = Path(__file__).parent / "stage_2_prompt.md"
-
-
-# --- Helpers ---------------------------------------------------------
-
-
-def _strip_markdown_fences(text: str) -> str:
-    """Remove leading/trailing ``\`\`\`json`` and ``\`\`\``` fences.
-
-    Older google-genai versions had a bug where Gemini wrapped JSON
-    output in markdown fences despite ``response_mime_type=
-    "application/json"``. The 2.4.0 SDK mostly fixed this but the
-    behavior is empirically still inconsistent on Gemini 2.5 Pro for
-    long structured outputs. Stripping defensively costs nothing.
-    """
-    text = text.strip()
-    if not text.startswith("```"):
-        return text
-    lines = text.splitlines()
-    # Drop the opening fence (```json or ```)
-    if lines and lines[0].strip().startswith("```"):
-        lines = lines[1:]
-    # Drop the closing fence if present
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-def _serialize_words_for_prompt(stage1_output: Stage1Output) -> str:
-    """Render Stage 1's word array as compact JSON for the prompt.
-
-    Deepgram-style shape: ``[{"w":"hello","s":0.10,"e":0.45}, ...]``.
-    We round timestamps to 3 decimals to keep the prompt tokens-tight
-    (3-decimal precision = 1ms, plenty for cut decisions). Speaker
-    and confidence are omitted -- Stage 2 doesn't use them at the
-    prompt level (continuity is mostly textual signal).
-    """
-    arr = [
-        {
-            "w": w.w,
-            "s": round(float(w.s), 3),
-            "e": round(float(w.e), 3),
-        }
-        for w in stage1_output.transcript.words
-    ]
-    return json.dumps(arr, ensure_ascii=False)
 
 
 # --- Stage entry -----------------------------------------------------
 
 
 class Stage2ContinuityEditor:
-    """Gemini 2.5 Pro continuity editor.
+    """Provider-agnostic continuity editor.
 
     Usage::
 
-        editor = Stage2ContinuityEditor()
+        editor = Stage2ContinuityEditor()                           # default: gemini
+        editor = Stage2ContinuityEditor(provider_name="claude")     # explicit Claude
         decisions = await editor.transcribe_to_decisions(stage1_output)
-        # decisions: Stage2Output with full_video_cuts / skipped_segments
-        # / retake_audit. CleanTranscript is reconstructed elsewhere
-        # (Step 5.4).
 
-    Constructor overrides are kwargs-only so future arguments can be
-    added without breaking call sites. The dispatcher (Step 10) will
-    instantiate this with no args; tests may override the model /
+    The dispatcher (Step 10) instantiates this with ``provider_name``
+    taken from the job's Inngest envelope (which the runner stamps
+    from ``Job.stage_2_provider``). Tests may override the model /
     temperature / thinking_budget / max_output_tokens / prompt_path.
+
+    Provider exposure: after a successful call, ``self.provider_name``
+    and ``self.last_cost_usd`` reflect what was actually used. The
+    orchestrator reads both for the cost ledger.
     """
 
     def __init__(
         self,
         *,
-        model: str = DEFAULT_MODEL,
-        temperature: float = DEFAULT_TEMPERATURE,
+        provider_name: str = DEFAULT_PROVIDER,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
         thinking_budget: int = DEFAULT_THINKING_BUDGET,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         prompt_path: Optional[Path] = None,
     ):
+        self.provider_name = provider_name
+        # Resolve default model from provider when caller didn't pin one.
+        # Backward-compat: legacy callers / tests that read editor.model
+        # before any call expect a non-None default; the previous
+        # constructor pre-item-114 had ``model: str = DEFAULT_MODEL``.
+        if model is None:
+            if provider_name == PROVIDER_CLAUDE:
+                model = DEFAULT_CLAUDE_MODEL
+            else:
+                model = DEFAULT_GEMINI_MODEL
         self.model = model
+        # Same pattern for temperature: legacy default was 0.2 (Gemini).
+        # Claude defaults to 0.0 in its provider. Surface a sensible
+        # default per provider so callers can inspect ``editor.temperature``.
+        if temperature is None:
+            if provider_name == PROVIDER_CLAUDE:
+                temperature = 0.0
+            else:
+                temperature = DEFAULT_TEMPERATURE
         self.temperature = temperature
         self.thinking_budget = thinking_budget
         self.max_output_tokens = max_output_tokens
         self.prompt_path = Path(prompt_path) if prompt_path else DEFAULT_PROMPT_PATH
-        self._client: Optional[genai.Client] = None
-        self._prompt_template: Optional[str] = None
+        # Provider instance -- built lazily on first call. Built once
+        # per Stage2ContinuityEditor so the prompt template is loaded
+        # only once and (for Claude) the prompt cache breakpoint
+        # stays warm across the corrective retry.
+        self._provider: Optional[Stage2Provider] = None
 
-    # ---- lazy resources ---------------------------------------------
+    def _get_provider(self) -> Stage2Provider:
+        if self._provider is not None:
+            return self._provider
+        kwargs: dict = {
+            "max_output_tokens": self.max_output_tokens,
+        }
+        # Forward only the params that match. create_provider's per-
+        # provider sig_keys filter prevents irrelevant kwargs from
+        # crashing the constructor.
+        if self.model is not None:
+            kwargs["model"] = self.model
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.thinking_budget is not None:
+            kwargs["thinking_budget"] = self.thinking_budget
+        self._provider = create_provider(
+            self.provider_name,
+            prompt_path=self.prompt_path,
+            **kwargs,
+        )
+        return self._provider
 
-    def _get_client(self) -> genai.Client:
-        """Construct the Gemini client on first call.
+    @property
+    def last_cost_usd(self) -> float:
+        """Last call's USD cost, or 0 if no call has been made yet."""
+        return self._provider.last_cost_usd if self._provider else 0.0
 
-        API key is fetched lazily so a missing key doesn't kill
-        construction. Tests can monkey-patch ``GEMINI_API_KEY`` to a
-        fake value -- the SDK only complains when an actual API call
-        is made (which tests mock).
-        """
-        if self._client is not None:
-            return self._client
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY env var is empty/unset. Add it to "
-                "KaizerBackend/.env."
-            )
-        self._client = genai.Client(api_key=api_key)
-        return self._client
+    @property
+    def last_usage(self) -> dict:
+        """Last call's token usage breakdown."""
+        return self._provider.last_usage if self._provider else {}
+
+    # ---- Backward-compat delegates ----------------------------------
+    #
+    # Pre-item-114 callers (mostly the existing test suite) probed
+    # _load_prompt and read self._prompt_template directly on the
+    # editor. Forward those to the underlying provider so the same
+    # access patterns keep working.
 
     def _load_prompt(self) -> str:
-        if self._prompt_template is not None:
-            return self._prompt_template
-        if not self.prompt_path.is_file():
-            raise FileNotFoundError(
-                f"Stage 2 prompt template not found at {self.prompt_path}. "
-                f"Step 5.3 fills this in. For testing earlier, pass "
-                f"prompt_path= explicitly to the constructor."
-            )
-        self._prompt_template = self.prompt_path.read_text(encoding="utf-8")
-        return self._prompt_template
+        """Delegate -- loads the prompt template via the provider."""
+        return self._get_provider()._load_prompt()
 
-    # ---- prompt construction ----------------------------------------
+    @property
+    def _prompt_template(self) -> Optional[str]:
+        """Reflect the provider's cached template (None if not yet
+        loaded). Read-only; tests that want to invalidate the cache
+        should construct a fresh editor."""
+        return self._get_provider()._prompt_template
 
-    def _build_prompt(
-        self,
-        stage1_output: Stage1Output,
-        correction_note: str = "",
-    ) -> str:
-        template = self._load_prompt()
-        words_json = _serialize_words_for_prompt(stage1_output)
-        # Stage 1 metadata that may be useful in the prompt:
-        lang = stage1_output.stt_language_detected or "unknown"
-        provider = stage1_output.stt_provider
-        duration = stage1_output.stt_audio_duration_sec
-
-        prompt = (
-            f"{template}\n\n"
-            f"## Audio metadata\n"
-            f"- Detected language: {lang}\n"
-            f"- STT provider:      {provider}\n"
-            f"- Duration:          {duration:.1f}s\n"
-            f"- Word count:        {len(stage1_output.transcript.words)}\n"
-            f"\n"
-            f"## Word array (Deepgram-style timestamps, one entry per word)\n"
-            f"{words_json}\n"
-        )
-        if correction_note:
-            prompt += f"\n## Correction note\n{correction_note}\n"
-        return prompt
-
-    # ---- Gemini call + parse ---------------------------------------
-
-    async def _call_gemini(self, prompt: str):
-        client = self._get_client()
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=Stage2Output,
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=self.thinking_budget,
-            ),
-        )
-        return await client.aio.models.generate_content(
-            model=self.model,
-            contents=[prompt],
-            config=config,
-        )
-
-    def _parse_response(self, response) -> Stage2Output:
-        """Manual validate path -- do NOT trust ``response.parsed``.
-
-        Per the google-genai 2.4.0 research (issue #289):
-          - ``response.parsed`` silently catches ``json.JSONDecodeError``
-            and ``pydantic.ValidationError``, returning ``None`` instead
-            of raising
-          - ``response.parsed`` does NOT run our ``@field_validator``
-            decorators (e.g. ShortsCut's 15-60s duration check)
-
-        We use ``response.text`` + ``json.loads`` + ``Stage2Output.
-        model_validate(...)`` so every validation step happens
-        explicitly and surfaces errors for the corrective-retry layer.
-        """
-        raw_text = getattr(response, "text", "") or ""
-        if not raw_text.strip():
-            # Empty response.text: treat as JSON decode error so the
-            # corrective-retry catches it like any other parse failure.
-            raise json.JSONDecodeError(
-                "response.text is empty (Gemini returned no JSON body; "
-                "check finish_reason for MAX_TOKENS truncation or "
-                "thinking-budget exhaustion)",
-                "",
-                0,
-            )
-        cleaned = _strip_markdown_fences(raw_text)
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            raise
-        return Stage2Output.model_validate(data)
+    @_prompt_template.setter
+    def _prompt_template(self, value: Optional[str]) -> None:
+        """Tests sometimes pre-populate the cache to skip the file
+        read. Honour that by writing through to the provider."""
+        self._get_provider()._prompt_template = value
 
     # ---- Public entry -----------------------------------------------
 
@@ -267,31 +205,29 @@ class Stage2ContinuityEditor:
     ) -> Stage2Output:
         """Convert a Stage 1 word transcript into Stage 2 cut decisions.
 
-        Retry policy (locked by Step 5 design):
-          1. First attempt: call Gemini, parse, return.
+        Retry policy (unchanged from Gemini-only era):
+          1. First attempt: call provider.decide(), return.
           2. On ``json.JSONDecodeError`` or ``pydantic.ValidationError``:
-             single corrective retry with the validation error appended
-             to the prompt.
+             single corrective retry with the validation error
+             appended to the prompt.
           3. On second failure: raise ``RuntimeError`` wrapping both
              errors. Inngest's exponential backoff is the outer retry
              layer -- we deliberately do NOT retry beyond 1 in-step.
           4. Other exceptions (auth fail, rate limit, network) are
-             allowed to propagate immediately -- the dispatcher / Inngest
-             handles those.
+             allowed to propagate immediately.
         """
-        base_prompt = self._build_prompt(stage1_output)
+        provider = self._get_provider()
 
         # ---- First attempt ----
         first_error: Optional[Exception] = None
         try:
-            response = await self._call_gemini(base_prompt)
-            return self._parse_response(response)
+            return await provider.decide(stage1_output)
         except (json.JSONDecodeError, ValidationError) as exc:
             first_error = exc
             logger.warning(
-                "stage_2: first attempt failed validation: %s. "
+                "stage_2 [%s]: first attempt failed validation: %s. "
                 "Issuing 1 corrective retry with the error appended.",
-                exc,
+                self.provider_name, exc,
             )
 
         # ---- Corrective retry ----
@@ -305,15 +241,14 @@ class Stage2ContinuityEditor:
             "hesitation, aside, self_correction (NEVER invent new "
             "categories)."
         )
-        retry_prompt = self._build_prompt(
-            stage1_output, correction_note=correction_note,
-        )
         try:
-            response = await self._call_gemini(retry_prompt)
-            return self._parse_response(response)
+            return await provider.decide(
+                stage1_output, correction_note=correction_note,
+            )
         except (json.JSONDecodeError, ValidationError) as second_exc:
             raise RuntimeError(
-                f"Stage 2 failed after corrective retry. "
+                f"Stage 2 failed after corrective retry "
+                f"(provider={self.provider_name!r}). "
                 f"First error: {first_error!r}. "
                 f"Second error: {second_exc!r}. "
                 f"Inngest's outer retry will handle if applicable."

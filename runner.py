@@ -44,6 +44,7 @@ def _dispatch_v2_inngest_event(
     stt_provider: str,
     db_session_factory,
     transition_style: str = "smart_cut",
+    stage_2_provider: str = "gemini",
 ) -> None:
     """Fire ``video/v2/uploaded`` so the Inngest V2 worker picks up.
 
@@ -109,6 +110,11 @@ def _dispatch_v2_inngest_event(
         # validated in main.create_job; the worker re-validates via
         # resolve_for_render so a stale event survives a catalog edit.
         "transition_style": transition_style or "smart_cut",
+        # Item 114: operator's Stage 2 provider selection.
+        # ("gemini" | "claude"). Validated in main.create_job; the
+        # orchestrator falls back to "gemini" if the value is blank
+        # or unknown at consumption time.
+        "stage_2_provider": stage_2_provider or "gemini",
         # preset is caller-supplied via Stage 4; we ship the PLATFORMS
         # entry shape from main.py for the V2 platform. Looking it up
         # here avoids pulling main into runner's import graph (would
@@ -239,7 +245,8 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  default_logo: str = "",
                  bulletin_images: Optional[list] = None,
                  stt_provider: str = "",
-                 transition_style: str = "smart_cut"):
+                 transition_style: str = "smart_cut",
+                 stage_2_provider: str = "gemini"):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -274,6 +281,7 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             frame=frame,
             stt_provider=stt_provider,
             transition_style=transition_style,
+            stage_2_provider=stage_2_provider,
             db_session_factory=db_session_factory,
         )
         return   # V2 worker takes over; no subprocess spawn

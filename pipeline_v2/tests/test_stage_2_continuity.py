@@ -248,7 +248,7 @@ class TestGeminiCallConfig:
             return_value=_mock_response(valid_stage2_json),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             await e.transcribe_to_decisions(stage1_output)
@@ -282,7 +282,7 @@ class TestHappyPath:
             return_value=_mock_response(valid_stage2_json),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             result = await e.transcribe_to_decisions(stage1_output)
@@ -308,7 +308,7 @@ class TestHappyPath:
             return_value=_mock_response(wrapped),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             result = await e.transcribe_to_decisions(stage1_output)
@@ -360,7 +360,7 @@ class TestManualValidatePath:
             return_value=_mock_response(bad_json),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             with pytest.raises(RuntimeError, match="corrective retry"):
@@ -382,7 +382,7 @@ class TestManualValidatePath:
             return_value=_mock_response(""),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             with pytest.raises(RuntimeError, match="corrective retry"):
@@ -411,7 +411,7 @@ class TestCorrectiveRetry:
             ],
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             result = await e.transcribe_to_decisions(stage1_output)
@@ -440,7 +440,7 @@ class TestCorrectiveRetry:
             return_value=_mock_response(bad_json),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             with pytest.raises(RuntimeError, match="corrective retry"):
@@ -463,7 +463,7 @@ class TestCorrectiveRetry:
             ],
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             await e.transcribe_to_decisions(stage1_output)
@@ -501,7 +501,7 @@ class TestExceptionPropagation:
             side_effect=RuntimeError("HTTP 401 unauthorized"),
         )
         with patch(
-            "pipeline_v2.stages.stage_2_continuity.genai.Client",
+            "pipeline_v2.stages.stage_2_providers.genai.Client",
             return_value=fake_client,
         ):
             # The provider does NOT catch SDK exceptions -- only

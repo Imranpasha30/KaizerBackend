@@ -580,6 +580,12 @@ class TestStage2Handler:
         )
 
         class _FakeEditor:
+            # Item 114: accept provider_name kwarg + expose cost / usage.
+            def __init__(self, *args, **kwargs):
+                self.provider_name = kwargs.get("provider_name", "gemini")
+                self.last_cost_usd = 0.0
+                self.last_usage = {}
+
             async def transcribe_to_decisions(self, s1):
                 return fake_decisions
         monkeypatch.setattr(
@@ -734,6 +740,12 @@ class TestCurrentStageWrittenPerHandler:
         )
 
         class _FakeEditor:
+            # Item 114: accept provider_name kwarg + expose cost / usage.
+            def __init__(self, *args, **kwargs):
+                self.provider_name = kwargs.get("provider_name", "gemini")
+                self.last_cost_usd = 0.0
+                self.last_usage = {}
+
             async def transcribe_to_decisions(self, s1):
                 return Stage2Output(
                     full_video_cuts=full.full_video_cuts,

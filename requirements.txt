@@ -46,6 +46,12 @@ future==1.0.0
 google-genai>=1.0.0
 google-api-core==2.30.0
 google-api-python-client==2.193.0
+
+# Item 114: Anthropic SDK for the Claude Sonnet 4.6 Stage 2 provider
+# alternative. Used by pipeline_v2/pipeline_v2/stages/stage_2_providers.py.
+# Lazy-imported inside ClaudeStage2Provider so V2 jobs that pick the
+# Gemini path never pay the import cost.
+anthropic>=0.103.0
 google-auth==2.49.1
 google-auth-httplib2==0.3.0
 google-auth-oauthlib==1.3.1

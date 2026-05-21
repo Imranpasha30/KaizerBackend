@@ -412,7 +412,12 @@ async def _stage_1_transcribe_handler(envelope: dict) -> dict:
 
 
 async def _stage_2_continuity_handler(envelope: dict) -> dict:
-    """Stage 2: Gemini 2.5 Pro continuity editor.
+    """Stage 2: provider-agnostic continuity editor.
+
+    Item 114: provider chosen per-job via ``envelope["stage_2_provider"]``
+    (set by runner._dispatch_v2_inngest_event from Job.stage_2_provider).
+    Blank/unknown -> "gemini" (default). The dispatcher in
+    Stage2ContinuityEditor builds the right SDK client.
 
     Builds the full StageTwoOutput (LLM decisions +
     deterministically-reconstructed clean_transcript via
@@ -421,20 +426,31 @@ async def _stage_2_continuity_handler(envelope: dict) -> dict:
     job_id = envelope["job_id"]
     _check_cancelled(job_id)
     _write_current_stage(job_id, STAGE_2_CONTINUITY)
+
+    # Item 114: resolve operator's Stage 2 provider selection from the
+    # event envelope. Blank/unknown coerces to "gemini" downstream via
+    # create_provider.
+    _s2p = (envelope.get("stage_2_provider") or "gemini").strip().lower()
+    if _s2p not in ("gemini", "claude"):
+        _s2p = "gemini"
+
     _append_progress_log(
-        job_id, "Stage 2/7 continuity editor started (Gemini 2.5 Pro)",
+        job_id, f"Stage 2/7 continuity editor started "
+                f"(provider: {_s2p})",
     )
 
     stage_1 = Stage1Output.model_validate(envelope["stage_1"])
-    editor = Stage2ContinuityEditor()
+    editor = Stage2ContinuityEditor(provider_name=_s2p)
     decisions: Stage2Output = await editor.transcribe_to_decisions(stage_1)
     full: StageTwoOutput = assemble_stage_two_output(stage_1, decisions)
 
     envelope["stage_2"] = full.model_dump()
-    # Gemini cost tracking is best-effort -- pull token counts off the
-    # response only if available. For Beta we log $0.0 here; Step 12
-    # can plumb usage_metadata through Stage 2's return.
-    envelope["stage_costs"][STAGE_2_CONTINUITY] = 0.0
+    # Item 114: cost ledger now sourced from the provider's
+    # last_cost_usd, which both Gemini and Claude populate after
+    # decide(). Records the actual cost rather than 0.0.
+    envelope["stage_costs"][STAGE_2_CONTINUITY] = float(editor.last_cost_usd)
+    envelope["stage_2_provider"] = _s2p
+    envelope["stage_2_usage"] = dict(editor.last_usage or {})
     cuts_n = len(getattr(full, "full_video_cuts", None) or [])
     skip_n = len(getattr(decisions, "skipped_segments", None) or [])
 
@@ -471,7 +487,8 @@ async def _stage_2_continuity_handler(envelope: dict) -> dict:
 
     _append_progress_log(
         job_id,
-        f"Stage 2/7 done ({cuts_n} cuts, {skip_n} skipped segments)",
+        f"Stage 2/7 done ({cuts_n} cuts, {skip_n} skipped segments, "
+        f"provider: {_s2p}, ${editor.last_cost_usd:.4f})",
     )
     return envelope
 
