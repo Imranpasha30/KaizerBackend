@@ -154,6 +154,31 @@ def _stage2_minimal_dict():
     }
 
 
+def _fake_parsed_response(stage2_dict: dict):
+    """Build a fake ``ParsedMessage`` shape matching what
+    ``client.messages.parse(output_format=Stage2Output)`` returns.
+
+    Real SDK: ``response.content`` is a list of blocks; each text
+    block has ``type='text'``, ``text=<raw json>``, and a
+    ``parsed_output`` already validated to ``Stage2Output``. There is
+    NO top-level ``response.parsed_output`` -- the provider walks the
+    content list.
+    """
+    from pipeline_v2.models import Stage2Output
+    parsed = Stage2Output.model_validate(stage2_dict)
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = "{}"   # fallback raw JSON; unused when parsed_output present
+    text_block.parsed_output = parsed
+    response = MagicMock()
+    response.content = [text_block]
+    response.usage = MagicMock(
+        input_tokens=100, output_tokens=50,
+        cache_read_input_tokens=0, cache_creation_input_tokens=0,
+    )
+    return response, parsed
+
+
 @pytest.mark.asyncio
 async def test_07_claude_call_uses_correct_model_temp_and_thinking_disabled(
     tmp_path: Path, monkeypatch,
@@ -168,13 +193,7 @@ async def test_07_claude_call_uses_correct_model_temp_and_thinking_disabled(
     pp.write_text("TEST PROMPT TEMPLATE")
     provider = ClaudeStage2Provider(prompt_path=pp)
 
-    # Fake response that satisfies parsed_output + usage.
-    fake_response = MagicMock()
-    fake_response.parsed_output = Stage2Output.model_validate(_stage2_minimal_dict())
-    fake_response.usage = MagicMock(
-        input_tokens=100, output_tokens=50,
-        cache_read_input_tokens=0, cache_creation_input_tokens=0,
-    )
+    fake_response, _ = _fake_parsed_response(_stage2_minimal_dict())
 
     fake_messages = MagicMock()
     fake_messages.parse = AsyncMock(return_value=fake_response)
@@ -223,8 +242,7 @@ async def test_08_claude_cost_includes_cache_read_and_write(
     pp.write_text("TEMPLATE")
     provider = ClaudeStage2Provider(prompt_path=pp)
 
-    fake_response = MagicMock()
-    fake_response.parsed_output = Stage2Output.model_validate(_stage2_minimal_dict())
+    fake_response, _ = _fake_parsed_response(_stage2_minimal_dict())
     fake_response.usage = MagicMock(
         input_tokens=1000, output_tokens=500,
         cache_read_input_tokens=8000, cache_creation_input_tokens=0,
@@ -252,6 +270,90 @@ async def test_08_claude_cost_includes_cache_read_and_write(
     assert CLAUDE_SONNET_4_6_CACHE_READ_PER_M_USD < CLAUDE_SONNET_4_6_INPUT_PER_M_USD
     # Cache write is more expensive than input.
     assert CLAUDE_SONNET_4_6_CACHE_WRITE_PER_M_USD > CLAUDE_SONNET_4_6_INPUT_PER_M_USD
+
+
+# ----- Bug 1: parsed_output retrieval from ParsedTextBlock ------------
+
+
+@pytest.mark.asyncio
+async def test_14_claude_reads_parsed_output_from_content_block(
+    tmp_path: Path, monkeypatch,
+):
+    """REGRESSION: anthropic SDK v0.103.x puts ``parsed_output`` on
+    each ``ParsedTextBlock`` inside ``response.content`` -- NOT on the
+    top-level response. The provider must walk content blocks; if it
+    naively did ``response.parsed_output`` (None on the real shape),
+    every call would silently fall through to the raw-JSON fallback
+    path and lose the SDK's structured-output guarantees.
+    """
+    from pipeline_v2.stages.stage_2_providers import ClaudeStage2Provider
+    from pipeline_v2.models import Stage2Output
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pp = tmp_path / "p.md"
+    pp.write_text("TEMPLATE")
+    provider = ClaudeStage2Provider(prompt_path=pp)
+
+    fake_response, expected = _fake_parsed_response(_stage2_minimal_dict())
+    # Top-level parsed_output MUST NOT be the source of truth.
+    # If the production code reads it, it'd find a Mock here and
+    # accidentally succeed. Clear it explicitly so the test fails
+    # loudly when the provider walks the wrong attribute.
+    del fake_response.parsed_output
+
+    fake_messages = MagicMock()
+    fake_messages.parse = AsyncMock(return_value=fake_response)
+    fake_client = MagicMock()
+    fake_client.messages = fake_messages
+
+    with patch.object(provider, "_get_client", return_value=fake_client):
+        result = await provider.decide(_stage1_minimal())
+
+    assert isinstance(result, Stage2Output)
+    # The provider returned the EXACT parsed_output from the
+    # content block (not a fallback re-parse of the raw text).
+    assert result is expected
+
+
+@pytest.mark.asyncio
+async def test_15_claude_fallback_parses_raw_text_when_parsed_output_missing(
+    tmp_path: Path, monkeypatch,
+):
+    """Defensive fallback: if a text block has no parsed_output (e.g.
+    SDK skipped parsing because output_config got stripped server-side,
+    refusal partial, etc.), the provider still parses the raw JSON +
+    Pydantic-validates it. Validation errors propagate to the
+    corrective-retry layer."""
+    import json
+    from pipeline_v2.stages.stage_2_providers import ClaudeStage2Provider
+    from pipeline_v2.models import Stage2Output
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pp = tmp_path / "p.md"
+    pp.write_text("TEMPLATE")
+    provider = ClaudeStage2Provider(prompt_path=pp)
+
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = json.dumps(_stage2_minimal_dict())
+    text_block.parsed_output = None   # SDK didn't pre-parse for us
+
+    fake_response = MagicMock()
+    fake_response.content = [text_block]
+    fake_response.usage = MagicMock(
+        input_tokens=10, output_tokens=5,
+        cache_read_input_tokens=0, cache_creation_input_tokens=0,
+    )
+
+    fake_messages = MagicMock()
+    fake_messages.parse = AsyncMock(return_value=fake_response)
+    fake_client = MagicMock()
+    fake_client.messages = fake_messages
+
+    with patch.object(provider, "_get_client", return_value=fake_client):
+        result = await provider.decide(_stage1_minimal())
+
+    assert isinstance(result, Stage2Output)
 
 
 # ----- Backwards-compat: Stage2ContinuityEditor dispatcher ------------

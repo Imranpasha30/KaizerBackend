@@ -1415,3 +1415,64 @@ Full pipeline_v2 suite: 943 passed (was 930; +13 new).
 
 NOTE: production restart pending; current uvicorn is on item 112
 without item 114. The next stack restart picks up both.
+
+### Item 114 follow-up: SDK API correctness fixes (post-commit)
+
+Two real bugs caught during ANTHROPIC_API_KEY-backed smoke testing.
+Both were silent failures the original test suite missed because the
+mocks happened to be wrong in the same way as the production code.
+
+BUG 1 -- ``response.parsed_output`` does not exist.
+  In anthropic-sdk-python 0.103.x, ``client.messages.parse(...)``
+  returns a ``ParsedMessage`` whose ``content`` is a list of
+  ``ParsedTextBlock``s; each text block has its OWN ``parsed_output``
+  field validated against the supplied ``output_format``. The
+  top-level response has NO ``parsed_output`` attribute. The
+  original ``decide()`` did ``getattr(response, "parsed_output",
+  None)`` -> always ``None`` -> silently fell through to the raw-JSON
+  fallback path on every single call, defeating the SDK's native
+  validation guarantees.
+
+  Fix: walk ``response.content`` for the first text block with a
+  non-None ``parsed_output``. Fallback to raw-JSON parsing only if
+  no block has it set.
+
+BUG 2 -- ``_strip_unsupported_constraints`` is dead code.
+  The Anthropic SDK already runs ``transform_schema`` over the
+  Pydantic JSON schema (folds ``minimum``/``maximum`` into the
+  field's ``description`` text instead of emitting them as JSON
+  Schema constraints). The original provider had a 30-line
+  ``_strip_unsupported_constraints`` walker that was never called
+  AND would have stripped the constraints the SDK actually wants.
+
+  Fix: removed the dead method.
+
+TESTS: +2 new regression tests in test_stage_2_providers.py:
+  - ``test_14_claude_reads_parsed_output_from_content_block``:
+    builds a fake response with ``parsed_output`` on the content
+    block only (no top-level field) and asserts the provider
+    returns the exact parsed instance (not a fallback re-parse).
+  - ``test_15_claude_fallback_parses_raw_text_when_parsed_output_missing``:
+    text block with ``parsed_output=None`` + valid JSON text;
+    asserts the fallback path still produces a valid ``Stage2Output``.
+
+REAL API SMOKE TEST (one call, $0.046):
+  - 12-word Telugu fixture with a deliberate "namaskaram andariki
+    um <restart> namaskaram andariki ee roju..." phrase-level retake
+  - Claude correctly identified the retake (words 0-2, category=retake)
+    and produced a clean cut covering words 0-11 with a coherent
+    retake_audit prose summary
+  - Cost ledger captured 11,072 cache_write tokens for the static
+    prompt -- subsequent calls within the 5-min ephemeral window
+    pay 0.1x for cache_read, ~12.5x cheaper on the static portion
+
+PROMPT SIZE: stage_2_prompt.md = 24,881 chars / ~9,470 tokens (well
+above the 1,024-token minimum for Claude ephemeral cache).
+
+  Notably: Claude caught a phrase-level partial-restart pattern that
+  Gemini fails on. Item 107 ("Partial-restart detection patterns")
+  was DEFERRED for Gemini because the prompt-level approach regressed
+  Iteration 2 (6/11). The Claude provider may solve item 107 out of
+  the box -- worth measuring in the A/B bake-off.
+
+Full pipeline_v2 suite: 945 passed (was 943; +2 regression tests).

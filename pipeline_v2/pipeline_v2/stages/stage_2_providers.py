@@ -392,37 +392,6 @@ class ClaudeStage2Provider(Stage2Provider):
         payload = _build_user_payload(stage1_output, correction_note=correction_note)
         return [{"role": "user", "content": payload}]
 
-    def _strip_unsupported_constraints(self, schema: dict) -> dict:
-        """Claude's structured outputs reject the JSON Schema
-        ``minimum``/``maximum`` keys (see anthropic docs). Strip
-        them defensively so the schema validates.
-
-        ``Stage2Output``'s ``FullVideoCut.importance: int = Field(ge=1,
-        le=10)`` produces both. Pydantic's own validator still enforces
-        the range when we ``model_validate(...)`` the response, so
-        stripping here doesn't weaken correctness.
-
-        Also strips the ``$defs`` top-level if it contains numeric
-        constraints (Pydantic emits enum / nested-model defs there).
-        """
-        import copy
-        s = copy.deepcopy(schema)
-
-        def _walk(obj):
-            if isinstance(obj, dict):
-                for k in ("minimum", "maximum", "exclusiveMinimum",
-                          "exclusiveMaximum", "minLength", "maxLength",
-                          "multipleOf"):
-                    obj.pop(k, None)
-                for v in obj.values():
-                    _walk(v)
-            elif isinstance(obj, list):
-                for v in obj:
-                    _walk(v)
-
-        _walk(s)
-        return s
-
     async def decide(
         self,
         stage1: Stage1Output,
@@ -473,29 +442,41 @@ class ClaudeStage2Provider(Stage2Provider):
             "cache_write_tokens": cache_write,
         }
 
-        # parse() returns response with .parsed_output already
-        # validated against Stage2Output. If parse failed (model
-        # didn't conform to schema) the SDK raises an error.
-        parsed = getattr(response, "parsed_output", None)
-        if parsed is None:
-            # Fallback: parse the raw text ourselves. parse() should
-            # have done this, but defend against SDK behavioural drift.
-            text_block = next(
-                (b for b in response.content if getattr(b, "type", "") == "text"),
-                None,
+        # client.messages.parse() returns a ParsedMessage whose
+        # ParsedTextBlock entries each carry a ``parsed_output``
+        # field already validated against ``Stage2Output``. (The
+        # SDK invokes ``parse_response`` internally; see
+        # anthropic.lib._parse._response.) The top-level response
+        # has NO ``parsed_output`` attribute -- look inside the
+        # content blocks instead.
+        parsed: Optional[Stage2Output] = None
+        text_block = None
+        for block in response.content:
+            if getattr(block, "type", "") != "text":
+                continue
+            text_block = block
+            candidate = getattr(block, "parsed_output", None)
+            if candidate is not None:
+                parsed = candidate
+                break
+        if parsed is not None:
+            return parsed
+
+        # Fallback: parse the raw text ourselves if the SDK didn't
+        # populate parsed_output (e.g. refusal, partial response).
+        # We still raise JSONDecodeError / ValidationError so the
+        # corrective-retry layer catches them.
+        raw = getattr(text_block, "text", "") if text_block is not None else ""
+        if not raw.strip():
+            raise json.JSONDecodeError(
+                "Claude response had no parsed_output and no text block "
+                "(check stop_reason for max_tokens / refusal)",
+                "",
+                0,
             )
-            raw = getattr(text_block, "text", "") if text_block else ""
-            if not raw.strip():
-                raise json.JSONDecodeError(
-                    "Claude response had no text block (check stop_reason "
-                    "for max_tokens / refusal)",
-                    "",
-                    0,
-                )
-            cleaned = _strip_markdown_fences(raw)
-            data = json.loads(cleaned)
-            return Stage2Output.model_validate(data)
-        return parsed
+        cleaned = _strip_markdown_fences(raw)
+        data = json.loads(cleaned)
+        return Stage2Output.model_validate(data)
 
 
 # --- Factory ----------------------------------------------------------
