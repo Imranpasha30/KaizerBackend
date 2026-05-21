@@ -1705,3 +1705,123 @@ Updated existing tests for new flag layout:
     the retry's ``-t`` reflects the 100ms-grid snapped duration.
 
 Full pipeline_v2 suite: 951 passed (was 949; +2 new tests).
+
+### Item 117 (COMPLETED): single-pass multi-output raw extraction architecture
+
+After items 111-116 each fixed a specific lip-sync regression source
+(stitcher xfade chain collapse, compose-step AAC residue, AAC priming
+leak through acrossfade, ``-to`` vs ``-t`` cut-step bug), the user
+reported the same drift class kept appearing on different source
+videos. Diagnosis: the cut-then-recombine architecture has too many
+A/V misalignment risk points; each new video tickles a different
+seam. Whack-a-mole engineering doesn't scale.
+
+The user proposed a structural refactor: **decode the mezzanine
+ONCE per render, produce all raw timeline outputs (bulletin + per-
+short) in a SINGLE ffmpeg invocation via filter_complex
+trim+atrim+concat, then apply overlays in separate passes with
+``-c:a copy`` so audio is byte-identical past the slice step**.
+
+DIAGNOSTIC PHASE (item 117 prerequisite, run BEFORE any code):
+  Test 1: 3-output multi-decode -> A/V delta <1ms on all outputs.
+  Test 2: Job 51's full 28-bulletin + 8-shorts in ONE invocation
+          -> bulletin A/V delta -0.01ms (vs -695.8ms legacy cut
+          cumulative); max shorts |A/V| 0.67ms; 145s wall time.
+  Test 3: Overlay with ``-c:a copy`` preserves audio sha256
+          BIT-IDENTICAL between input and output.
+  Test 4: Cross-video on HEVC 1080p 25fps (different codec /
+          resolution / fps from C7040.mp4) -> bulletin -0.01ms,
+          shorts 0.00ms across the board.
+
+  Verdict: architecture works, proceeded to implementation.
+
+IMPLEMENTATION (5 phases, 5 commits):
+
+  Phase 1 (commit -- pipeline_v2/render/edl_builder.py):
+    Pure function ``build_extraction_edl(bulletin_cuts, shorts_cuts,
+    bulletin_mode)`` returns ``(filter_complex_str, OutputSpec list)``.
+    Snaps boundaries to the 1/30s grid, drops zero-length cuts,
+    handles 1-cut bulletin (skip concat node), 2 modes:
+      - ``concat`` (default): single bulletin_raw.mp4
+      - ``per_story``: one raw_clip_NN.mp4 per bulletin cut
+    13 unit tests.
+
+  Phase 2 (commit -- pipeline_v2/stages/stage_4_raw_extract.py):
+    ``extract_raw_timeline()`` runs the single-pass multi-output
+    ffmpeg. NVENC by default with libx264 fallback. Post-extract
+    a-v drift verification: every output must be within 5ms or
+    RawExtractError fires. Output filenames + dirs:
+      bulletin_raw.mp4 / raw_clip_NN.mp4 -> bulletin_out_dir
+      short_NN_raw.mp4 -> out_dir (shorts)
+    8 unit tests.
+
+  Phase 3 (commit -- pipeline_v2/stages/stage_4_bulletin_overlay.py):
+    ``apply_bulletin_overlays()`` takes bulletin_raw.mp4 + caller-
+    built filter_complex string, applies it with ``-c:a copy``
+    enforced. Audio SHA-256 verification: input + output bitstreams
+    must match byte-for-byte or BulletinOverlayError fires. Default
+    overlay graph helper handles per-story lower-thirds (time-
+    conditioned via ``enable=between(t, A, B)``), continuous ticker,
+    channel bug. 8 unit tests.
+
+  Phase 4 (commit -- pipeline_v2/stages/stage_4_shorts_overlay.py):
+    Symmetric to Phase 3 but for shorts: 9:16 crop + scale to
+    1080x1920, optional hook text + LT PNG overlay. Same ``-c:a
+    copy`` invariant + sha verification. Called per-short (not in
+    a batch loop) so a single short failing doesn't blow up the
+    batch. 8 unit tests.
+
+  Phase 5 (commit -- stage_4_render.py wire-through):
+    Stage4Render gains ``_run_unified_raw_extract()`` which runs
+    Phase 2 against the full shorts+bulletin plan at the top of
+    _render_impl. Feature flag ``KAIZER_USE_V2_RAW_EXTRACT`` gates
+    the path (default OFF). When the flag is set:
+      - One ffmpeg invocation produces all raw files
+      - Downstream cut_raw_shorts / cut_raw_bulletin_stories run
+        cut_clips_frame_aligned which sees the pre-extracted files
+        via the >100KB cache check and skips re-encoding
+      - Net effect: the per-clip cut step is replaced with a
+        single sync-perfect extract
+    Failure mode is graceful: unified extract throwing falls back
+    to the legacy cut step + logs a WARN. 13 wire-through tests.
+
+VERIFICATION GATE
+  User submits a fresh V2 job with ``KAIZER_USE_V2_RAW_EXTRACT=1``
+  in the backend env. Expected outcomes:
+    - [cut summary] cumulative a-v delta <25ms (was -695.8ms)
+    - drift_measure_v2 on bulletin: global delta <5ms (was -25.3ms
+      at the file level, but with the per-segment artifact the
+      user actually perceived)
+    - End-of-segment "silence under moving lips" artifact gone
+      (because per-story raw files are sample-accurate; item 115's
+      apad pad becomes a tiny no-op of <1ms instead of the legacy
+      33ms silence pad)
+    - Cross-video: must hold lip-sync on a NEW source video the
+      pipeline has never been tuned for
+
+ITEMS SUPERSEDED BY ITEM 117 (kept for safety but no longer needed
+when the flag is on):
+  - item 111 (3-pass stitcher): only relevant if the legacy cut
+    chain is in use. With unified extract, the per-story raw files
+    are sync-perfect and the bulletin's final concat from the
+    existing pipeline holds within tolerance.
+  - item 115 (compose-step apad + Pass 3 audio re-encode): the
+    AAC frame-boundary residue these mitigated comes from re-
+    encoding audio inside the compose chain. With unified extract
+    the audio for each story is already sync-aligned before
+    compose runs.
+  - item 116 (cut step -to -> -t): the ``-to`` boundary-inclusion
+    bug doesn't apply because the unified extract uses filter
+    graph trim+atrim (operates on decoded frames, no -ss/-to
+    boundary semantics).
+
+ITEMS STILL RELEVANT:
+  - item 112 (cut_clips_frame_aligned): still used as the cache-
+    check + fallback path for clips that aren't covered by the
+    unified extract.
+  - item 114 (Claude provider): entirely orthogonal to render.
+  - item 100 A/V invariant guardrail: still runs; should pass
+    trivially when the unified extract is in use.
+
+Full pipeline_v2 suite: 1001 passed (was 951; +50 new tests across
+all phases). All legacy tests still pass.
