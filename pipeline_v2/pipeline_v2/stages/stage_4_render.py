@@ -336,6 +336,14 @@ def _align_composed_audio_to_video(
     returns False so the caller can continue without retrying.
 
     Returns True when alignment succeeded.
+
+    Item 116: this helper still runs but now operates as a SAFETY NET
+    on AAC-encoder frame-boundary residue (max ~21ms / segment). The
+    -695ms-cumulative cut-step gap on job 51 was a SYMPTOM of
+    `_cut_one_clip_strict`'s `-to` placement bug, not encoder residue;
+    that root cause is fixed there directly. If this safety-net pad
+    ever has to add more than ``MAX_EXPECTED_PAD_MS`` of silence the
+    cut step has regressed -- log a WARN so an operator notices.
     """
     import subprocess as _sp
 
@@ -343,12 +351,26 @@ def _align_composed_audio_to_video(
         return False
 
     v_dur = _ffprobe_video_duration_s(composed_path)
+    a_dur_before = _ffprobe_audio_duration_s(composed_path)
     if v_dur <= 0:
         logger.warning(
             "stage_4: a/v alignment skipped (no video duration): %s",
             composed_path,
         )
         return False
+
+    # Item 116: if audio is more than MAX_EXPECTED_PAD_MS shorter
+    # than video, item 112's cut step has regressed (this pad would
+    # be papering over real lost audio rather than AAC tail residue).
+    MAX_EXPECTED_PAD_MS = 5.0
+    pre_pad_gap_ms = (v_dur - a_dur_before) * 1000.0
+    if pre_pad_gap_ms > MAX_EXPECTED_PAD_MS:
+        logger.warning(
+            "stage_4: a/v alignment will pad %s with %.1fms of silence "
+            "(threshold %.1fms). Suggests cut step regressed -- check "
+            "_cut_one_clip_strict's -t/-to flag handling.",
+            composed_path, pre_pad_gap_ms, MAX_EXPECTED_PAD_MS,
+        )
 
     ffmpeg = ffmpeg_bin or _v1_FFMPEG_BIN or "ffmpeg"
     aligned_path = composed_path + ".aligned.mp4"
@@ -656,11 +678,33 @@ def _cut_one_clip_strict(
                      f"({start_snap:.3f} -> {end_snap:.3f})",
         }
 
+    # Item 116: use -t (duration) AFTER -i instead of -to (end time)
+    # BEFORE -i. The original input-side ``-to`` semantics were
+    # video-INCLUSIVE for the end frame: when ``end_snap * 30`` landed
+    # exactly on an integer, ffmpeg pulled one EXTRA video frame past
+    # the cutoff while audio cut cleanly. Result: video 33ms longer
+    # than audio on those clips, item 115's apad then padded the gap
+    # with silence, leaving the bulletin's final 33ms of every segment
+    # as "mouth-moving + silent audio" -- the user-visible lip-sync
+    # artifact on job 51.
+    #
+    # Empirical A/B/C bake-off on job 51 mezzanine
+    # (5 clips, frame-aligned + non-aligned starts):
+    #   A: -ss X -to Y -i FILE       => +1 frame, -33ms a-v (BUG)
+    #   B: -ss X -i FILE -to Y       => unusable (output-side -to is
+    #                                  absolute, covers [0, Y] not
+    #                                  [X, Y]; long clips timed out)
+    #   C: -ss X -i FILE -t (Y-X)    => 0 frame off, -0.02ms a-v
+    #
+    # ``.6f`` precision (microseconds) is well below the audio sample
+    # rate (21µs per sample @ 48kHz) so floating-point format
+    # truncation no longer matters at this scale.
+    duration_s = end_snap - start_snap
     cmd = [
         ffmpeg_bin, "-y",
-        "-ss", f"{start_snap:.4f}",
-        "-to", f"{end_snap:.4f}",
+        "-ss", f"{start_snap:.6f}",
         "-i", video_path,
+        "-t", f"{duration_s:.6f}",
         # Strict CFR + audio-sync. -r and -fps_mode lock output to
         # 30fps CFR; -async 1 resyncs audio to PTS. -ar 48000 is
         # already in ENCODE_ARGS_INTERMEDIATE but we pin it again

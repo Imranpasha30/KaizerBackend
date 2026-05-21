@@ -3963,10 +3963,17 @@ class TestCutClipsFrameAlignedBuildsStrictCommand:
         assert "-r 30" in cmd_str, f"missing -r 30 in: {cmd_str}"
         assert "-fps_mode cfr" in cmd_str, f"missing -fps_mode cfr in: {cmd_str}"
         assert "-async 1" in cmd_str, f"missing -async 1 in: {cmd_str}"
-        # Boundaries were snapped to frame grid.
-        # 1.6 -> 1.6000 (already on grid); 25.745 -> 25.7333.
-        assert "-ss 1.6000" in cmd_str or "-ss 1.6" in cmd_str
-        assert "-to 25.7333" in cmd_str
+        # Item 116: cut step now uses -ss BEFORE -i (fast input seek)
+        # and -t (duration) AFTER -i (precise both-streams duration).
+        # The old -to BEFORE -i was video-inclusive of the end frame,
+        # systematically producing 1 extra video frame per clip.
+        assert "-ss 1.600000" in cmd_str
+        # Duration: 25.745 -> 25.7333; - 1.6 = 24.1333 (with snapping).
+        # The exact value depends on grid arithmetic; assert -t is
+        # present and matches the expected duration to 4 decimals.
+        assert "-t 24.1333" in cmd_str
+        # Old buggy form must NOT appear.
+        assert "-to 25.7333" not in cmd_str
 
 
 class TestCutClipsFrameAlignedRetry:
@@ -4017,10 +4024,12 @@ class TestCutClipsFrameAlignedRetry:
             f"expected 2 ffmpeg invocations (initial + retry), "
             f"got {len(attempts)}"
         )
-        # The retry's -to should be the 100ms-grid snapped value:
-        # 25.745 -> 25.7 (nearest 100ms).
+        # Item 116: the retry's -t should reflect the 100ms-grid
+        # snapped duration: 25.745 -> 25.7 (nearest 100ms); start
+        # 1.6 -> 1.6; duration = 24.1.
         retry_cmd_str = " ".join(attempts[1]["cmd"])
-        assert "-to 25.7000" in retry_cmd_str or "-to 25.7" in retry_cmd_str
+        assert "-t 24.100000" in retry_cmd_str
+        assert "-to 25.7" not in retry_cmd_str  # old buggy form
 
     def test_no_retry_when_first_attempt_within_tolerance(
         self, monkeypatch, tmp_path,
@@ -4102,5 +4111,164 @@ class TestItem112LiveSliceProducesAlignedAV:
         assert abs(result["delta_ms"]) < 1.0, (
             f"item 112 should produce sub-millisecond a-v drift; "
             f"got {result['delta_ms']:+.3f}ms"
+        )
+
+
+class TestItem116CutStepNoExtraFrame:
+    """Item 116 spec: ``_cut_one_clip_strict`` must produce exactly
+    ``round((end - start) * 30)`` video frames per clip, and audio
+    duration must match video duration within 5ms.
+
+    The original input-side ``-to`` had INCLUSIVE end-frame semantics
+    when ``end_snap * 30`` landed on an integer -- producing one
+    extra video frame past the cutoff and a 33ms a-v gap per clip.
+    These tests prevent that regression from coming back.
+    """
+
+    def _live_mezzanine(self):
+        """Return a real source mp4 the test can cut from, or None
+        if no fixture is available (live ffmpeg required)."""
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        # Try job 51's mezzanine first (the bug's actual repro source),
+        # then fall back to job 46.
+        for jobid in (51, 50, 46):
+            mezz = (backend_root / "output" / "full_video_shorts_v2"
+                    / f"job_{jobid}" / "mezzanine.mp4")
+            if mezz.exists():
+                return mezz
+        return None
+
+    def test_cut_one_clip_strict_no_extra_video_frame(self, tmp_path):
+        """A 5-second cut starting at a non-frame-boundary must
+        produce exactly 150 video frames (5 * 30), NOT 151.
+        Audio duration must match video duration within one AAC
+        frame (21ms).
+        """
+        import shutil
+        import subprocess
+        import pytest as _pytest
+
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            _pytest.skip("ffmpeg / ffprobe not available")
+        mezz = self._live_mezzanine()
+        if mezz is None:
+            _pytest.skip("no V2 mezzanine on disk -- skipping live test")
+
+        from pipeline_v2.stages.stage_4_render import _cut_one_clip_strict
+
+        # Pick a cut where end_snap * 30 hits exactly an integer
+        # -- this is the failure mode that triggered job 51's bug
+        # (end=66.800 -> 66.8 * 30 = 2004 exactly).
+        out = str(tmp_path / "five_sec.mp4")
+        result = _cut_one_clip_strict(
+            str(mezz), 61.800, 66.800, out,
+        )
+        assert result["ok"], result.get("error", "strict cut failed")
+
+        # Probe exact frame count + audio duration.
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", out],
+            capture_output=True, text=True, timeout=30,
+        )
+        nb_frames = int((r.stdout or "0").strip() or 0)
+        expected_frames = 150   # 5.000s * 30fps EXACTLY
+        assert nb_frames == expected_frames, (
+            f"Item 116 regression: cut produced {nb_frames} video "
+            f"frames, expected {expected_frames}. The pre-fix "
+            f"behaviour would give 151 (one frame past the cutoff)."
+        )
+
+        # Audio duration within one AAC frame of 5.000s.
+        AAC_FRAME_S = 1024 / 48000   # ~21.33ms
+        assert abs(result["audio_dur"] - 5.000) <= AAC_FRAME_S, (
+            f"Audio duration {result['audio_dur']:.3f}s should match "
+            f"5.000s within one AAC frame ({AAC_FRAME_S*1000:.1f}ms)."
+        )
+
+        # Within-clip a-v delta must be tight (well under one frame).
+        assert abs(result["delta_ms"]) <= 5.0, (
+            f"a-v delta {result['delta_ms']:+.2f}ms exceeds 5ms "
+            f"tolerance. Item 116's -t flag should give near-zero."
+        )
+
+    def test_cut_step_cumulative_drift_under_100ms_on_typical_bulletin(
+        self, tmp_path,
+    ):
+        """Simulate job 51's 28-clip bulletin shape: sum the per-clip
+        a-v drift and verify the cumulative magnitude stays under
+        100ms. Pre-fix cumulative was -695.8ms on job 51 (item 112's
+        own [cut WARN] guardrail caught this).
+
+        Uses a real ffmpeg cut against the on-disk mezzanine so the
+        test exercises the actual flag behaviour. Skipped in CI
+        without the source fixture.
+        """
+        import shutil
+        import pytest as _pytest
+
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            _pytest.skip("ffmpeg / ffprobe not available")
+        mezz = self._live_mezzanine()
+        if mezz is None:
+            _pytest.skip("no V2 mezzanine on disk -- skipping live test")
+
+        from pipeline_v2.stages.stage_4_render import _cut_one_clip_strict
+
+        # Representative 8-clip subset of typical bulletin shapes:
+        # mix of frame-aligned and non-aligned starts, short/medium
+        # durations. End values chosen so end_snap * 30 hits exact
+        # integers on multiple clips (the original failure mode).
+        cuts = [
+            (1.600,   26.467),    # 24.867s, frame-aligned end
+            (27.100,  59.433),    # 32.333s, frame-aligned end (bug clip)
+            (60.400,  62.467),    # 2.067s
+            (62.700,  66.800),    # 4.100s, frame-aligned end
+            (67.033,  69.233),    # 2.200s, frame-aligned end
+            (69.500,  71.733),    # 2.233s
+            (72.033,  82.400),    # 10.367s, frame-aligned end
+            (84.567,  92.967),    # 8.400s
+        ]
+
+        # Some test fixtures' mezzanines may be too short for all
+        # these ranges -- bail safely instead of failing on the I/O.
+        import subprocess as _sp
+        r = _sp.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(mezz)],
+            capture_output=True, text=True, timeout=30,
+        )
+        mezz_dur = float((r.stdout or "0").strip() or 0)
+        max_needed = max(end for _, end in cuts)
+        if mezz_dur < max_needed:
+            _pytest.skip(
+                f"mezzanine duration {mezz_dur:.1f}s too short "
+                f"for test range up to {max_needed:.1f}s"
+            )
+
+        deltas: list[float] = []
+        for i, (start, end) in enumerate(cuts):
+            out = str(tmp_path / f"clip_{i:02d}.mp4")
+            result = _cut_one_clip_strict(str(mezz), start, end, out)
+            assert result["ok"], (
+                f"clip {i}: strict cut failed -- {result.get('error', '')}"
+            )
+            deltas.append(result["delta_ms"])
+
+        cumulative = sum(deltas)
+        max_per_clip = max(abs(d) for d in deltas)
+        assert abs(cumulative) < 100.0, (
+            f"Item 116 regression: cumulative a-v drift "
+            f"{cumulative:+.1f}ms across {len(cuts)} clips exceeds "
+            f"100ms threshold. Pre-fix was -695.8ms on job 51. "
+            f"Per-clip deltas: "
+            f"{[f'{d:+.1f}' for d in deltas]}"
+        )
+        # And the worst per-clip delta should also be tight.
+        assert max_per_clip < 35.0, (
+            f"Item 116 regression: worst per-clip delta "
+            f"{max_per_clip:.1f}ms exceeds 35ms tolerance."
         )
 

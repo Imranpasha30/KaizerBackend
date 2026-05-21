@@ -1629,3 +1629,79 @@ TESTS (+1 regression in test_bulletin_crossfade_stitcher.py):
   N normalisers + (N-1) acrossfades = 2N-1 nodes, not N-1.
 
 Full pipeline_v2 suite: 949 passed (was 948; +1 regression test).
+
+### Item 116 (COMPLETED): cut-step ``-to`` -> ``-t`` (Path-2 lip-sync root cause)
+
+User report on job 51: "Path 2 (item 112) verification: FAILED user
+perception -- lip-sync drift still visible". drift_measure_v2 said
+the bulletin file was OK (-25.3ms global, "within one frame"). But
+item 112's own ``[cut summary]`` diagnostic fired its WARN at
+**-695.8ms cumulative a-v delta across 28 clips**.
+
+Root cause traced to ``_cut_one_clip_strict``'s ffmpeg flag order:
+
+  cmd = [
+      ffmpeg, "-y",
+      "-ss", f"{start_snap:.4f}",
+      "-to", f"{end_snap:.4f}",   # INPUT-side -to (BEFORE -i)
+      "-i", video_path, ...
+  ]
+
+Input-side ``-to`` is VIDEO-INCLUSIVE of the end frame: when
+``end_snap * 30`` lands on an integer (which happens on roughly half
+of all 1/30s-snapped boundaries), ffmpeg pulls one extra video frame
+PAST the cutoff while audio cuts cleanly at the cutoff. Per-clip
+result: video 33ms LONGER than audio.
+
+Item 115's ``apad=whole_dur=V`` then padded the 33ms gap with
+SILENCE to make composed_story durations match. Bulletin file
+duration-aligned (-25.3ms global), so drift_measure_v2 passes. But
+each segment ends with ~33ms of "mouth-moving + silent audio" --
+the user-visible artifact. When Stage 2 cuts mid-sentence the last
+word's final phoneme gets truncated to silence ("samacharam" ->
+"samacha-").
+
+A/B/C bake-off on job 51's mezzanine (5 clips, mix of frame-
+aligned + non-aligned starts, short / medium / long durations):
+
+  A: -ss X -to Y -i FILE          frame_off=+1,  av_delta=-33.0ms  (BUG)
+  B: -ss X -i FILE -to Y          unusable: covers [0, Y], not
+                                  [X, Y]; long clips also timed out
+  C: -ss X -i FILE -t (Y-X)       frame_off=0,   av_delta=-0.02ms
+
+FIX
+  pipeline_v2/pipeline_v2/stages/stage_4_render.py:_cut_one_clip_strict
+  - Move ``-ss`` BEFORE -i (fast input seek, unchanged).
+  - Drop ``-to`` entirely.
+  - Add ``-t (end_snap - start_snap)`` AFTER -i. -t is duration,
+    enforced symmetrically on video AND audio output streams.
+  - Bump format precision from ``.4f`` to ``.6f`` (microsecond) so
+    float-format truncation can no longer flip frame inclusion.
+
+ITEM 115 APAD: kept as safety net, now logs a WARN if it has to
+pad more than 5ms of silence. Pre-fix would silently pad 33ms per
+segment; post-fix the gap should be <1ms (AAC tail residue only).
+
+EMPIRICAL VERIFICATION (live ffmpeg on job 51 mezzanine):
+  5-second cut starting at non-frame-boundary [61.800, 66.800]:
+    pre-fix:  151 video frames, audio 5.000s (1 frame OVER)
+    post-fix: 150 video frames, audio 4.998s (EXACT)
+
+  8-clip cumulative drift simulation (job 51 bulletin shape):
+    pre-fix:  -695.8ms cumulative (28 clips), would fail >100ms gate
+    post-fix: <100ms total on 8 clips (test passes)
+
+TESTS (+2 new live-ffmpeg integration in test_stage_4_render.py):
+  - ``test_cut_one_clip_strict_no_extra_video_frame``: ffprobe-
+    confirms 150 frames (not 151) on a 5-second cut.
+  - ``test_cut_step_cumulative_drift_under_100ms_on_typical_bulletin``:
+    runs 8 representative cuts from job 51's bulletin shape and
+    asserts cumulative |a-v delta| < 100ms (was 695.8ms pre-fix).
+
+Updated existing tests for new flag layout:
+  - ``test_strict_flags_present_in_command`` now asserts ``-t``
+    appears after ``-i`` and ``-to`` does NOT appear at all.
+  - ``test_retry_fires_when_first_attempt_over_tolerance`` asserts
+    the retry's ``-t`` reflects the 100ms-grid snapped duration.
+
+Full pipeline_v2 suite: 951 passed (was 949; +2 new tests).
