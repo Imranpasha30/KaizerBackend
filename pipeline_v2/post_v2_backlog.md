@@ -1825,3 +1825,91 @@ ITEMS STILL RELEVANT:
 
 Full pipeline_v2 suite: 1001 passed (was 951; +50 new tests across
 all phases). All legacy tests still pass.
+
+### Item 118 (ARCHITECTURAL RESEARCH NEEDED -- DO NOT IMPLEMENT)
+
+V2 has been through 17+ items and lip-sync is still broken in
+production. Items 111 / 112 / 114 / 115 / 116 / 117 each fixed a
+specific drift source on a specific source video; the next video
+revealed a new edge case. The whack-a-mole pattern is not scaling
+to a news channel that processes diverse content.
+
+**Job 53 evidence (2026-05-21 19:25-20:15):**
+  - Stage 2 (Gemini) produced ONLY 1 bulletin cut covering 587.5s
+    (essentially the entire source) -- not the 28-cut decomposition
+    of earlier jobs.
+  - Item 117 unified extract started, timed out at the configured
+    1800s, fell back to legacy cut step.
+  - Standalone reproduction of the EXACT same ffmpeg cmd (post-
+    hoc, on the same mezzanine) completed in 148-171s across 3
+    pipe-handling variants. The architecture is sound; production
+    hit a transient system state (likely NVENC/driver) that I
+    couldn't reproduce.
+  - Bulletin drift_measure on Job 53 output: -69.3ms global, -1733
+    ms video lost -- legacy drift signature, confirming the
+    fallback path produced the broken output.
+
+**Critical insight from this debugging:** even if item 117 had
+succeeded on Job 53, it would NOT have fixed the lip-sync drift
+the user perceived. With only 1 bulletin cut, item 117's multi-
+cut alignment win doesn't apply. The downstream silence-trim +
+micro-fragment-split path in the V1 chain split that 1 cut into
+22 composed segments and re-introduced drift inside the legacy
+compose+stitcher chain. The architectural fix is in the wrong
+PLACE.
+
+**Known state at stop point:**
+  - V1 baseline: pre-V2 implementation (~4/10 quality, user
+    reference)
+  - V2 iter-2 ship: ``v2-iter2-ship`` tag at ``a031ddf`` (8.1/10
+    measured at ship time, real lip-sync issues in production
+    surfaced after)
+  - Latest commit: ``34e3bac`` (item 117 with feature flag +
+    legacy fallback)
+  - ``KAIZER_USE_V2_RAW_EXTRACT=1`` present in backend .env
+  - Stack last started 2026-05-21 19:24:31
+
+**Open architectural questions:**
+  1. Should silence-trim and micro-fragment filtering happen at
+     Stage 2 (semantic, LLM-driven) or Stage 4 (render-time,
+     mechanical)? Currently they're at render, AFTER cuts are
+     locked, which means downstream tools re-split a single
+     Stage-2 cut into many compose-step segments without the
+     LLM's knowledge.
+  2. Should we eliminate downstream segmentation entirely? If
+     every "segment" must be a Stage-2 decision, the cut decisions
+     are auditable / reproducible / fix-once. The compose chain
+     becomes a pure visual pass on already-final ranges.
+  3. Why does Stage 2 sometimes produce 1 cut vs 28 cuts on the
+     same source? Determinism issue, or genuine editorial variance
+     from temperature=0.2? Worth running the same source 5x
+     against both Gemini and Claude to characterise variance.
+  4. What does a professional Telugu news bulletin actually look
+     like? Are we optimising for the wrong target? TV9 / NTV
+     bulletins should be the reference -- we may be re-inventing
+     a pattern they've solved differently.
+
+**Research needed before next code change:**
+  - Sample analysis of TV9 / NTV / etv Telugu bulletins (3-5
+    professional references). What's their average story length,
+    transition style, overlay decoration, cut density?
+  - Stage 2 determinism analysis: same source through Gemini and
+    Claude 5x each; compare cut count, cut boundaries, skipped
+    segments. Is the 1-cut vs 28-cut variance editorial or noise?
+  - Architectural diagram of EVERY V2 stage with its inputs /
+    outputs and the SPECIFIC places where A/V drift can enter.
+    The current mental model (cut -> compose -> stitch) misses
+    sub-stage drift sources like silence-trim's re-cut behaviour.
+  - Cost analysis: pure-ffmpeg architecture (item 117 plus follow-
+    up overlay refactor) vs ffmpeg + intermediate-files (current)
+    vs hybrid. Includes wall time, disk I/O, NVENC session usage,
+    and failure-mode breadth.
+
+**Halt criteria (DO NOT lift until these are met):**
+  - User completes the research above OR delegates it explicitly
+  - User returns with a research-driven direction
+  - No more reactive fixes that address the most recent broken
+    video while introducing a new edge case for the next one
+
+Logged 2026-05-21 evening. Next session resumes from a research
+checkpoint, not from "let's try architecture #N+1".
