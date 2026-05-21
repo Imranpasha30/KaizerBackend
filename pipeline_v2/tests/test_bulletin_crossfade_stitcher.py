@@ -199,6 +199,11 @@ class TestBuildAudioAcrossfadeGraph:
     filter_complex video chain."""
 
     def test_two_segment_graph_has_one_acrossfade_node(self):
+        """Item 115 follow-up: each input is prefixed with an
+        atrim+asetpts normalisation node that strips AAC priming
+        before the acrossfade chain consumes it. Two inputs =>
+        2 normalisation nodes + 1 acrossfade = 3 total nodes.
+        """
         from pipeline_v2.bulletin_crossfade_stitcher import (
             build_audio_acrossfade_graph,
         )
@@ -207,18 +212,29 @@ class TestBuildAudioAcrossfadeGraph:
         )
         assert a_label == "a001"
         nodes = filter_str.split(";")
-        assert len(nodes) == 1   # one acrossfade only
-        assert nodes[0].startswith("[0:a][1:a]acrossfade=")
-        assert "d=0.08" in nodes[0]
-        assert nodes[0].endswith("[a001]")
+        # 2 atrim normalisers + 1 acrossfade.
+        assert len(nodes) == 3
+        # Normalisers strip AAC priming on each raw input.
+        assert "[0:a]atrim=0:" in nodes[0] and "[n000]" in nodes[0]
+        assert "[1:a]atrim=0:" in nodes[1] and "[n001]" in nodes[1]
+        assert "asetpts=PTS-STARTPTS" in nodes[0]
+        # Acrossfade reads from the NORMALISED labels, not the raw
+        # [N:a] streams (this is the lip-sync fix).
+        assert nodes[2].startswith("[n000][n001]acrossfade=")
+        assert "d=0.08" in nodes[2]
+        assert nodes[2].endswith("[a001]")
         # No video xfade nodes anywhere -- the bug from item 111.
         assert "xfade=" not in filter_str
+        # Raw video streams must not appear at all.
         assert "0:v" not in filter_str
         assert "1:v" not in filter_str
 
     def test_three_segment_graph_chains_acrossfade_labels(self):
-        """The k-th acrossfade reads from the (k-1)th output, not
-        from [0:a]. Catches the off-by-one chain regression."""
+        """The k-th acrossfade reads from the previous acrossfade
+        output AND the next normalised input, not the raw [N:a].
+        Catches both the off-by-one chain regression AND a
+        regression that bypasses the priming-strip normaliser.
+        """
         from pipeline_v2.bulletin_crossfade_stitcher import (
             build_audio_acrossfade_graph,
         )
@@ -227,18 +243,21 @@ class TestBuildAudioAcrossfadeGraph:
         )
         assert a_label == "a002"
         nodes = filter_str.split(";")
-        assert len(nodes) == 2   # 2 acrossfade nodes for 3 inputs
-        # First acrossfade: [0:a][1:a] -> a001.
-        assert "[0:a][1:a]acrossfade=" in nodes[0]
-        assert nodes[0].endswith("[a001]")
-        # Second acrossfade: [a001][2:a] -> a002.
-        assert "[a001][2:a]acrossfade=" in nodes[1]
-        assert nodes[1].endswith("[a002]")
+        # 3 normalisers + 2 acrossfade = 5 nodes for 3 inputs.
+        assert len(nodes) == 5
+        # First acrossfade: [n000][n001] -> a001.
+        assert "[n000][n001]acrossfade=" in nodes[3]
+        assert nodes[3].endswith("[a001]")
+        # Second acrossfade: [a001][n002] -> a002.
+        assert "[a001][n002]acrossfade=" in nodes[4]
+        assert nodes[4].endswith("[a002]")
 
     def test_twenty_five_segment_chain_does_not_collapse(self):
         """The Job-46 regression test pinned to a real failure case.
-        25 segments (Job 46's actual count) must produce 24 chained
-        acrossfade nodes with labels a001..a024 in order."""
+        25 segments (Job 46's actual count) must produce 25
+        normalisers + 24 chained acrossfade nodes with labels
+        a001..a024 in order.
+        """
         from pipeline_v2.bulletin_crossfade_stitcher import (
             build_audio_acrossfade_graph,
         )
@@ -246,9 +265,10 @@ class TestBuildAudioAcrossfadeGraph:
         filter_str, a_label = build_audio_acrossfade_graph(durs, 0.08)
         assert a_label == "a024"
         nodes = filter_str.split(";")
-        assert len(nodes) == 24
-        # Final node consumes [a023][24:a] -> [a024].
-        assert "[a023][24:a]acrossfade=" in nodes[-1]
+        # 25 normalisers + 24 acrossfade.
+        assert len(nodes) == 49
+        # Final node consumes [a023][n024] -> [a024].
+        assert "[a023][n024]acrossfade=" in nodes[-1]
         assert nodes[-1].endswith("[a024]")
 
     def test_single_input_returns_passthrough_label(self):
@@ -261,11 +281,61 @@ class TestBuildAudioAcrossfadeGraph:
         assert filter_str == ""
         assert a_label == "0:a"
 
+    def test_item115_followup_strips_aac_priming_before_acrossfade(self):
+        """REGRESSION: ffmpeg's AAC decoder emits encoder-priming
+        samples (PTS = -1024) when a filter graph pulls from a
+        ``[N:a]`` input. On job 50's 33-segment bulletin this
+        accumulated to +350 ms of extra audio in Pass 2, leaving
+        audio extending past the last video frame and producing a
+        steadily-growing lip-sync drift (~10 ms / segment).
+
+        ``build_audio_acrossfade_graph`` must wrap every raw
+        ``[N:a]`` with ``atrim=0:duration,asetpts=PTS-STARTPTS``
+        BEFORE the acrossfade chain consumes it. If the filter
+        chain references ``[N:a]`` directly inside an acrossfade
+        node (skipping the normaliser), the priming leaks through
+        and the bug returns.
+        """
+        from pipeline_v2.bulletin_crossfade_stitcher import (
+            build_audio_acrossfade_graph,
+        )
+        import re
+        filter_str, _ = build_audio_acrossfade_graph(
+            [24.866, 32.333, 2.066, 4.1, 4.7], audio_overlap_s=0.08,
+        )
+        # Every raw [N:a] reference must be inside an atrim
+        # normalisation node, NOT directly inside an acrossfade.
+        for k in range(5):
+            raw_ref = f"[{k}:a]"
+            # Find all occurrences and confirm each is followed by
+            # an atrim node (not an acrossfade).
+            for match in re.finditer(re.escape(raw_ref), filter_str):
+                tail = filter_str[match.end(): match.end() + 50]
+                assert tail.startswith("atrim=0:"), (
+                    f"Raw input {raw_ref} must feed an atrim "
+                    f"normaliser (item 115 follow-up), not "
+                    f"directly into a filter. Got tail={tail!r}"
+                )
+        # acrossfade nodes must read from normalised labels [n###]
+        # or chained outputs [a###], never from a raw [N:a].
+        for match in re.finditer(r"acrossfade=", filter_str):
+            head = filter_str[max(0, match.start() - 20): match.start()]
+            assert "[n" in head or "[a" in head, (
+                f"Acrossfade input must be a normalised or chained "
+                f"label, not raw [N:a]. Got head={head!r}"
+            )
+
     def test_backwards_compat_shim_still_returns_three_tuple(self):
         """The old ``build_crossfade_filter_graph`` 3-tuple shape is
         preserved (one external caller -- a not-yet-migrated test --
         depends on it). The video label is hard-coded to '0:v'
-        because there is no longer a video filter chain."""
+        because there is no longer a video filter chain.
+
+        Item 115 follow-up: the audio chain now prepends an
+        atrim+asetpts normaliser per input to strip AAC priming
+        (see ``test_item115_followup_strips_aac_priming_before_acrossfade``);
+        the legacy 3-tuple shape carries the new filter unchanged.
+        """
         from pipeline_v2.bulletin_crossfade_stitcher import (
             build_crossfade_filter_graph,
         )
@@ -275,9 +345,11 @@ class TestBuildAudioAcrossfadeGraph:
         # No video chain anywhere.
         assert v_label == "0:v"
         assert "xfade=" not in filter_str
-        # Audio chain identical to build_audio_acrossfade_graph.
+        # Audio chain identical to build_audio_acrossfade_graph
+        # (item 115 follow-up: normalisers prepended).
         assert a_label == "a001"
-        assert filter_str == "[0:a][1:a]acrossfade=d=0.08[a001]"
+        assert "[0:a]atrim=0:" in filter_str
+        assert "[n000][n001]acrossfade=d=0.08[a001]" in filter_str
 
 
 # ---- Item 111 spec tests (the 4 the user explicitly named) ------------

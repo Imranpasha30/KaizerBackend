@@ -155,6 +155,22 @@ def build_audio_acrossfade_graph(
     ``durations`` (input k corresponds to ``durations[k]``).
 
     For N == 1, the filter graph is empty (caller should bypass).
+
+    Item 115 (follow-up): pre-normalize each input audio stream
+    with ``atrim=0:duration,asetpts=PTS-STARTPTS`` BEFORE feeding
+    it into the acrossfade chain. ffmpeg's AAC decoder emits its
+    encoder-priming samples (PTS -1024) and any tail padding when
+    a filter graph pulls from a `[N:a]` source. Across 33 segments
+    on job 50 this leaked ~350 ms of extra audio into the bulletin,
+    leaving audio 116 ms past the last video frame and producing
+    a steadily-growing lip-sync drift (~10 ms/segment).
+
+    ``atrim=0:duration`` clamps each input to its declared stream
+    duration, dropping the priming + tail. ``asetpts=PTS-STARTPTS``
+    resets timestamps so acrossfade sees clean inputs starting at
+    t=0. Empirical on job 50's 33 segments: Pass 2 audio output
+    went from 470.016 s (+350 ms drift) to 469.666 s (= the
+    formula ``sum(durs) - (N-1)*overlap`` to the millisecond).
     """
     n = len(durations)
     if n < 2:
@@ -167,11 +183,21 @@ def build_audio_acrossfade_graph(
     # "segment shorter than overlap" guard fires.
     _ = compute_xfade_offsets(durations, audio_overlap_s)
     parts: list[str] = []
-    prev_a = "0:a"
+    # Pre-normalize each input audio: strip AAC priming + tail
+    # padding by clamping to declared duration with reset PTS.
+    norm_labels: list[str] = []
+    for k, d in enumerate(durations):
+        lab = f"n{k:03d}"
+        parts.append(
+            f"[{k}:a]atrim=0:{d:.6f},asetpts=PTS-STARTPTS[{lab}]"
+        )
+        norm_labels.append(lab)
+    # Chain acrossfade on the normalized inputs.
+    prev_a = norm_labels[0]
     for k in range(n - 1):
         out_a = f"a{k+1:03d}"
         parts.append(
-            f"[{prev_a}][{k+1}:a]acrossfade=d={audio_overlap_s}[{out_a}]"
+            f"[{prev_a}][{norm_labels[k+1]}]acrossfade=d={audio_overlap_s}[{out_a}]"
         )
         prev_a = out_a
     return ";".join(parts), prev_a

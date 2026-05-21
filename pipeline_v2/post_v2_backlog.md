@@ -1565,3 +1565,67 @@ On a 26-segment bulletin that's ~10s additional render time. Well
 worth the lip-sync fix.
 
 Full pipeline_v2 suite: 948 passed (was 945; +3 new tests).
+
+### Item 115 follow-up: AAC priming leak through acrossfade chain
+
+User report on job 50 (post-item-115): "after 1:23 sec lipsync issue".
+drift_measure_v2 confirmed:
+  - Per-segment intra drift now near-zero (-7.3ms cumul over 33
+    segments) -- item 115's compose alignment works.
+  - But the stitcher Pass 2 audio output ran ~+350ms longer than
+    ``sum(audio) - (N-1) * overlap`` predicted.
+  - Final bulletin: 469.9s video / 470.016s audio, -116ms global
+    delta, with lip-sync visibly drifting from minute 1 onward.
+
+Root-causing the +350ms Pass 2 overshoot: each composed_story
+AAC stream carries encoder-priming samples (first audio packet
+``pts=-1024`` / -21.33ms / 1024 samples) AND tail padding (the
+encoder rounds the file's audio up to a full AAC frame boundary).
+
+ffmpeg's MP4 demuxer respects the edit list when DECODING for
+direct stream copy, but when a filter graph references
+``[N:a]`` it pulls the decoded PCM INCLUDING the priming +
+tail. Across 33 inputs at ~10ms / segment of leaked padding,
+the acrossfade chain emitted 350ms of phantom audio. That
+audio is REAL pcm samples (decoder-padded silence), so the
+output file actually contains 350ms more sound than the source
+intends -- video plays at native rate while audio progressively
+falls behind, hitting visible lip-sync drift around minute 1.
+
+FIX
+  pipeline_v2/pipeline_v2/bulletin_crossfade_stitcher.py
+  ``build_audio_acrossfade_graph``: prepend a per-input
+  normaliser node BEFORE the acrossfade chain. For each input N
+  with declared audio duration ``d_N``:
+
+      [N:a]atrim=0:d_N,asetpts=PTS-STARTPTS[n###]
+
+  Then chain acrossfade across the ``[n###]`` labels instead of
+  the raw ``[N:a]``. ``atrim=0:d`` clamps the decoded PCM to
+  exactly the declared duration (drops priming AND tail).
+  ``asetpts=PTS-STARTPTS`` resets timestamps so acrossfade sees
+  inputs starting cleanly at t=0.
+
+EMPIRICAL (job 50, 33 segments):
+  Pass 2 PCM duration before fix: 470.016s  (+350ms vs formula)
+  Pass 2 PCM duration after fix:  469.666s  (delta 0.0ms)
+
+PROJECTED on the next bulletin:
+  - audio EOF aligns to formula prediction to within <1ms
+  - Pass 3 ``-c:v copy + -c:a aac -shortest`` truncates cleanly
+    (no GOP-rounding video loss, no audio leak past video EOF)
+  - global V/A delta within 1 AAC frame (<=21ms)
+  - per-segment lip-sync: stable across the full bulletin
+
+TESTS (+1 regression in test_bulletin_crossfade_stitcher.py):
+  - ``test_item115_followup_strips_aac_priming_before_acrossfade``:
+    asserts every raw ``[N:a]`` reference in the filter graph
+    feeds an ``atrim=0:`` normaliser (never directly into an
+    acrossfade node). Catches a regression where someone
+    re-wires the chain to bypass the normalisers.
+
+  Plus updates to 3 existing tests in
+  ``TestBuildAudioAcrossfadeGraph`` -- the filter graph now has
+  N normalisers + (N-1) acrossfades = 2N-1 nodes, not N-1.
+
+Full pipeline_v2 suite: 949 passed (was 948; +1 regression test).
