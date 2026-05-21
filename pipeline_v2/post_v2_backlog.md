@@ -1230,3 +1230,90 @@ up without re-deciding:
 
 - **Production restart pending**. Once uvicorn picks up the new
   module, the next V2 job ships with the fixed bulletin.
+
+### Item 112 (COMPLETED): Frame-aligned per-clip cut step
+
+- **Surfaced**: 2026-05-21. Job 47 + Job 48 drift measurements
+  showed cumulative intra-segment a-v drift of +299ms / +469ms
+  respectively, even though the bulletin file's global delta was
+  only 24-40ms. Drift accumulated 0-32ms per composed_story
+  segment.
+- **Root cause**: AAC frames are 21.33ms; 30fps video frames are
+  33.33ms. The two grids don't align, so when V1's
+  ``cut_video_clips`` sliced a source-time range from mezzanine,
+  audio rounded to its sample grid and video to its frame grid.
+  Audio ended up 0-32ms longer than video per slice. Across 23-29
+  segments per bulletin, this produced ~300-500ms of cumulative
+  lip-sync drift.
+- **Fix**: new ``cut_clips_frame_aligned()`` in
+  ``stage_4_render.py``::
+
+      1. Snap source-time boundaries to the 30fps grid (33.333ms)
+         BEFORE invoking ffmpeg -- start/end now land on video
+         frame boundaries; audio quantizes to its grid but error
+         is bounded.
+      2. Strict CFR + audio-sync flags on every cut:
+         ``-r 30 -fps_mode cfr -async 1`` (plus existing
+         ``-ar 48000`` from ENCODE_ARGS_INTERMEDIATE).
+      3. Post-cut ffprobe verify: ``abs(audio_dur - video_dur)
+         <= 33ms`` (one frame) per slice.
+      4. Retry on failure: re-cut with 100ms grid (3 video
+         frames) -- absorbs the remaining AAC/video boundary
+         lottery.
+      5. Aggregate guardrail: sum of all per-slice a-v deltas
+         across the bulletin. If > 100ms total, log a warning
+         (lip-sync will be perceptible at this scale).
+
+- **Module-level constants**:
+  - ``VIDEO_FRAME_RATE = 30.0`` / ``VIDEO_FRAME_S`` (1/30 = 33.333ms)
+  - ``PER_CLIP_AV_TOLERANCE_S = 0.035`` (one frame + 2ms margin)
+  - ``RECUT_GRID_S = 0.1`` (100ms fallback grid)
+  - ``CUMULATIVE_AV_WARN_MS = 100.0``
+
+- **Stage4Render new field**:
+  - ``use_frame_aligned_cut: bool = True`` -- defaults to True (the
+    item-112 fix); set False to fall back to V1's looser cut for
+    rollout or fixture tests.
+
+- **Helpers added**:
+  - ``_snap_to_frame_grid(t, frame_s)`` -- pure round-to-grid
+  - ``_probe_av_durations(path, ffprobe_bin)`` -> (v_dur, a_dur)
+  - ``_parse_clip_time(value)`` -- accepts float, ``MM:SS.mmm``,
+    or ``HH:MM:SS.mmm`` strings (V1 clip dict shape)
+  - ``_cut_one_clip_strict(video_path, start, end, out, grid_s)``
+    -> dict with ok/video_dur/audio_dur/delta_ms
+
+- **Wired through**: ``cut_raw_shorts`` and
+  ``cut_raw_bulletin_stories`` now use ``cut_clips_frame_aligned``
+  when ``self.use_frame_aligned_cut`` is True (default). Both
+  methods take a new ``progress_cb`` kwarg that
+  ``_render_impl`` threads through ``render_bulletin`` so per-clip
+  drift lines + the aggregate summary land in the operator log.
+
+- **Live verification on Job 46's mezzanine**::
+
+      Test slice: source [1.6s -> 25.745s] (was V1's +7.3ms drift case)
+      Item 112: video=24.133s audio=24.133s delta=-0.008ms (8us)
+      Improvement: 913x better than V1's per-segment drift.
+
+- **Tests**: 11 new behavioural in test_stage_4_render.py
+  (TestSnapToFrameGrid, TestParseClipTime,
+  TestCutClipsFrameAlignedBuildsStrictCommand,
+  TestCutClipsFrameAlignedRetry,
+  TestStage4RenderFrameAlignedCutDefault,
+  TestItem112LiveSliceProducesAlignedAV).
+  Existing render-bulletin tests opted into V1 path via
+  ``use_frame_aligned_cut=False`` so they continue exercising
+  their _v1_cut_video_clips mocks.
+
+- **The -shortest video truncation question (Path 2-E)**:
+  investigated separately. The 1.46-1.80s of video trimmed by
+  item 111's ``-shortest`` mux is the dead-air tail after the last
+  spoken word. Verified via ffmpeg astats on Job 47's last
+  composed_story: trailing 2s measures -66dB RMS (silence /
+  room tone). Harmless; no fix required.
+
+- **Full pipeline_v2 suite**: 930 passed, 15 skipped.
+- **Production restart pending**: once uvicorn picks up the new
+  cut path, next V2 job should show per-segment drift < 1ms and
+  cumulative drift < 25ms.

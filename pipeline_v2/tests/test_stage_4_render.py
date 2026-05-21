@@ -120,11 +120,18 @@ def render(tmp_path: Path) -> Stage4Render:
     """Stage4Render with a tmp_path output_dir and a non-existent
     video_path (V1 functions are mocked so the file doesn't need to
     exist).
+
+    Item 112: ``use_frame_aligned_cut=False`` keeps the existing V1
+    cut tests asserting against ``_v1_cut_video_clips`` working.
+    The frame-aligned path is exercised by the dedicated item-112
+    tests further down (TestCutClipsFrameAlignedBuildsStrictCommand,
+    TestCutClipsFrameAlignedRetry).
     """
     return Stage4Render(
         output_dir=tmp_path / "out",
         video_path=tmp_path / "source.mp4",
         preset=_preset(),
+        use_frame_aligned_cut=False,
     )
 
 
@@ -1327,11 +1334,18 @@ def _post_cut_bulletin_clip(idx: int, tmp_path: Path,
 
 @pytest.fixture
 def bulletin_render(tmp_path: Path) -> Stage4Render:
-    """Stage4Render with all bulletin features ON (default)."""
+    """Stage4Render with all bulletin features ON (default).
+
+    Item 112: ``use_frame_aligned_cut=False`` forces the V1 cut path
+    so the existing ``_v1_cut_video_clips`` mock in
+    ``bulletin_v1_patches`` still wins. Tests that exercise the
+    frame-aligned cut path use their own targeted patches (see
+    ``TestCutClipsFrameAlignedBuildsStrictCommand`` etc.)."""
     return Stage4Render(
         output_dir=tmp_path / "out",
         video_path=tmp_path / "source.mp4",
         preset=_preset(),
+        use_frame_aligned_cut=False,
     )
 
 
@@ -1567,6 +1581,7 @@ class TestRenderBulletinFeatureToggles:
             video_path=tmp_path / "source.mp4",
             preset=_preset(),
             use_sidebar_carousel=False,
+            use_frame_aligned_cut=False,    # item 112: V1 mock path
         )
         # Need >=2 images in pool to test the "carousel would build" path
         render.image_pool = {
@@ -1599,6 +1614,7 @@ class TestRenderBulletinFeatureToggles:
             video_path=tmp_path / "source.mp4",
             preset=_preset(),
             use_pip=False,
+            use_frame_aligned_cut=False,    # item 112: V1 mock path
         )
         render.image_pool["X"] = tmp_path / "img.jpg"
         (tmp_path / "img.jpg").write_text("img")
@@ -1634,6 +1650,7 @@ class TestRenderBulletinFeatureToggles:
             video_path=tmp_path / "source.mp4",
             preset=_preset(),
             use_takeovers=False,
+            use_frame_aligned_cut=False,    # item 112: V1 mock path
         )
         # Need >=2 images in pool to satisfy the "takeover would build" condition
         render.image_pool = {
@@ -3762,4 +3779,259 @@ class TestAVInvariantAcceptsTailTrimAndCrossfade:
         msg = str(exc_info.value)
         assert "crossfade" in msg
         assert "tail_trim" in msg
+
+
+# ======================================================================
+# Backlog item 112: frame-aligned per-clip cut step
+# ======================================================================
+#
+# Jobs 47 and 48 measurements (2026-05-21) showed cumulative
+# intra-segment a-v drift of +299ms / +469ms respectively, even
+# though the bulletin file's global delta was 24-40ms. The root
+# cause is AAC frame quantization (21.33ms) not aligning with
+# video frame quantization (33.33ms); each per-clip cut from
+# mezzanine produces audio that's 0-32ms longer than video.
+# Item 112 snaps boundaries to the 30fps grid and applies strict
+# CFR + audio-sync flags so every slice has audio_dur == video_dur
+# within one frame.
+
+
+class TestSnapToFrameGrid:
+    """Item 112 helper: round time values to the 30fps grid."""
+
+    def test_exact_frame_boundary_unchanged(self):
+        from pipeline_v2.stages.stage_4_render import (
+            _snap_to_frame_grid, VIDEO_FRAME_S,
+        )
+        # 1.0s = 30 frames exactly.
+        assert _snap_to_frame_grid(1.0) == 1.0
+        # Bang on the 1/30 grid.
+        assert abs(_snap_to_frame_grid(1.0 + VIDEO_FRAME_S) - (1.0 + VIDEO_FRAME_S)) < 1e-9
+
+    def test_rounds_to_nearest_frame(self):
+        """25.745s lies 0.0117s past the closest frame boundary
+        (25.7333s). Snap should round DOWN to 25.7333s."""
+        from pipeline_v2.stages.stage_4_render import _snap_to_frame_grid
+        snapped = _snap_to_frame_grid(25.745)
+        assert abs(snapped - 25.733333) < 1e-4
+
+    def test_custom_grid_is_honoured(self):
+        """100ms recut grid: 25.745s -> 25.7s (nearest 100ms).
+        Float ulp leaves a tiny residual after the round-then-multiply,
+        so check within 1e-9."""
+        from pipeline_v2.stages.stage_4_render import _snap_to_frame_grid
+        assert abs(_snap_to_frame_grid(25.745, frame_s=0.1) - 25.7) < 1e-9
+
+
+class TestParseClipTime:
+    """Item 112 helper: accept V1 clip-dict's MM:SS.mmm strings AND
+    raw floats."""
+
+    def test_float_passes_through(self):
+        from pipeline_v2.stages.stage_4_render import _parse_clip_time
+        assert _parse_clip_time(1.6) == 1.6
+        assert _parse_clip_time(0.0) == 0.0
+        assert _parse_clip_time(589.123) == 589.123
+
+    def test_mmss_mmm_string_parsed(self):
+        from pipeline_v2.stages.stage_4_render import _parse_clip_time
+        assert _parse_clip_time("00:25.745") == 25.745
+        assert _parse_clip_time("01:30") == 90.0
+        assert _parse_clip_time("00:00.000") == 0.0
+
+    def test_hhmmss_string_parsed(self):
+        from pipeline_v2.stages.stage_4_render import _parse_clip_time
+        # HH:MM:SS.mmm form (rare but accepted).
+        assert _parse_clip_time("01:02:03.456") == 3723.456
+
+
+class TestCutClipsFrameAlignedBuildsStrictCommand:
+    """Item 112 spec: ``cut_clips_frame_aligned`` must build ffmpeg
+    commands that include -r 30 -fps_mode cfr -async 1. Catches a
+    regression where someone removes one of the strict flags."""
+
+    def test_strict_flags_present_in_command(self, monkeypatch, tmp_path):
+        """Patch subprocess.run to capture the ffmpeg command and
+        assert it includes the strict-flag set."""
+        import subprocess as _sp
+        from pipeline_v2.stages import stage_4_render as s4
+
+        captured: dict = {"cmd": None}
+
+        def _fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            # Write a tiny placeholder so the >100KB cache check
+            # doesn't fire on next probe.
+            out = cmd[-1]
+            with open(out, "wb") as f:
+                f.write(b"x" * 110_000)
+            class _R:
+                returncode = 0
+                stderr = ""
+                stdout = ""
+            return _R()
+
+        def _fake_probe(path, ffprobe_bin):
+            # Return identical audio + video durations so verify
+            # passes on the first attempt.
+            return 24.133, 24.133
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        monkeypatch.setattr(s4, "_probe_av_durations", _fake_probe)
+        # Skip the ffmpeg-binary lookup by faking a fixed name.
+        monkeypatch.setattr(
+            "pipeline_core.pipeline.FFMPEG_BIN", "ffmpeg",
+            raising=False,
+        )
+
+        clips = [{"start_sec": 1.6, "end_sec": 25.745}]
+        s4.cut_clips_frame_aligned(
+            "/fake/video.mp4", clips, str(tmp_path),
+        )
+        cmd = captured["cmd"]
+        assert cmd is not None, "ffmpeg was never invoked"
+        cmd_str = " ".join(cmd)
+        assert "-r 30" in cmd_str, f"missing -r 30 in: {cmd_str}"
+        assert "-fps_mode cfr" in cmd_str, f"missing -fps_mode cfr in: {cmd_str}"
+        assert "-async 1" in cmd_str, f"missing -async 1 in: {cmd_str}"
+        # Boundaries were snapped to frame grid.
+        # 1.6 -> 1.6000 (already on grid); 25.745 -> 25.7333.
+        assert "-ss 1.6000" in cmd_str or "-ss 1.6" in cmd_str
+        assert "-to 25.7333" in cmd_str
+
+
+class TestCutClipsFrameAlignedRetry:
+    """Item 112 spec: when the 30fps cut's a-v drift exceeds 35ms,
+    the helper must re-cut with the 100ms fallback grid."""
+
+    def test_retry_fires_when_first_attempt_over_tolerance(
+        self, monkeypatch, tmp_path,
+    ):
+        import subprocess as _sp
+        from pipeline_v2.stages import stage_4_render as s4
+
+        # Each ffmpeg run writes a fake clip; we count attempts.
+        attempts: list[dict] = []
+
+        def _fake_run(cmd, **kw):
+            attempts.append({"cmd": list(cmd)})
+            out = cmd[-1]
+            with open(out, "wb") as f:
+                f.write(b"x" * 110_000)
+            class _R:
+                returncode = 0
+                stderr = ""
+                stdout = ""
+            return _R()
+
+        # First probe: large drift (50ms > 35ms tolerance) -> retry.
+        # Second probe: small drift (5ms < tolerance) -> ok.
+        probe_calls = {"n": 0}
+        def _fake_probe(path, ffprobe_bin):
+            probe_calls["n"] += 1
+            if probe_calls["n"] == 1:
+                return 24.100, 24.150   # delta = +50ms (OVER)
+            return 24.133, 24.138       # delta = +5ms (OK)
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        monkeypatch.setattr(s4, "_probe_av_durations", _fake_probe)
+        monkeypatch.setattr(
+            "pipeline_core.pipeline.FFMPEG_BIN", "ffmpeg",
+            raising=False,
+        )
+
+        clips = [{"start_sec": 1.6, "end_sec": 25.745}]
+        s4.cut_clips_frame_aligned(
+            "/fake/video.mp4", clips, str(tmp_path),
+        )
+        assert len(attempts) == 2, (
+            f"expected 2 ffmpeg invocations (initial + retry), "
+            f"got {len(attempts)}"
+        )
+        # The retry's -to should be the 100ms-grid snapped value:
+        # 25.745 -> 25.7 (nearest 100ms).
+        retry_cmd_str = " ".join(attempts[1]["cmd"])
+        assert "-to 25.7000" in retry_cmd_str or "-to 25.7" in retry_cmd_str
+
+    def test_no_retry_when_first_attempt_within_tolerance(
+        self, monkeypatch, tmp_path,
+    ):
+        """The happy path: first attempt's a-v delta < 35ms -> no
+        retry, only one ffmpeg invocation."""
+        import subprocess as _sp
+        from pipeline_v2.stages import stage_4_render as s4
+
+        attempts: list[dict] = []
+
+        def _fake_run(cmd, **kw):
+            attempts.append({"cmd": list(cmd)})
+            with open(cmd[-1], "wb") as f:
+                f.write(b"x" * 110_000)
+            class _R:
+                returncode = 0; stderr = ""; stdout = ""
+            return _R()
+
+        def _fake_probe(path, ffprobe_bin):
+            return 24.133, 24.140     # delta = +7ms (OK)
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        monkeypatch.setattr(s4, "_probe_av_durations", _fake_probe)
+        monkeypatch.setattr(
+            "pipeline_core.pipeline.FFMPEG_BIN", "ffmpeg",
+            raising=False,
+        )
+
+        clips = [{"start_sec": 1.6, "end_sec": 25.745}]
+        s4.cut_clips_frame_aligned(
+            "/fake/video.mp4", clips, str(tmp_path),
+        )
+        assert len(attempts) == 1
+
+
+class TestStage4RenderFrameAlignedCutDefault:
+    """Item 112: ``use_frame_aligned_cut`` default flipped to True."""
+
+    def test_default_is_true(self):
+        """The whole point of item 112 is to make the new cut step
+        the default. Catches a future revert to False."""
+        from dataclasses import fields
+        from pipeline_v2.stages.stage_4_render import Stage4Render
+        f = next(
+            f for f in fields(Stage4Render)
+            if f.name == "use_frame_aligned_cut"
+        )
+        assert f.default is True
+
+
+class TestItem112LiveSliceProducesAlignedAV:
+    """Integration smoke: actually run _cut_one_clip_strict against
+    Job 46's mezzanine and verify the per-clip a-v delta drops to
+    sub-millisecond. Skipped when ffmpeg / the source file are
+    unavailable."""
+
+    def test_strict_cut_on_job46_mezzanine_under_1ms(self, tmp_path):
+        import shutil
+        import pytest as _pytest
+
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            _pytest.skip("ffmpeg / ffprobe not available")
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        mezzanine = (backend_root / "output" / "full_video_shorts_v2"
+                     / "job_46" / "mezzanine.mp4")
+        if not mezzanine.exists():
+            _pytest.skip("Job 46 mezzanine not on disk -- skipping live test")
+
+        from pipeline_v2.stages.stage_4_render import _cut_one_clip_strict
+        out = str(tmp_path / "test_slice.mp4")
+        # The same range that produced +7.3ms with V1 cut step.
+        result = _cut_one_clip_strict(
+            str(mezzanine), 1.6, 25.745, out,
+        )
+        assert result["ok"], (
+            f"strict cut failed: {result.get('error', '')}"
+        )
+        assert abs(result["delta_ms"]) < 1.0, (
+            f"item 112 should produce sub-millisecond a-v drift; "
+            f"got {result['delta_ms']:+.3f}ms"
+        )
 

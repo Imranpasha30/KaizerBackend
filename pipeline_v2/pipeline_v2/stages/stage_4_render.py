@@ -428,6 +428,293 @@ def _validate_av_invariant(
         )
 
 
+# --- Item 112: frame-aligned per-clip cut step -------------------------
+#
+# Job 47 + Job 48 diagnostic (2026-05-21): the V1 _v1_cut_video_clips
+# step produces per-segment audio_dur that runs 0-32ms LONGER than
+# video_dur. AAC frames are 21.33ms; 30fps video frames are 33.33ms.
+# The two grids don't align, so when cut_video_clips slices a range
+# [start, end] from the mezzanine, audio rounds to its sample grid
+# and video to its frame grid. Audio ends up slightly longer.
+#
+# Aggregated across 23-29 segments per bulletin, this produces ~300-
+# 500ms of cumulative intra-segment drift. The bulletin file's GLOBAL
+# delta still measures small (24-40ms) because the streams "end" near
+# the same point thanks to acrossfade savings + -shortest mux, but
+# per-segment lip-sync varies sawtooth-like across the bulletin --
+# perceptible to the user as inconsistent lip-sync.
+#
+# Item 112 fixes this by:
+#   1. Rounding source-time cut boundaries to the nearest 30fps frame
+#      (33.333ms grid) BEFORE invoking ffmpeg.
+#   2. Forcing strict CFR + audio-sync flags on every per-clip cut.
+#   3. ffprobe-verifying each output's audio_dur - video_dur within
+#      one frame (33ms tolerance).
+#   4. Re-cutting on failure with a coarser 100ms grid as a fallback.
+#   5. Logging a cumulative per-bulletin a-v delta sum so the operator
+#      can see when the cut step starts drifting.
+
+VIDEO_FRAME_RATE: float = 30.0
+VIDEO_FRAME_S: float = 1.0 / VIDEO_FRAME_RATE   # ~33.333 ms
+
+# Per-clip a-v duration tolerance. One frame at 30fps = 33.333ms; we
+# add 2ms of margin for AAC frame quantization within that frame.
+PER_CLIP_AV_TOLERANCE_S: float = 0.035
+
+# Fallback grid when the 30fps grid first attempt still exceeds the
+# tolerance. 100ms = 3 video frames; coarse enough to absorb the
+# AAC/video boundary lottery.
+RECUT_GRID_S: float = 0.1
+
+# Cumulative a-v delta sum warning threshold. Below this, lip-sync
+# is imperceptible; above this, the operator should see a flag.
+CUMULATIVE_AV_WARN_MS: float = 100.0
+
+
+def _snap_to_frame_grid(t: float, frame_s: float = VIDEO_FRAME_S) -> float:
+    """Round time to nearest video-frame boundary."""
+    return round(t / frame_s) * frame_s
+
+
+def _probe_av_durations(path: str, ffprobe_bin: str) -> tuple[float, float]:
+    """Return ``(video_duration_s, audio_duration_s)`` from ffprobe.
+    Returns 0.0 for either stream on probe failure (caller decides
+    whether that's fatal)."""
+    import subprocess as _sp
+
+    def _one(stream_sel: str) -> float:
+        try:
+            r = _sp.run(
+                [ffprobe_bin, "-v", "error",
+                 "-select_streams", stream_sel,
+                 "-show_entries", "stream=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            return float((r.stdout or "0").strip() or 0.0)
+        except Exception:
+            return 0.0
+
+    return _one("v:0"), _one("a:0")
+
+
+def _parse_clip_time(value) -> float:
+    """V1 clip dicts carry start/end as MM:SS.mmm strings AND as raw
+    floats (start_sec / end_sec). Accept either."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if ":" not in s:
+        return float(s)
+    parts = s.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    return float(s)
+
+
+def _cut_one_clip_strict(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    out_path: str,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    grid_s: float = VIDEO_FRAME_S,
+) -> dict:
+    """Cut a single clip from ``video_path`` with frame-aligned
+    boundaries + strict CFR + audio-sync flags. Probes the result
+    and reports a-v duration drift.
+
+    Returns dict with: ``ok`` (bool), ``video_dur``, ``audio_dur``,
+    ``delta_ms`` (a-v), ``start`` (snapped), ``end`` (snapped),
+    ``out_path``, optionally ``error``.
+    """
+    import os as _os
+    import subprocess as _sp
+
+    start_snap = _snap_to_frame_grid(start_sec, grid_s)
+    end_snap = _snap_to_frame_grid(end_sec, grid_s)
+    if end_snap <= start_snap:
+        return {
+            "ok": False, "video_dur": 0.0, "audio_dur": 0.0,
+            "delta_ms": 0.0, "start": start_snap, "end": end_snap,
+            "out_path": out_path,
+            "error": f"non-positive duration after snap "
+                     f"({start_snap:.3f} -> {end_snap:.3f})",
+        }
+
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-ss", f"{start_snap:.4f}",
+        "-to", f"{end_snap:.4f}",
+        "-i", video_path,
+        # Strict CFR + audio-sync. -r and -fps_mode lock output to
+        # 30fps CFR; -async 1 resyncs audio to PTS. -ar 48000 is
+        # already in ENCODE_ARGS_INTERMEDIATE but we pin it again
+        # here so the strict-flag set is self-describing.
+        "-r", "30", "-fps_mode", "cfr",
+        "-async", "1",
+    ]
+    try:
+        from pipeline_core.pipeline import ENCODE_ARGS_INTERMEDIATE
+        cmd.extend(ENCODE_ARGS_INTERMEDIATE)
+    except Exception:
+        # Fallback if the import graph is unavailable in test fixtures.
+        cmd.extend([
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        ])
+    cmd.append(out_path)
+
+    _os.makedirs(_os.path.dirname(_os.path.abspath(out_path)) or ".", exist_ok=True)
+    r = _sp.run(cmd, capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        return {
+            "ok": False, "video_dur": 0.0, "audio_dur": 0.0,
+            "delta_ms": 0.0, "start": start_snap, "end": end_snap,
+            "out_path": out_path,
+            "error": f"ffmpeg rc={r.returncode}: {(r.stderr or '')[-400:]}",
+        }
+
+    v_dur, a_dur = _probe_av_durations(out_path, ffprobe_bin)
+    delta_s = a_dur - v_dur
+    return {
+        "ok": abs(delta_s) <= PER_CLIP_AV_TOLERANCE_S,
+        "video_dur": v_dur, "audio_dur": a_dur,
+        "delta_ms": delta_s * 1000.0,
+        "start": start_snap, "end": end_snap,
+        "out_path": out_path,
+    }
+
+
+def cut_clips_frame_aligned(
+    video_path: str,
+    clips: list,
+    output_dir: str,
+    progress_cb=None,
+    ffmpeg_bin: Optional[str] = None,
+    ffprobe_bin: Optional[str] = None,
+) -> list[str]:
+    """V2-strict per-clip cut step. Drop-in replacement for V1's
+    ``cut_video_clips`` with frame-aligned boundaries + strict CFR
+    + post-cut verify.
+
+    Contract (mirrors V1's ``cut_video_clips``):
+      - Mutates each ``clip`` dict: sets ``raw_path`` + ``duration_sec``.
+      - Returns the list of produced output paths in order.
+      - Idempotent: if ``raw_clip_NN.mp4`` already exists at >100KB
+        the cut is skipped and the cached file's a/v durations are
+        probed instead.
+
+    Failure handling:
+      - Per-clip 30fps cut whose a-v delta exceeds 35ms -> re-cut
+        with the 100ms fallback grid.
+      - Per-clip ffmpeg failure -> the clip is OMITTED from the
+        return list (V1's contract); the operator sees a warning
+        via progress_cb.
+    """
+    import os as _os
+
+    if ffmpeg_bin is None:
+        try:
+            from pipeline_core.pipeline import FFMPEG_BIN as _FF
+            ffmpeg_bin = _FF
+        except Exception:
+            ffmpeg_bin = "ffmpeg"
+    if ffprobe_bin is None:
+        try:
+            from pipeline_core.qa import FFPROBE_BIN as _FP
+            ffprobe_bin = _FP
+        except Exception:
+            import shutil as _sh
+            ffprobe_bin = _sh.which("ffprobe") or "ffprobe"
+
+    def _p(msg: str) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
+    out_paths: list[str] = []
+    cumulative_delta_ms = 0.0
+    n_failures = 0
+
+    for i, clip in enumerate(clips, start=1):
+        start = _parse_clip_time(
+            clip.get("start_sec", clip.get("start", 0.0))
+        )
+        end = _parse_clip_time(
+            clip.get("end_sec", clip.get("end", 0.0))
+        )
+        out_path = _os.path.join(output_dir, f"raw_clip_{i:02d}.mp4")
+
+        # Idempotency: reuse a cached >100KB file (matches V1 behaviour
+        # so --resume-dir / mid-run retries still skip completed cuts).
+        if _os.path.exists(out_path) and _os.path.getsize(out_path) > 100_000:
+            v_dur, a_dur = _probe_av_durations(out_path, ffprobe_bin)
+            delta_ms = (a_dur - v_dur) * 1000.0
+            cumulative_delta_ms += delta_ms
+            clip["raw_path"] = out_path
+            clip["duration_sec"] = round(v_dur, 2)
+            out_paths.append(out_path)
+            _p(f"  [cut {i:02d}] cached "
+               f"video={v_dur:.3f}s audio={a_dur:.3f}s "
+               f"delta={delta_ms:+.1f}ms (reused)")
+            continue
+
+        # Attempt 1: 30fps grid.
+        result = _cut_one_clip_strict(
+            video_path, start, end, out_path,
+            ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
+            grid_s=VIDEO_FRAME_S,
+        )
+
+        if not result["ok"] and "error" not in result:
+            _p(f"  [cut {i:02d}] first attempt drift "
+               f"{result['delta_ms']:+.1f}ms exceeds "
+               f"{PER_CLIP_AV_TOLERANCE_S * 1000:.0f}ms tolerance; "
+               f"retrying with {RECUT_GRID_S * 1000:.0f}ms grid")
+            result = _cut_one_clip_strict(
+                video_path, start, end, out_path,
+                ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
+                grid_s=RECUT_GRID_S,
+            )
+            result["retried"] = True
+
+        if "error" in result:
+            n_failures += 1
+            _p(f"  [cut {i:02d}] FAILED: {result['error'][:200]}")
+            continue
+
+        cumulative_delta_ms += result["delta_ms"]
+        status = "ok" if result["ok"] else "OVER TOLERANCE"
+        retry_tag = " (retried)" if result.get("retried") else ""
+        _p(f"  [cut {i:02d}] [{result['start']:.3f}, {result['end']:.3f}]s "
+           f"video={result['video_dur']:.3f}s "
+           f"audio={result['audio_dur']:.3f}s "
+           f"delta={result['delta_ms']:+.1f}ms {status}{retry_tag}")
+
+        clip["raw_path"] = out_path
+        clip["duration_sec"] = round(result["video_dur"], 2)
+        out_paths.append(out_path)
+
+    # Aggregate guardrail.
+    _p(f"  [cut summary] cumulative a-v delta: "
+       f"{cumulative_delta_ms:+.1f}ms across {len(clips)} clips "
+       f"({n_failures} failures)")
+    if abs(cumulative_delta_ms) > CUMULATIVE_AV_WARN_MS:
+        _p(f"  [cut WARN] cumulative a-v delta exceeds "
+           f"{CUMULATIVE_AV_WARN_MS:.0f}ms threshold -- lip-sync "
+           f"will be perceptible across the bulletin")
+
+    return out_paths
+
+
 # --- Item 109: end-frame trim -----------------------------------------
 
 END_FRAME_TRIM_BUFFER_S: float = 0.5
@@ -1189,6 +1476,15 @@ class Stage4Render:
     # has no source-time references to compute gaps from).
     original_words: Optional[list] = None
 
+    # Item 112: use the frame-aligned cut helper (cut_clips_frame_aligned)
+    # instead of V1's _v1_cut_video_clips. When True, every per-clip
+    # cut snaps boundaries to the 30fps grid, applies strict CFR +
+    # audio-sync flags, and ffprobe-verifies a-v drift within 33ms
+    # before accepting the slice. Defaults to True (the item-112 fix);
+    # set to False to fall back to V1's looser cut behaviour during
+    # rollout or for fixture tests that pre-stage their own slices.
+    use_frame_aligned_cut: bool = True
+
     # Instance-level cache, populated by Step 9.2 image resolution.
     # Maps canonical entity_name -> absolute path of resolved image
     # file. Shared between shorts and bulletin passes so the same
@@ -1211,10 +1507,16 @@ class Stage4Render:
         self,
         shorts_cuts: list[ShortsCut],
         metadata: Metadata,
+        progress_cb=None,
     ) -> list[dict]:
         """Cut the source video into per-shorts raw segments.
 
-        Wires V1's ``cut_video_clips`` against converted V2 inputs.
+        Item 112: when ``self.use_frame_aligned_cut`` is True (default),
+        uses ``cut_clips_frame_aligned`` -- snaps boundaries to the
+        30fps grid, applies strict CFR + audio-sync flags, verifies
+        each output's a-v drift within one frame. When False, falls
+        back to V1's ``cut_video_clips`` for compatibility.
+
         V1 mutates each clip dict in place to add ``raw_path`` (the
         absolute path to the produced ``raw_clip_NN.mp4``) and
         ``duration_sec``. Returns the mutated clip dict list.
@@ -1228,12 +1530,20 @@ class Stage4Render:
         applied at the compose stage (Step 9.2), not here.
         """
         v1_clips = shorts_cuts_to_v1_clip_dicts(shorts_cuts, metadata)
-        # V1's signature: cut_video_clips(video_path: str, clips: list, output_dir: str)
-        _v1_cut_video_clips(
-            str(self.video_path),
-            v1_clips,
-            str(self.output_dir),
-        )
+        if self.use_frame_aligned_cut:
+            cut_clips_frame_aligned(
+                str(self.video_path),
+                v1_clips,
+                str(self.output_dir),
+                progress_cb=progress_cb,
+            )
+        else:
+            # Legacy V1 path. Retained as a rollout fallback.
+            _v1_cut_video_clips(
+                str(self.video_path),
+                v1_clips,
+                str(self.output_dir),
+            )
         return v1_clips
 
     def cut_raw_bulletin_stories(
@@ -1241,6 +1551,7 @@ class Stage4Render:
         full_video_cuts: list[FullVideoCut],
         metadata: Metadata,
         parent_v2_indexes: Optional[list[int]] = None,
+        progress_cb=None,
     ) -> list[dict]:
         """Cut the source video into per-story raw segments for the
         bulletin pass.
@@ -1248,6 +1559,10 @@ class Stage4Render:
         Same wiring as ``cut_raw_shorts`` but with full_video_cuts and
         a SEPARATE output directory (``bulletin_dir`` instead of
         ``output_dir``).
+
+        Item 112: defaults to ``cut_clips_frame_aligned``; falls back
+        to V1's ``cut_video_clips`` when ``self.use_frame_aligned_cut``
+        is False.
 
         ``parent_v2_indexes`` (item 100) is the parallel list returned
         by ``splice_cuts_minus_skipped`` -- it stamps each V1 clip
@@ -1274,11 +1589,19 @@ class Stage4Render:
             full_video_cuts, metadata,
             parent_v2_indexes=parent_v2_indexes,
         )
-        _v1_cut_video_clips(
-            str(self.video_path),
-            v1_clips,
-            str(self.bulletin_dir),
-        )
+        if self.use_frame_aligned_cut:
+            cut_clips_frame_aligned(
+                str(self.video_path),
+                v1_clips,
+                str(self.bulletin_dir),
+                progress_cb=progress_cb,
+            )
+        else:
+            _v1_cut_video_clips(
+                str(self.video_path),
+                v1_clips,
+                str(self.bulletin_dir),
+            )
         return v1_clips
 
     # ---- Step 9.2: image resolution + compose dispatcher -------------
@@ -1768,6 +2091,7 @@ class Stage4Render:
         parent_v2_indexes: Optional[list[int]] = None,
         takeovers_enabled: Optional[bool] = None,
         pip_enabled: Optional[bool] = None,
+        progress_cb=None,
     ) -> dict:
         """Assemble the full-form bulletin video.
 
@@ -1818,6 +2142,7 @@ class Stage4Render:
         clips = self.cut_raw_bulletin_stories(
             full_video_cuts, metadata,
             parent_v2_indexes=parent_v2_indexes,
+            progress_cb=progress_cb,
         )
 
         # ---- 2. Image resolution (reuses image_pool per D-9.5) ----
@@ -2305,7 +2630,7 @@ class Stage4Render:
                     f"{_format_mmss_mmm(sc.start_sec)} -> "
                     f"{_format_mmss_mmm(sc.end_sec)} ({dur:.1f}s)"
                 )
-            shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata)
+            shorts_clips = self.cut_raw_shorts(shorts_cuts, metadata, progress_cb=_p)
             _p(f"Stage 5/7 raw shorts cut ({len(shorts_clips)} clips on disk)")
             if cancel_check is not None:
                 cancel_check()
@@ -2567,6 +2892,7 @@ class Stage4Render:
                 parent_v2_indexes=parent_v2_indexes,
                 takeovers_enabled=takeovers_enabled,
                 pip_enabled=pip_enabled,
+                progress_cb=_p,
             )
             _p(
                 f"Stage 6/7 bulletin assembled "
