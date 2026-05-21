@@ -153,6 +153,7 @@ def build_extraction_edl(
     shorts_cuts: Iterable[tuple[float, float]] = (),
     *,
     snap_grid_s: float = DEFAULT_SNAP_GRID_S,
+    bulletin_mode: str = "concat",
 ) -> EDL:
     """Convert cut decisions into a filter_complex graph + map specs.
 
@@ -168,6 +169,14 @@ def build_extraction_edl(
     snap_grid_s
         Frame grid for boundary snapping. Default is 1/30 s (V2's
         mezzanine fps).
+    bulletin_mode
+        ``"concat"`` (default): one bulletin_raw.mp4 with all kept
+        ranges concatenated. ``"per_story"``: each bulletin cut
+        becomes its own ``story_NN_raw.mp4`` output (no concat). The
+        per-story mode is the gentle-integration path: existing
+        compose / stitcher chain runs unchanged on top, getting
+        sync-perfect raw files in place of the legacy cut-step's
+        drift-prone per-clip files.
 
     Returns
     -------
@@ -177,8 +186,14 @@ def build_extraction_edl(
     Raises
     ------
     ValueError
-        Both bulletin_cuts and shorts_cuts are empty (no work).
+        Both bulletin_cuts and shorts_cuts are empty (no work), OR
+        ``bulletin_mode`` is not one of the documented options.
     """
+    if bulletin_mode not in ("concat", "per_story"):
+        raise ValueError(
+            f"build_extraction_edl: unknown bulletin_mode "
+            f"{bulletin_mode!r} (expected 'concat' or 'per_story')"
+        )
     bulletin_cuts = list(bulletin_cuts)
     shorts_cuts = list(shorts_cuts)
     if not bulletin_cuts and not shorts_cuts:
@@ -208,30 +223,47 @@ def build_extraction_edl(
                 f"[0:a]atrim=start={_fmt(s)}:end={_fmt(e)},"
                 f"asetpts=PTS-STARTPTS[ba{i:02d}]"
             )
-        if len(bulletin_kept) == 1:
-            # N=1: skip concat node; the single trim outputs ARE the bulletin.
-            v_label = "bv00"
-            a_label = "ba00"
+        if bulletin_mode == "per_story":
+            # Emit one OutputSpec per bulletin cut (no concat).
+            # Each story_NN_raw.mp4 carries exactly that cut's range
+            # with sample-accurate boundaries. Existing compose +
+            # stitcher chain runs over these unchanged.
+            for i, (s, e) in enumerate(bulletin_kept):
+                outputs.append(OutputSpec(
+                    role="bulletin_story",
+                    index=i + 1,
+                    v_label=f"bv{i:02d}",
+                    a_label=f"ba{i:02d}",
+                    duration_s=e - s,
+                    source_cuts=((s, e),),
+                ))
         else:
-            bv_in = "".join(f"[bv{i:02d}]" for i in range(len(bulletin_kept)))
-            ba_in = "".join(f"[ba{i:02d}]" for i in range(len(bulletin_kept)))
-            parts.append(
-                f"{bv_in}concat=n={len(bulletin_kept)}:v=1:a=0[bv_out]"
-            )
-            parts.append(
-                f"{ba_in}concat=n={len(bulletin_kept)}:v=0:a=1[ba_out]"
-            )
-            v_label = "bv_out"
-            a_label = "ba_out"
-        bul_dur = sum(e - s for s, e in bulletin_kept)
-        outputs.append(OutputSpec(
-            role="bulletin",
-            index=0,
-            v_label=v_label,
-            a_label=a_label,
-            duration_s=bul_dur,
-            source_cuts=tuple(bulletin_kept),
-        ))
+            # "concat" mode: single bulletin_raw.mp4 (the original
+            # item-117 architecture). Used for the bulletin-overlay
+            # path that draws all decoration in one pass.
+            if len(bulletin_kept) == 1:
+                v_label = "bv00"
+                a_label = "ba00"
+            else:
+                bv_in = "".join(f"[bv{i:02d}]" for i in range(len(bulletin_kept)))
+                ba_in = "".join(f"[ba{i:02d}]" for i in range(len(bulletin_kept)))
+                parts.append(
+                    f"{bv_in}concat=n={len(bulletin_kept)}:v=1:a=0[bv_out]"
+                )
+                parts.append(
+                    f"{ba_in}concat=n={len(bulletin_kept)}:v=0:a=1[ba_out]"
+                )
+                v_label = "bv_out"
+                a_label = "ba_out"
+            bul_dur = sum(e - s for s, e in bulletin_kept)
+            outputs.append(OutputSpec(
+                role="bulletin",
+                index=0,
+                v_label=v_label,
+                a_label=a_label,
+                duration_s=bul_dur,
+                source_cuts=tuple(bulletin_kept),
+            ))
 
     # --- Shorts ---
     for i, (s, e) in enumerate(shorts_kept):

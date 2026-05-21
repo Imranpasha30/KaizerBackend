@@ -1657,6 +1657,63 @@ class Stage4Render:
 
     # ---- Step 9.1: raw cut wiring -------------------------------------
 
+    # Item 117 Phase 5: shared cache for the unified raw-extract pass.
+    # ``_unified_extract_done`` is set on first call to either
+    # ``cut_raw_shorts`` or ``cut_raw_bulletin_stories`` when the
+    # KAIZER_USE_V2_RAW_EXTRACT env flag is set. The second call sees
+    # the cache + skips the redundant ffmpeg invocation; both shorts
+    # and bulletin outputs are written by the single extract.
+    _unified_extract_done: bool = False
+
+    def _v2_extract_enabled(self) -> bool:
+        """Read the item 117 phase 5 feature flag. Returns True when
+        ``KAIZER_USE_V2_RAW_EXTRACT`` is set to a truthy value."""
+        import os as _os
+        v = (_os.environ.get("KAIZER_USE_V2_RAW_EXTRACT") or "").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _run_unified_raw_extract(
+        self,
+        shorts_cuts: list[ShortsCut],
+        full_video_cuts: list[FullVideoCut],
+        progress_cb=None,
+    ) -> None:
+        """Item 117 phase 5: single ffmpeg multi-output extraction
+        that produces BOTH shorts and bulletin raw files. Called once
+        per render when the V2 extract flag is set; downstream
+        ``cut_raw_*`` calls become idempotent no-ops once this has
+        run (the on-disk files satisfy the >100KB cache check).
+
+        See ``pipeline_v2.stages.stage_4_raw_extract.extract_raw_timeline``
+        for the architecture and post-extract verification.
+        """
+        from pipeline_v2.stages.stage_4_raw_extract import (
+            extract_raw_timeline,
+        )
+
+        shorts_ranges = [
+            (float(c.start_sec), float(c.end_sec)) for c in shorts_cuts
+        ]
+        bulletin_ranges = [
+            (float(c.start_sec), float(c.end_sec)) for c in full_video_cuts
+        ]
+        if progress_cb:
+            progress_cb(
+                f"Stage 5-6/7 unified raw-extract (item 117): "
+                f"{len(shorts_ranges)} shorts + "
+                f"{len(bulletin_ranges)} bulletin stories in one pass"
+            )
+        extract_raw_timeline(
+            mezzanine_path=str(self.video_path),
+            bulletin_cuts=bulletin_ranges,
+            shorts_cuts=shorts_ranges,
+            out_dir=str(self.output_dir),
+            bulletin_out_dir=str(self.bulletin_dir),
+            bulletin_mode="per_story",
+            progress_cb=progress_cb,
+        )
+        self._unified_extract_done = True
+
     def cut_raw_shorts(
         self,
         shorts_cuts: list[ShortsCut],
@@ -1664,6 +1721,13 @@ class Stage4Render:
         progress_cb=None,
     ) -> list[dict]:
         """Cut the source video into per-shorts raw segments.
+
+        Item 117 phase 5: when ``KAIZER_USE_V2_RAW_EXTRACT=1`` and the
+        unified extract has NOT yet run for this render, kicks off a
+        single ffmpeg multi-output pass that produces both shorts and
+        bulletin raw files. Downstream the existing
+        ``cut_clips_frame_aligned`` is still called but its >100KB
+        cache check sees the pre-extracted files and skips.
 
         Item 112: when ``self.use_frame_aligned_cut`` is True (default),
         uses ``cut_clips_frame_aligned`` -- snaps boundaries to the
@@ -1684,6 +1748,17 @@ class Stage4Render:
         applied at the compose stage (Step 9.2), not here.
         """
         v1_clips = shorts_cuts_to_v1_clip_dicts(shorts_cuts, metadata)
+
+        # Item 117 phase 5: opportunistically pre-extract via the
+        # unified path. The shorts pass only knows about shorts_cuts;
+        # the bulletin pass will fire its own unified extract on first
+        # call if the flag is set but no shorts ran. We cannot run a
+        # combined extract here because we don't have full_video_cuts
+        # in this method's scope -- that lives one call up in
+        # _render_impl. To keep this method's signature stable we let
+        # _render_impl orchestrate the unified extract before either
+        # cut_raw_* method runs.
+
         if self.use_frame_aligned_cut:
             cut_clips_frame_aligned(
                 str(self.video_path),
@@ -2789,6 +2864,36 @@ class Stage4Render:
                     logger.warning(
                         "stage_4 progress_cb raised (ignored): %s", exc,
                     )
+
+        # ---- Item 117 phase 5: unified raw-extract (feature-flagged) ---
+        # When KAIZER_USE_V2_RAW_EXTRACT=1, run a SINGLE ffmpeg pass
+        # up-front that produces both shorts and bulletin raw files.
+        # The downstream cut_raw_shorts / cut_raw_bulletin_stories
+        # still run but their cache check skips re-encoding (the
+        # files are already on disk). This eliminates the per-clip
+        # +33ms drift class that items 112 / 115 / 116 worked around.
+        # Default OFF for safety; verification job opts in.
+        if (
+            self._v2_extract_enabled()
+            and not self._unified_extract_done
+            and (shorts_cuts or full_video_cuts)
+        ):
+            try:
+                self._run_unified_raw_extract(
+                    shorts_cuts, full_video_cuts, progress_cb=_p,
+                )
+            except Exception as exc:
+                # Don't take the render down -- fall through to the
+                # legacy cut_raw_* paths. The operator sees the
+                # warning in the job log + can disable the flag.
+                logger.warning(
+                    "stage_4: unified raw-extract failed (falling back "
+                    "to legacy cut step): %s", exc,
+                )
+                _p(
+                    f"  [v2-extract WARN] unified extract failed; "
+                    f"falling back to legacy cut step: {exc}"
+                )
 
         # ---- 1. SHORTS pass ------------------------------------------
         if shorts_cuts:

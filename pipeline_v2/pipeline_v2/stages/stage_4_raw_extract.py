@@ -108,6 +108,11 @@ class RawExtractResult:
     def shorts(self) -> tuple[ExtractedOutput, ...]:
         return tuple(o for o in self.outputs if o.role == "short")
 
+    @property
+    def bulletin_stories(self) -> tuple[ExtractedOutput, ...]:
+        """per_story mode: one ExtractedOutput per bulletin cut."""
+        return tuple(o for o in self.outputs if o.role == "bulletin_story")
+
 
 def _ffprobe_streams(path: str, ffprobe_bin: str) -> dict:
     """Return ``{codec_type: {"duration": float, "nb_frames": int}}``.
@@ -138,17 +143,38 @@ def _ffprobe_streams(path: str, ffprobe_bin: str) -> dict:
         return {}
 
 
-def _output_path_for(out_dir: Path, spec: OutputSpec) -> Path:
-    """Production filenames: ``bulletin_raw.mp4`` + ``short_NN_raw.mp4``."""
+def _output_path_for(
+    spec: OutputSpec,
+    *,
+    shorts_dir: Path,
+    bulletin_dir: Path,
+) -> Path:
+    """Production filenames + directories:
+      - ``bulletin_raw.mp4`` (concat mode) lands in ``bulletin_dir``
+      - ``raw_clip_NN.mp4`` (per_story mode) lands in ``bulletin_dir``
+        -- matches V1 / current cut step output names so the existing
+        compose chain can consume them unchanged.
+      - ``short_NN_raw.mp4`` lands in ``shorts_dir`` (V2 keeps shorts
+        and bulletin in separate dirs to avoid V1 cache-key collision;
+        see ``cut_raw_bulletin_stories`` docstring).
+
+    NOTE on item 117 per_story integration: V1's compose chain expects
+    raw_clip_NN.mp4 in the bulletin_dir. We honour that layout so the
+    new extract is a drop-in replacement for the legacy
+    cut_clips_frame_aligned step at the file-system level.
+    """
     if spec.role == "bulletin":
-        return out_dir / "bulletin_raw.mp4"
-    return out_dir / f"short_{spec.index:02d}_raw.mp4"
+        return bulletin_dir / "bulletin_raw.mp4"
+    if spec.role == "bulletin_story":
+        return bulletin_dir / f"raw_clip_{spec.index:02d}.mp4"
+    return shorts_dir / f"short_{spec.index:02d}_raw.mp4"
 
 
 def _build_ffmpeg_cmd(
     mezzanine_path: str,
     edl: EDL,
-    out_dir: Path,
+    shorts_dir: Path,
+    bulletin_dir: Path,
     *,
     ffmpeg_bin: str,
     use_nvenc: bool,
@@ -163,7 +189,9 @@ def _build_ffmpeg_cmd(
         "-filter_complex", edl.filter_complex,
     ]
     for spec in edl.outputs:
-        out_path = _output_path_for(out_dir, spec)
+        out_path = _output_path_for(
+            spec, shorts_dir=shorts_dir, bulletin_dir=bulletin_dir,
+        )
         cmd += [
             "-map", f"[{spec.v_label}]",
             "-map", f"[{spec.a_label}]",
@@ -182,6 +210,8 @@ def extract_raw_timeline(
     out_dir: str,
     *,
     snap_grid_s: float = DEFAULT_SNAP_GRID_S,
+    bulletin_mode: str = "concat",
+    bulletin_out_dir: Optional[str] = None,
     ffmpeg_bin: Optional[str] = None,
     ffprobe_bin: Optional[str] = None,
     use_nvenc: Optional[bool] = None,
@@ -200,8 +230,20 @@ def extract_raw_timeline(
     shorts_cuts
         List of ``(start_s, end_s)`` ranges, one per desired short.
     out_dir
-        Output directory. Created if missing. Outputs land here as
-        ``bulletin_raw.mp4`` + ``short_NN_raw.mp4``.
+        Shorts output directory. ``short_NN_raw.mp4`` files land
+        here. Created if missing.
+    bulletin_out_dir
+        Optional separate directory for bulletin outputs
+        (``bulletin_raw.mp4`` or ``raw_clip_NN.mp4``). When ``None``
+        bulletin outputs share ``out_dir``. In production V2 layout
+        (item 117 phase 5 integration) callers should pass the
+        bulletin_dir to avoid the V1 cache-key collision documented
+        in ``cut_raw_bulletin_stories``.
+    bulletin_mode
+        ``"concat"`` -> single ``bulletin_raw.mp4`` covering all
+        kept ranges. ``"per_story"`` -> one ``raw_clip_NN.mp4`` per
+        bulletin cut (drop-in for the legacy cut step; the existing
+        compose chain runs over these unchanged).
     snap_grid_s
         Frame grid for boundary snapping. Defaults to 1/30 s.
     ffmpeg_bin / ffprobe_bin
@@ -232,8 +274,10 @@ def extract_raw_timeline(
         Caller-side mistake: empty plan, etc. (propagated from EDL
         builder).
     """
-    out_dir_p = Path(out_dir)
-    out_dir_p.mkdir(parents=True, exist_ok=True)
+    shorts_dir_p = Path(out_dir)
+    shorts_dir_p.mkdir(parents=True, exist_ok=True)
+    bulletin_dir_p = Path(bulletin_out_dir) if bulletin_out_dir else shorts_dir_p
+    bulletin_dir_p.mkdir(parents=True, exist_ok=True)
 
     if ffmpeg_bin is None:
         try:
@@ -257,7 +301,9 @@ def extract_raw_timeline(
             use_nvenc = False
 
     edl = build_extraction_edl(
-        bulletin_cuts, shorts_cuts, snap_grid_s=snap_grid_s,
+        bulletin_cuts, shorts_cuts,
+        snap_grid_s=snap_grid_s,
+        bulletin_mode=bulletin_mode,
     )
 
     if progress_cb:
@@ -270,7 +316,7 @@ def extract_raw_timeline(
         )
 
     cmd = _build_ffmpeg_cmd(
-        mezzanine_path, edl, out_dir_p,
+        mezzanine_path, edl, shorts_dir_p, bulletin_dir_p,
         ffmpeg_bin=ffmpeg_bin, use_nvenc=bool(use_nvenc),
     )
 
@@ -296,7 +342,9 @@ def extract_raw_timeline(
     results: list[ExtractedOutput] = []
     failures: list[str] = []
     for spec in edl.outputs:
-        out_path = _output_path_for(out_dir_p, spec)
+        out_path = _output_path_for(
+            spec, shorts_dir=shorts_dir_p, bulletin_dir=bulletin_dir_p,
+        )
         if not out_path.is_file():
             failures.append(
                 f"missing output {out_path.name} for {spec.role}[{spec.index}]"
