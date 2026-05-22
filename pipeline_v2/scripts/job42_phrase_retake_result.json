@@ -9,21 +9,21 @@
       "spot_sec": 24.0,
       "caught": true,
       "matched_span": "26.46-27.11s",
-      "matched_reason": "The speaker mispronounced 'సంచలనం' as 'సంచూన్' and immediately restarted the phrase correctly."
+      "matched_reason": "Speaker mispronounced 'సంచలనం' as 'సంచూన్', then immediately restarted the phrase with the correct word."
     },
     {
       "label": "01:27",
       "spot_sec": 87.0,
       "caught": true,
-      "matched_span": "84.16-84.56s",
-      "matched_reason": "Restarted the word 'కమర్షియల్' after a brief pause to complete the phrase 'కమర్షియల్ గ్యాస్'."
+      "matched_span": "91.04-93.52s",
+      "matched_reason": "The speaker restarts the phrase to correct the grammar from 'జీవితాల్లో' (in lives) to the more appropriate 'జీవితాలతో' (with lives)."
     },
     {
       "label": "01:44",
       "spot_sec": 104.0,
       "caught": true,
-      "matched_span": "98.31-109.27s",
-      "matched_reason": "The speaker made two incomplete attempts to form a sentence about students' lives before restarting cleanly at word 201."
+      "matched_span": "98.31-110.78s",
+      "matched_reason": "A long, confused section with multiple false starts and nonsensical phrases about students' lives before restarting with a clearer topic."
     },
     {
       "label": "02:08",
@@ -36,8 +36,8 @@
       "label": "04:10",
       "spot_sec": 250.0,
       "caught": true,
-      "matched_span": "253.06-254.74s",
-      "matched_reason": "The speaker begins a thought about the girl's father but trails off and abandons it."
+      "matched_span": "247.54-249.87s",
+      "matched_reason": "The speaker starts a question 'మరి ఆ పిల్ల సంగతి ఏంటి?' but restarts it immediately."
     },
     {
       "label": "04:27",
@@ -62,273 +62,201 @@
     }
   ],
   "n_cuts": 1,
-  "n_skipped": 33,
-  "n_retakes": 15,
-  "retake_audit": "Skipped numerous phrase-level retakes, hesitations, and asides throughout the monologue, including redundant questions, self-corrections on names and grammar, and a lengthy disclaimer that was repeated multiple times.",
+  "n_skipped": 24,
+  "n_retakes": 12,
+  "retake_audit": "Skipped numerous phrase-level retakes (e.g., correcting grammar at 91s, repeating questions at 149s, and a long disclaimer at 374s), several hesitations and stutters, and two asides where the speaker broke character to comment on their own speech.",
   "skipped_segments": [
     {
       "category": "retake",
       "start_sec": 26.465,
       "end_sec": 27.105,
       "start_word_idx": 62,
-      "end_word_idx": 63,
-      "reason": "The speaker mispronounced 'సంచలనం' as 'సంచూన్' and immediately restarted the phrase correctly."
+      "end_word_idx": 62,
+      "reason": "Speaker mispronounced 'సంచలనం' as 'సంచూన్', then immediately restarted the phrase with the correct word."
     },
     {
       "category": "hesitation",
       "start_sec": 59.43,
       "end_sec": 60.39,
-      "start_word_idx": 128,
-      "end_word_idx": 128,
-      "reason": "A stuttered repetition of 'ఎందరో' (many people) before continuing the sentence."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 82.4,
-      "end_sec": 82.56,
-      "start_word_idx": 163,
-      "end_word_idx": 164,
-      "reason": "Stutter 'ఐ ఐ' before clarifying with 'I mean'."
-    },
-    {
-      "category": "retake",
-      "start_sec": 84.16,
-      "end_sec": 84.56,
-      "start_word_idx": 168,
-      "end_word_idx": 168,
-      "reason": "Restarted the word 'కమర్షియల్' after a brief pause to complete the phrase 'కమర్షియల్ గ్యాస్'."
+      "start_word_idx": 125,
+      "end_word_idx": 125,
+      "reason": "Repetition of 'ఎందరో' serves as a stall before continuing the sentence."
     },
     {
       "category": "retake",
       "start_sec": 91.04,
       "end_sec": 93.52,
-      "start_word_idx": 179,
-      "end_word_idx": 181,
-      "reason": "A phrase-level restart to correct the grammar from 'జీవితాల్లో' (in lives) to 'జీవితాలతో' (with lives)."
+      "start_word_idx": 172,
+      "end_word_idx": 174,
+      "reason": "The speaker restarts the phrase to correct the grammar from 'జీవితాల్లో' (in lives) to the more appropriate 'జీవితాలతో' (with lives)."
     },
     {
       "category": "retake",
       "start_sec": 98.305,
-      "end_sec": 109.265,
-      "start_word_idx": 188,
-      "end_word_idx": 199,
-      "reason": "The speaker made two incomplete attempts to form a sentence about students' lives before restarting cleanly at word 201."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 125.65,
-      "end_sec": 125.65,
-      "start_word_idx": 226,
-      "end_word_idx": 226,
-      "reason": "Repetition of the word 'దీనిలో' (in this) after a brief pause, indicating a stall."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 138.98,
-      "end_sec": 139.46,
-      "start_word_idx": 250,
-      "end_word_idx": 250,
-      "reason": "The word 'దీనికి' is a false start before the speaker continues with the main point."
+      "end_sec": 110.785,
+      "start_word_idx": 181,
+      "end_word_idx": 192,
+      "reason": "A long, confused section with multiple false starts and nonsensical phrases about students' lives before restarting with a clearer topic."
     },
     {
       "category": "retake",
-      "start_sec": 151.995,
-      "end_sec": 153.675,
-      "start_word_idx": 266,
-      "end_word_idx": 270,
-      "reason": "The speaker repeats the question 'అక్కడ ఆ అమ్మాయి తప్పు లేదంటావా?' (Are you saying that girl is not at fault?) for emphasis, which is redundant."
+      "start_sec": 149.78,
+      "end_sec": 152.34,
+      "start_word_idx": 235,
+      "end_word_idx": 239,
+      "reason": "The rhetorical question 'అక్కడ ఆ అమ్మాయి తప్పు లేదంటావా?' is repeated verbatim; the first instance is dropped."
     },
     {
       "category": "retake",
-      "start_sec": 181.535,
-      "end_sec": 182.335,
-      "start_word_idx": 300,
+      "start_sec": 179.54,
+      "end_sec": 182.735,
+      "start_word_idx": 262,
+      "end_word_idx": 266,
+      "reason": "The phrase 'మన అందరి తోడు' is stuttered and repeated before being delivered cleanly."
+    },
+    {
+      "category": "retake",
+      "start_sec": 247.545,
+      "end_sec": 249.865,
+      "start_word_idx": 298,
       "end_word_idx": 301,
-      "reason": "An abandoned phrase 'మన అందరి' (all of us) is immediately restarted and repeated for emphasis."
+      "reason": "The speaker starts a question 'మరి ఆ పిల్ల సంగతి ఏంటి?' but restarts it immediately."
     },
     {
       "category": "retake",
-      "start_sec": 194.82,
-      "end_sec": 195.54,
-      "start_word_idx": 320,
-      "end_word_idx": 320,
-      "reason": "The speaker says 'బహిర్గతం' but immediately corrects the context with 'తప్పించుకొని తిరుగుతున్నాడని' (he is absconding)."
-    },
-    {
-      "category": "retake",
-      "start_sec": 208.455,
-      "end_sec": 211.015,
-      "start_word_idx": 331,
-      "end_word_idx": 333,
-      "reason": "The speaker starts with 'భగీ ఎక్కడ ఎక్కడ' (Where is Bhagi), pauses, and then restarts the thought."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 249.62,
-      "end_sec": 249.86,
-      "start_word_idx": 372,
-      "end_word_idx": 372,
-      "reason": "A brief filler 'ఆ' before restarting the question about the girl's fault."
-    },
-    {
-      "category": "retake",
-      "start_sec": 253.06,
+      "start_sec": 251.86,
       "end_sec": 254.74,
-      "start_word_idx": 376,
-      "end_word_idx": 380,
-      "reason": "The speaker begins a thought about the girl's father but trails off and abandons it."
+      "start_word_idx": 307,
+      "end_word_idx": 312,
+      "reason": "The speaker begins a thought about the girl's father but trails off and restarts the entire point later."
     },
     {
       "category": "retake",
       "start_sec": 257.7,
       "end_sec": 261.46,
-      "start_word_idx": 381,
-      "end_word_idx": 387,
-      "reason": "The speaker repeats the same question 'ఆ పిల్ల సంగతి ఏంటి? ఆ పిల్ల తప్పు చేయలేద అంటారా?' which was already asked, making it redundant."
+      "start_word_idx": 313,
+      "end_word_idx": 321,
+      "reason": "A verbatim repetition of the phrase 'మరి ఆ పిల్ల సంగతి ఏంటి? ఆ పిల్ల తప్పు చేయలేద అంటారా?'."
     },
     {
       "category": "aside",
-      "start_sec": 267.935,
+      "start_sec": 264.255,
+      "end_sec": 277.86,
+      "start_word_idx": 326,
+      "end_word_idx": 344,
+      "reason": "The speaker breaks the flow to comment on their own speech, saying 'this is not what I actually wanted to say', before restarting the main point."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 278.5,
       "end_sec": 284.02,
-      "start_word_idx": 394,
-      "end_word_idx": 420,
-      "reason": "The speaker goes on a long, rambling aside, stating that the point they are making is not what they originally intended to say, before restarting the main topic."
+      "start_word_idx": 345,
+      "end_word_idx": 351,
+      "reason": "A long pause and filler words ('ఆ... చెప్పాలనుకుంటే ఇది కాదు... ఓకే') indicating the speaker is gathering their thoughts."
     },
     {
       "category": "retake",
-      "start_sec": 290.005,
-      "end_sec": 290.885,
-      "start_word_idx": 423,
-      "end_word_idx": 424,
-      "reason": "The speaker says 'శిక్ష పడాల అంటున్నారు' (they are saying he should be punished) and immediately repeats it, which is redundant."
-    },
-    {
-      "category": "retake",
-      "start_sec": 300.085,
+      "start_sec": 298.085,
       "end_sec": 302.085,
-      "start_word_idx": 432,
-      "end_word_idx": 437,
-      "reason": "The speaker starts a sentence, then pauses and restarts it with the same phrasing."
+      "start_word_idx": 366,
+      "end_word_idx": 371,
+      "reason": "The speaker addresses the audience as 'brother' then immediately corrects to the more general 'friends'."
     },
     {
       "category": "retake",
       "start_sec": 305.42,
       "end_sec": 307.26,
-      "start_word_idx": 438,
-      "end_word_idx": 442,
-      "reason": "Another false start and restart of the same sentence 'నేను కూడా చెప్తున్నా ఫ్రెండ్స్'."
+      "start_word_idx": 372,
+      "end_word_idx": 377,
+      "reason": "A near-verbatim repetition of the phrase 'నేను కూడా చెప్తున్నా ఫ్రెండ్స్' from the previous line."
     },
     {
       "category": "hesitation",
-      "start_sec": 319.035,
-      "end_sec": 319.435,
-      "start_word_idx": 455,
-      "end_word_idx": 455,
-      "reason": "A false start with the name 'సాయి' before correctly saying 'సాయి భిరత్'."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 332.91,
-      "end_sec": 333.55,
-      "start_word_idx": 475,
-      "end_word_idx": 475,
-      "reason": "The speaker says 'డబ్బున్న' (wealthy) as a false start before continuing with 'పేరెంట్స్'."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 345.105,
-      "end_sec": 345.345,
-      "start_word_idx": 500,
-      "end_word_idx": 500,
-      "reason": "A filler 'ఆ' before continuing the sentence."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 374.775,
-      "end_sec": 376.295,
-      "start_word_idx": 529,
-      "end_word_idx": 530,
-      "reason": "The speaker says 'చేస్తున్నాను' (I am doing) which is grammatically awkward and immediately corrects by restarting the thought."
+      "start_sec": 358.96,
+      "end_sec": 359.36,
+      "start_word_idx": 412,
+      "end_word_idx": 412,
+      "reason": "A single-word repetition ('పదవి') that functions as a stutter."
     },
     {
       "category": "retake",
-      "start_sec": 390.99,
+      "start_sec": 374.775,
       "end_sec": 408.425,
-      "start_word_idx": 536,
-      "end_word_idx": 558,
-      "reason": "The speaker repeats the entire disclaimer about not supporting Bandi Sanjay multiple times, making this segment highly redundant."
+      "start_word_idx": 427,
+      "end_word_idx": 467,
+      "reason": "The speaker repeats a long disclaimer almost verbatim, stating they are not supporting Bandi Sanjay and do not know him or his son."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 423.92,
+      "end_sec": 424.16,
+      "start_word_idx": 491,
+      "end_word_idx": 492,
+      "reason": "A filler word 'ఆ' used as a pause before restarting the name 'ఇవన్'."
     },
     {
       "category": "hesitation",
       "start_sec": 430.335,
       "end_sec": 430.735,
-      "start_word_idx": 600,
+      "start_word_idx": 497,
+      "end_word_idx": 497,
+      "reason": "A stuttered repetition of the word 'దాంట్లో'."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 469.355,
+      "end_sec": 470.155,
+      "start_word_idx": 542,
+      "end_word_idx": 542,
+      "reason": "A filler word 'ఇంకా' followed by a nonsensical word, indicating a pause to think."
+    },
+    {
+      "category": "hesitation",
+      "start_sec": 513.925,
+      "end_sec": 514.245,
+      "start_word_idx": 599,
       "end_word_idx": 600,
-      "reason": "Repetition of 'దాంట్లో' (in that) indicating a stall in thought."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 444.34,
-      "end_sec": 444.74,
-      "start_word_idx": 619,
-      "end_word_idx": 619,
-      "reason": "A false start 'ఒక్కడే' (only one) before continuing with the main point."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 499.175,
-      "end_sec": 499.335,
-      "start_word_idx": 718,
-      "end_word_idx": 718,
-      "reason": "The word 'ఎక్కడ' is repeated, serving as a filler."
-    },
-    {
-      "category": "hesitation",
-      "start_sec": 509.08,
-      "end_sec": 509.48,
-      "start_word_idx": 734,
-      "end_word_idx": 734,
-      "reason": "The word 'చట్టం' (law) is a false start before the speaker continues."
+      "reason": "The filler word 'సో' interrupts the flow of the sentence."
     },
     {
       "category": "aside",
-      "start_sec": 513.925,
+      "start_sec": 514.245,
       "end_sec": 531.33,
-      "start_word_idx": 740,
-      "end_word_idx": 767,
-      "reason": "The speaker breaks into English with 'So see one thing... I just don't want to get...' which is an aside to avoid getting into trouble, before returning to the main topic."
+      "start_word_idx": 601,
+      "end_word_idx": 643,
+      "reason": "The speaker goes on a tangent expressing fear of getting into legal trouble for their commentary, which is off-topic from the main news analysis."
     },
     {
       "category": "retake",
       "start_sec": 531.33,
       "end_sec": 534.45,
-      "start_word_idx": 768,
-      "end_word_idx": 772,
-      "reason": "The speaker starts a sentence about delivering justice but trails off and restarts."
+      "start_word_idx": 644,
+      "end_word_idx": 648,
+      "reason": "The speaker starts a sentence about getting justice for 'యుఎన్' but halts and restarts the thought."
     },
     {
       "category": "hesitation",
       "start_sec": 540.53,
-      "end_sec": 541.01,
-      "start_word_idx": 779,
-      "end_word_idx": 780,
-      "reason": "Stuttering on the name 'బండి' before saying the full name."
+      "end_sec": 541.41,
+      "start_word_idx": 653,
+      "end_word_idx": 655,
+      "reason": "A stuttered repetition of the name 'బండి'."
     },
     {
       "category": "hesitation",
-      "start_sec": 570.075,
-      "end_sec": 570.635,
-      "start_word_idx": 846,
-      "end_word_idx": 846,
-      "reason": "A filler 'సో' before continuing the point."
+      "start_sec": 561.79,
+      "end_sec": 562.83,
+      "start_word_idx": 686,
+      "end_word_idx": 687,
+      "reason": "A stuttered repetition of the word 'అబ్బాయి'."
     },
     {
       "category": "hesitation",
       "start_sec": 581.763,
       "end_sec": 582.243,
-      "start_word_idx": 863,
-      "end_word_idx": 863,
-      "reason": "Another filler 'సో' before the concluding remarks."
+      "start_word_idx": 711,
+      "end_word_idx": 711,
+      "reason": "An interjected 'సో' that breaks the sentence flow before the concluding remarks."
     }
   ],
   "full_video_cuts": [
@@ -338,7 +266,7 @@
       "end_sec": 589.123,
       "start_word_idx": 0,
       "end_word_idx": 1166,
-      "importance": 8
+      "importance": 7
     }
   ]
 }
