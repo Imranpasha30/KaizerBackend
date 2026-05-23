@@ -286,6 +286,59 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         )
         return   # V2 worker takes over; no subprocess spawn
 
+    if platform == "full_video_shorts_v3":
+        # V3: linear pipeline (Deepgram word-STT + Claude word-edit + V1
+        # render). No Inngest. Spawn as a detached Python subprocess so
+        # the runner returns immediately and uvicorn's request thread is
+        # not blocked. The orchestrator updates the Job row's status.
+        out_dir = OUTPUT_ROOT / "full_video_shorts_v3" / f"job_{job_id}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
+        if not Path(venv_python).exists():
+            venv_python = sys.executable
+        # V3 provider: "claude" or "gemini". Same prompt + same V1 output
+        # schema; only the LLM differs. Default to claude (lower T, stronger
+        # rule-following). UI exposes this via the V3 form's stage_2_provider
+        # field (same field name V2 already uses).
+        _v3_provider = (stage_2_provider or "claude").strip().lower()
+        if _v3_provider not in ("claude", "gemini"):
+            _v3_provider = "claude"
+        cmd = [
+            venv_python, "-m", "pipeline_v3.pipeline_v3.orchestrator",
+            "--job-id", str(job_id),
+            "--source-video", video_path,
+            "--output-dir", str(out_dir),
+            "--language", language or "te",
+            "--frame", frame or "torn_card",
+            "--stage-2-provider", _v3_provider,
+        ]
+        # Detach: don't capture stdout/stderr in this thread; write to log files
+        log_out = open(out_dir / "stdout.log", "w", encoding="utf-8")
+        log_err = open(out_dir / "stderr.log", "w", encoding="utf-8")
+        # The semaphore MUST be held for the entire subprocess lifetime,
+        # not just for spawn -- otherwise 10 parallel submissions all
+        # spawn instantly and contend for the GPU. We run the
+        # acquire+spawn+wait in a daemon thread so the HTTP submit
+        # returns immediately while the subprocess (or its queued wait)
+        # makes progress in the background.
+        def _v3_worker():
+            with _PIPELINE_SEMAPHORE:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(BASE_DIR),
+                    stdout=log_out, stderr=log_err,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                _register_proc(job_id, proc)
+                print(f"[runner.v3] subprocess spawned pid={proc.pid} job_id={job_id} -> {out_dir}", flush=True)
+                try:
+                    rc = proc.wait()
+                    print(f"[runner.v3] job_id={job_id} subprocess exited rc={rc}", flush=True)
+                finally:
+                    _deregister_proc(job_id)
+                    log_out.close(); log_err.close()
+        threading.Thread(target=_v3_worker, daemon=True).start()
+        return   # V3 worker queued; subprocess runs when semaphore is available
+
     def _run():
         from models import Job, Clip
 
@@ -823,10 +876,19 @@ def _import_clips(job, db, meta_override: Path | None = None):
             for p in search_root.rglob("editor_meta.json"):
                 meta_path = p
                 break
+        # Last-resort rglob over OUTPUT_ROOT used to silently pick up the
+        # FIRST editor_meta.json it found anywhere -- which on a busy box
+        # is almost always a different job. That caused V3 jobs (which
+        # write editor_meta.json now, item 120) to occasionally import
+        # clips from an unrelated V2 job after a search_root miss.
+        # Scope the fallback to a per-job-id substring so we can only
+        # accidentally match this job's directory.
         if not meta_path or not meta_path.exists():
+            job_id_token = f"job_{job.id}"
             for p in OUTPUT_ROOT.rglob("editor_meta.json"):
-                meta_path = p
-                break
+                if job_id_token in str(p):
+                    meta_path = p
+                    break
 
     if not meta_path or not meta_path.exists():
         raise FileNotFoundError(

@@ -1,0 +1,273 @@
+"""V3 renderer — bridge to V1's pipeline_core cut + compose + stitch.
+
+Takes KeptSpan list from word_editor and renders the bulletin via V1's
+SIMPLE pipeline: cut -> compose -> concat-demux stitch. NO crossfade,
+NO acrossfade, NO multi-pass mux. V1's stitcher uses
+`ffmpeg -f concat -c copy` which is bit-exact and mathematically
+incapable of A/V drift.
+
+Shorts are picked deterministically from the kept spans (longest 5 by
+default, capped). Each short is rendered via V1's `compose_clip` for
+9:16 vertical output.
+
+Concurrency: each renderer call holds a process-wide semaphore
+(_RENDER_SEMAPHORE) capped at 2 by default (RTX 5060 NVENC limit).
+For 10 parallel job submissions, Stages 1+2 fan out, Stage 3 (this
+module) queues at semaphore=2.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger("pipeline_v3.renderer")
+
+
+# Process-wide cap on concurrent renders. RTX 5060 effectively
+# serializes >= 4 NVENC sessions (bench: K=4 wall=23.5s, K=6=41.6s,
+# K=8=55.5s — diminishing returns past 2).
+_DEFAULT_RENDER_CONCURRENCY = int(os.environ.get("KAIZER_V3_RENDER_CONCURRENCY", "2"))
+_RENDER_SEMAPHORE = threading.BoundedSemaphore(_DEFAULT_RENDER_CONCURRENCY)
+
+
+@dataclass
+class RenderResult:
+    bulletin_path: str
+    short_paths: list[str]
+    n_clips_cut: int
+    n_shorts: int
+    bulletin_duration_sec: float
+    total_render_sec: float
+
+
+def _run_ffmpeg(args: list[str], log_label: str, timeout_s: int = 1800) -> None:
+    """Run an ffmpeg command. Pipe-safe (stderr to file via -loglevel error)."""
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-loglevel", "error"] + args
+    logger.debug("%s: %s", log_label, " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    if r.returncode != 0:
+        tail = (r.stderr or "")[-1500:]
+        raise RuntimeError(f"{log_label} failed (rc={r.returncode}):\n{tail}")
+
+
+def _ffprobe_duration(path: str) -> float:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        return float(r.stdout.strip())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _detect_nvenc() -> bool:
+    """Reuse V2's runtime probe."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+        from pipeline_v2.pipeline_v2.utils.ffmpeg_runner import detect_encoder
+        return detect_encoder() == "h264_nvenc"
+    except Exception as exc:
+        logger.warning("v3 renderer: NVENC probe failed (%s); falling back to libx264", exc)
+        return False
+
+
+def _encode_args(use_nvenc: bool) -> list[str]:
+    if use_nvenc:
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p"]
+
+
+def _audio_args() -> list[str]:
+    return ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+
+
+def cut_kept_spans(
+    mezzanine_path: str,
+    spans: list,
+    output_dir: str,
+    use_nvenc: bool,
+) -> list[str]:
+    """Cut N spans from the mezzanine. Each span -> raw_clip_NN.mp4 in
+    output_dir. Sequential, NVENC-encoded.
+
+    Note: this is sequential by design — the renderer semaphore already
+    caps the GPU. Adding inter-clip parallelism inside one job would
+    fight the semaphore.
+
+    Args:
+        spans: List of objects with .start_sec and .end_sec attributes.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_paths: list[str] = []
+    vargs = _encode_args(use_nvenc)
+    aargs = _audio_args()
+    for i, span in enumerate(spans, start=1):
+        start = float(span.start_sec)
+        end = float(span.end_sec)
+        dur = end - start
+        if dur <= 0.1:
+            logger.warning("v3 cut: span %d zero-dur, skipping", i)
+            continue
+        out_path = os.path.join(output_dir, f"raw_clip_{i:02d}.mp4")
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 100_000:
+            logger.info("v3 cut: clip %d cached at %s", i, out_path)
+            out_paths.append(out_path)
+            continue
+        args = [
+            "-ss", f"{start:.6f}",
+            "-i", mezzanine_path,
+            "-t", f"{dur:.6f}",
+            "-r", "30", "-fps_mode", "cfr",
+            "-async", "1",
+            *vargs, *aargs,
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        logger.info("v3 cut: clip %d -> %.3fs (%.3f -> %.3f)", i, dur, start, end)
+        _run_ffmpeg(args, f"v3 cut clip_{i:02d}")
+        out_paths.append(out_path)
+    return out_paths
+
+
+def stitch_bulletin_v1(
+    clip_paths: list[str],
+    output_path: str,
+    work_dir: str,
+) -> float:
+    """Call V1's bulletin_stitcher (concat-demuxer, -c copy). Returns
+    final bulletin duration."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from pipeline_core.bulletin_stitcher import stitch_bulletin as _v1_stitch
+    result = _v1_stitch(
+        story_paths=clip_paths,
+        output_path=output_path,
+        work_dir=work_dir,
+    )
+    return float(getattr(result, "total_duration_s", _ffprobe_duration(output_path)))
+
+
+def pick_shorts(spans: list, max_shorts: int = 5) -> list:
+    """Pick up to N shorts from kept spans.
+
+    Selection: spans between 15 and 60 seconds, sorted by duration desc
+    (longest first). If fewer than max_shorts spans qualify, take what
+    we have.
+    """
+    candidates = [
+        s for s in spans
+        if 15.0 <= s.duration_sec <= 60.0
+    ]
+    if not candidates:
+        # Fall back to longest spans regardless of bounds
+        candidates = sorted(spans, key=lambda s: s.duration_sec, reverse=True)
+    else:
+        candidates = sorted(candidates, key=lambda s: s.duration_sec, reverse=True)
+    return candidates[:max_shorts]
+
+
+def render_short(
+    mezzanine_path: str,
+    span,
+    short_idx: int,
+    output_dir: str,
+    use_nvenc: bool,
+) -> str:
+    """Render one short — vertical 9:16 from the mezzanine. Simple crop
+    + scale, no fancy overlays for V3 baseline. Caller can extend later.
+
+    Returns output path.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"short_{short_idx:02d}.mp4")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 100_000:
+        logger.info("v3 short: %d cached at %s", short_idx, out_path)
+        return out_path
+    start = float(span.start_sec)
+    dur = float(span.duration_sec)
+    vargs = _encode_args(use_nvenc)
+    aargs = _audio_args()
+    args = [
+        "-ss", f"{start:.6f}",
+        "-i", mezzanine_path,
+        "-t", f"{dur:.6f}",
+        "-vf", "crop=ih*9/16:ih,scale=1080:1920,setsar=1",
+        "-r", "30", "-fps_mode", "cfr",
+        *vargs, *aargs,
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    logger.info("v3 short: %d %.1fs (vertical 1080x1920)", short_idx, dur)
+    _run_ffmpeg(args, f"v3 short_{short_idx:02d}")
+    return out_path
+
+
+def render_v3(
+    mezzanine_path: str,
+    kept_spans: list,
+    output_dir: str,
+    *,
+    render_bulletin: bool = True,
+    max_shorts: int = 5,
+) -> RenderResult:
+    """End-to-end V3 render. Acquires the global render semaphore so
+    parallel job submissions queue gracefully.
+    """
+    import time
+    t_start = time.time()
+    os.makedirs(output_dir, exist_ok=True)
+
+    with _RENDER_SEMAPHORE:
+        logger.info("v3 renderer: acquired semaphore (cap=%d)", _DEFAULT_RENDER_CONCURRENCY)
+        use_nvenc = _detect_nvenc()
+        logger.info("v3 renderer: encoder=%s", "h264_nvenc" if use_nvenc else "libx264")
+
+        # Step A: cut kept spans -> raw_clip_NN.mp4 (used as bulletin segments)
+        bulletin_dir = os.path.join(output_dir, "bulletin")
+        clip_paths = cut_kept_spans(
+            mezzanine_path=mezzanine_path,
+            spans=kept_spans,
+            output_dir=bulletin_dir,
+            use_nvenc=use_nvenc,
+        )
+        logger.info("v3 renderer: cut %d clips", len(clip_paths))
+
+        # Step B: V1 stitcher (concat-demux, no re-encode = no drift)
+        bulletin_path = os.path.join(bulletin_dir, "bulletin.mp4")
+        bulletin_dur = 0.0
+        if render_bulletin and clip_paths:
+            bulletin_dur = stitch_bulletin_v1(clip_paths, bulletin_path, bulletin_dir)
+            logger.info("v3 renderer: bulletin %.2fs at %s", bulletin_dur, bulletin_path)
+
+        # Step C: shorts (top-N kept spans by duration, capped)
+        shorts = pick_shorts(kept_spans, max_shorts=max_shorts)
+        short_paths: list[str] = []
+        for i, span in enumerate(shorts, start=1):
+            sp = render_short(
+                mezzanine_path=mezzanine_path,
+                span=span,
+                short_idx=i,
+                output_dir=output_dir,
+                use_nvenc=use_nvenc,
+            )
+            short_paths.append(sp)
+        logger.info("v3 renderer: %d shorts rendered", len(short_paths))
+
+    total = time.time() - t_start
+    logger.info("v3 renderer: complete in %.2fs", total)
+    return RenderResult(
+        bulletin_path=bulletin_path if render_bulletin else "",
+        short_paths=short_paths,
+        n_clips_cut=len(clip_paths),
+        n_shorts=len(short_paths),
+        bulletin_duration_sec=bulletin_dur,
+        total_render_sec=total,
+    )

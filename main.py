@@ -624,6 +624,18 @@ PLATFORMS = {
         "width":  1080,
         "height": 1920,
     },
+    # ── V3 platform — clean rewrite ──────────────────────────────────
+    # V3 architecture (2026-05-23): Deepgram word-level STT + Claude
+    # word-edit + V1 concat-demuxer render. NO Inngest. NO crossfade
+    # stitcher. NO multi-pass mux. Single linear pipeline with the V1
+    # bulletin_stitcher (concat-demuxer, -c copy) which is mathematically
+    # incapable of A/V drift. Shorts capped at 5. Concurrency: 2 jobs
+    # at once via runner.py's _PIPELINE_SEMAPHORE.
+    "full_video_shorts_v3": {
+        "label":  "Full Video + Shorts (V3)",
+        "width":  1080,
+        "height": 1920,
+    },
 }
 
 
