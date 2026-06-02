@@ -1,0 +1,15 @@
+[languages]
+python = true
+
+[python]
+version = "3.12"
+requirementsFiles = ["requirements-deploy.txt"]
+
+[build]
+cmds = [
+  "python manage.py migrate --noinput",
+  "python manage.py collectstatic --noinput"
+]
+
+[start]
+cmd = "gunicorn kaizer_news.wsgi --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
