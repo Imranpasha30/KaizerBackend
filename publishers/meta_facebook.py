@@ -130,6 +130,61 @@ class FacebookPagePublisher(Publisher):
                 remediation_url="/channels",
             )
 
+        # Files >100 MB MUST go through the resumable upload session
+        # path; one-shot multipart is rejected. Bulletin renders
+        # routinely cross 100 MB so this is the common case.
+        from ._meta_resumable import (
+            RESUMABLE_THRESHOLD_BYTES, post_resumable_to_page, MetaUploadError,
+        )
+        if size > RESUMABLE_THRESHOLD_BYTES:
+            try:
+                body = post_resumable_to_page(
+                    page_id=page_id,
+                    access_token=token,
+                    file_path=prepared.upload_path,
+                    title=prepared.title,
+                    description=("\n\n".join(
+                        x for x in (prepared.title, prepared.description) if x
+                    ))[:5000],
+                    endpoint_path=endpoint_path,
+                )
+            except MetaUploadError as e:
+                # Map Meta error codes the same way the one-shot path does.
+                err = (e.body.get("error") or {})
+                meta_code = err.get("code")
+                msg = err.get("message") or str(e.body)
+                if meta_code in (190, 102):
+                    raise TerminalPublishError(
+                        f"Meta auth invalid (code {meta_code}): {msg}",
+                        remediation_url="/settings/meta",
+                    ) from e
+                if meta_code == 200:
+                    raise TerminalPublishError(
+                        f"Meta permission missing (code 200): {msg}",
+                        remediation_url="/settings/meta",
+                    ) from e
+                raise TransientPublishError(str(e)) from e
+            video_id = body.get("id") or body.get("post_id") or body.get("video_id") or ""
+            if not video_id:
+                raise TransientPublishError(f"resumable finish returned no id: {body}")
+            # Bump counters + return as with the one-shot path below.
+            self.destination.last_publish_at = datetime.now(timezone.utc)
+            today = datetime.now(timezone.utc).date()
+            last = (self.destination.publishes_today_at or
+                    datetime(2000, 1, 1, tzinfo=timezone.utc)).date()
+            if today != last:
+                self.destination.publishes_today = 0
+                self.destination.publishes_today_at = datetime.now(timezone.utc)
+            self.destination.publishes_today = (self.destination.publishes_today or 0) + 1
+            self.db.commit()
+            return PublishResult(
+                external_id=video_id,
+                public_url=f"https://www.facebook.com/{video_id}",
+                accepted_at=datetime.now(timezone.utc),
+                published_at=datetime.now(timezone.utc),
+                raw_response=str(body)[:1000],
+            )
+
         url = f"{GRAPH_BASE}/{page_id}/{endpoint_path}"
         # Caption: title + description + hashtag block. Matches what the
         # SEO contract already produces.

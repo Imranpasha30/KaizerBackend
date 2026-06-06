@@ -33,7 +33,11 @@ UPLOAD_PROVIDER_DEFAULT  = "postiz"
 # Whitelist of provider keys the worker can route to. The set is also
 # the source of truth for the publishers/__init__.py registry — every
 # key here MUST have a registered Publisher subclass, and vice versa.
-UPLOAD_PROVIDER_VALID    = {"postiz", "kaizer", "meta_fb", "meta_ig"}
+UPLOAD_PROVIDER_VALID    = {
+    "postiz", "kaizer",                       # legacy + native YouTube
+    "meta_fb", "meta_ig",                     # Facebook Page + IG Reels
+    "x", "linkedin", "tiktok",                # scaffolded for credentials
+}
 
 
 # ─── Read / write helpers ────────────────────────────────────────────────────

@@ -87,3 +87,16 @@ _safe_import("youtube_direct")
 _safe_import("postiz")
 _safe_import("meta_facebook")
 _safe_import("meta_instagram")
+_safe_import("x_twitter")
+_safe_import("linkedin")
+_safe_import("tiktok")
+
+# Background workers (idempotent — only start when their platform is
+# actually configured via env vars).
+try:
+    from .meta_token_refresh import start_meta_refresh_loop
+    start_meta_refresh_loop()
+except Exception as exc:  # noqa: BLE001
+    import sys
+    print(f"[publishers] meta_token_refresh boot failed: {exc}",
+          file=sys.stderr, flush=True)
