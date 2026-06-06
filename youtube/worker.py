@@ -669,6 +669,79 @@ def _process(job_id: int) -> None:
         )
         db.commit()
 
+        # ─── Publisher-abstraction dispatch ────────────────────────
+        # Any provider key registered in publishers/__init__.py gets
+        # the unified lifecycle (prepare → publish → verify) with
+        # consistent error handling. Falls through to the legacy
+        # direct path when the key is not in the registry — keeps
+        # legacy custom providers working during migration.
+        try:
+            from publishers import get_publisher_class
+            from publishers.base import (
+                TerminalPublishError, TransientPublishError,
+                QuotaExceededError,
+            )
+            PubClass = get_publisher_class(provider)
+            # Resolve the destination row. YouTube destinations are
+            # Channel rows; Meta destinations are MetaAccount rows.
+            # The publisher knows which it expects — we use the
+            # provider key as the discriminator.
+            if provider in ("meta_fb", "meta_ig"):
+                dest_row = db.query(models.MetaAccount).filter(
+                    models.MetaAccount.id == job.channel_id
+                ).first()
+            else:
+                dest_row = _dest_channel_for_routing
+            if not dest_row:
+                _fail(db, job,
+                      f"destination {job.channel_id} not found for provider {provider!r}",
+                      status="failed")
+                return
+            pub = PubClass(destination=dest_row, db_session=db)
+            try:
+                prepared = pub.prepare(
+                    job=job, clip=clip,
+                    source_video_path=resolved_clip_path,
+                )
+                published = pub.publish(job=job, prepared=prepared)
+                pub.verify(job=job, published=published)
+                # Mirror the publish result onto the job row so the
+                # existing UI fields (video_id, video_url, status) keep
+                # working without per-publisher tweaks.
+                if published.external_id and not getattr(job, "video_id", ""):
+                    job.video_id = published.external_id
+                if published.public_url and not getattr(job, "video_url", ""):
+                    job.video_url = published.public_url
+                job.status = "done"
+                job.last_error = ""
+                db.commit()
+                _append_log(job,
+                    f"published via {provider!r} → {published.external_id}")
+                return
+            except TerminalPublishError as e:
+                _fail(db, job, str(e), status="provider_failed")
+                return
+            except QuotaExceededError as e:
+                # Don't count quota against the retry ladder. Re-queue
+                # with the next-window timestamp baked into last_error
+                # so the operator can see when it'll resume.
+                msg = (
+                    f"{provider!r} quota exhausted; next window: "
+                    f"{e.next_window_at.isoformat() if e.next_window_at else 'unknown'}"
+                )
+                job.status = "queued"
+                job.last_error = msg[:500]
+                _append_log(job, msg)
+                db.commit()
+                return
+            except TransientPublishError as e:
+                _retry(db, job, str(e))
+                return
+        except KeyError:
+            # Provider not in the registry — fall through to the
+            # legacy hardcoded path below for backward compat.
+            pass
+
         if provider == "postiz":
             _process_via_postiz(db, job, clip, resolved_clip_path)
             return

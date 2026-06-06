@@ -289,6 +289,68 @@ class OAuthToken(Base):
     channel = relationship("Channel", back_populates="oauth_token")
 
 
+class MetaAccount(Base):
+    """A connected Meta destination — a Facebook Page and optionally
+    a linked Instagram Business/Creator account that the operator owns.
+
+    One row per Page (Meta's model). The ig_user_id is only set when
+    the Page has an IG account linked AND the operator has granted
+    the instagram_basic + instagram_content_publish permissions during
+    OAuth.
+
+    Tokens here are LONG-LIVED Page tokens (≈60 days). The OAuth
+    refresh worker swaps them for fresh long-lived tokens before they
+    expire — Meta tokens don't auto-refresh like Google's, but a
+    long-lived token can mint another long-lived token at any point.
+
+    Encryption: same Fernet pattern as OAuthToken — never store the
+    plaintext on disk."""
+    __tablename__ = "meta_accounts"
+
+    id                   = Column(Integer, primary_key=True, index=True)
+    user_id              = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                                  nullable=False, index=True)
+
+    # Facebook side — every row has these.
+    fb_user_id           = Column(String(50), default="")   # the human Meta user that authorised
+    fb_page_id           = Column(String(50), default="", index=True)
+    fb_page_name         = Column(String(255), default="")
+    fb_page_category     = Column(String(120), default="")
+    fb_page_picture_url  = Column(String(500), default="")
+    fb_page_url          = Column(String(500), default="")
+
+    # Instagram side — present only when the Page has a linked IG
+    # Business/Creator account AND the operator granted IG perms.
+    ig_user_id           = Column(String(50), default="", index=True)
+    ig_username          = Column(String(120), default="")
+    ig_profile_pic_url   = Column(String(500), default="")
+    ig_account_type      = Column(String(40),  default="")  # "BUSINESS" | "CREATOR" | ""
+
+    # Auth — long-lived Page access token (~60 days). The user
+    # access token isn't stored after the initial exchange; we
+    # derive Page tokens from the user token at connect time and
+    # store ONLY those.
+    page_access_token_enc = Column(Text, default="")
+    page_token_expiry     = Column(DateTime(timezone=True), nullable=True)
+    granted_scopes        = Column(Text, default="")  # comma-separated
+
+    connected_at          = Column(DateTime(timezone=True), server_default=func.now())
+    last_refreshed_at     = Column(DateTime(timezone=True), nullable=True)
+    last_publish_at       = Column(DateTime(timezone=True), nullable=True)
+
+    # Per-account upload routing knob — matches the OAuthToken column
+    # so the worker's 4-tier precedence works the same way for Meta
+    # destinations. Null = inherit from system default.
+    upload_provider       = Column(String(20), nullable=True)
+
+    # Per-account quota counters. Meta's published rate limit is 200
+    # calls/hour/user but the practical content-publish ceiling is
+    # much lower (a few dozen video posts per day per Page). Tracked
+    # for observability + soft-cap in the worker.
+    publishes_today       = Column(Integer, default=0)
+    publishes_today_at    = Column(DateTime(timezone=True), nullable=True)
+
+
 class ChannelGroup(Base):
     """User-defined group of YouTube destinations for one-click fan-out.
 

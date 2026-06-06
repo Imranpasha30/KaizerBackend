@@ -84,5 +84,6 @@ def _safe_import(modname: str) -> None:
 
 
 _safe_import("youtube_direct")
+_safe_import("postiz")
 _safe_import("meta_facebook")
 _safe_import("meta_instagram")

@@ -30,7 +30,10 @@ import models
 
 UPLOAD_PROVIDER          = "upload_provider"
 UPLOAD_PROVIDER_DEFAULT  = "postiz"
-UPLOAD_PROVIDER_VALID    = {"postiz", "kaizer"}
+# Whitelist of provider keys the worker can route to. The set is also
+# the source of truth for the publishers/__init__.py registry — every
+# key here MUST have a registered Publisher subclass, and vice versa.
+UPLOAD_PROVIDER_VALID    = {"postiz", "kaizer", "meta_fb", "meta_ig"}
 
 
 # ─── Read / write helpers ────────────────────────────────────────────────────
