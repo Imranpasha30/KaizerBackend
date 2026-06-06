@@ -1,0 +1,273 @@
+"""yt-dlp ingest for Live Studio.
+
+When a user pastes a YouTube URL in Live Studio, the streams it
+creates need a video file on disk before the existing broadcast
+pipeline can kick in. This module handles that bridge:
+
+  1. Verify the URL with yt-dlp's metadata extractor (no download).
+  2. Download the best MP4 (≤1080p) to ONE shared path per
+     ``(batch_id, video_slot)``.
+  3. Hard-link the downloaded file to every ``LiveStream.upload_path``
+     that shares the slot — so each broadcast row has its own file
+     handle without doubling disk usage.
+  4. Mark each row ``upload_done=True`` and status ``uploaded`` so the
+     standard ``/streams/{id}/start`` endpoint picks them up.
+
+Failures land in ``LiveStream.error`` with a human-readable message;
+no exception leaks to the request handler.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import threading
+import traceback
+from pathlib import Path
+from typing import Optional
+
+import models
+from database import SessionLocal
+from live_studio import uploads as live_uploads
+
+
+# Limit downloads to a sane resolution so disk + uplink don't blow up
+# on 4K/8K sources. 1080p is YouTube's max ingest tier for most
+# accounts anyway.
+_YTDLP_FORMAT = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b"
+
+_YT_URL_RE = re.compile(
+    r"^https?://(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"[\w\-]{6,}",
+    re.IGNORECASE,
+)
+
+
+def is_supported_url(url: str) -> bool:
+    return bool(_YT_URL_RE.match((url or "").strip()))
+
+
+def _shared_path(batch_id: int, video_slot: int) -> str:
+    """Single canonical path that ALL streams in a (batch, slot)
+    will hard-link to. Lives in the same temp dir the chunk uploads
+    use so cleanup paths see it naturally."""
+    base = os.path.dirname(live_uploads.upload_path_for(0))
+    return os.path.join(base, f"url-b{batch_id}-v{video_slot}.mp4")
+
+
+def _hardlink_or_copy(src: str, dst: str) -> None:
+    """Replicate ``src`` to ``dst`` via a hardlink (cheap, same
+    inode). Falls back to ``copy2`` if the filesystem refuses
+    (cross-volume, FAT32, etc.). Idempotent: removes existing dst
+    first."""
+    try:
+        if os.path.exists(dst):
+            os.remove(dst)
+    except OSError:
+        pass
+    try:
+        os.link(src, dst)
+    except OSError:
+        # Cross-volume or unsupported — fall back to a full copy.
+        import shutil
+        shutil.copy2(src, dst)
+
+
+def _ytdlp_download(url: str, out_path: str) -> tuple[bool, str]:
+    """Blocking download via the yt-dlp CLI. Returns ``(ok, log_tail)``.
+
+    Why the CLI not the python module: yt-dlp's Python API drives
+    output through callbacks that don't behave well from a daemon
+    thread on Windows. The CLI is rock-solid + we get progress on
+    stderr for free.
+    """
+    # Cap to 1080p and force the merged output to be the path we asked
+    # for (no auto-numbering of duplicates).
+    cmd = [
+        "yt-dlp",
+        "--no-progress",
+        "--no-colors",
+        "--no-warnings",
+        "--retries", "3",
+        "-f", _YTDLP_FORMAT,
+        "--merge-output-format", "mp4",
+        "-o", out_path,
+        url,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60 * 60,    # 1 h hard ceiling per download
+        )
+    except subprocess.TimeoutExpired:
+        return False, "yt-dlp download exceeded 1h timeout"
+    except FileNotFoundError:
+        return False, "yt-dlp not installed on the server PATH"
+
+    if proc.returncode != 0 or not os.path.isfile(out_path):
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
+        return False, "yt-dlp failed: " + " | ".join(tail)
+    return True, ""
+
+
+def _mark_failed(stream_ids: list[int], reason: str) -> None:
+    sess = SessionLocal()
+    try:
+        for sid in stream_ids:
+            row = sess.query(models.LiveStream).get(sid)
+            if not row:
+                continue
+            row.status = "failed"
+            row.error = reason[:2000]
+            row.message = "URL ingest failed"
+        sess.commit()
+    finally:
+        sess.close()
+
+
+def _mark_ready(stream_ids: list[int], paths_by_stream: dict[int, str],
+                size_bytes: int) -> None:
+    sess = SessionLocal()
+    try:
+        for sid in stream_ids:
+            row = sess.query(models.LiveStream).get(sid)
+            if not row:
+                continue
+            row.upload_path = paths_by_stream[sid]
+            row.upload_bytes = size_bytes
+            row.upload_total = size_bytes
+            row.upload_done = True
+            row.status = "uploaded"
+            row.message = "downloaded from URL; awaiting broadcast slot"
+        sess.commit()
+    finally:
+        sess.close()
+
+
+def mark_passthrough_ready(
+    *,
+    batch_id: int,
+    video_slot: int,
+    source_url: str,
+    stream_ids: list[int],
+) -> None:
+    """Pass-through (OBS-style) URL streams skip the server-side
+    download entirely. The orchestrator pipes yt-dlp straight into
+    ffmpeg when it sees ``source_url`` on the row.
+
+    All we have to do here is flip every stream sharing the slot to
+    ``uploaded`` (the marker the existing /start endpoint requires)
+    so the user's "Start broadcasting" submission flows the row into
+    the orchestrator without any wait-for-download polling.
+    """
+    if not is_supported_url(source_url):
+        _mark_failed(stream_ids,
+            f"unsupported URL (must be a youtube.com / youtu.be link): {source_url}")
+        return
+
+    sess = SessionLocal()
+    try:
+        for sid in stream_ids:
+            row = sess.query(models.LiveStream).get(sid)
+            if not row:
+                continue
+            row.source_url = source_url[:1024]
+            row.upload_done = True             # /start gate
+            row.upload_bytes = 0
+            row.upload_total = 0
+            row.upload_path = ""               # explicitly empty — orchestrator
+                                               # uses source_url instead.
+            row.status = "uploaded"
+            row.message = "URL ready — passthrough live (no download)"
+        sess.commit()
+    finally:
+        sess.close()
+
+
+# Legacy download-then-broadcast helper — kept here so the previously
+# wired call sites compile, but the router now drives URL streams
+# through ``kick_off`` → ``mark_passthrough_ready``. Delete this in a
+# follow-up once nothing else references it.
+def ingest_url_for_slot(
+    *,
+    batch_id: int,
+    video_slot: int,
+    source_url: str,
+    stream_ids: list[int],
+) -> None:
+    try:
+        if not is_supported_url(source_url):
+            _mark_failed(stream_ids,
+                f"unsupported URL (must be a youtube.com / youtu.be link): {source_url}")
+            return
+
+        sess = SessionLocal()
+        try:
+            for sid in stream_ids:
+                row = sess.query(models.LiveStream).get(sid)
+                if not row:
+                    continue
+                row.status = "downloading"
+                row.message = f"server is downloading from {source_url[:120]}…"
+                row.source_url = source_url[:1024]
+            sess.commit()
+        finally:
+            sess.close()
+
+        out_path = _shared_path(batch_id, video_slot)
+        Path(os.path.dirname(out_path)).mkdir(parents=True, exist_ok=True)
+        ok, err = _ytdlp_download(source_url, out_path)
+        if not ok:
+            _mark_failed(stream_ids, err)
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except OSError:
+                pass
+            return
+
+        size = os.path.getsize(out_path)
+
+        # 3) Hard-link the file to each stream's canonical upload_path
+        # so the orchestrator's existing cleanup (which unlinks per
+        # stream) works without cross-deletes. Hardlinks share the
+        # inode → space cost is one copy regardless of N.
+        paths: dict[int, str] = {}
+        for sid in stream_ids:
+            stream_path = live_uploads.upload_path_for(sid)
+            try:
+                _hardlink_or_copy(out_path, stream_path)
+                paths[sid] = stream_path
+            except OSError as exc:
+                _mark_failed(
+                    [sid],
+                    f"could not replicate download to stream {sid}: {exc}",
+                )
+        if not paths:
+            return
+
+        _mark_ready(list(paths.keys()), paths, size)
+
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[live_studio/url_ingest] ingest crashed for batch={batch_id} "
+              f"slot={video_slot}:\n{tb}")
+        _mark_failed(stream_ids, f"ingest crashed: {tb.splitlines()[-1][:200]}")
+
+
+def kick_off(*, batch_id: int, video_slot: int, source_url: str,
+             stream_ids: list[int]) -> None:
+    """OBS-style passthrough: flip the rows to ``uploaded`` immediately
+    so /start can run. The orchestrator does the actual yt-dlp →
+    ffmpeg → YouTube pipe inline once it acquires a slot. No disk
+    landing, no looping — broadcast ends when the source ends.
+
+    Synchronous (no thread) because it's a single UPDATE statement.
+    """
+    mark_passthrough_ready(
+        batch_id=batch_id, video_slot=video_slot,
+        source_url=source_url, stream_ids=stream_ids,
+    )

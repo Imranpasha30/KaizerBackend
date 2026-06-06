@@ -61,6 +61,8 @@ from routers.bulletin_images import router as bulletin_images_router
 from routers.express_mode import router as express_mode_router
 from routers.heygen import router as heygen_router
 from routers.live_studio import router as live_studio_router
+from routers.v4_editor import router as v4_editor_router
+from routers.v4_defaults import router as v4_defaults_router
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -141,6 +143,19 @@ def _migrate_schema():
                 conn.execute(text(
                     f"ALTER TABLE live_streams ADD COLUMN backup_expires_at {ts_type}"
                 ))
+            # Per-video custom thumbnail (Live Studio thumbnail upload).
+            # Nullable string; one image path replicated across all
+            # streams that share a (batch_id, video_slot).
+            if "thumbnail_path" not in ls_cols:
+                conn.execute(text(
+                    "ALTER TABLE live_streams ADD COLUMN thumbnail_path VARCHAR(512)"
+                ))
+            # Origin URL when the stream was ingested from a YouTube
+            # link via yt-dlp instead of a direct chunked upload.
+            if "source_url" not in ls_cols:
+                conn.execute(text(
+                    "ALTER TABLE live_streams ADD COLUMN source_url VARCHAR(1024)"
+                ))
 
         # ── channels.logo_asset_id (per-channel video overlay logo) ─────
         if inspector.has_table("channels"):
@@ -150,6 +165,20 @@ def _migrate_schema():
             # Per-channel upload route override.  Null = use system default.
             if "upload_provider" not in cols:
                 conn.execute(text("ALTER TABLE channels ADD COLUMN upload_provider VARCHAR(20)"))
+            # Per-channel watermark — applied at upload time so each
+            # destination gets its own brand stamp on the same render.
+            if "watermark_text" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN watermark_text VARCHAR(64) DEFAULT ''"))
+            if "watermark_opacity" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN watermark_opacity FLOAT DEFAULT 0.35"))
+            if "watermark_position" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN watermark_position VARCHAR(16) DEFAULT 'top-right'"))
+            # Per-channel social links (JSON) — appended to the SEO
+            # description footer at publish time so each channel's own
+            # @handles get the reach boost instead of the user's.
+            if "socials" not in cols:
+                col_type = "JSONB" if engine.dialect.name == "postgresql" else "TEXT"
+                conn.execute(text(f"ALTER TABLE channels ADD COLUMN socials {col_type}"))
 
         # ── upload_jobs.upload_provider (per-publish override) ──────────
         if inspector.has_table("upload_jobs"):
@@ -189,6 +218,11 @@ def _migrate_schema():
             for col, dtype in user_billing_additions.items():
                 if col not in ucols:
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {dtype}"))
+
+            # V4 automation: per-user JSON blob with auto-pipeline defaults
+            # so the wizard can be skipped end-to-end.
+            if "v4_defaults" not in ucols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN v4_defaults TEXT"))
 
         # ── profile_destinations: cached YouTube metadata for the
         # multi-channel picker (lets the UI show channel-title /
@@ -482,6 +516,8 @@ app.include_router(bulletin_images_router)  # Per-image bulletin carousel mgmt (
 app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
 app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)
 app.include_router(live_studio_router)      # Live Studio — bulk RTMP-live publishing (multi-video × multi-channel)
+app.include_router(v4_editor_router)        # V4 — canvas editor (read/write canvas.json, re-render)
+app.include_router(v4_defaults_router)      # V4 — user auto-pipeline defaults
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend
@@ -579,6 +615,37 @@ async def _live_studio_expiry_sweeper():
         print(f"[startup] WARN: live studio expiry sweeper failed to start: {e}")
 
 
+@app.on_event("startup")
+async def _live_studio_orphan_sweeper():
+    """At backend startup, sweep LiveStream rows that were mid-broadcast
+    when the previous process died (status in
+    starting/provisioning/streaming/queued/downloading) — their ffmpeg
+    subprocess is gone, so they need to be marked failed honestly rather
+    than appearing stuck-on-streaming forever in the UI.
+
+    Runs synchronously on boot before serving requests.
+    """
+    try:
+        from sqlalchemy import text as _text
+        with engine.begin() as conn:
+            res = conn.execute(_text(
+                """
+                UPDATE live_streams
+                   SET status      = 'failed',
+                       error       = COALESCE(error, '')
+                                     || ' | backend restarted while broadcast was in flight',
+                       message     = 'backend restarted; broadcast interrupted',
+                       finished_at = CURRENT_TIMESTAMP
+                 WHERE status IN ('starting','provisioning','streaming','queued','downloading','uploaded')
+                """
+            ))
+            n = res.rowcount or 0
+            if n:
+                print(f"[startup] marked {n} orphaned live_streams as failed (backend was restarted mid-broadcast)")
+    except Exception as e:
+        print(f"[startup] WARN: live studio orphan sweeper failed: {e}")
+
+
 @app.on_event("shutdown")
 async def _stop_corpus_scheduler():
     corpus_scheduler.stop()
@@ -633,6 +700,21 @@ PLATFORMS = {
     # at once via runner.py's _PIPELINE_SEMAPHORE.
     "full_video_shorts_v3": {
         "label":  "Full Video + Shorts (V3)",
+        "width":  1080,
+        "height": 1920,
+    },
+    # ── V4 platform — trim + canvas architecture ────────────────────
+    # V4 (2026-06-03): two atomic passes — Step 1 builds a clean
+    # trimmed.mp4 (Deepgram + Claude KEEP/CUT + single filter_complex
+    # trim+concat with inline audio normalization), Step 2 overlays
+    # the canvas (text panels + timed images + brand chrome) onto
+    # that trimmed video with audio passthrough (-c:a copy). Lipsync
+    # cannot drift because Step 2 never touches the audio. The canvas
+    # JSON is the source of truth — editor reads/writes it; image
+    # swaps, duration changes, and reordering only re-run Step 2
+    # (~5-15 s). Same engine produces bulletin (16:9) and shorts (9:16).
+    "full_video_shorts_v4": {
+        "label":  "Full Video + Shorts (V4)",
         "width":  1080,
         "height": 1920,
     },
@@ -872,6 +954,13 @@ async def create_job(
     # the editorial-decision stage. One of {"gemini", "claude"}. Blank
     # or unknown -> "gemini" (the default). Ignored by V1 platforms.
     stage_2_provider: str = Form("gemini"),
+    # V4 only: studio-background video the user picked in the NewJob
+    # wizard. Stamped onto canvas.layout.bg_video_path before the very
+    # first render so the bulletin opens with the user-chosen backdrop
+    # instead of flat black. Blank = legacy flat-colour behaviour.
+    v4_bg_video_path:   str = Form(""),
+    v4_bg_video_volume: float = Form(0.0),
+    v4_bg_intro_seconds: float = Form(0.0),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -1144,6 +1233,12 @@ async def create_job(
         transition_style=_ts,
         # Item 114: V2 only. V1 paths ignore.
         stage_2_provider=_s2p,
+        # V4 only: studio bg the user picked in the new-job wizard.
+        # runner forwards into the V4 orchestrator, which stamps it onto
+        # the freshly-built canvas.json so the very first render uses it.
+        v4_bg_video_path=(v4_bg_video_path or "").strip() or None,
+        v4_bg_video_volume=max(0.0, min(1.0, v4_bg_video_volume or 0.0)),
+        v4_bg_intro_seconds=max(0.0, min(30.0, v4_bg_intro_seconds or 0.0)),
         db_session_factory=SessionLocal,
     )
 
@@ -1571,6 +1666,13 @@ def reimport_clips(job_id: int, db: Session = Depends(get_db), user: models.User
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # V4 doesn't produce editor_meta.json — it produces canvas.json,
+    # and the canvas editor reads it directly without going through
+    # the Clip table. Reimport is a no-op for V4 jobs and must not
+    # touch the job's status / error fields.
+    if (job.platform or "") == "full_video_shorts_v4":
+        return {"ok": True, "platform": job.platform, "note": "V4 jobs use canvas.json, not editor_meta.json. Nothing to reimport."}
 
     # Drop any stale Clip rows for this job so we don't accumulate duplicates
     db.query(models.Clip).filter(models.Clip.job_id == job_id).delete()
@@ -2319,8 +2421,20 @@ async def serve_file(path: str, request: Request):
             },
         )
 
+    # Wrap the file handle in a generator so it's closed when streaming
+    # finishes (or the client disconnects). Passing a raw `open(...)` to
+    # StreamingResponse leaks descriptors on every request — the source
+    # of the "unclosed file" ResourceWarning spam in backend.err.log.
+    def _whole_file_iter():
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
     return StreamingResponse(
-        open(file_path, "rb"), media_type=mime,
+        _whole_file_iter(), media_type=mime,
         headers={**base_headers, "Content-Length": str(file_size)},
     )
 

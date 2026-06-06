@@ -246,7 +246,10 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  bulletin_images: Optional[list] = None,
                  stt_provider: str = "",
                  transition_style: str = "smart_cut",
-                 stage_2_provider: str = "gemini"):
+                 stage_2_provider: str = "gemini",
+                 v4_bg_video_path: Optional[str] = None,
+                 v4_bg_video_volume: float = 0.0,
+                 v4_bg_intro_seconds: float = 0.0):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -338,6 +341,81 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                     log_out.close(); log_err.close()
         threading.Thread(target=_v3_worker, daemon=True).start()
         return   # V3 worker queued; subprocess runs when semaphore is available
+
+    if platform == "full_video_shorts_v4":
+        # V4: trim+canvas architecture (single atomic trim, then atomic
+        # canvas composite — zero lipsync drift, editable canvas.json).
+        # Spawn as a detached Python subprocess; orchestrator updates
+        # the Job row's status and log.
+        out_dir = OUTPUT_ROOT / "full_video_shorts_v4" / f"job_{job_id}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
+        if not Path(venv_python).exists():
+            venv_python = sys.executable
+        cmd = [
+            venv_python, "-m", "pipeline_v4.orchestrator",
+            "--job-id", str(job_id),
+            "--source", video_path,
+            "--output-dir", str(out_dir),
+            "--language", language or "te",
+        ]
+        if default_logo:
+            cmd += ["--brand-logo", default_logo]
+        log_out = open(out_dir / "stdout.log", "w", encoding="utf-8")
+        log_err = open(out_dir / "stderr.log", "w", encoding="utf-8")
+        # CRITICAL on Windows: the subprocess inherits cp1252 for its
+        # stdout encoding by default, which crashes on any non-Latin-1
+        # character (em-dash, right-arrow, Telugu text, etc.). Force
+        # utf-8 so every print() inside pipeline_v4 just works.
+        _env = {
+            **os.environ,
+            "PYTHONIOENCODING":  "utf-8",
+            "PYTHONUNBUFFERED":  "1",
+        }
+        if bulletin_images:
+            _env["KAIZER_BULLETIN_IMAGES"] = "|".join(p for p in bulletin_images if p)
+        # Studio background video the user picked in the new-job wizard.
+        # The orchestrator reads these env vars and stamps them onto the
+        # initial canvas.json so the first render uses them.
+        if v4_bg_video_path:
+            _env["KAIZER_V4_BG_VIDEO_PATH"] = v4_bg_video_path
+            _env["KAIZER_V4_BG_VIDEO_VOLUME"] = f"{max(0.0, min(1.0, v4_bg_video_volume or 0.0)):.3f}"
+            _env["KAIZER_V4_BG_INTRO_SECONDS"] = f"{max(0.0, min(30.0, v4_bg_intro_seconds or 0.0)):.3f}"
+        # Stash output_dir on the Job row up-front so the V4 editor can
+        # find canvas.json even before the subprocess writes it. Also
+        # stamp started_at so the JobDetail "elapsed - live" badge has a
+        # reference time. The orchestrator updates finished_at on exit.
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            from models import Job as _JobModel
+            _db = db_session_factory()
+            _j = _db.query(_JobModel).filter(_JobModel.id == job_id).first()
+            if _j:
+                _j.output_dir = str(out_dir)
+                if _j.started_at is None:
+                    _j.started_at = _dt.now(_tz.utc)
+                _db.commit()
+            _db.close()
+        except Exception as exc:
+            print(f"[runner.v4] could not stash output_dir on job: {exc}")
+        def _v4_worker():
+            with _PIPELINE_SEMAPHORE:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(BASE_DIR),
+                    stdout=log_out, stderr=log_err,
+                    env=_env,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                _register_proc(job_id, proc)
+                print(f"[runner.v4] subprocess spawned pid={proc.pid} job_id={job_id} -> {out_dir}", flush=True)
+                try:
+                    rc = proc.wait()
+                    print(f"[runner.v4] job_id={job_id} subprocess exited rc={rc}", flush=True)
+                finally:
+                    _deregister_proc(job_id)
+                    log_out.close(); log_err.close()
+        threading.Thread(target=_v4_worker, daemon=True).start()
+        return   # V4 worker queued; subprocess runs when semaphore is available
 
     def _run():
         from models import Job, Clip
@@ -576,8 +654,18 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             j.log = "\n".join(log_lines)
 
             if not failed_pass and captured_meta_paths:
+                # Order: shorts first, bulletin (youtube_full) LAST so the
+                # bulletin's parent dir wins as job.output_dir. This is
+                # critical for the editor's "Images" tab which loads
+                # <output_dir>/bulletin/ -- if the shorts dir wins the
+                # tab shows "No bulletin images on disk yet." even when
+                # they exist in the youtube_full sibling folder.
+                _ordered_metas = sorted(
+                    captured_meta_paths,
+                    key=lambda p: 1 if "youtube_full" in p else 0,
+                )
                 try:
-                    for _meta in captured_meta_paths:
+                    for _meta in _ordered_metas:
                         _import_clips(j, db2, meta_override=Path(_meta))
                     if not j.clips:
                         j.status = "failed"

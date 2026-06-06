@@ -554,6 +554,34 @@ def _process(job_id: int) -> None:
             _fail(db, job, str(resolve_err))
             return
 
+        # ─── Per-channel watermark stamp ──────────────────────────────
+        # The renderer produces a clean file; the bug stamp happens here
+        # per destination so the same source can ship to many channels
+        # each with its own logo + brand text. Channel settings override
+        # the user's V4 defaults; missing both means the stamp is a no-op.
+        try:
+            from pipeline_v4 import watermark as _wm
+            channel = (job.channel if hasattr(job, "channel") else None) \
+                       or db.query(models.Channel).filter(
+                           models.Channel.id == job.channel_id
+                       ).first()
+            owner = (clip.job.user if (clip.job and getattr(clip.job, "user", None)) else None) \
+                    or db.query(models.User).filter(
+                        models.User.id == job.user_id
+                    ).first()
+            stamped_path = _wm.stamp_for_channel(
+                source_path=resolved_clip_path,
+                channel=channel,
+                user=owner,
+                db=db,
+            )
+            if stamped_path and stamped_path != resolved_clip_path:
+                # Track the new tempdir alongside the existing one so
+                # `finally` below cleans both up.
+                resolved_clip_path = stamped_path
+        except Exception as wm_exc:
+            print(f"[upload] watermark soft-skip for clip {clip.id}: {wm_exc}", flush=True)
+
         # ─── Prefer Pro Editor beta render if newer than original ───
         # The editor writes its result to
         # ``output/beta_renders/clip_<id>/<style>_beta.mp4`` and a

@@ -129,6 +129,14 @@ def list_accounts(
                 # Per-YT-account upload route (null = inherit channel /
                 # system default).  Set via POST /upload-provider below.
                 "upload_provider":      t.upload_provider or None,
+                # Per-channel watermark + social-link footer settings.
+                # Stored on the primary Channel row (t.channel); the
+                # upload worker reads them via stamp_for_channel +
+                # build_socials_footer at publish time.
+                "watermark_text":       (getattr(t.channel, "watermark_text", "") or "") if t.channel else "",
+                "watermark_opacity":    float((getattr(t.channel, "watermark_opacity", 0.35) or 0.35)) if t.channel else 0.35,
+                "watermark_position":   (getattr(t.channel, "watermark_position", "top-right") or "top-right") if t.channel else "top-right",
+                "socials":              (getattr(t.channel, "socials", None) or {}) if t.channel else {},
                 # Sibling Brand Accounts the user can toggle on/off as
                 # publish destinations. Includes the primary itself with
                 # is_primary=true so the UI can render it locked-on.

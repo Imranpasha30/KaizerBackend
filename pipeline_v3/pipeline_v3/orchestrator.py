@@ -346,7 +346,23 @@ def run_pipeline(
 
         # Import clips from each meta path we captured. _import_clips also
         # sets job.output_dir to the meta's parent directory.
+        #
+        # IMPORTANT (item BULLETIN_DIR_FIX): V1 compound emits TWO meta
+        # markers -- youtube_full/<ts>/editor_meta.json for the bulletin
+        # AND youtube_short/<ts>/editor_meta.json for the shorts. If we
+        # naively iterate, the LAST _import_clips call's parent wins as
+        # job.output_dir. The shorts dir would overwrite the bulletin
+        # path, and the editor's "Images" tab (which loads
+        # <output_dir>/bulletin/) would say "No bulletin images on disk
+        # yet." So we ORDER the imports: shorts first, bulletin last --
+        # then output_dir lands on the youtube_full path where the
+        # bulletin images actually live.
         if captured_meta_paths:
+            def _meta_sort_key(p: str) -> int:
+                # bulletin = youtube_full goes LAST so its parent wins
+                # as job.output_dir
+                return 1 if "youtube_full" in p else 0
+            sorted_meta_paths = sorted(captured_meta_paths, key=_meta_sort_key)
             try:
                 import runner as _runner  # type: ignore
                 from database import SessionLocal as _SessionLocal
@@ -355,7 +371,7 @@ def run_pipeline(
                 try:
                     _job = _db.query(_models.Job).filter(_models.Job.id == job_id).first()
                     n_imported = 0
-                    for _mp in captured_meta_paths:
+                    for _mp in sorted_meta_paths:
                         if not os.path.exists(_mp):
                             logger.warning("captured meta path does not exist: %s", _mp)
                             continue
@@ -365,7 +381,7 @@ def run_pipeline(
                             logger.info("_import_clips OK from %s -> %d clips", _mp, n_imported)
                         except Exception as _ie:
                             logger.error("_import_clips failed for %s: %s", _mp, _ie)
-                    _log_ui(f"Clip import: {n_imported} clips imported")
+                    _log_ui(f"Clip import: {n_imported} clips imported (output_dir={_job.output_dir})")
                 finally:
                     _db.close()
             except Exception as _ic_exc:

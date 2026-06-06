@@ -123,12 +123,18 @@ def run_stream(stream_id: int) -> None:
             _release_cancel_event(stream_id)
             return
 
-        # 1) Concurrency slot
-        _append_message(stream_id, "waiting for broadcast slot…")
-        with concurrency.acquire_slot(timeout_s=600) as got:
+        # 1) Concurrency slot. Queued workers may wait a long time — a
+        # 24h broadcast occupying slot 1 means the 11th submission has
+        # to wait the full 24h before it even starts. The cap is
+        # KAIZER_LIVE_STUDIO_CONCURRENCY (default 10); the wait timeout
+        # is KAIZER_LIVE_STUDIO_QUEUE_TIMEOUT_S (default 48h).
+        _update(stream_id, status="queued",
+                message="queued — waiting for an available broadcast slot")
+        with concurrency.acquire_slot(timeout_s=concurrency.QUEUE_TIMEOUT_S) as got:
             if not got:
                 _update(stream_id, status="failed",
-                        error="timed out waiting for a broadcast slot")
+                        error=f"timed out waiting for a broadcast slot "
+                              f"(after {concurrency.QUEUE_TIMEOUT_S:.0f}s)")
                 return
 
             # Re-fetch in case state changed during the wait.
@@ -186,20 +192,62 @@ def run_stream(stream_id: int) -> None:
                 started_at=datetime.now(timezone.utc),
             )
 
+            # 3b) Apply the user-uploaded thumbnail, if any. Soft-fail —
+            # YouTube will fall back to an auto-picked frame, and the
+            # broadcast itself is already minted. Burns 50 quota units
+            # per call; the helper resizes to ≤2 MB JPEG as needed.
+            thumb_path = (getattr(row, "thumbnail_path", "") or "").strip()
+            yt_video_id = target.get("video_id") or target.get("broadcast_id") or ""
+            if thumb_path and yt_video_id and os.path.isfile(thumb_path):
+                try:
+                    from youtube import uploader as yt_uploader
+                    yt_uploader.set_thumbnail(
+                        creds=creds, video_id=yt_video_id,
+                        thumb_path=thumb_path, job=row,
+                    )
+                    _append_message(stream_id, "thumbnail applied; ffmpeg starting")
+                except Exception as exc:
+                    print(f"[live_studio] set_thumbnail soft-fail for "
+                          f"stream={stream_id} video={yt_video_id}: {exc}")
+
             # 4) ffmpeg push (blocks until done, cancel, or error).
+            # Two modes based on the row's source:
+            #   - source_url present → OBS-style passthrough pipe
+            #     (yt-dlp | ffmpeg → YouTube). No looping, broadcast
+            #     ends when the source video ends.
+            #   - upload_path present → loop-on-disk mode (existing).
+            #     Loops a finished file for the configured duration.
+            src_url = (getattr(row, "source_url", "") or "").strip()
             try:
-                streamer.push_loop(
-                    input_path=row.upload_path,
-                    ingest_url=target["ingest_url"],
-                    stream_key=target["stream_key"],
-                    duration_hours=float(row.target_hours or 1.0),
-                    progress_cb=lambda pct: _update(
-                        stream_id, progress_pct=int(pct),
-                        message=f"streaming… {pct:.1f}%",
-                    ),
-                    cancel_event=cancel_ev,
-                    extra_log_cb=None,
-                )
+                if src_url:
+                    _append_message(
+                        stream_id,
+                        "passthrough live (no loop, ends when source ends)",
+                    )
+                    streamer.push_passthrough(
+                        source_url=src_url,
+                        ingest_url=target["ingest_url"],
+                        stream_key=target["stream_key"],
+                        progress_cb=lambda pct: _update(
+                            stream_id, progress_pct=int(pct),
+                            message=f"streaming (passthrough)… {pct:.1f}%",
+                        ),
+                        cancel_event=cancel_ev,
+                        extra_log_cb=None,
+                    )
+                else:
+                    streamer.push_loop(
+                        input_path=row.upload_path,
+                        ingest_url=target["ingest_url"],
+                        stream_key=target["stream_key"],
+                        duration_hours=float(row.target_hours or 1.0),
+                        progress_cb=lambda pct: _update(
+                            stream_id, progress_pct=int(pct),
+                            message=f"streaming… {pct:.1f}%",
+                        ),
+                        cancel_event=cancel_ev,
+                        extra_log_cb=None,
+                    )
                 completed_clean = True
             except streamer.StreamerError as exc:
                 _update(stream_id, status="failed",
@@ -239,8 +287,10 @@ def run_stream(stream_id: int) -> None:
 
             # 6) R2 preview upload (48 h). Soft-fails — broadcast is
             # already on YouTube, this is just for in-Kaizer preview.
-            # Done before the temp file is cleaned up in finally.
-            if completed_clean and not cancel_ev.is_set():
+            # SKIPPED for passthrough URL streams: there's no local
+            # file to upload (yt-dlp piped straight to ffmpeg).
+            # YouTube keeps the durable copy of the broadcast either way.
+            if completed_clean and not cancel_ev.is_set() and not src_url:
                 try:
                     from live_studio import r2_backup
                     backup = r2_backup.upload_for_preview(

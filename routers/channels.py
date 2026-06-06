@@ -35,6 +35,12 @@ class ChannelIn(BaseModel):
     logo_asset_id: Optional[int] = None
     # "postiz" | "kaizer" | None (= use system default)
     upload_provider: Optional[str] = None
+    # Per-channel watermark (applied at upload time by the worker).
+    watermark_text: str = ""
+    watermark_opacity: float = 0.35
+    watermark_position: str = "top-right"
+    # Per-channel social links injected into the SEO description footer.
+    socials: dict = Field(default_factory=dict)
 
     @field_validator("upload_provider")
     @classmethod
@@ -81,6 +87,11 @@ class ChannelPatch(BaseModel):
     logo_asset_id: Optional[int] = None
     # "postiz" | "kaizer" | "" (= clear → fall back to system default)
     upload_provider: Optional[str] = None
+    # Per-channel watermark + socials. None = leave existing values.
+    watermark_text: Optional[str] = None
+    watermark_opacity: Optional[float] = None
+    watermark_position: Optional[str] = None
+    socials: Optional[dict] = None
 
     @field_validator("upload_provider")
     @classmethod
@@ -117,21 +128,30 @@ class ChannelPatch(BaseModel):
 
 def _to_dict(c: models.Channel) -> dict:
     tok = c.oauth_token
-    # Logo preview — look up the referenced asset if set.  Cheap single-query
-    # because the caller is either reading one channel or we've already
-    # loaded everything in list_channels.
+    # Logo preview — same resolution order the upload worker uses:
+    # OAuthToken.logo_asset_id first (the "VIDEO OVERLAY LOGO" set on
+    # the My YouTube Accounts card), then Channel.logo_asset_id (style-
+    # profile-level fallback). Without this, the legacy DownloadModal
+    # mislabels every channel "no logo" even when the OAuth-token logo
+    # IS set and would actually be applied.
     logo_asset = None
-    if c.logo_asset_id:
-        try:
-            from sqlalchemy.orm import object_session
-            sess = object_session(c)
-            if sess is not None:
-                la = sess.query(models.UserAsset).filter(models.UserAsset.id == c.logo_asset_id).first()
+    effective_logo_asset_id = None
+    try:
+        from sqlalchemy.orm import object_session
+        sess = object_session(c)
+        if sess is not None:
+            for source_id in (
+                (tok.logo_asset_id if tok and getattr(tok, "logo_asset_id", None) else None),
+                c.logo_asset_id,
+            ):
+                if not source_id:
+                    continue
+                la = sess.query(models.UserAsset).filter(models.UserAsset.id == source_id).first()
                 if la:
+                    effective_logo_asset_id = la.id
                     logo_asset = {
                         "id":       la.id,
                         "filename": la.filename,
-                        # Prefer R2 — survives container restarts + cross-device.
                         "url":      la.storage_url or (f"/api/file/?path={la.file_path}" if la.file_path else ""),
                         "thumb_url": (
                             getattr(la, "thumb_storage_url", "")
@@ -139,8 +159,9 @@ def _to_dict(c: models.Channel) -> dict:
                             or (f"/api/file/?path={la.thumb_path}" if la.thumb_path else "")
                         ),
                     }
-        except Exception:
-            logo_asset = None
+                    break
+    except Exception:
+        logo_asset = None
     return {
         "id": c.id,
         "name": c.name,
@@ -154,10 +175,19 @@ def _to_dict(c: models.Channel) -> dict:
         "mandatory_hashtags": c.mandatory_hashtags or [],
         "is_priority": bool(c.is_priority),
         "logo_asset_id": c.logo_asset_id,
+        # `effective_logo_asset_id` reflects whatever logo the upload
+        # worker would actually apply — OAuthToken first, Channel
+        # second — so UIs can label "logo configured" correctly. Stays
+        # null only when truly no logo is set anywhere.
+        "effective_logo_asset_id": effective_logo_asset_id,
         "logo":          logo_asset,
         # null = "use system default" — the UI shows the resolved
         # value via the system-settings endpoint when null.
         "upload_provider": c.upload_provider,
+        "watermark_text":     getattr(c, "watermark_text", "") or "",
+        "watermark_opacity":  float(getattr(c, "watermark_opacity", 0.35) or 0.35),
+        "watermark_position": getattr(c, "watermark_position", "top-right") or "top-right",
+        "socials":            getattr(c, "socials", None) or {},
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         "connected": tok is not None and bool(tok.refresh_token_enc),
@@ -405,7 +435,20 @@ def create_channel(payload: ChannelIn, db: Session = Depends(get_db), user: mode
         raise HTTPException(status_code=409, detail=f"Profile with name '{payload.name}' already exists")
 
     _validate_logo_ownership(db, user.id, payload.logo_asset_id)
-    ch = models.Channel(user_id=user.id, **payload.model_dump())
+    data = payload.model_dump()
+    # If the caller didn't supply per-channel socials, seed them from
+    # the user's global Settings socials so new channels start with
+    # sensible defaults. The user can still override any field later
+    # via the Channels page's ✦ Brand modal.
+    if not data.get("socials"):
+        try:
+            import json as _json
+            user_socials = _json.loads(user.socials or "{}") if isinstance(user.socials, str) else (user.socials or {})
+            if isinstance(user_socials, dict) and any(user_socials.values()):
+                data["socials"] = user_socials
+        except Exception:
+            pass
+    ch = models.Channel(user_id=user.id, **data)
     db.add(ch)
     db.commit()
     db.refresh(ch)

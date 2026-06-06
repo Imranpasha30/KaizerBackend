@@ -302,7 +302,11 @@ def list_postiz_integrations(
     try:
         items = postiz_client.list_integrations()
     except postiz_client.PostizAuthError as exc:
-        raise HTTPException(401, f"Postiz auth failed: {exc}")
+        # 502, not 401: a 401 here would trick the frontend into thinking
+        # the user's own JWT expired and force-logging them out. This is
+        # an upstream-provider auth failure (Postiz token bad), not a
+        # session failure.
+        raise HTTPException(502, f"Postiz auth failed: {exc}")
     except postiz_client.PostizError as exc:
         raise HTTPException(502, f"Postiz error: {exc}")
     return {"integrations": items}

@@ -100,7 +100,16 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
 
     email = payload.email.lower().strip()
     u = db.query(models.User).filter(models.User.email == email).first()
-    if not u or not u.password_hash or not _auth.verify_password(payload.password, u.password_hash):
+    if u and not u.password_hash:
+        # Google-Sign-In-only account: explicit reason instead of the
+        # generic "Wrong email or password." Otherwise the user stares
+        # at a confusing error and has no idea this account doesn't
+        # accept a password — they need to click "Sign in with Google".
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account is linked to Google. Click 'Sign in with Google' instead of using a password.",
+        )
+    if not u or not _auth.verify_password(payload.password, u.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Wrong email or password.",

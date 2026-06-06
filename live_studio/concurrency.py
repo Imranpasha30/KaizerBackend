@@ -20,9 +20,34 @@ from typing import Iterator
 
 
 # Env override so cloud workers can bump it without code change.
+# Default 10 — matches the operator-facing promise that Live Studio
+# ships "10 simultaneous broadcasts, rest queued". On a single
+# RTX-class GPU + a typical 50 Mbps uplink, 10 concurrent 1080p
+# pushes is the sweet spot before YouTube starts deprioritising
+# encoder lag warnings. Bump higher only with headroom on both
+# uplink and encoder.
 MAX_CONCURRENT = max(1, int(
-    (os.environ.get("KAIZER_LIVE_STUDIO_CONCURRENCY") or "8").strip()
+    (os.environ.get("KAIZER_LIVE_STUDIO_CONCURRENCY") or "10").strip()
 ))
+
+
+# How long a queued worker is allowed to sit waiting for a free slot
+# before it gives up and marks itself failed. The realistic worst case
+# is: 10 concurrent broadcasts of 24h each → an 11th has to wait the
+# full 24h to even start. Default 48h covers that with margin.
+# Operators can shrink this if they prefer faster "queue too long"
+# failure semantics. Setting it to 0 means "never time out" — workers
+# wait until either a slot frees or someone cancels them.
+def _queue_timeout_s() -> float:
+    raw = (os.environ.get("KAIZER_LIVE_STUDIO_QUEUE_TIMEOUT_S") or "172800").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 172800.0
+    return v if v > 0 else float("inf")
+
+
+QUEUE_TIMEOUT_S = _queue_timeout_s()
 
 
 _GLOBAL_SLOT = threading.BoundedSemaphore(MAX_CONCURRENT)

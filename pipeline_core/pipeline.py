@@ -960,6 +960,55 @@ def _cache_dir() -> str:
     return d
 
 
+def _extract_gemini_text(response) -> tuple:
+    # google-genai sometimes returns a response whose `.text` is None
+    # (MAX_TOKENS, SAFETY, RECITATION, or empty candidate). The default
+    # call site at .text.strip() then crashes with AttributeError and we
+    # lose the actual reason. This helper returns (text_or_None, reason)
+    # so the caller can either retry, fall back to the next model, or
+    # raise a descriptive error.
+    try:
+        txt = response.text
+    except Exception:
+        txt = None
+    if txt:
+        return txt.strip(), "ok"
+
+    finish_reason = None
+    block_reason = None
+    parts_text = ""
+    try:
+        cands = getattr(response, "candidates", None) or []
+        if cands:
+            fr = getattr(cands[0], "finish_reason", None)
+            finish_reason = getattr(fr, "name", None) or str(fr) if fr is not None else None
+            content = getattr(cands[0], "content", None)
+            parts = getattr(content, "parts", None) or [] if content else []
+            for p in parts:
+                t = getattr(p, "text", None)
+                if t:
+                    parts_text += t
+    except Exception:
+        pass
+    try:
+        pf = getattr(response, "prompt_feedback", None)
+        if pf is not None:
+            br = getattr(pf, "block_reason", None)
+            block_reason = getattr(br, "name", None) or str(br) if br is not None else None
+    except Exception:
+        pass
+
+    if parts_text.strip():
+        return parts_text.strip(), f"recovered_from_parts (finish={finish_reason})"
+
+    reason_bits = []
+    if finish_reason:
+        reason_bits.append(f"finish_reason={finish_reason}")
+    if block_reason:
+        reason_bits.append(f"block_reason={block_reason}")
+    return None, ", ".join(reason_bits) or "empty_response"
+
+
 def analyze_video_with_gemini(
     video_path: str,
     preset: dict,
@@ -1108,7 +1157,19 @@ def analyze_video_with_gemini(
     if legacy_single and legacy_single not in candidates:
         candidates.insert(0, legacy_single)
 
+    # Force JSON output + give the compound prompt the full output budget.
+    # gemini-2.5-flash defaults to ~8k output tokens, which is below what
+    # a compound analysis (word-level skipped_segments + image_plan +
+    # full_video_cuts + shorts_cuts) actually needs. Hitting that ceiling
+    # makes .text come back None with finish_reason=MAX_TOKENS, which is
+    # exactly how job_86 died. 65536 is the published 2.5-flash ceiling.
+    gen_config = genai_types.GenerateContentConfig(
+        response_mime_type="application/json",
+        max_output_tokens=65536,
+    )
+
     response = None
+    raw_text = None
     last_error = None
     for model_name in candidates:
         try:
@@ -1129,6 +1190,7 @@ def analyze_video_with_gemini(
                         response = client.models.generate_content(
                             model=model_name,
                             contents=[video_file, prompt],
+                            config=gen_config,
                         )
                         _gcall.record(response)
                     break
@@ -1144,8 +1206,20 @@ def analyze_video_with_gemini(
                         time.sleep(5)
                     else:
                         raise
+            # The response object exists, but `.text` may be None if the
+            # model hit MAX_TOKENS, was blocked by safety, or returned an
+            # empty candidate. Treat that the same as a recoverable
+            # failure — try the next model in the chain.
             if response is not None:
-                break  # Got a response — stop trying fallback models
+                raw_text, reason = _extract_gemini_text(response)
+                if raw_text:
+                    if reason != "ok":
+                        print(f"\n    [note] {model_name}: {reason}")
+                    break
+                print(f"\n    [empty] {model_name}: {reason} — falling back to next model in chain")
+                last_error = RuntimeError(f"{model_name}: empty response ({reason})")
+                response = None
+                continue
         except Exception as e:
             msg = str(e)
             is_quota = ("429" in msg) or ("ResourceExhausted" in msg) or ("quota" in msg.lower())
@@ -1166,10 +1240,11 @@ def analyze_video_with_gemini(
                 print(f"\n    [404] All configured models are unavailable. Update KAIZER_GEMINI_VIDEO_MODELS in .env.")
             raise
 
-    if response is None:
-        raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+    if not raw_text:
+        raise RuntimeError(
+            f"All Gemini models returned empty/blocked responses. Last error: {last_error}"
+        )
 
-    raw_text = response.text.strip()
     print(" done")
 
     result = _parse_gemini_json(raw_text)
@@ -2944,7 +3019,12 @@ html,body{{width:{area_w}px;height:{area_h}px;margin:0;padding:0;
 #t{{width:100%;height:100%;display:flex;flex-direction:column;
   align-items:center;justify-content:center;text-align:center;
   font-family:{_font_family};font-size:{fnt_sz}px;font-weight:800;
-  color:{text_color};line-height:1.3;word-break:break-word;padding:0 8px;
+  color:{text_color};line-height:1.35;word-break:break-word;
+  /* Inner padding so the headline never kisses the torn-paper edge.
+     Vertical was 0 -> Telugu descenders + the torn jag visually
+     collided. 22px gives the card room to breathe; horizontal 28px
+     keeps left/right glyphs off the ragged side. */
+  padding:22px 28px;
   filter:drop-shadow(2px 2px 0 rgba(0,0,0,0.7));}}
 </style></head><body><div id="t">{_title_html}</div>
 <script>document.fonts.ready.then(function(){{window._done=true;}});</script>

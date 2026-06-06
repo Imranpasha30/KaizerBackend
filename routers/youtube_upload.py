@@ -458,6 +458,7 @@ def publish_clip(
 def list_uploads(
     status_filter: Optional[str] = Query(None, alias="status"),
     channel_id:    Optional[int] = None,
+    clip_id:       Optional[int] = None,
     limit:         int = 100,
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
@@ -467,6 +468,8 @@ def list_uploads(
         q = q.filter(models.UploadJob.status == status_filter)
     if channel_id:
         q = q.filter(models.UploadJob.channel_id == channel_id)
+    if clip_id:
+        q = q.filter(models.UploadJob.clip_id == clip_id)
     rows = q.order_by(models.UploadJob.created_at.desc()).limit(limit).all()
     return [_to_dict(r) for r in rows]
 

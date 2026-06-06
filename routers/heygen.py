@@ -304,7 +304,9 @@ def list_avatars(user: models.User = Depends(auth.current_user)) -> dict:
     try:
         return heygen_client.list_avatars()
     except heygen_client.HeyGenAuthError as exc:
-        raise HTTPException(401, f"HeyGen auth: {exc}")
+        # 502, not 401: upstream-provider auth failure, NOT a session
+        # failure. Returning 401 would force-logout the user.
+        raise HTTPException(502, f"HeyGen auth: {exc}")
     except heygen_client.HeyGenError as exc:
         raise HTTPException(502, f"HeyGen error: {exc}")
 
@@ -315,7 +317,9 @@ def list_voices(user: models.User = Depends(auth.current_user)) -> dict:
     try:
         voices = heygen_client.list_voices()
     except heygen_client.HeyGenAuthError as exc:
-        raise HTTPException(401, f"HeyGen auth: {exc}")
+        # 502, not 401: upstream-provider auth failure, NOT a session
+        # failure. Returning 401 would force-logout the user.
+        raise HTTPException(502, f"HeyGen auth: {exc}")
     except heygen_client.HeyGenError as exc:
         raise HTTPException(502, f"HeyGen error: {exc}")
     return {"voices": voices, "count": len(voices)}

@@ -122,6 +122,19 @@ def compose(
         body = body.replace(footer, "").strip()
         body = f"{body}\n\n{footer}".strip()
 
+    # Per-channel social links — injected as a separate footer block.
+    # YouTube turns URLs / @handles into clickable links so the reach
+    # is real, not cosmetic. Channel.socials wins; user-level socials
+    # are not used here (intentional — different audiences per channel).
+    try:
+        from pipeline_v4.watermark import build_socials_footer
+        socials_block = build_socials_footer(getattr(destination, "socials", None) or {})
+        if socials_block:
+            body = body.replace(socials_block, "").strip()
+            body = f"{body}\n\n{socials_block}".strip()
+    except Exception:
+        pass
+
     # Shorts tag injection — if caller signalled a Shorts publish
     if publish_kind == "short":
         shorts_tag = "#Shorts"

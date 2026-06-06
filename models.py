@@ -52,6 +52,13 @@ class User(Base):
     heygen_avatar_id = Column(String(64), nullable=True)
     heygen_voice_id  = Column(String(64), nullable=True)
 
+    # ── V4 automation defaults ─────────────────────────────────────────
+    # JSON blob the V4 pipeline applies when the user runs in auto mode
+    # ("upload + publish to YouTube — no clicks in between"). See
+    # routers/v4_defaults.py for the shape. Stored as text so we can
+    # extend the schema without an Alembic migration on every iteration.
+    v4_defaults = Column(Text, nullable=True)
+
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -181,6 +188,19 @@ class Channel(Base):
     # paths side-by-side, or when one channel's google project has
     # exhausted its daily quota.
     upload_provider    = Column(String(20), nullable=True)  # "postiz" | "kaizer" | "native_rtmp" | null
+    # Per-channel watermark — applied at upload time (before videos.insert)
+    # so the same rendered file can ship to multiple destinations with
+    # each channel's own brand stamp. Empty text = logo-only watermark
+    # using the channel's logo_asset_id image.
+    watermark_text     = Column(String(64), default="", nullable=True)
+    watermark_opacity  = Column(Float,      default=0.35, nullable=True)
+    watermark_position = Column(String(16), default="top-right", nullable=True)
+    # Per-channel social links — injected into the SEO description
+    # footer at publish time. Same shape as the per-user socials JSON
+    # so the existing UI inputs (YouTube/Twitter/Instagram/...) port
+    # over directly. None / {} = nothing added; the user-level socials
+    # are still used as a fallback by compose() when this is empty.
+    socials            = Column(JSON, default=dict, nullable=True)
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
     updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -1087,6 +1107,17 @@ class LiveStream(Base):
     backup_url        = Column(String(512), nullable=True)
     backup_key        = Column(String(255), nullable=True)
     backup_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    # Optional per-video custom thumbnail. One image per video_slot —
+    # all streams that share a slot point at the same file. The
+    # orchestrator hands this to youtube.uploader.set_thumbnail() once
+    # the broadcast is minted. NULL = let YouTube auto-pick a frame.
+    thumbnail_path    = Column(String(512), nullable=True)
+
+    # When the stream's source is a YouTube URL (yt-dlp ingested) rather
+    # than a user-uploaded file, we record the original URL here for
+    # history / audit. NULL = file-upload source.
+    source_url        = Column(String(1024), nullable=True)
 
     created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

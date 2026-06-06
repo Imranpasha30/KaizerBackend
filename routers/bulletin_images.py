@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 
 import auth
 import models
-from database import get_db
+from database import SessionLocal, get_db
 
 
 router = APIRouter(prefix="/api/jobs", tags=["bulletin-images"])
@@ -54,15 +54,65 @@ def _bulletin_dir_for(job: models.Job) -> Path:
     """Absolute path to ``<job.output_dir>/bulletin/``. ``Job.output_dir``
     is stored as a project-relative POSIX-ish path (e.g.
     ``output\\youtube_full\\20260513_144338``) — we resolve it against
-    the backend root so the same code works on Windows + Linux."""
+    the backend root so the same code works on Windows + Linux.
+
+    Fallback: for compound jobs (``youtube_full_plus_shorts``) the
+    pipeline writes BOTH a ``youtube_short/<ts>/`` directory AND a
+    ``youtube_full/<ts>/`` directory, and the import loop captures
+    whichever ``[kaizer:meta]`` marker the subprocess emitted last
+    as the job's ``output_dir``. If the short-side path won the
+    race the stored ``output_dir`` won't contain a ``bulletin/``
+    subfolder — but the bulletin still exists, just under a sibling
+    ``youtube_full/`` directory. We find it by mtime proximity to
+    the job's ``created_at``.
+    """
     if not job.output_dir:
         raise HTTPException(404, "Job has no output directory yet — pipeline may still be running")
     backend_root = Path(__file__).resolve().parent.parent
     out = (backend_root / job.output_dir).resolve()
     bdir = out / "bulletin"
-    if not bdir.is_dir():
-        raise HTTPException(404, f"Bulletin folder not found at {bdir}")
-    return bdir
+    if bdir.is_dir():
+        return bdir
+
+    # Fallback search — look for the closest-in-time youtube_full
+    # sibling that has a bulletin/ subfolder.
+    full_root = backend_root / "output" / "youtube_full"
+    if full_root.is_dir() and job.created_at:
+        try:
+            target_ts = job.created_at.timestamp()
+        except Exception:
+            target_ts = None
+        best: Optional[Path] = None
+        best_dt: float = float("inf")
+        for sub in full_root.iterdir():
+            if not sub.is_dir():
+                continue
+            cand = sub / "bulletin"
+            if not cand.is_dir():
+                continue
+            try:
+                dir_ts = sub.stat().st_mtime
+            except OSError:
+                continue
+            if target_ts is None:
+                # No created_at → return the newest sibling.
+                if dir_ts > -best_dt:
+                    best_dt = -dir_ts
+                    best = cand
+            else:
+                # Must have been created AFTER the job started — the
+                # bulletin can't predate the job's submission. Allow
+                # a small clock-skew margin (5 minutes early).
+                if dir_ts < target_ts - 300:
+                    continue
+                gap = abs(dir_ts - target_ts)
+                if gap < best_dt:
+                    best_dt = gap
+                    best = cand
+        if best is not None:
+            return best
+
+    raise HTTPException(404, f"Bulletin folder not found at {bdir} (no sibling youtube_full match either)")
 
 
 def _safe_join(base: Path, *parts: str) -> Path:
@@ -128,6 +178,13 @@ def _resolve_image_paths(bdir: Path) -> list[dict]:
     if manifest_path.is_file():
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            # BUG-FIX 2026-05-26: dedup key was (story_idx, filename) which
+            # collapsed `real/images/news_01.jpg` and `generated/news_01.jpg`
+            # (different FILES at different paths, but same basename) into
+            # one row -- losing the generated variant entirely. The editor
+            # then showed only 3 pool images for a job that actually has
+            # 5-7. Use the resolved absolute path so distinct files in
+            # real/ vs generated/ subdirs are both preserved.
             seen: set[tuple[int, str]] = set()
             for entry in data:
                 p = Path(entry.get("path", "") or "")
@@ -135,8 +192,9 @@ def _resolve_image_paths(bdir: Path) -> list[dict]:
                     continue
                 story_idx = int(entry.get("story_index", 0) or 0)
                 slot_idx  = _slot_from_filename(entry.get("filename", "") or p.name)
-                # dedupe same (story, filename) pairs
-                key = (story_idx, p.name.lower())
+                # dedupe same (story, ABSOLUTE PATH) pairs -- pure
+                # filename was too aggressive (see bug-fix note above)
+                key = (story_idx, str(p.resolve()).lower())
                 if key in seen:
                     continue
                 seen.add(key)
@@ -317,10 +375,50 @@ def replace_bulletin_image(
     # Resolve the target slot. We allow .jpg only on the output side —
     # whatever the user uploaded gets re-encoded to JPG to keep the
     # carousel renderer's expectations stable.
-    story_dir = _safe_join(bdir, f"story_{story_index:02d}_assets")
-    img_dir   = _safe_join(story_dir, "images")
-    img_dir.mkdir(parents=True, exist_ok=True)
-    target    = _safe_join(img_dir, f"news_{slot_index:02d}.jpg")
+    #
+    # Pool-mode short-circuit: when the manifest exists AND the
+    # (story_index, slot) entry points at a shared ``_job_pool/...``
+    # file, OVERWRITE THAT POOL FILE directly. Every other story that
+    # references the same pool entry then sees the new image without
+    # us having to fan-out the replace across N story_dir copies.
+    # Without this branch, the previous behavior added a fresh file
+    # at ``story_NN_assets/images/news_XX.jpg`` and only ONE of the
+    # N stories visually updated — the pool count drifted upward
+    # every replace.
+    target: Optional[Path] = None
+    manifest_path = bdir / "_generated_images.json"
+    if manifest_path.is_file():
+        try:
+            _data_pre = json.loads(manifest_path.read_text(encoding="utf-8"))
+            target_filename = f"news_{slot_index:02d}.jpg"
+            for entry in _data_pre:
+                if (
+                    int(entry.get("story_index", -1)) == int(story_index)
+                    and Path(entry.get("filename", "") or "").stem
+                        == Path(target_filename).stem
+                ):
+                    src_path = Path(entry.get("path", "") or "")
+                    # Only overwrite-in-place when the entry points at
+                    # a sane existing pool file inside THIS bulletin
+                    # dir — never write outside the dir for safety.
+                    try:
+                        if (src_path.is_file()
+                                and bdir.resolve() in src_path.resolve().parents):
+                            target = src_path
+                    except OSError:
+                        pass
+                    break
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if target is None:
+        # Fallback: legacy per-story-dir slot. Used when no manifest
+        # exists (older job layouts) or the manifest entry points
+        # somewhere we don't trust.
+        story_dir = _safe_join(bdir, f"story_{story_index:02d}_assets")
+        img_dir   = _safe_join(story_dir, "images")
+        img_dir.mkdir(parents=True, exist_ok=True)
+        target    = _safe_join(img_dir, f"news_{slot_index:02d}.jpg")
 
     # If the original existed, back it up next to the new file as
     # ``news_NN.jpg.prev`` so the user can revert manually if needed.
@@ -540,7 +638,190 @@ def recompose_bulletin(
             "verify": do_verify,
         }
 
+    # Resolve a viable source video path. Two-tier lookup:
+    #   1) The original upload at output/raw_uploads/<ts>/<video_name>
+    #      (kept across pipeline runs in dev; cleaned up in prod).
+    #   2) Fallback: any cached raw_clip_*.mp4 in the same output dir.
+    #      The pipeline subprocess only needs a real MP4 so its initial
+    #      ffprobe call succeeds. The cut-clips stage caches per-clip
+    #      outputs and skips re-cutting when raw_clip_NN.mp4 already
+    #      exists, so providing a clip as "the video" is functionally
+    #      equivalent for a recompose-only run.
+    out_root = bdir.parent       # bdir is <output_dir>/bulletin
+
+    def _resolve_source_video() -> str:
+        try:
+            backend_root = Path(__file__).resolve().parent.parent
+            uploads_root = backend_root / "output" / "raw_uploads"
+            vname = (job.video_name or "").strip()
+            if vname and uploads_root.is_dir():
+                hits = sorted(
+                    uploads_root.glob(f"*/{vname}"),
+                    key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                    reverse=True,
+                )
+                for h in hits:
+                    if h.is_file():
+                        return str(h)
+        except Exception:
+            pass
+        # Fallback — any cached clip is enough for ffprobe to succeed.
+        for clip in sorted(out_root.glob("raw_clip_*.mp4")):
+            if clip.is_file() and clip.stat().st_size > 100_000:
+                return str(clip)
+        return ""
+
+    video_path = _resolve_source_video()
+    if not video_path:
+        with _RECOMPOSE_LOCK:
+            _RECOMPOSING[job_id] = {
+                "state": "failed",
+                "msg":   ("recompose requires either the original upload or a cached "
+                          "raw_clip_*.mp4 — neither was found in the job's output dir"),
+            }
+        raise HTTPException(
+            409,
+            "Cannot recompose: source video and cached clips are both missing. "
+            "Re-submit the job from scratch.",
+        )
+
+    # Cached Gemini analysis at the job's output root. When present,
+    # the pipeline subprocess will short-circuit the analysis call
+    # entirely (no Gemini quota, no re-upload). For a recompose this
+    # is the difference between "writes a new bulletin" and "fails on
+    # the missing source video".
+    analysis_path = out_root / "gemini_analysis.json"
+    reuse_analysis = str(analysis_path) if analysis_path.is_file() else ""
+
+    platform = job.platform or "youtube_full"
+    frame = job.frame_layout or "torn_card"
+    lang = job.language or "te"
+    s2p = getattr(job, "stage_2_provider", None) or "gemini"
+    tstyle = getattr(job, "transition_style", None) or "smart_cut"
+
+    # Captured at recompose start so we can clean up the OLD paired
+    # directories (youtube_full + youtube_short) AFTER the new render
+    # succeeds. Filled inside _run_pipeline_sync.
+    new_meta_paths: list[str] = []
+
+    # Snapshot the current image pool BEFORE spawning the subprocess.
+    # The pipeline accepts a pipe-separated list of pre-selected images
+    # via ``KAIZER_BULLETIN_IMAGES`` — we hand it the user's existing
+    # pool (including any swaps they made via /replace) so the new
+    # render uses THOSE instead of asking OpenAI for fresh generations
+    # from scratch. Without this, every recompose would shrink the
+    # pool back to whatever Gemini's image_plan generates by default
+    # (typically 3 images), losing all the user's curation work.
+    try:
+        existing_rows = _resolve_image_paths(bdir)
+        # Deduplicate by absolute path — many rows can point at the
+        # same pool file (story_indexes list).
+        seen_pool: set[str] = set()
+        existing_pool: list[str] = []
+        for r in existing_rows:
+            p = str(Path(r.get("abs_path", "")).resolve())
+            if p and p not in seen_pool and Path(p).is_file():
+                seen_pool.add(p)
+                existing_pool.append(p)
+        if existing_pool:
+            print(f"[bulletin-recompose] job={job_id} preserving {len(existing_pool)} existing pool images for the new render")
+    except Exception as exc:
+        print(f"[bulletin-recompose] job={job_id} could not snapshot existing pool: {exc}")
+        existing_pool = []
+
+    def _run_pipeline_sync() -> int:
+        """Spawn the V1 pipeline subprocess SYNCHRONOUSLY (block until
+        it exits). ``runner.run_pipeline`` is fire-and-forget — it
+        spawns a daemon thread and returns immediately, which leaves
+        the recompose worker thinking the job finished before it
+        actually started. For a recompose we need the opposite: the
+        ``state=done`` UI signal must mean the bulletin file is
+        physically on disk.
+
+        Returns the subprocess return code. Output is streamed into
+        backend stdout with a ``[bulletin-recompose:pipe]`` prefix so
+        the operator can tail the same backend.log they'd already be
+        watching.
+
+        Also captures ``[kaizer:meta] <path>`` markers — the pipeline
+        emits one per output (youtube_full + youtube_short for compound
+        jobs). The recompose worker uses these to swap ``job.output_dir``
+        to the new render and delete the old paired directories.
+        """
+        import sys as _sys
+        import subprocess as _sub
+        backend_root = Path(__file__).resolve().parent.parent
+        pipeline_script = backend_root / "pipeline_core" / "pipeline.py"
+        if not pipeline_script.is_file():
+            raise RuntimeError(f"pipeline.py not found at {pipeline_script}")
+        # Pipeline.py accepts EITHER --platform <single_platform_name>
+        # OR --compound (runs the both-pass compound flow). The compound
+        # job's platform field is ``youtube_full_plus_shorts`` which is
+        # NOT a valid value for --platform; argparse rejects it with
+        # rc=2 — see runner.py's pass-list construction for the same
+        # split. For a recompose we want the same shape as the
+        # original render.
+        if platform == "youtube_full_plus_shorts":
+            cmd = [
+                _sys.executable, "-u", str(pipeline_script),
+                video_path,
+                "--compound",
+                "--frame", frame,
+                "--language", lang,
+            ]
+        else:
+            cmd = [
+                _sys.executable, "-u", str(pipeline_script),
+                video_path,
+                "--platform", platform,
+                "--frame", frame,
+                "--language", lang,
+            ]
+        env = {
+            **os.environ,
+            "KAIZER_JOB_ID":  str(job.id),
+            "KAIZER_USER_ID": str(job.user_id or 0),
+            "PYTHONUNBUFFERED":    "1",
+            "PYTHONIOENCODING":    "utf-8",
+        }
+        if reuse_analysis:
+            env["KAIZER_REUSE_ANALYSIS_FROM"] = reuse_analysis
+        # Hand the existing pool to the bulletin pass so it cycles
+        # through the user's curated images instead of asking OpenAI
+        # for fresh ones from scratch. Pipe-separated because Windows
+        # paths contain ':'.
+        if existing_pool:
+            env["KAIZER_BULLETIN_IMAGES"] = "|".join(existing_pool)
+        proc = _sub.Popen(
+            cmd, cwd=str(backend_root),
+            stdout=_sub.PIPE, stderr=_sub.STDOUT,
+            text=True, bufsize=1,
+            encoding="utf-8", errors="replace",
+            env=env,
+        )
+        for line in proc.stdout:
+            ln = line.rstrip()
+            if not ln:
+                continue
+            print(f"[bulletin-recompose:pipe job={job.id}] {ln[-400:]}")
+            # Capture the [kaizer:meta] markers — one per render path
+            # (compound jobs emit two: full + shorts). The orchestrator
+            # uses these to repoint the job at the new output dir.
+            if "[kaizer:meta]" in ln:
+                payload = ln.split("[kaizer:meta]", 1)[1].strip()
+                if payload:
+                    new_meta_paths.append(payload)
+        return proc.wait()
+
     def _run():
+        # ``bdir`` is rewritten by the swap-and-cleanup step below once
+        # the new render lands at a fresh ``output/youtube_full/<ts>/``
+        # directory. Declaring it nonlocal here keeps Python from
+        # treating that assignment as creating a fresh local that
+        # shadows the enclosing scope (which would make this very
+        # first ``_apply_scope_invalidation(bdir, ...)`` call crash
+        # with UnboundLocalError).
+        nonlocal bdir
         try:
             with _RECOMPOSE_LOCK:
                 _RECOMPOSING[job_id] = {
@@ -558,13 +839,164 @@ def recompose_bulletin(
                 print(f"[bulletin-recompose] job={job_id} pre-invalidate ({scope}): {summary}")
 
             try:
-                import runner
-                runner.run_pipeline(job.id)
+                rc = _run_pipeline_sync()
             except Exception as exc:
                 with _RECOMPOSE_LOCK:
                     _RECOMPOSING[job_id] = {"state": "failed", "msg": str(exc)[:300]}
                 print(f"[bulletin-recompose] job={job_id} failed (fast pass): {exc}")
                 return
+            if rc != 0:
+                with _RECOMPOSE_LOCK:
+                    _RECOMPOSING[job_id] = {
+                        "state": "failed",
+                        "msg":   f"pipeline subprocess exited rc={rc}",
+                    }
+                print(f"[bulletin-recompose] job={job_id} fast pass returned rc={rc}")
+                return
+
+            # ── Render-new / repoint swap ──────────────────────────────
+            # The pipeline always writes to a fresh ``<output>/youtube_full/<ts>/``
+            # directory. To make the editor's player pick up the new
+            # bulletin without breaking anything else, we:
+            #   1. Resolve the NEW youtube_full output dir from the
+            #      [kaizer:meta] markers captured during the subprocess.
+            #   2. Repoint ``job.output_dir`` at it.
+            #   3. RENAME the OLD paired directories with a ``.old``
+            #      suffix instead of deleting them. We lost a user's
+            #      replaced images by deleting outright once — never
+            #      again. A disk-janitor script can prune ``*.old``
+            #      dirs older than N days; that decision is reversible.
+            try:
+                new_yt_full_dir: Optional[Path] = None
+                new_yt_short_dir: Optional[Path] = None
+                for mp in new_meta_paths:
+                    pp = Path(mp.strip())
+                    parent = pp.parent
+                    if "youtube_full" in str(parent).replace("\\", "/").lower():
+                        new_yt_full_dir = parent
+                    elif "youtube_short" in str(parent).replace("\\", "/").lower():
+                        new_yt_short_dir = parent
+
+                if new_yt_full_dir and new_yt_full_dir.is_dir():
+                    old_yt_full = bdir.parent
+                    backend_root = Path(__file__).resolve().parent.parent
+                    raw_out = (job.output_dir or "").strip()
+                    if raw_out:
+                        candidate = Path(raw_out)
+                        if not candidate.is_absolute():
+                            candidate = (backend_root / candidate).resolve()
+                        if (candidate != old_yt_full
+                                and candidate.is_dir()
+                                and "youtube_short" in str(candidate).replace("\\", "/").lower()):
+                            old_yt_short = candidate
+                        else:
+                            old_yt_short = None
+                    else:
+                        old_yt_short = None
+
+                    new_rel = str(new_yt_full_dir.resolve())
+                    # Build path-substitution map for Clip rows.
+                    # The editor's player URL is built from Clip.file_path,
+                    # not from job.output_dir — so repointing the job
+                    # alone leaves the player fetching the OLD path
+                    # (which we just demoted). Rewrite every Clip row
+                    # of this job: old yt_full prefix → new yt_full,
+                    # old yt_short prefix → new yt_short, in
+                    # file_path / thumb_path / image_path / meta JSON.
+                    subs: list[tuple[str, str]] = []
+                    backend_root = Path(__file__).resolve().parent.parent
+                    if old_yt_full and new_yt_full_dir:
+                        # Absolute + project-relative variants — Clip
+                        # rows have been observed with both shapes.
+                        abs_old = str(old_yt_full.resolve())
+                        abs_new = str(new_yt_full_dir.resolve())
+                        subs.append((abs_old, abs_new))
+                        try:
+                            rel_old = str(old_yt_full.resolve().relative_to(backend_root))
+                            rel_new = str(new_yt_full_dir.resolve().relative_to(backend_root))
+                            subs.append((rel_old, rel_new))
+                        except ValueError:
+                            pass
+                    if old_yt_short and new_yt_short_dir:
+                        abs_old = str(old_yt_short.resolve())
+                        abs_new = str(new_yt_short_dir.resolve())
+                        subs.append((abs_old, abs_new))
+                        try:
+                            rel_old = str(old_yt_short.resolve().relative_to(backend_root))
+                            rel_new = str(new_yt_short_dir.resolve().relative_to(backend_root))
+                            subs.append((rel_old, rel_new))
+                        except ValueError:
+                            pass
+
+                    def _sub_all(s: str) -> str:
+                        if not s:
+                            return s
+                        out = s
+                        for a, b in subs:
+                            if not a or not b:
+                                continue
+                            out = out.replace(a, b)
+                            # JSON-escaped variant — meta column stores
+                            # paths inside JSON where every backslash is
+                            # doubled. Replace both shapes.
+                            out = out.replace(a.replace("\\", "\\\\"), b.replace("\\", "\\\\"))
+                        return out
+
+                    job_db = SessionLocal()
+                    try:
+                        j2 = job_db.query(models.Job).filter(models.Job.id == job.id).first()
+                        if j2:
+                            j2.output_dir = new_rel
+                        # Rewrite every Clip row's path fields.
+                        clip_rows = job_db.query(models.Clip).filter(models.Clip.job_id == job.id).all()
+                        rewritten = 0
+                        for cr in clip_rows:
+                            changed = False
+                            for attr in ("file_path", "thumb_path", "image_path"):
+                                v = getattr(cr, attr, None)
+                                if isinstance(v, str) and v:
+                                    nv = _sub_all(v)
+                                    if nv != v:
+                                        setattr(cr, attr, nv)
+                                        changed = True
+                            if cr.meta:
+                                nm = _sub_all(cr.meta)
+                                if nm != cr.meta:
+                                    cr.meta = nm
+                                    changed = True
+                            if changed:
+                                rewritten += 1
+                        job_db.commit()
+                        print(f"[bulletin-recompose] job={job_id} repointed output_dir -> {new_rel}, rewrote {rewritten}/{len(clip_rows)} clip path fields")
+                    finally:
+                        job_db.close()
+
+                    # Safe demotion — rename OLD dirs to ``<name>.old.<ts>``.
+                    # If a .old already exists from a previous recompose
+                    # we just leave the current name in place rather
+                    # than risk clobbering it.
+                    import time as _time
+                    ts_suffix = _time.strftime("%Y%m%d_%H%M%S")
+                    for old_dir in (old_yt_full, old_yt_short):
+                        if old_dir and old_dir.is_dir() and old_dir not in (new_yt_full_dir, new_yt_short_dir):
+                            demoted = old_dir.with_name(f"{old_dir.name}.old.{ts_suffix}")
+                            try:
+                                old_dir.rename(demoted)
+                                print(f"[bulletin-recompose] job={job_id} demoted OLD dir: {old_dir} -> {demoted.name}")
+                            except OSError as exc:
+                                print(f"[bulletin-recompose] could not demote {old_dir}: {exc}")
+
+                    # Switch ``bdir`` to the new path for downstream
+                    # steps (verify pass + done message).
+                    bdir = new_yt_full_dir / "bulletin"
+                else:
+                    print(f"[bulletin-recompose] job={job_id} could not find new yt_full dir in "
+                          f"{len(new_meta_paths)} meta markers — old paths kept")
+            except Exception as exc:
+                # Swap failed but the new render is on disk — log and
+                # leave the old paths in place so the user can still
+                # find the result by walking output/.
+                print(f"[bulletin-recompose] job={job_id} swap-and-cleanup soft-fail: {exc}")
 
             psnr_db: Optional[float] = None
             if do_verify:
@@ -590,7 +1022,9 @@ def recompose_bulletin(
                 _apply_scope_invalidation(bdir, "full")
                 full_out = bdir / "bulletin.mp4"
                 try:
-                    runner.run_pipeline(job.id)
+                    rc2 = _run_pipeline_sync()
+                    if rc2 != 0:
+                        raise RuntimeError(f"pipeline subprocess exited rc={rc2}")
                 except Exception as exc:
                     # Verify pass crashed mid-render. The fast output is
                     # still safe at fast_keep — restore it as the canonical

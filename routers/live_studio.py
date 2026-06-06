@@ -51,6 +51,7 @@ from live_studio import concurrency
 from live_studio import orchestrator as live_orch
 from live_studio import seo as live_seo
 from live_studio import uploads as live_uploads
+from live_studio import url_ingest as live_url_ingest
 
 
 router = APIRouter(prefix="/api/live-studio", tags=["live-studio"])
@@ -60,13 +61,19 @@ router = APIRouter(prefix="/api/live-studio", tags=["live-studio"])
 
 class BatchVideoIn(BaseModel):
     """One video in the batch. The browser uploads this file via
-    chunks AFTER batch creation (we need the stream id back first)."""
+    chunks AFTER batch creation (we need the stream id back first).
+
+    If ``source_url`` is set, the server ingests the video via yt-dlp
+    instead — no chunk upload required. The orchestrator's existing
+    /start path picks it up once the download lands.
+    """
     filename:      str = Field(..., min_length=1, max_length=255)
     size_bytes:    int = Field(0, ge=0)
     duration_hours:float = Field(1.0, gt=0, le=24)
     channel_ids:   list[int] = Field(..., min_length=1)
     seo_source:    str = Field("user", pattern="^(user|ai)$")
     seo:           live_seo.LiveSeoIn
+    source_url:    Optional[str] = None     # YouTube URL → server-side fetch
 
     @field_validator("filename")
     @classmethod
@@ -88,6 +95,17 @@ class BatchStreamOut(BaseModel):
     progress_pct: int
     title:        str
     duration_hours: float
+    yt_video_id:  Optional[str] = None
+    yt_watch_url: Optional[str] = None
+    started_at:   Optional[datetime] = None
+    finished_at:  Optional[datetime] = None
+    thumbnail_url: Optional[str] = None
+    message:      Optional[str] = None
+    error:        Optional[str] = None
+    upload_bytes: int = 0
+    upload_total: Optional[int] = None
+    upload_done:  bool = False
+    source_url:   Optional[str] = None
 
 
 class BatchOut(BaseModel):
@@ -104,6 +122,42 @@ class BatchOut(BaseModel):
 
 # ─── Helpers ─────────────────────────────────────────────────────
 
+def _watch_url(yt_video_id: Optional[str]) -> Optional[str]:
+    yid = (yt_video_id or "").strip()
+    return f"https://www.youtube.com/watch?v={yid}" if yid else None
+
+
+def _thumb_url(stream_id: int, thumbnail_path: Optional[str]) -> Optional[str]:
+    # Only expose the URL if the file actually exists on disk — avoids
+    # broken <img>s in the UI when a row has the column populated from
+    # a prior attempt but the file got cleaned up.
+    p = (thumbnail_path or "").strip()
+    if not p or not os.path.isfile(p):
+        return None
+    return f"/api/live-studio/streams/{stream_id}/thumbnail"
+
+
+def _stream_to_out(s: models.LiveStream) -> BatchStreamOut:
+    return BatchStreamOut(
+        id=s.id, video_slot=s.video_slot,
+        channel_id=s.channel_id or 0,
+        status=s.status, progress_pct=s.progress_pct,
+        title=s.title or "",
+        duration_hours=float(s.target_hours or 0),
+        yt_video_id=s.yt_video_id or None,
+        yt_watch_url=_watch_url(s.yt_video_id),
+        started_at=s.started_at,
+        finished_at=s.finished_at,
+        thumbnail_url=_thumb_url(s.id, getattr(s, "thumbnail_path", None)),
+        message=s.message,
+        error=s.error,
+        upload_bytes=int(s.upload_bytes or 0),
+        upload_total=s.upload_total,
+        upload_done=bool(s.upload_done),
+        source_url=getattr(s, "source_url", None),
+    )
+
+
 def _batch_to_out(batch: models.LiveBatch, streams: list[models.LiveStream]) -> BatchOut:
     return BatchOut(
         id=batch.id,
@@ -113,15 +167,7 @@ def _batch_to_out(batch: models.LiveBatch, streams: list[models.LiveStream]) -> 
         total_streams=batch.total_streams,
         streams_done=batch.streams_done,
         streams_failed=batch.streams_failed,
-        streams=[
-            BatchStreamOut(
-                id=s.id, video_slot=s.video_slot,
-                channel_id=s.channel_id or 0,
-                status=s.status, progress_pct=s.progress_pct,
-                title=s.title or "",
-                duration_hours=float(s.target_hours or 0),
-            ) for s in streams
-        ],
+        streams=[_stream_to_out(s) for s in streams],
         created_at=batch.created_at,
     )
 
@@ -273,11 +319,16 @@ def generate_seo(
         targets the right fixes.
         """
         parts = [
-            "Generate a single JSON object with keys "
-            "{title, description, tags, hashtags} for the topic below. "
-            "There is no transcript or upstream metadata — only the "
-            "operator's brief. Treat the brief as the entire context. "
-            "Score target: ≥{} (verifier-graded).".format(seo_gen.TARGET_SCORE),
+            # f-string with doubled braces — the literal {title,…} is part
+            # of the human-readable schema description, not a placeholder.
+            # The previous .format() call collided on the literal braces
+            # and raised KeyError('title, description, tags, hashtags')
+            # before Gemini was ever called.
+            f"Generate a single JSON object with keys "
+            f"{{title, description, tags, hashtags}} for the topic below. "
+            f"There is no transcript or upstream metadata — only the "
+            f"operator's brief. Treat the brief as the entire context. "
+            f"Score target: ≥{seo_gen.TARGET_SCORE} (verifier-graded).",
             "",
             "TOPIC / BRIEF:",
             f'"""\n{brief_text}\n"""',
@@ -357,21 +408,23 @@ def generate_seo(
     if not best:
         raise HTTPException(502, "SEO generation produced no usable candidates")
 
-    # Strict-validate the final result against YouTube hard caps.
-    try:
-        validated = live_seo.validate_ai_path(live_seo.LiveSeoIn(
-            title       = (best.get("title") or "").strip(),
-            description = (best.get("description") or "").strip(),
-            tags        = list(best.get("tags") or best.get("keywords") or []),
-            privacy     = payload.privacy or "unlisted",
-            made_for_kids = False,
-        ))
-    except ValueError as exc:
-        raise HTTPException(
-            422,
-            f"Editor SEO best-of-{len(attempts_log)} attempt(s) failed "
-            f"strict validator: {exc}. Edit manually or retry generation."
-        )
+    # YouTube-hard-cap conformance. We use the truncating sanitizer
+    # (same one the user-typed path uses), NOT the strict reject-path
+    # validator, because the verifier loop already graded brand-safety
+    # and topical quality. The verifier's title-length target is
+    # 75-90 chars — narrower than YouTube's 100 ceiling — so a
+    # well-scored attempt can still be 5-10 chars over the verifier's
+    # ideal while remaining fully publishable. The old strict path
+    # turned that into a 422 ("AI title is 106 chars, limit 100")
+    # and the user got no usable output despite a green-ish score.
+    # Truncate on a word boundary instead → user always sees output.
+    validated = live_seo.sanitize_for_user_path(live_seo.LiveSeoIn(
+        title         = (best.get("title") or "").strip(),
+        description   = (best.get("description") or "").strip(),
+        tags          = list(best.get("tags") or best.get("keywords") or []),
+        privacy       = payload.privacy or "unlisted",
+        made_for_kids = False,
+    ))
 
     return {
         "ok":       True,
@@ -471,12 +524,34 @@ def create_batch(
                 tags_json=json.dumps(cleaned.tags, ensure_ascii=False),
                 privacy=cleaned.privacy,
                 made_for_kids=cleaned.made_for_kids,
+                source_url=(vid.source_url or "")[:1024] or None,
             )
             db.add(row); db.commit(); db.refresh(row)
             # The upload path needs the row id so we set it now.
             row.upload_path = live_uploads.upload_path_for(row.id)
             db.commit()
             streams.append(row)
+
+    # URL-sourced videos: kick off a single yt-dlp download per
+    # video_slot. The daemon thread fans out the resulting file to
+    # every stream sharing the slot via hardlink, then flips them
+    # to ``uploaded`` so the standard /start endpoint takes over.
+    streams_by_slot: dict[int, list[int]] = {}
+    for s in streams:
+        streams_by_slot.setdefault(s.video_slot, []).append(s.id)
+    for vi, vid in enumerate(payload.videos):
+        url = (vid.source_url or "").strip()
+        if not url:
+            continue
+        if not live_url_ingest.is_supported_url(url):
+            raise HTTPException(
+                400,
+                f"video[{vi}] source_url is not a recognised YouTube URL: {url}",
+            )
+        live_url_ingest.kick_off(
+            batch_id=batch.id, video_slot=vi,
+            source_url=url, stream_ids=streams_by_slot.get(vi, []),
+        )
 
     return _batch_to_out(batch, streams)
 
@@ -602,17 +677,53 @@ def list_batches(
           .limit(min(max(1, limit), 200))
           .all()
     )
+    # Hydrate per-stream YouTube watch links + finished timestamps so
+    # the History pane can deep-link to each broadcast without a
+    # second round-trip. One query, joined by batch_id.
+    batch_ids = [b.id for b in rows]
+    streams_by_batch: dict[int, list[models.LiveStream]] = {}
+    if batch_ids:
+        for s in (
+            db.query(models.LiveStream)
+              .filter(models.LiveStream.batch_id.in_(batch_ids))
+              .order_by(models.LiveStream.video_slot.asc(),
+                        models.LiveStream.id.asc())
+              .all()
+        ):
+            streams_by_batch.setdefault(s.batch_id, []).append(s)
+    # Compute an "effective" batch status from the underlying streams.
+    # The DB ``batch.status`` is set at creation and never moves, so
+    # without this hint every batch sits at ``queued`` forever in the
+    # UI — even after every stream has finished (or been swept by the
+    # startup orphan-fixer). The UI uses this derived status for the
+    # status pill so the operator sees an honest snapshot at a glance.
+    def _effective(streams_for_batch: list[models.LiveStream], db_status: str) -> str:
+        if not streams_for_batch:
+            return db_status
+        terminal = {"done", "failed", "canceled"}
+        statuses = [s.status for s in streams_for_batch]
+        if not all(st in terminal for st in statuses):
+            # Anything still in flight → keep the in-flight signal.
+            return db_status
+        # All streams terminal — pick the dominant outcome.
+        if "done" in statuses:
+            return "done"
+        if "failed" in statuses:
+            return "failed"
+        return "canceled"
+
     return {
         "batches": [
             {
                 "id":           b.id,
                 "public_id":    b.public_id,
-                "status":       b.status,
+                "status":       _effective(streams_by_batch.get(b.id, []), b.status),
                 "message":      b.message,
                 "total":        b.total_streams,
-                "done":         b.streams_done,
-                "failed":       b.streams_failed,
+                "done":         sum(1 for s in streams_by_batch.get(b.id, []) if s.status == "done"),
+                "failed":       sum(1 for s in streams_by_batch.get(b.id, []) if s.status == "failed"),
                 "created_at":   b.created_at,
+                "streams":      [_stream_to_out(s) for s in streams_by_batch.get(b.id, [])],
             } for b in rows
         ],
         "count": len(rows),
@@ -668,8 +779,150 @@ def get_stream(
         "tags":           json.loads(row.tags_json) if row.tags_json else [],
         "privacy":        row.privacy,
         "yt_video_id":    row.yt_video_id,
+        "yt_watch_url":   _watch_url(row.yt_video_id),
+        "thumbnail_url":  _thumb_url(row.id, getattr(row, "thumbnail_path", None)),
         "backup_url":     row.backup_url,
     }
+
+
+# ─── Thumbnail upload / serve ────────────────────────────────────
+#
+# Thumbnails are per-video (one image for the whole video_slot,
+# regardless of how many channels it broadcasts to). The frontend
+# uploads ONCE after batch creation and the server writes the same
+# path into every stream row that shares the batch+slot. The
+# orchestrator hands the file to youtube.uploader.set_thumbnail
+# after the broadcast is minted.
+
+# 2 MB is YouTube's recommended ceiling for thumbnails.set; the
+# uploader shrinks larger inputs but rejecting up front saves a
+# round-trip on obvious oversize.
+MAX_THUMB_BYTES = 4 * 1024 * 1024
+_ALLOWED_THUMB_MIME = ("image/jpeg", "image/jpg", "image/png", "image/webp")
+
+
+def _thumb_dir() -> str:
+    # Co-locate thumbnails with the chunked video uploads so cleanup
+    # paths (R2 backup, --resume-dir, periodic janitor) see them.
+    base = os.path.dirname(live_uploads.upload_path_for(0))
+    out = os.path.join(base, "_thumbs")
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _thumb_path_for(batch_id: int, video_slot: int, ext: str) -> str:
+    safe_ext = (ext or "jpg").lstrip(".").lower()
+    if safe_ext not in ("jpg", "jpeg", "png", "webp"):
+        safe_ext = "jpg"
+    return os.path.join(_thumb_dir(), f"b{batch_id}_v{video_slot}.{safe_ext}")
+
+
+@router.post("/batches/{batch_id}/videos/{video_slot}/thumbnail")
+async def upload_thumbnail(
+    batch_id: int,
+    video_slot: int,
+    request: Request,
+    content_type: Optional[str] = Header(default=None, alias="Content-Type"),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """Receive a thumbnail for one video in a batch and apply it to
+    every stream sharing that (batch, video_slot).
+
+    Body: raw image bytes (no multipart wrapper — same fast-path the
+    chunk upload uses). Header ``Content-Type`` carries the mime type
+    (``image/jpeg`` / ``image/png`` / ``image/webp``).
+    """
+    batch = db.query(models.LiveBatch).filter(
+        models.LiveBatch.id == batch_id,
+        models.LiveBatch.user_id == user.id,
+    ).first()
+    if not batch:
+        raise HTTPException(404, "batch not found")
+
+    streams = (
+        db.query(models.LiveStream)
+          .filter(
+              models.LiveStream.batch_id == batch.id,
+              models.LiveStream.video_slot == video_slot,
+              models.LiveStream.user_id == user.id,
+          )
+          .all()
+    )
+    if not streams:
+        raise HTTPException(404, "no streams found for that video slot")
+
+    # Refuse if any stream is already mid-broadcast — YouTube accepts
+    # thumbnail changes mid-stream but the operator probably meant to
+    # set it before starting, and silently doing it after start is a
+    # surprising side-effect. Cancelled / failed / done rows are fine
+    # to skip (no-op on apply).
+    for s in streams:
+        if s.status in ("provisioning", "starting", "streaming"):
+            raise HTTPException(
+                409,
+                f"stream {s.id} is already in flight ({s.status}); "
+                "cancel and recreate the batch to change the thumbnail",
+            )
+
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if mime not in _ALLOWED_THUMB_MIME:
+        raise HTTPException(
+            415,
+            f"unsupported thumbnail mime type {mime!r} "
+            f"(allowed: {', '.join(_ALLOWED_THUMB_MIME)})",
+        )
+    ext = "jpg" if mime in ("image/jpeg", "image/jpg") else mime.split("/", 1)[1]
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty thumbnail body")
+    if len(body) > MAX_THUMB_BYTES:
+        raise HTTPException(
+            413,
+            f"thumbnail is {len(body)} bytes — limit {MAX_THUMB_BYTES} "
+            "(YouTube accepts ≤2 MB; we shrink up to 4 MB inputs)",
+        )
+
+    path = _thumb_path_for(batch.id, video_slot, ext)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(body)
+    except OSError as exc:
+        raise HTTPException(500, f"thumbnail write failed: {exc}")
+
+    # Replicate the path across every stream sharing this video slot.
+    # All N streams (one per channel destination) use the same image.
+    for s in streams:
+        s.thumbnail_path = path
+    db.commit()
+
+    return {
+        "ok":             True,
+        "bytes":          len(body),
+        "applied_to":     [s.id for s in streams],
+        "thumbnail_url":  f"/api/live-studio/streams/{streams[0].id}/thumbnail",
+    }
+
+
+@router.get("/streams/{stream_id}/thumbnail")
+def get_thumbnail(
+    stream_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Serve the raw thumbnail image for one stream."""
+    from fastapi.responses import FileResponse
+    row = _owned_stream(db, stream_id, user.id)
+    path = (getattr(row, "thumbnail_path", "") or "").strip()
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "no thumbnail set")
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    mt = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png",  "webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=mt)
 
 
 @router.get("/health")
