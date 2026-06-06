@@ -43,6 +43,7 @@ from routers.seo import router as seo_router
 from routers.youtube_oauth import router as youtube_oauth_router
 from routers.youtube_upload import router as youtube_upload_router
 from routers.meta_oauth import router as meta_oauth_router
+from routers.linkedin_oauth import router as linkedin_oauth_router
 from routers.youtube_quota import router as youtube_quota_router
 from routers.campaigns import router as campaigns_router
 from routers.performance import router as performance_router
@@ -499,6 +500,7 @@ app.include_router(seo_router)
 app.include_router(youtube_oauth_router)
 app.include_router(youtube_upload_router)
 app.include_router(meta_oauth_router)
+app.include_router(linkedin_oauth_router)
 app.include_router(youtube_quota_router)
 # Billion-dollar phases A–E: campaigns, performance, translation, trending radar.
 app.include_router(campaigns_router)

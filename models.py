@@ -351,6 +351,48 @@ class MetaAccount(Base):
     publishes_today_at    = Column(DateTime(timezone=True), nullable=True)
 
 
+class LinkedInAccount(Base):
+    """One connected LinkedIn destination — either a personal profile
+    or a Company Page the operator is an admin of.
+
+    LinkedIn tokens are simpler than Meta's: a single short-lived
+    access token (60 days) plus a refresh token (365 days) you can
+    swap for a fresh access token at any time. Both are Fernet-
+    encrypted at rest.
+
+    The `linkedin_urn` is what we POST against. For a personal
+    profile it's "urn:li:person:<id>"; for a Company Page it's
+    "urn:li:organization:<id>". Single column covers both."""
+    __tablename__ = "linkedin_accounts"
+
+    id                = Column(Integer, primary_key=True, index=True)
+    user_id           = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                               nullable=False, index=True)
+
+    linkedin_urn      = Column(String(120), default="", index=True)  # urn:li:person:... or urn:li:organization:...
+    linkedin_id       = Column(String(64),  default="")              # raw id without urn prefix
+    profile_name      = Column(String(255), default="")
+    profile_headline  = Column(String(255), default="")
+    profile_pic_url   = Column(String(500), default="")
+    profile_url       = Column(String(500), default="")
+    # "person" | "organization" — picks the right Posts API field
+    # (author=urn vs. author=urn but with different payload shape).
+    account_type      = Column(String(20),  default="person")
+
+    access_token_enc  = Column(Text, default="")
+    refresh_token_enc = Column(Text, default="")
+    token_expiry      = Column(DateTime(timezone=True), nullable=True)
+    granted_scopes    = Column(Text, default="")
+
+    connected_at      = Column(DateTime(timezone=True), server_default=func.now())
+    last_refreshed_at = Column(DateTime(timezone=True), nullable=True)
+    last_publish_at   = Column(DateTime(timezone=True), nullable=True)
+
+    upload_provider   = Column(String(20), nullable=True)
+    publishes_today    = Column(Integer, default=0)
+    publishes_today_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class ChannelGroup(Base):
     """User-defined group of YouTube destinations for one-click fan-out.
 
