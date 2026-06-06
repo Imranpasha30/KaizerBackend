@@ -35,7 +35,31 @@ def build_system_prompt(
 ) -> str:
     """Channel-agnostic system prompt.  Tells Gemini to produce news-topic SEO
     with ZERO channel branding — that's added mechanically at publish time.
+
+    The language is resolved through `languages.get(...)` so the prompt
+    carries the FULL language name + native script directive instead of
+    just the ISO code. Without this Gemini tends to fall back to English
+    for `te`/`hi`/etc., which breaks the contract that the bulletin's
+    SEO must match the language the operator selected in the wizard.
     """
+    # Resolve to the rich language config — gives us name_english,
+    # name_native, script. Falls back to Telugu silently for unknown
+    # codes (same behaviour as the rest of the pipeline).
+    try:
+        import languages as _langs  # local import — avoid circular at module load
+        cfg = _langs.get(language)
+        lang_full = cfg.name_english          # "Telugu", "Hindi", ...
+        lang_native = cfg.name_native          # "తెలుగు", "हिन्दी", ...
+        script_name = cfg.script               # "Telugu", "Devanagari", ...
+        lang_code = cfg.code or language
+    except Exception:
+        # Defensive fallback so a missing languages module never blocks
+        # SEO generation entirely.
+        lang_full = language
+        lang_native = ""
+        script_name = ""
+        lang_code = language
+
     voice_block = ""
     if style_source:
         tf = (style_source.title_formula or "").strip()
@@ -49,8 +73,37 @@ Do NOT include the reference channel's name, handle, hashtags, or any
 branding in the output.  Use only its RHYTHM and WORDING STYLE.
 """
 
+    # Hard language directive — placed at the very top of the system
+    # prompt so Gemini reads it before any other rule. The script name
+    # ("Telugu", "Devanagari", ...) is the unambiguous instruction; the
+    # native name ("తెలుగు", "हिन्दी", ...) is a concrete example
+    # Gemini can pattern-match against when writing back.
+    language_directive = (
+        f"# ⚠ LANGUAGE CONTRACT (MOST IMPORTANT RULE)\n"
+        f"All SEO output (title, description, keywords, hashtags, hook,\n"
+        f"thumbnail_text) MUST be written in {lang_full} ({lang_native})\n"
+        f"using the {script_name} script natively. ISO code: {lang_code}.\n"
+        f"\n"
+        f"- The TITLE may mix native script with one or two English\n"
+        f"  power words (e.g. \"Shocking\", \"Breaking\", \"Exclusive\")\n"
+        f"  AS LONG AS the bulk of the headline is in {script_name} script.\n"
+        f"- The DESCRIPTION must be in {lang_full} ({script_name} script)\n"
+        f"  with at most one English line for the opening hook. No\n"
+        f"  romanised transliteration of {lang_full} words — write them\n"
+        f"  in the proper script.\n"
+        f"- KEYWORDS: 60% in {lang_full} ({script_name}), 40% English.\n"
+        f"- HASHTAGS: at least 4 of the 10-12 hashtags must be in\n"
+        f"  {script_name} script (e.g. native-script topic names).\n"
+        f"- HOOK and THUMBNAIL_TEXT may be English IF that maximises CTR,\n"
+        f"  but prefer the native script when the topic is local news.\n"
+        f"\n"
+        f"If the output language doesn't match the operator's selection,\n"
+        f"our verifier rejects the SEO and the operator has to regenerate\n"
+        f"manually — that's a failure mode we never want.\n\n"
+    )
+
     return f"""\
-You are an elite YouTube SEO strategist specializing in {language}-language news.
+{language_directive}You are an elite YouTube SEO strategist specializing in {lang_full} ({lang_native}) news.
 Your job: write viral, click-worthy, factually-honest SEO metadata that will
 score ≥{target_score}/100 on our independent verifier.
 
@@ -74,16 +127,31 @@ will be mechanically stripped before publish.
   word (Shocking, Breaking, Exclusive, Revealed, Viral, or the native-script
   equivalent: బిగ్, షాకింగ్, బ్రేకింగ్, వైరల్, ...).  Put the key person
   / place in the first 6 words.
-- `description`: 700-1800 characters.  Plain text, no markdown.  Line 1 is
-  the HOOK sentence, verbatim.  Then 3 context paragraphs with blank-line
-  breaks.  Cite facts from "Live Google News context" if provided.  Do NOT
-  include hashtag-only lines or subscribe lines.
-- `keywords`: exactly 28-30 unique SEO tags.  Plain lowercase strings.  No
-  '#' prefix.  Total combined length ≤500 chars (YouTube hard cap).  Must
-  include 2-3 trending keywords from "Google Trends" if provided.  Mix
-  English + native-script.
+- `description`: 700-1800 characters.  Plain text, no markdown.  Structure:
+    1. Line 1: the HOOK sentence, verbatim.
+    2. Three context paragraphs separated by blank lines.  Cite facts from
+       "Live Google News context" if provided.
+    3. A blank line, then a HASHTAG BLOCK as the FINAL line(s) — every
+       hashtag from `hashtags` listed inline separated by spaces (e.g.
+       `#TeluguNews #BreakingNews #HeeraGold ...`). This block is what
+       YouTube surfaces above the title for viewers; without it the
+       channel loses the top-of-watch-page hashtag chip.
+  Do NOT include subscribe lines or "follow us" blocks anywhere — those
+  land per-destination at publish time.
+- `keywords`: exactly 28-30 unique SEO TAGS (the hidden YouTube tags
+  field — NOT the hashtags). Plain lowercase strings.  No '#' prefix.
+  Total combined length ≤500 chars (YouTube hard cap).  Must include
+  2-3 trending keywords from "Google Trends" if provided.  Mix English
+  + native-script. These TAGS and the HASHTAGS below are two separate
+  surfaces with different roles — they MUST be substantially different
+  sets (allow at most 2 overlapping topics, the rest unique). The
+  hashtags drive viewer-facing topic chips; the keywords drive the
+  recommendation algorithm.
 - `hashtags`: 10-12 unique hashtags with '#' prefix, strict CamelCase.  No
   spaces, no punctuation inside the tag.  Topic-only — NO channel brands.
+  These appear in the description block (see above) AND above the title
+  on the YouTube watch page. Pick the 10-12 most clickable topic chips,
+  not the 10-12 most searched terms — those go in `keywords`.
 - `hook`: one strong opening sentence reused on thumbnails + social copy.
 - `thumbnail_text`: 2-5 shouting words, no punctuation.
 - `metadata.sentiment`: one of shock | breaking | political | emotional | analytical | positive

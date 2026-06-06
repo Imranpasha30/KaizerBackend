@@ -1125,7 +1125,37 @@ def _process_via_postiz(
                 pass
 
 
+# Substrings in the failure message that mean the same error WILL
+# happen again on the next attempt — retrying is pointless and just
+# burns clock + makes the UI look stuck for an hour+. These get
+# converted into an immediate terminal `provider_failed` so the editor
+# can show a clear "Fix Postiz" / "Reconnect channel" CTA instead of
+# a spinning queued state.
+_TERMINAL_PROVIDER_HINTS = (
+    "No subscription found",       # Postiz subscription expired / cancelled
+    "Invalid Postiz token",        # Postiz API key revoked / wrong env
+    "invalid_grant",               # YouTube OAuth refresh token revoked
+    "Account has been deleted",    # YouTube channel deleted
+    "youtubeSignupRequired",       # destination has no YouTube channel
+    "Postiz integration not found",  # operator removed the integration
+)
+
+
+def _is_terminal_provider_error(err: str) -> bool:
+    if not err:
+        return False
+    e = err.lower()
+    return any(h.lower() in e for h in _TERMINAL_PROVIDER_HINTS)
+
+
 def _retry(db: Session, job: models.UploadJob, err: str) -> None:
+    # Terminal provider errors short-circuit the retry ladder. Without
+    # this, a dead Postiz subscription burns 30+60+120+300+900+3600s of
+    # worker time per affected upload before failing — and the UI looks
+    # stuck for the whole window.
+    if _is_terminal_provider_error(err):
+        _fail(db, job, err, status="provider_failed")
+        return
     if (job.attempts or 0) >= MAX_ATTEMPTS:
         _fail(db, job, f"exceeded {MAX_ATTEMPTS} attempts — {err}")
         return
@@ -1140,8 +1170,14 @@ def _retry(db: Session, job: models.UploadJob, err: str) -> None:
     # The next poll cycle will pick it up
 
 
-def _fail(db: Session, job: models.UploadJob, err: str) -> None:
-    _append_log(job, f"FAILED — {err}")
-    job.status = "failed"
+def _fail(db: Session, job: models.UploadJob, err: str,
+          *, status: str = "failed") -> None:
+    """Mark the job terminal. ``status`` defaults to ``"failed"`` (the
+    legacy 'we tried everything and it didn't work' state). Callers can
+    pass ``status="provider_failed"`` for known upstream-config errors
+    (dead Postiz subscription, revoked OAuth, etc.) so the editor can
+    render a remediation CTA instead of the generic 'failed' pill."""
+    _append_log(job, f"{status.upper()} — {err}")
+    job.status = status
     job.last_error = err[:500]
     db.commit()

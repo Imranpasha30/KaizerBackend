@@ -21,12 +21,102 @@ visual polish without re-deriving any of the filtergraph math.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# Bump when the per-story compose filter graph changes in a way that
+# would produce different pixels from the same canvas inputs. Treated
+# as a string ingredient in the hash so old cached clips invalidate
+# automatically the next time render_bulletin runs.
+_PER_STORY_RENDERER_VERSION = "v4-2026-06-06-no-ticker"
+
+
+def _per_story_cache_hash(*,
+                          story,
+                          ticker_path: str,  # kept in signature for back-compat; ignored now
+                          sidebar_path: str,
+                          layout,
+                          channel_bug_path: str,
+                          watermark_path: str,
+                          watermark_position: str,
+                          font_path: str,
+                          bg_video_abs: Optional[str],
+                          bg_video_volume: float,
+                          language_code: str) -> str:
+    """Deterministic short hash of every input that influences the
+    rendered story clip. If anything in here changes, the cached
+    composed_story_NN.mp4 is stale and must be re-rendered."""
+    layout_keys = ("width", "height", "bg_color",
+                   "video_x_pct", "video_y_pct", "video_w_pct", "video_h_pct",
+                   "picture_x_pct", "picture_y_pct", "picture_w_pct", "picture_h_pct",
+                   "brand_logo_path",
+                   "brand_logo_x_pct", "brand_logo_y_pct", "brand_logo_w_pct",
+                   "bg_video_path", "bg_video_volume", "bg_intro_seconds")
+    layout_blob = {}
+    if layout is not None:
+        for k in layout_keys:
+            v = getattr(layout, k, None)
+            if isinstance(v, float):
+                v = round(v, 4)
+            layout_blob[k] = v
+    # _file_fingerprint: include path + size + mtime so a same-named
+    # ticker.png with different content invalidates the cache.
+    def _fp(p: Optional[str]) -> dict:
+        if not p:
+            return {"p": None}
+        try:
+            st = os.stat(p)
+            return {"p": str(p), "s": st.st_size, "m": int(st.st_mtime)}
+        except OSError:
+            return {"p": str(p), "s": 0, "m": 0}
+    blob = {
+        "renderer": _PER_STORY_RENDERER_VERSION,
+        "language": language_code,
+        "story": {
+            "title_native":  getattr(story, "title_native", "") or "",
+            "title_english": getattr(story, "title_english", "") or "",
+            "summary":       getattr(story, "summary", "") or "",
+            "video_t_start": round(float(getattr(story, "video_t_start", 0.0)), 3),
+            "video_t_end":   round(float(getattr(story, "video_t_end", 0.0)), 3),
+            "story_index":   int(getattr(story, "story_index", 0) or 0),
+            "total_stories": int(getattr(story, "total_stories", 0) or 0),
+        },
+        # NOTE: ticker_path intentionally excluded — the ticker is now
+        # overlaid AFTER stitch, so per-story clips no longer depend
+        # on the headline list. Title edits only invalidate the
+        # ticker-overlay pass, not the per-story cache.
+        "sidebar":  _fp(sidebar_path),
+        "bug":      _fp(channel_bug_path),
+        "watermark": _fp(watermark_path),
+        "watermark_position": watermark_position or "",
+        "font":     _fp(font_path),
+        "bg_video": _fp(bg_video_abs),
+        "bg_video_volume": round(float(bg_video_volume or 0.0), 3),
+        "layout":   layout_blob,
+    }
+    raw = json.dumps(blob, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_cached_hash(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _write_cached_hash(path: str, value: str) -> None:
+    try:
+        Path(path).write_text(value, encoding="utf-8")
+    except OSError as exc:
+        print(f"[v4/v1_bridge] cache hash write failed: {exc}", flush=True)
 
 
 # ── Bg-video helpers ─────────────────────────────────────────────────
@@ -131,6 +221,42 @@ def _concat_clips(intro_path: str, main_path: str, out_path: str,
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 20)
     if proc.returncode != 0:
         raise RuntimeError(f"concat failed: {proc.stderr[-800:]}")
+
+
+def _overlay_ticker_post_stitch(*, bulletin_path: str, ticker_png_path: str,
+                                  out_path: str,
+                                  canvas_w: int, canvas_h: int,
+                                  ticker_y: int,
+                                  ticker_speed_px_s: float = 200.0) -> None:
+    """Overlay a scrolling ticker onto the already-stitched bulletin.
+
+    Moving the ticker out of the per-story composer means a title edit
+    invalidates only the ticker.png + this one post-stitch pass, not
+    every per-story compose. Cost: one re-encoding pass over the full
+    bulletin instead of N concat-copy concat ops. Net win on incremental
+    edits scales with N.
+    """
+    ffmpeg = _ffmpeg_bin()
+    cmd = [
+        ffmpeg, "-y", "-v", "error",
+        "-i", bulletin_path,
+        "-loop", "1", "-i", ticker_png_path,
+        "-filter_complex",
+        f"[0:v][1:v]overlay="
+        f"x='W-mod(t*{ticker_speed_px_s:.1f}\\,w+W)':y={ticker_y}:"
+        f"format=auto:shortest=1[v]",
+        "-map", "[v]",
+        "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-r", "30", "-fps_mode", "cfr",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 20)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ticker overlay failed: {proc.stderr[-800:]}")
 
 
 def _file_has_audio(path: str) -> bool:
@@ -440,6 +566,7 @@ def _compose_v4_bulletin_story(
     watermark_position: str = "top-right",
     bg_video_path: Optional[str] = None,   # studio bg looped behind canvas
     bg_video_volume: float = 0.0,          # 0..1 mixed against story audio
+    apply_ticker: bool = True,             # bake scrolling ticker into clip
 ) -> str:
     """V4-flavoured bulletin story composer.
 
@@ -495,7 +622,12 @@ def _compose_v4_bulletin_story(
     else:
         cmd += ["-loop", "1", "-i", sidebar_path]
     cmd += ["-loop", "1", "-i", lt_path]
-    cmd += ["-loop", "1", "-i", ticker_path]
+    # Ticker can be skipped per-story when the stitch-level overlay
+    # path is in use — this is what lets title edits stay incremental
+    # (changing a title invalidates only the ticker pass, not every
+    # per-story compose).
+    if apply_ticker:
+        cmd += ["-loop", "1", "-i", ticker_path]
     has_bug = bool(channel_bug_path and os.path.isfile(channel_bug_path))
     if has_bug:
         cmd += ["-loop", "1", "-i", channel_bug_path]
@@ -503,12 +635,24 @@ def _compose_v4_bulletin_story(
     if has_wm:
         cmd += ["-loop", "1", "-i", watermark_path]
     # Studio bg video — last input so the existing per-feature input
-    # indices (sidebar=1, lt=2, ticker=3, bug=4?, wm=5?) stay stable.
-    # `-stream_loop -1` keeps the bg playing for the entire story clip
-    # length; -shortest downstream truncates to the story audio length.
+    # indices stay stable. `-stream_loop -1` keeps the bg playing for
+    # the entire story clip length; -shortest downstream truncates to
+    # the story audio length.
     has_bg = bool(bg_video_path and os.path.isfile(bg_video_path))
     if has_bg:
         cmd += ["-stream_loop", "-1", "-i", bg_video_path]
+
+    # Compute input indices dynamically — ticker may or may not exist.
+    # Layout: 0=story, 1=sidebar, 2=lt, [ticker?], [bug?], [wm?], [bg?]
+    _next_idx = 3
+    ticker_in_idx = _next_idx if apply_ticker else None
+    if apply_ticker: _next_idx += 1
+    bug_in_idx = _next_idx if has_bug else None
+    if has_bug: _next_idx += 1
+    wm_in_idx = _next_idx if has_wm else None
+    if has_wm: _next_idx += 1
+    bg_input_idx = _next_idx if has_bg else None
+    if has_bg: _next_idx += 1
 
     # Lower-third animation — identical branch to V1's so the slide-in /
     # marquee feels the same.
@@ -527,10 +671,6 @@ def _compose_v4_bulletin_story(
         # tile frame. Keep it white but allow override via a future
         # ``tile_border_color`` field without breaking existing canvases.
         border_colour = getattr(layout, "tile_border_color", None) or "white"
-
-    # Compute the bg input index — bg is always the LAST input added.
-    # Layout: 0=story, 1=sidebar, 2=lt, 3=ticker, [4]=bug?, [5]=wm?, [N]=bg
-    bg_input_idx = 4 + (1 if has_bug else 0) + (1 if has_wm else 0) if has_bg else None
 
     fc = [
         f"[0:v]scale={main_inner_w}:{tile_inner_h}:"
@@ -562,22 +702,24 @@ def _compose_v4_bulletin_story(
         f"[stage_m][side_v]overlay=x={side_x}:y={tile_y}[stage_top]",
 
         f"[stage_top][2:v]overlay=x='{lt_x_expr}':y={lt_y}:format=auto[stage_lt]",
-
-        f"[stage_lt][3:v]overlay="
-        f"x='W-mod(t*{ticker_speed_px_s:.1f}\\,w+W)':"
-        f"y={ticker_y}:format=auto[stage_ticker]",
     ]
+    cursor = "stage_lt"
+    if apply_ticker and ticker_in_idx is not None:
+        fc.append(
+            f"[{cursor}][{ticker_in_idx}:v]overlay="
+            f"x='W-mod(t*{ticker_speed_px_s:.1f}\\,w+W)':"
+            f"y={ticker_y}:format=auto[stage_ticker]"
+        )
+        cursor = "stage_ticker"
     if has_bug:
         fc.append(
-            f"[stage_ticker][4:v]overlay="
+            f"[{cursor}][{bug_in_idx}:v]overlay="
             f"x=W-w-{V4_SIDE_MARGIN}:y={tile_y}:format=auto[stage_bug]"
         )
-        last_stage = "stage_bug"
-    else:
-        last_stage = "stage_ticker"
+        cursor = "stage_bug"
+    last_stage = cursor
 
     if has_wm:
-        wm_in_idx = 5 if has_bug else 4
         wx, wy = _watermark_overlay_xy(watermark_position, canvas_w, canvas_h)
         fc.append(
             f"[{last_stage}][{wm_in_idx}:v]overlay="
@@ -682,17 +824,17 @@ def render_bulletin(inputs: BulletinRenderInputs) -> str:
         )
 
     # 3) Per-story compose: slice the bulletin into the story's range
-    #    and call V1's composer.
+    #    and call V1's composer. Each story's render-affecting inputs
+    #    are hashed and compared against a sidecar file from the
+    #    previous render — when nothing meaningful changed we reuse the
+    #    cached composed_story_NN.mp4 instead of paying for another
+    #    ffmpeg pass. Typical wins: image swaps (one story dirty),
+    #    trim-point tweaks (one story dirty), per-slot edits.
     composed_paths: list[str] = []
     pool = inputs.sidebar_images or []
+    cache_hits = 0
+    cache_misses = 0
     for i, s in enumerate(inputs.stories):
-        raw_slice = str(bdir / f"raw_story_{i:02d}.mp4")
-        _slice_video(
-            source_path=inputs.trimmed_bulletin_path,
-            start_sec=s.video_t_start,
-            end_sec=s.video_t_end,
-            output_path=raw_slice,
-        )
         sidebar_img = pool[i] if i < len(pool) else None
         sidebar_path = _resolve_sidebar(
             work_dir=bdir, story_index=i, pool_image_path=sidebar_img,
@@ -705,6 +847,47 @@ def render_bulletin(inputs: BulletinRenderInputs) -> str:
             total_stories=len(inputs.stories),
         )
         composed = str(bdir / f"composed_story_{i:02d}.mp4")
+        hash_file = str(bdir / f"composed_story_{i:02d}.hash")
+
+        # Stash story_index/total_stories on the story object so the
+        # hash sees them — most TrimmedStory shapes already carry these
+        # but SimpleNamespace stand-ins from the editor route may not.
+        try:
+            if getattr(s, "story_index", None) is None:
+                setattr(s, "story_index", i)
+            if getattr(s, "total_stories", None) is None:
+                setattr(s, "total_stories", len(inputs.stories))
+        except Exception:
+            pass
+
+        new_hash = _per_story_cache_hash(
+            story=s,
+            ticker_path=ticker_path,
+            sidebar_path=sidebar_path,
+            layout=getattr(inputs, "layout", None),
+            channel_bug_path=bug_path,
+            watermark_path=watermark_path,
+            watermark_position=inputs.watermark_position,
+            font_path=lang_cfg.font_primary,
+            bg_video_abs=_bg_abs,
+            bg_video_volume=_bg_vol,
+            language_code=lang_cfg.code,
+        )
+        old_hash = _read_cached_hash(hash_file)
+        if old_hash == new_hash and os.path.isfile(composed):
+            print(f"[v4/v1_bridge] story {i+1}/{len(inputs.stories)} cache hit "
+                  f"({new_hash}) — skipping recompose", flush=True)
+            composed_paths.append(composed)
+            cache_hits += 1
+            continue
+        cache_misses += 1
+        raw_slice = str(bdir / f"raw_story_{i:02d}.mp4")
+        _slice_video(
+            source_path=inputs.trimmed_bulletin_path,
+            start_sec=s.video_t_start,
+            end_sec=s.video_t_end,
+            output_path=raw_slice,
+        )
         _compose_v4_bulletin_story(
             story_clip_path=raw_slice,
             story_meta=story_meta,
@@ -720,25 +903,51 @@ def render_bulletin(inputs: BulletinRenderInputs) -> str:
             watermark_position=inputs.watermark_position,
             bg_video_path=_bg_abs,
             bg_video_volume=_bg_vol,
+            # Ticker is overlaid AFTER stitch instead of per-story so
+            # title-only edits keep the per-story cache warm.
+            apply_ticker=False,
         )
+        _write_cached_hash(hash_file, new_hash)
         composed_paths.append(composed)
+    print(f"[v4/v1_bridge] per-story cache: {cache_hits} hit / {cache_misses} miss",
+          flush=True)
 
     if not composed_paths:
         raise RuntimeError("render_bulletin: no stories composed")
 
-    # 4) Stitch — V1's bulletin_stitcher handles codec-param mismatches.
-    stitched_path = inputs.output_path
-    if _intro_sec > 0 and _bg_abs:
-        # When an intro reel is configured, stitch into a temp file first,
-        # then concat the intro on the front so the final mp4 still lives
-        # at inputs.output_path (downstream code references that path).
-        stitched_path = str(Path(inputs.output_path).with_name(
-            "_inner_" + Path(inputs.output_path).name))
+    # 4) Stitch (no ticker yet) — V1's bulletin_stitcher handles codec
+    #    mismatches and uses -c copy for speed.
+    no_ticker_stitched = str(bdir / "_stitched_no_ticker.mp4")
     stitch_bulletin(
         composed_paths,
-        stitched_path,
+        no_ticker_stitched,
         work_dir=str(bdir),
     )
+
+    # 5) Overlay the scrolling ticker once across the full bulletin.
+    #    Doing this here (instead of inside every per-story compose)
+    #    means a title edit only invalidates THIS pass; per-story
+    #    composes stay cached. Cost: one re-encoding pass over the
+    #    stitched file; win: skips N per-story re-encodes.
+    canvas_w_l = getattr(getattr(inputs, "layout", None), "width", V4_W) or V4_W
+    canvas_h_l = getattr(getattr(inputs, "layout", None), "height", V4_H) or V4_H
+    ticker_y_l = canvas_h_l - V4_TICKER_H
+    # When an intro reel is configured, the ticker-overlaid file is the
+    # "inner" file we'll prepend to; otherwise it's the final output.
+    stitched_path = inputs.output_path
+    if _intro_sec > 0 and _bg_abs:
+        stitched_path = str(Path(inputs.output_path).with_name(
+            "_inner_" + Path(inputs.output_path).name))
+    _overlay_ticker_post_stitch(
+        bulletin_path=no_ticker_stitched,
+        ticker_png_path=ticker_path,
+        out_path=stitched_path,
+        canvas_w=canvas_w_l,
+        canvas_h=canvas_h_l,
+        ticker_y=ticker_y_l,
+    )
+    try: Path(no_ticker_stitched).unlink(missing_ok=True)
+    except OSError: pass
 
     if _intro_sec > 0 and _bg_abs:
         intro_path = str(Path(inputs.output_path).with_name("_intro.mp4"))

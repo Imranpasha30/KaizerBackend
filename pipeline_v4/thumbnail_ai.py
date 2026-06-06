@@ -58,21 +58,48 @@ DEFAULT_GCP_LOCATION   = "us-central1"
 # preamble — so we can feed the response straight to the image model.
 _PROMPT_WRITER_SYSTEM = """\
 You are a YouTube thumbnail art director for a news channel. Given a
-news clip's headline + summary, you write ONE image prompt that will
-generate a high-CTR thumbnail.
+news clip's transcript + SEO description + headline, you write ONE
+image-generation prompt that produces a high-CTR thumbnail.
 
-Rules:
+# ⚠ LANGUAGE CONTRACT (MOST IMPORTANT — PIPELINE FAILS WITHOUT THIS)
+The clip's LANGUAGE is specified in the user message (full name +
+script). The SHOUT TEXT in the thumbnail MUST be written in that
+language's NATIVE SCRIPT — not romanised, not English.
+
+For example:
+- language=Telugu/Telugu  → shout text in Telugu script (e.g. "షాకింగ్!", "బ్రేకింగ్")
+- language=Hindi/Devanagari → shout text in Devanagari (e.g. "बड़ी खबर", "ब्रेकिंग")
+- language=Tamil/Tamil    → shout text in Tamil script (e.g. "முக்கியம்")
+- language=English/Latin  → shout text in English (e.g. "SHOCKING!")
+
+The prompt you write MUST embed the actual native-script characters
+the image generator will render — don't ask the generator to "write
+Telugu text", spell out the literal characters in the prompt so the
+generator can rasterise them. Pick 2-4 words that match the SEO hook
+or thumbnail_text suggestion, in the native script.
+
+If you output a prompt with romanised text (e.g. "ShoCkInG" for a
+Telugu clip), the verifier rejects the thumbnail and the operator has
+to regenerate manually — a workflow failure we never want.
+
+# Output rules
 1. Output a single prompt, no preamble, no bullet points, no JSON.
 2. 16:9 photographic news-broadcast aesthetic.
 3. Bold colour palette (red, yellow, white accents) — feels urgent.
-4. Includes a 2-3 word LARGE shout text overlay matching the hook,
-   typeset bold. The text must be in the source language of the clip.
-5. Faces of REAL public figures should be replaced with generic
+4. Includes a 2-4 word LARGE shout text overlay matching the SEO hook,
+   typeset bold. The text MUST be in the native script per the contract
+   above. Spell out the literal characters inside double-quotes in the
+   prompt so the image model rasterises them verbatim.
+5. Compose the visual scene from facts in the transcript / SEO
+   description — pick the most arresting element (the heist tools,
+   the courtroom, the protest crowd, the burning vehicle, the
+   document). Do NOT invent details the source doesn't support.
+6. Faces of REAL public figures should be replaced with generic
    silhouettes / outlines / back-of-head shots — never name them.
    Generic symbols (handcuffs, scales of justice, money bags, broken
    glass, court hammer) for crime/scam stories.
-6. No watermarks, no channel branding, no logos.
-7. Aspect ratio: 16:9, sharp focus, cinematic lighting, slight vignette.
+7. No watermarks, no channel branding, no logos.
+8. Aspect ratio: 16:9, sharp focus, cinematic lighting, slight vignette.
 
 Output: ONE prompt string under 300 words. Nothing else.
 """
@@ -163,19 +190,47 @@ def write_thumbnail_prompt(
     summary: str = "",
     seo_hook: str = "",
     seo_thumbnail_text: str = "",
+    seo_description: str = "",
+    transcript_excerpt: str = "",
     language: str = "te",
 ) -> str:
     """Ask Gemini for a thumbnail brief based on the clip's content.
 
+    The clip's transcript (or per-story summaries when full transcript
+    isn't available) + the SEO description carry the editorial detail
+    Gemini needs to pick an arresting visual scene. The clip's full
+    language (resolved through ``languages.get``) carries the
+    native-script name so the shout text comes back in the right
+    script — this is the operator's primary complaint surface.
+
     Returns the prompt string. Falls back to a deterministic stock
     prompt on failure so the image generation step never starves."""
+    # Resolve the rich language metadata — the model needs the script
+    # name ("Telugu", "Devanagari") more than the ISO code ("te", "hi")
+    # to write characters in the correct script.
+    try:
+        import languages as _langs
+        cfg = _langs.get(language)
+        lang_full = cfg.name_english
+        lang_native = cfg.name_native
+        script_name = cfg.script
+    except Exception:
+        lang_full = language
+        lang_native = ""
+        script_name = ""
+
     facts = []
+    # Language metadata FIRST — this is what drives the script the
+    # shout text comes back in. Front-loaded so Gemini reads it before
+    # diving into the editorial details.
+    facts.append(f"language: {lang_full} ({lang_native}) — write shout text in {script_name} script")
     if title_native:       facts.append(f"native-script headline: {title_native}")
     if title_english:      facts.append(f"English headline: {title_english}")
+    if seo_hook:           facts.append(f"SEO hook: {seo_hook}")
+    if seo_thumbnail_text: facts.append(f"SEO thumbnail_text (use as the shout text source): {seo_thumbnail_text}")
     if summary:            facts.append(f"summary: {summary[:600]}")
-    if seo_hook:           facts.append(f"hook: {seo_hook}")
-    if seo_thumbnail_text: facts.append(f"shout text suggested by SEO: {seo_thumbnail_text}")
-    facts.append(f"language: {language}")
+    if seo_description:    facts.append(f"SEO description (full editorial body):\n{seo_description[:2000]}")
+    if transcript_excerpt: facts.append(f"transcript (clip's actual spoken content):\n{transcript_excerpt[:2000]}")
     user_msg = (
         "Write the thumbnail prompt for the following news clip.\n\n"
         + "\n".join(facts)
@@ -353,6 +408,7 @@ def make_thumbnail_for_canvas(
     language: str = "te",
     previous_prompt: str = "",
     tweak: str = "",
+    transcript_excerpt: str = "",        # raw spoken content, when caller has it
 ) -> tuple[Optional[str], str]:
     """End-to-end helper: derive prompt → render image → save to
     ``out_path``. Returns ``(saved_path or None, final_prompt)`` so the
@@ -373,12 +429,28 @@ def make_thumbnail_for_canvas(
     else:
         story0 = canvas.stories[0] if canvas.stories else None
         seo    = canvas.seo
+        # Build a "transcript-shaped" excerpt when the caller didn't
+        # pass one explicitly: join every story's title + summary so
+        # Gemini has the full editorial spread to draw a compelling
+        # composition from, not just the first story. The verbatim
+        # speech transcript would be richer, but stories carry the
+        # important facts and live in the canvas the route reads.
+        if not transcript_excerpt:
+            chunks = []
+            for s in (canvas.stories or []):
+                hd = (s.title_native or s.title_english or "").strip()
+                sm = (s.summary or "").strip()
+                if hd or sm:
+                    chunks.append(f"- {hd}\n  {sm}".strip())
+            transcript_excerpt = "\n".join(chunks)
         prompt = write_thumbnail_prompt(
             title_native=(story0.title_native if story0 else "") or "",
             title_english=(story0.title_english if story0 else "") or "",
             summary=(story0.summary if story0 else "") or "",
             seo_hook=(seo.hook if seo else "") or "",
             seo_thumbnail_text=(seo.thumbnail_text if seo else "") or "",
+            seo_description=(seo.description if seo else "") or "",
+            transcript_excerpt=transcript_excerpt,
             language=language,
         )
     print(f"[nano-banana] prompt: {prompt[:160]}…", flush=True)
