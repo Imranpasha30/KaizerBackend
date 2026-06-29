@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="kaizer:canvas" content="1920x1080">
+<style>
+  :root{
+    --kaizer-brand:#e11d2a; --kaizer-accent:#ffd23f;
+    --kaizer-text:#ffffff; --kaizer-bg:#0a0e17;
+    --kaizer-font:'Segoe UI',system-ui,sans-serif;
+  }
+  *{margin:0;box-sizing:border-box}
+  html,body{width:1920px;height:1080px;overflow:hidden;background:var(--kaizer-bg);
+    font-family:var(--kaizer-font);color:var(--kaizer-text)}
+  .top{position:absolute;top:0;left:0;right:0;height:96px;display:flex;align-items:center;
+    gap:24px;padding:0 44px;background:linear-gradient(90deg,var(--kaizer-brand),#7a0d14)}
+  .live{display:flex;align-items:center;gap:12px;font-weight:800;font-size:40px;letter-spacing:.04em}
+  .dot{width:26px;height:26px;border-radius:50%;background:#fff;animation:blink 1s ease-in-out infinite}
+  @keyframes blink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.15;transform:scale(.7)}}
+  .headline{font-size:40px;font-weight:700;opacity:.95;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* two video tiles side by side */
+  .stage{position:absolute;top:128px;left:44px;right:44px;height:780px;display:flex;gap:32px}
+  .tile{flex:1;position:relative;border-radius:26px;overflow:hidden;border:3px solid rgba(255,255,255,.1);
+    box-shadow:0 24px 60px rgba(0,0,0,.5)}
+  .tile .clip{position:absolute;inset:0;width:100%;height:100%}
+  .tag{position:absolute;left:18px;top:18px;background:rgba(0,0,0,.55);padding:8px 16px;border-radius:10px;
+    font-weight:700;font-size:26px}
+  /* scrolling marquee / ticker */
+  .ticker{position:absolute;left:0;right:0;bottom:0;height:72px;background:var(--kaizer-accent);
+    color:#0a0e17;display:flex;align-items:center;overflow:hidden}
+  .ticker .label{background:var(--kaizer-brand);color:#fff;height:100%;display:flex;align-items:center;
+    padding:0 26px;font-weight:800;font-size:34px;flex-shrink:0}
+  .ticker .track{display:inline-block;white-space:nowrap;font-size:34px;font-weight:600;padding-left:100%;
+    animation:scroll 14s linear infinite}
+  @keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-100%)}}
+</style>
+</head>
+<body>
+  <div class="top">
+    <span class="live"><span class="dot"></span>LIVE</span>
+    <span class="headline" data-kaizer="headline">Headline goes here</span>
+  </div>
+  <div class="stage">
+    <div class="tile"><div class="clip" data-kaizer="video:left"></div><span class="tag" data-kaizer="hook">STUDIO</span></div>
+    <div class="tile"><div class="clip" data-kaizer="video:right"></div><span class="tag">FIELD</span></div>
+  </div>
+  <div class="ticker">
+    <span class="label">BREAKING</span>
+    <span class="track" data-kaizer="ticker">Markets rally as GDP grows 8 percent this quarter • Monsoon arrives early across the south • Tech sector adds 12,000 jobs • Back to you in the studio •&nbsp;&nbsp;</span>
+  </div>
+</body>
+</html>

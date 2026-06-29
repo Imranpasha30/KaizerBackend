@@ -250,14 +250,26 @@ def run_stream(stream_id: int) -> None:
                     )
                 completed_clean = True
             except streamer.StreamerError as exc:
-                _update(stream_id, status="failed",
-                        error=f"ffmpeg push failed: {exc}",
-                        finished_at=datetime.now(timezone.utc))
+                # Race guard: if the user hit Stop right as ffmpeg exited
+                # non-zero, honour the cancel — a user stop is NOT a failure.
+                if cancel_ev.is_set():
+                    _update(stream_id, status="canceled",
+                            message="user canceled mid-broadcast",
+                            finished_at=datetime.now(timezone.utc))
+                else:
+                    _update(stream_id, status="failed",
+                            error=f"ffmpeg push failed: {exc}",
+                            finished_at=datetime.now(timezone.utc))
                 completed_clean = False
             except Exception as exc:
-                _update(stream_id, status="failed",
-                        error=f"unexpected: {exc}",
-                        finished_at=datetime.now(timezone.utc))
+                if cancel_ev.is_set():
+                    _update(stream_id, status="canceled",
+                            message="user canceled mid-broadcast",
+                            finished_at=datetime.now(timezone.utc))
+                else:
+                    _update(stream_id, status="failed",
+                            error=f"unexpected: {exc}",
+                            finished_at=datetime.now(timezone.utc))
                 completed_clean = False
 
             # 5) Finalize broadcast (transition=complete) regardless of

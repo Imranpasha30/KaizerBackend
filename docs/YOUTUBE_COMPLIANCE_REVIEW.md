@@ -1,4 +1,4 @@
-# Kaizer News — YouTube API Services Compliance Review
+# Kaizer X — YouTube API Services Compliance Review
 
 > Submission packet for the YouTube Data API v3 quota review. This document
 > explains every YouTube API call our application makes, the OAuth 2.0
@@ -12,9 +12,9 @@
 
 ## 1. Application overview
 
-### What Kaizer News is
+### What Kaizer X is
 
-**Kaizer News is a SaaS automation platform for YouTube creators.** Any
+**Kaizer X is a SaaS automation platform for YouTube creators.** Any
 creator can sign up at our public URL, connect their own YouTube channel
 via Google's standard OAuth 2.0 consent flow, and use our tools to
 automate their long-form-to-Shorts publishing workflow.
@@ -24,7 +24,7 @@ our AI pipeline (segment selection, vertical 9:16 reframing, bilingual
 captions, AI-generated SEO metadata, optional logo overlay), and lets the
 creator publish each generated clip to their own YouTube channel(s).
 **Every API call is made on the creator's behalf, with the creator's
-explicit OAuth grant** — there is no scenario in which Kaizer News
+explicit OAuth grant** — there is no scenario in which Kaizer X
 uploads to a channel that has not been individually authorised by its
 owner.
 
@@ -32,7 +32,7 @@ owner.
 
 | Item | Value |
 |---|---|
-| **Project / API client name** | Kaizer News |
+| **Project / API client name** | Kaizer X |
 | **OAuth client ID** | `542271243369-6ikvqv149ht0s569u4prf11kkm8vqalh.apps.googleusercontent.com` |
 | **OAuth client type** | Web application (confidential client) |
 | **Business model** | B2B SaaS — paid plans for creators (Free / Pro). |
@@ -46,11 +46,11 @@ owner.
 
 ### Who uses the platform
 
-Kaizer News serves **two populations of YouTube creators**, both going
+Kaizer X serves **two populations of YouTube creators**, both going
 through **the same self-serve sign-up + OAuth flow**:
 
 1. **Public creators (the SaaS user base)** — the primary audience. Anyone
-   with a YouTube channel can register a Kaizer News account at our public
+   with a YouTube channel can register a Kaizer X account at our public
    URL, link their channel via Google's OAuth consent screen, and start
    using the automation. Each creator pays per their plan, manages their
    own clips, and grants OAuth scoped to their own channel(s) only. **This
@@ -74,12 +74,12 @@ through **the same self-serve sign-up + OAuth flow**:
 ### Channel list (organization-owned)
 
 These are the YouTube channels the organization publishes content to
-through Kaizer News. Public creators connect their own channels via
+through Kaizer X. Public creators connect their own channels via
 the same sign-up flow demonstrated in Video 2.
 
 | # | Channel name | YouTube URL | Subscribers | Total videos |
 |---|---|---|---|---|
-| 1 | Kaizer News Andhra | `https://www.youtube.com/@KaizerNewsAndhra` | 327k | 2.1k |
+| 1 | Kaizer X Andhra | `https://www.youtube.com/@KaizerXAndhra` | 327k | 2.1k |
 | 2 | Auto Wala | `https://www.youtube.com/@kaizerautowala45` | 1 | 10 |
 
 ---
@@ -379,7 +379,7 @@ allocation.
 
 Shows the OAuth 2.0 consent flow a public creator goes through to
 connect their YouTube channel. Recorded with a Google account that has
-never authorised Kaizer News before, so the **full consent screen with
+never authorised Kaizer X before, so the **full consent screen with
 the scope list is visible**.
 
 The recording shows:

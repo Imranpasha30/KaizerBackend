@@ -130,7 +130,7 @@ def cut_clip(
     hook: str = "",
     logo_path: Optional[str] = None,
     panel_color: str = "#dc2626",
-    footer_text: str = "KAIZER NEWS NETWORK",
+    footer_text: str = "KAIZER X NETWORK",
     custom_snap_path: Optional[str] = None,
     color_grade: str = "subtle",
     cinematic_edit: bool = False,

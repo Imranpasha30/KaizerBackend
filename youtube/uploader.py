@@ -78,25 +78,35 @@ def sanitize_tags(raw: list | None) -> list[str]:
     return out
 
 
-def _build_body(job: models.UploadJob) -> dict:
+def _build_body(job: models.UploadJob, channel=None) -> dict:
     """Construct the YouTube videos.insert body from the UploadJob row.
 
     `status.publishAt` is honored only when privacy_status == 'private' —
     that's Google's requirement; otherwise YouTube rejects the request.
+
+    Per-channel publish defaults (``channel.yt_*``, set from Kaizer's brand
+    modal) override the job defaults when present. All None ⇒ byte-identical
+    to the pre-feature body, so this is safe for every existing channel.
     """
+    _cat  = (getattr(channel, "yt_category_id", None) or job.category_id or "25")
+    _lang = (getattr(channel, "yt_default_language", None) or "te")
+    _lic  = (getattr(channel, "yt_license", None) or "youtube")
+    _ch_mfk = getattr(channel, "yt_made_for_kids", None)
+    _mfk = bool(_ch_mfk) if _ch_mfk is not None else bool(job.made_for_kids)
     body: dict = {
         "snippet": {
             "title":       (job.title or "Untitled")[:100],
             "description": job.description or "",
             # Sanitize at insert time so retries of jobs queued with bad tags succeed
             "tags":        sanitize_tags(job.tags),
-            "categoryId":  job.category_id or "25",
-            "defaultLanguage":      "te",
-            "defaultAudioLanguage": "te",
+            "categoryId":  _cat,
+            "defaultLanguage":      _lang,
+            "defaultAudioLanguage": _lang,
         },
         "status": {
             "privacyStatus":           (job.privacy_status or "private").lower(),
-            "selfDeclaredMadeForKids": bool(job.made_for_kids),
+            "selfDeclaredMadeForKids": _mfk,
+            "license":                 _lic,
             "embeddable":              True,
             "publicStatsViewable":     True,
         },
@@ -148,6 +158,19 @@ def upload_video(
     except Exception:
         _gcid = ""
 
+    # Resolve the destination Channel for its per-channel publish defaults
+    # (category / language / made-for-kids / license + playlist). Best-effort:
+    # None ⇒ _build_body falls back to the job/defaults (current behaviour).
+    _pub_channel = None
+    try:
+        _cid = getattr(job, "channel_id", None)
+        if _cid:
+            _pub_channel = db.query(models.Channel).filter(
+                models.Channel.id == _cid
+            ).first()
+    except Exception:
+        _pub_channel = None
+
     try:
         from learning.youtube_quota_log import log_youtube_call as _log_yt
     except Exception:
@@ -173,7 +196,7 @@ def upload_video(
               ) if _log_yt is not None else _nullctx()) as _call:
             request = yt.videos().insert(
                 part="snippet,status",
-                body=_build_body(job),
+                body=_build_body(job, channel=_pub_channel),
                 media_body=media,
                 notifySubscribers=False,
             )
@@ -210,6 +233,27 @@ def upload_video(
             # can correlate "quota burn → YouTube URL" later.
             if _call is not None and hasattr(_call, "record_video_id"):
                 _call.record_video_id(video_id)
+            # Optional: add the video to the channel's configured playlist.
+            # Best-effort — a playlist failure must NEVER fail the publish
+            # (the video is already up). Only runs when the channel set one.
+            _pl = getattr(_pub_channel, "yt_playlist_id", None)
+            if _pl:
+                try:
+                    yt.playlistItems().insert(
+                        part="snippet",
+                        body={"snippet": {
+                            "playlistId": str(_pl),
+                            "resourceId": {
+                                "kind": "youtube#video", "videoId": video_id,
+                            },
+                        }},
+                    ).execute()
+                except Exception as _ple:
+                    import logging as _lg
+                    _lg.getLogger("youtube.uploader").warning(
+                        "playlistItems.insert failed (non-fatal) video=%s "
+                        "playlist=%s: %s", video_id, _pl, _ple,
+                    )
             return video_id
     finally:
         # googleapiclient's MediaFileUpload keeps a file handle open — close it

@@ -1,7 +1,7 @@
 """
 kaizer.pipeline.validator
 =========================
-FFprobe-based INPUT gate for the Kaizer News video pipeline.
+FFprobe-based INPUT gate for the Kaizer X video pipeline.
 
 Usage
 -----

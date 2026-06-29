@@ -36,6 +36,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional
 
 
@@ -111,11 +112,16 @@ def push_loop(
 
     last_progress = 0.0
     last_update = 0.0
+    # The pump thread drains stderr line-by-line, so a later proc.stderr.read()
+    # is always empty. Keep the tail here so the error message is diagnosable.
+    stderr_tail: deque = deque(maxlen=80)
 
     def _stderr_pump() -> None:
         nonlocal last_progress, last_update
         for raw in iter(proc.stderr.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                stderr_tail.append(line)
             if extra_log_cb and line:
                 extra_log_cb(line[-300:])
             m = _TIME_RE.search(line)
@@ -144,9 +150,9 @@ def push_loop(
             if proc.poll() is not None:
                 break
             if cancel_event and cancel_event.is_set():
-                # If we've already pushed ≥ 90% of the configured
-                # duration, treat a cancel as a clean stop.
-                cancelled_clean = (last_progress >= 90.0)
+                # A user-initiated stop is ALWAYS a clean stop, not a failure —
+                # regardless of how far the broadcast got. (Matches passthrough.)
+                cancelled_clean = True
                 _terminate(proc)
                 break
             time.sleep(0.5)
@@ -163,14 +169,10 @@ def push_loop(
             except Exception: pass
         return True
 
-    # Best-effort tail of stderr for the error message.
-    tail = ""
-    try:
-        if proc.stderr:
-            tail = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-600:]
-    except OSError:
-        pass
-    raise StreamerError(f"ffmpeg exited {code}: {tail}")
+    # The pump thread already drained stderr — use the captured ring buffer
+    # (proc.stderr.read() here would always return empty).
+    tail = "\n".join(stderr_tail)[-900:]
+    raise StreamerError(f"ffmpeg exited {code}: {tail or '(no stderr captured)'}")
 
 
 def push_passthrough(
@@ -266,6 +268,7 @@ def push_passthrough(
     last_update = 0.0
     discovered_dur_sec = 0.0
     started_at = time.time()
+    stderr_tail: deque = deque(maxlen=80)
 
     _DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)")
 
@@ -273,6 +276,8 @@ def push_passthrough(
         nonlocal last_progress, last_update, discovered_dur_sec
         for raw in iter(ff.stderr.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                stderr_tail.append(line)
             if extra_log_cb and line:
                 extra_log_cb(line[-300:])
             if discovered_dur_sec == 0:
@@ -330,13 +335,9 @@ def push_passthrough(
             except Exception: pass
         return True
 
-    tail = ""
-    try:
-        if ff.stderr:
-            tail = (ff.stderr.read() or b"").decode("utf-8", errors="replace")[-600:]
-    except OSError:
-        pass
-    raise StreamerError(f"ffmpeg exited {code} (passthrough): {tail}")
+    # Pump already drained stderr — use the captured ring buffer.
+    tail = "\n".join(stderr_tail)[-900:]
+    raise StreamerError(f"ffmpeg exited {code} (passthrough): {tail or '(no stderr captured)'}")
 
 
 def _terminate(proc: subprocess.Popen) -> None:

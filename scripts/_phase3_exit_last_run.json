@@ -1,0 +1,42 @@
+{
+  "n_pass": 2,
+  "n_total": 2,
+  "scenarios": [
+    {
+      "name": "A: kill-worker mid-upload, no duplicate video",
+      "passed": true,
+      "reason": "kill-worker \u2192 recover \u2192 success; no duplicate insert",
+      "metrics": {
+        "insert_calls_after_fail": 1,
+        "job_status_after_fail": "failed",
+        "attempt_count_after_fail": 1,
+        "yt_id_after_fail": null,
+        "recovered_jobs": 1,
+        "insert_calls_final": 2,
+        "job_status_final": "completed",
+        "yt_id_final": "FAKE_VID_4406da305769",
+        "attempt_count_final": 1,
+        "attempt_statuses_final": [
+          "completed"
+        ]
+      }
+    },
+    {
+      "name": "B: aging promotes Normal under Critical burst",
+      "passed": true,
+      "reason": "20/20 Normal jobs promoted by aging",
+      "metrics": {
+        "norm_count": 20,
+        "norm_promoted_count": 20,
+        "norm_priorities_at_dispatch": [
+          "critical"
+        ],
+        "wall_seconds": 2.66,
+        "completed_crit": 30,
+        "completed_norm": 20,
+        "parked_crit": 0,
+        "parked_norm": 0
+      }
+    }
+  ]
+}

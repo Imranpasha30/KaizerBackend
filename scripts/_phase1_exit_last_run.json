@@ -1,0 +1,267 @@
+[
+  {
+    "name": "A: 100-channel fanout",
+    "passed": true,
+    "reason": "100 jobs completed in 2.08s (48.1 jobs/sec); peak_net=16 peak_user=20",
+    "metrics": {
+      "wall_seconds": 2.078,
+      "throughput_jobs_per_sec": 48.12,
+      "peak_net_in_use": 16,
+      "peak_user_in_use": 20,
+      "balance_after_fanout": 0,
+      "snap_final_queue_depth": 0,
+      "snap_final_in_flight": 0,
+      "snap_final_net_in_use": 0,
+      "snap_final_user_in_use": 0,
+      "completed_count": 100,
+      "failed_count": 0
+    }
+  },
+  {
+    "name": "B: per-user slot cap",
+    "passed": true,
+    "reason": "max user_in_use=5 (cap=5) over 350 samples; 200/200 jobs in 10.58s",
+    "metrics": {
+      "wall_seconds": 10.578,
+      "samples_taken": 350,
+      "max_user_in_use": 5,
+      "cap_violation_samples": 0,
+      "completed_count": 200,
+      "failed_count": 0,
+      "n_channels": 200
+    }
+  },
+  {
+    "name": "C: priority precedence",
+    "passed": true,
+    "reason": "all 5 critical jobs finished by rank 15; 20 low jobs still after them",
+    "metrics": {
+      "finish_order": [
+        {
+          "rank": 1,
+          "upload_job_id": 981,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 2,
+          "upload_job_id": 977,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 3,
+          "upload_job_id": 976,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 4,
+          "upload_job_id": 975,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 5,
+          "upload_job_id": 980,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 6,
+          "upload_job_id": 978,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 7,
+          "upload_job_id": 979,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 8,
+          "upload_job_id": 984,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 9,
+          "upload_job_id": 974,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 10,
+          "upload_job_id": 983,
+          "tier": "low",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 11,
+          "upload_job_id": 1006,
+          "tier": "critical",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 12,
+          "upload_job_id": 1004,
+          "tier": "critical",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 13,
+          "upload_job_id": 1008,
+          "tier": "critical",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 14,
+          "upload_job_id": 1007,
+          "tier": "critical",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 15,
+          "upload_job_id": 1005,
+          "tier": "critical",
+          "finish_seconds": 0.235
+        },
+        {
+          "rank": 16,
+          "upload_job_id": 982,
+          "tier": "low",
+          "finish_seconds": 0.328
+        },
+        {
+          "rank": 17,
+          "upload_job_id": 985,
+          "tier": "low",
+          "finish_seconds": 0.422
+        },
+        {
+          "rank": 18,
+          "upload_job_id": 988,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 19,
+          "upload_job_id": 987,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 20,
+          "upload_job_id": 986,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 21,
+          "upload_job_id": 989,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 22,
+          "upload_job_id": 991,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 23,
+          "upload_job_id": 990,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 24,
+          "upload_job_id": 1000,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 25,
+          "upload_job_id": 994,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 26,
+          "upload_job_id": 992,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 27,
+          "upload_job_id": 998,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 28,
+          "upload_job_id": 997,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 29,
+          "upload_job_id": 999,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 30,
+          "upload_job_id": 995,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 31,
+          "upload_job_id": 993,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 32,
+          "upload_job_id": 996,
+          "tier": "low",
+          "finish_seconds": 0.516
+        },
+        {
+          "rank": 33,
+          "upload_job_id": 1001,
+          "tier": "low",
+          "finish_seconds": 0.625
+        },
+        {
+          "rank": 34,
+          "upload_job_id": 1003,
+          "tier": "low",
+          "finish_seconds": 0.735
+        },
+        {
+          "rank": 35,
+          "upload_job_id": 1002,
+          "tier": "low",
+          "finish_seconds": 0.735
+        }
+      ],
+      "first_critical_finish_rank": 11,
+      "last_critical_finish_rank": 15,
+      "low_after_last_critical": 20,
+      "total_finished": 35
+    }
+  },
+  {
+    "name": "D: legacy path intact",
+    "passed": true,
+    "reason": "legacy=401 new=401 health=200",
+    "metrics": {
+      "legacy_clips_publish_unauth": 401,
+      "new_publish_tasks_unauth": 401,
+      "health": 200
+    }
+  }
+]

@@ -245,6 +245,31 @@ def set_account_logo(
             raise HTTPException(status_code=404, detail="Logo asset not found in your library")
 
     ch.oauth_token.logo_asset_id = payload.logo_asset_id
+
+    # Account-level consistency: the same real YouTube channel may be
+    # connected as several profiles (e.g. Auto Wala = Personal 9 +
+    # Personal 10). Mirror the logo onto every sibling token of the same
+    # google_channel_id so publishing through ANY of them wears the same
+    # brand — the user's "the account owns its logo" model.
+    gcid = (getattr(ch.oauth_token, "google_channel_id", "") or "").strip()
+    if gcid:
+        siblings = (
+            db.query(models.OAuthToken)
+            .join(models.Channel, models.Channel.id == models.OAuthToken.channel_id)
+            .filter(
+                models.Channel.user_id == user.id,
+                models.OAuthToken.channel_id != ch.id,
+                models.OAuthToken.google_channel_id == gcid,
+                # Real connected accounts only — never a style reference
+                # carrying a stale/empty token row.
+                models.OAuthToken.refresh_token_enc.isnot(None),
+                models.OAuthToken.refresh_token_enc != "",
+            )
+            .all()
+        )
+        for sib_tok in siblings:
+            sib_tok.logo_asset_id = payload.logo_asset_id
+
     db.commit()
     return {"channel_id": channel_id, "logo_asset_id": payload.logo_asset_id}
 
@@ -314,6 +339,56 @@ def authorize(
     return {"auth_url": url, "channel_id": channel_id}
 
 
+def _gc_abandoned_placeholders(db: Session, user_id: int) -> int:
+    """Purge this user's abandoned connect placeholders.
+
+    A "Connect another account" click creates a minimal 'Personal N'
+    Channel BEFORE Google OAuth. If the user abandons the Google login,
+    that row (plus its oauth_states CSRF row) lingers — polluting SEO
+    Settings and 500-ing on delete. We GC them on the natural retry path:
+    an EMPTY 'Personal N' with no usable token, no learned corpus, no
+    destinations and no competitor identity is an abandoned placeholder,
+    never a real style reference. Returns how many were removed."""
+    removed = 0
+    candidates = (
+        db.query(models.Channel)
+        .filter(
+            models.Channel.user_id == user_id,
+            models.Channel.name.like("Personal%"),
+        )
+        .all()
+    )
+    for c in candidates:
+        tok = c.oauth_token
+        if tok is not None and (tok.refresh_token_enc or "").strip():
+            continue  # a real connected account — keep
+        has_corpus = (
+            db.query(models.ChannelCorpus)
+            .filter(models.ChannelCorpus.channel_id == c.id)
+            .count() > 0
+        )
+        n_dests = (
+            db.query(models.ProfileDestination)
+            .filter(models.ProfileDestination.profile_id == c.id)
+            .count()
+        )
+        handle = (c.handle or "").strip()
+        tf = (c.title_formula or "").strip()
+        tf_is_default = (not tf) or tf.startswith("English Hook")
+        if has_corpus or n_dests or handle or not tf_is_default:
+            continue  # has real data — keep
+        # Empty abandoned placeholder — remove it (states first for the FK,
+        # token cascades via the relationship).
+        db.query(models.OAuthState).filter(
+            models.OAuthState.channel_id == c.id
+        ).delete(synchronize_session=False)
+        db.delete(c)
+        removed += 1
+    if removed:
+        db.commit()
+    return removed
+
+
 @router.post("/new-account")
 def new_account(
     db: Session = Depends(get_db),
@@ -323,6 +398,13 @@ def new_account(
     the auth URL for it.  Lets users add another YouTube account without
     having to first fill out a whole profile form.
     """
+    # Clean up any abandoned placeholders from prior incomplete connects so
+    # they don't accumulate / pollute SEO Settings.
+    try:
+        _gc_abandoned_placeholders(db, user.id)
+    except Exception:
+        db.rollback()  # never let cleanup block a fresh connect
+
     # Find an unused name within THIS USER's profiles so the uniqueness
     # constraint (user_id, name) isn't violated — and so the profile is
     # visible only to the caller.
@@ -341,8 +423,13 @@ def new_account(
         name=candidate,
         handle="",
         language="te",
-        title_formula="English Hook (తెలుగు అనువాదం) | " + candidate,
-        desc_style="Neutral",
+        # Leave style fields BLANK — this is a publish-account placeholder,
+        # not a competitor style profile. exchange_code renames it to the
+        # real channel title on connect; if the user abandons OAuth, an
+        # empty placeholder is correctly treated as deletable rather than
+        # masquerading as a configured style reference.
+        title_formula="",
+        desc_style="",
         footer="",
         fixed_tags=[],
         hashtags=[],

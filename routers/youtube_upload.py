@@ -70,6 +70,40 @@ class PublishRequest(BaseModel):
     # to match JSON conventions.  Missing keys fall through to the
     # batch value, then the per-channel default, then system default.
     upload_provider_by_channel: Optional[dict[str, Optional[str]]] = None
+    # Per-CHANNEL explicit Postiz integration binding: { "17": "cmqc5..." }.
+    # The publish modal lists Postiz integrations from the LIVE Postiz org
+    # (postiz_client.list_integrations), which is a superset of what's mapped
+    # in our PostizIntegration table. When the admin name-matches a channel to
+    # one of those live integrations, the frontend sends the resolved id here
+    # so dispatch can route upload_path='postiz' WITHOUT relying on the DB
+    # table (which may have no row for a Postiz-only channel). Dispatch also
+    # persists it onto Channel.postiz_integration_id so future publishes +
+    # the production auto-fallback resolve it natively. Keys = stringified
+    # channel IDs.
+    postiz_integration_by_channel: Optional[dict[str, Optional[str]]] = None
+    # Branding mode for this publish: 'per_channel' (overlay each channel's
+    # logo+watermark+socials at upload — the default) | 'as_is' (the video is
+    # already branded; upload it verbatim to every channel, no overlay).
+    brand_mode: Optional[str] = "per_channel"
+    # Logo/watermark placement when overlaying: 'template' (use the template's
+    # marked slot — the default) | 'channel' (use this channel's own position).
+    brand_placement: Optional[str] = "template"
+
+    @field_validator("brand_mode")
+    @classmethod
+    def _brand_mode(cls, v):
+        v = (v or "per_channel").strip().lower()
+        if v not in {"per_channel", "as_is"}:
+            raise ValueError("brand_mode must be 'per_channel' or 'as_is'")
+        return v
+
+    @field_validator("brand_placement")
+    @classmethod
+    def _brand_placement(cls, v):
+        v = (v or "template").strip().lower()
+        if v not in {"template", "channel"}:
+            raise ValueError("brand_placement must be 'template' or 'channel'")
+        return v
 
     @field_validator("upload_provider")
     @classmethod
@@ -100,6 +134,19 @@ class PublishRequest(BaseModel):
                     f"'kaizer', 'native_rtmp', or null"
                 )
             cleaned[str(k)] = vs
+        return cleaned or None
+
+    @field_validator("postiz_integration_by_channel")
+    @classmethod
+    def _postiz_iid_map(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("postiz_integration_by_channel must be a dict")
+        cleaned: dict[str, Optional[str]] = {}
+        for k, vv in v.items():
+            sv = (str(vv).strip() if vv is not None else "")
+            cleaned[str(k)] = sv or None
         return cleaned or None
 
     @field_validator("privacy_status")
@@ -271,6 +318,785 @@ def _compose_metadata(
 
 from rate_limit import rate_limited as _rate_limited
 
+
+# ─── Legacy → v2 redirect (Phase 3 cutover) ───────────────────────────────
+#
+# When ``KAIZER_NEW_PUBLISH_PATH=1``, every legacy
+# ``POST /api/clips/:id/publish`` request is translated into a
+# ``PublishTaskRequest`` and routed through ``services.fanout.create_publish_task``.
+# Response shape stays the same as the legacy path (single dict OR
+# ``{jobs: [...]}`` for fan-out) so existing frontend code keeps working
+# without a deploy.
+#
+# Default (``=0``) is unchanged — legacy logic still runs unmodified.
+#
+# Mapping rules (Decision 10 — opaque caller-supplied version strings):
+#   - clip → its Job → MasterVideo (lookup or synthesise transiently)
+#   - channel_ids → targets[N]
+#   - publish_kind, privacy_status, publish_at → carried per-target
+#   - upload_provider:
+#         'kaizer'      -> direct
+#         'native_rtmp' -> rtmp
+#         'postiz'      -> direct (Postiz uses the Direct path under the hood)
+#         null/missing  -> channel.upload_provider then default 'direct'
+#   - SEO controls: seo_version + metadata_version are stubbed from the
+#     clip + channel ids (stable, deterministic) so re-publish dedupes.
+#
+# MasterVideo handling: if the clip's Job already has a MasterVideo row
+# we reuse it. Otherwise we synthesise one with ``clean_master=False``
+# (legacy render baked the logo). The Branding worker detects
+# ``clean_master=False`` and SKIPS the logo overlay — only the text
+# watermark gets applied — per services/branding.py docstring.
+# Decision 12 covers this transitional behaviour.
+def _legacy_publish_to_v2_enabled() -> bool:
+    """Re-read every request so an ops flip doesn't require a restart."""
+    import os as _os
+    return (_os.environ.get("KAIZER_NEW_PUBLISH_PATH", "0") or "0").strip() == "1"
+
+
+def _map_legacy_upload_provider(provider: Optional[str]) -> str:
+    """Map the legacy ``upload_provider`` enum onto the v2 ``upload_path`` enum.
+
+    Returns 'direct' or 'rtmp'.
+    """
+    if provider is None:
+        return "direct"
+    p = str(provider).strip().lower()
+    if p == "native_rtmp":
+        return "rtmp"
+    # 'kaizer' (native Direct) and 'postiz' (proxy through Postiz, which
+    # uses videos.insert under the hood) both map to direct on the new
+    # path. Postiz parity is preserved at the application layer; v2
+    # doesn't model the proxy as a distinct path.
+    return "direct"
+
+
+def _resolve_postiz_integration_for_channel(db, user, ch):
+    """Best-effort link a Kaizer channel to a connected Postiz integration.
+
+    When a publish selects Postiz for a channel that has no explicit binding,
+    match it to one of the user's TEAM-owned Postiz integrations by name (or
+    handle/identifier) — same name means the same channel, e.g. the Kaizer
+    channel "Kaizer 5" maps to the Postiz integration named "Kaizer 5".
+    Returns the integration_id or None when nothing matches.
+    """
+    try:
+        from services.postiz_scope import team_user_ids
+        team = team_user_ids(db, user.id)
+    except Exception:
+        team = {user.id}
+    rows = (db.query(models.PostizIntegration)
+              .filter(models.PostizIntegration.user_id.in_(team)).all())
+    if not rows:
+        return None
+    nm = (getattr(ch, "name", "") or "").strip().lower()
+    hd = (getattr(ch, "handle", "") or "").strip().lstrip("@").lower()
+    for r in rows:
+        if nm and (r.name or "").strip().lower() == nm:
+            return r.integration_id
+    for r in rows:
+        rid = (r.identifier or "").strip().lstrip("@").lower()
+        if hd and rid and rid == hd:
+            return r.integration_id
+    return None
+
+
+def _legacy_to_v2_redirect(
+    db: Session,
+    user: "models.User",
+    clip_id: int,
+    payload: PublishRequest,
+):
+    """Translate a legacy PublishRequest into a v2 PublishTaskRequest
+    and call ``services.fanout.create_publish_task``.
+
+    Returns the same response shape the legacy ``publish_clip`` returns:
+      * single UploadJob dict when one target was requested, OR
+      * ``{"jobs": [...], "count": n}`` for fan-out.
+
+    Raises HTTPException for the same validation conditions the legacy
+    code raises (404 on missing clip/channel, 409 on un-linked YouTube
+    token, 422 on no targets / no rendered file, etc.) — so the
+    frontend sees identical error semantics.
+    """
+    import logging as _logging
+    import os as _os
+    from services import fanout as _fanout
+    from services import credits as _credits
+    from services import idempotency as _idempotency
+
+    _log = _logging.getLogger("kaizer.publish.legacy_v2")
+
+    # ── 1. Validate the clip (mirror legacy 404/422 surface) ─────────────
+    clip = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    if not clip.file_path:
+        raise HTTPException(
+            status_code=422,
+            detail="Clip has no rendered file — run the pipeline first",
+        )
+
+    # ── 2. Resolve target list (same dedupe-preserving order) ────────────
+    raw_ids: list[int] = []
+    if payload.channel_ids:
+        raw_ids.extend(payload.channel_ids)
+    if payload.channel_id is not None:
+        raw_ids.append(payload.channel_id)
+    seen: set[int] = set()
+    target_ids = [i for i in raw_ids if not (i in seen or seen.add(i))]
+    if not target_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one destination must be selected.",
+        )
+
+    # ── 3. Load channels + validate ownership/OAuth (mirror legacy) ──────
+    channels = (
+        db.query(models.Channel).filter(models.Channel.id.in_(target_ids)).all()
+    )
+    by_id = {c.id: c for c in channels}
+    missing = [i for i in target_ids if i not in by_id]
+    if missing:
+        raise HTTPException(
+            status_code=404, detail=f"Profile(s) not found: {missing}"
+        )
+    for cid in target_ids:
+        ch = by_id[cid]
+        if not ch.oauth_token or not ch.oauth_token.refresh_token_enc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Style profile '{ch.name}' is not linked to YouTube. "
+                    "Open Style Profiles → Link my YT."
+                ),
+            )
+
+    # ── 4. Resolve / synthesise MasterVideo (PER CLIP) ───────────────────
+    # One MasterVideo per CLIP, not per job. A V4 job emits 1 Full Video
+    # + N shorts — each a distinct file. Keying the master by clip means
+    # publishing the bulletin and a short no longer collapse onto a
+    # single master (which used to upload the SAME file twice).
+    job_id = int(getattr(clip, "job_id", 0) or 0)
+    master = (
+        db.query(models.MasterVideo)
+        .filter(models.MasterVideo.clip_id == int(clip.id))
+        .first()
+    )
+    # Legacy adopt: a pre-fix per-job master whose r2_key already points
+    # at THIS clip's file (the rows the repair script healed). Claim it
+    # for this clip so we don't orphan a real uploaded artifact.
+    if master is None and job_id:
+        legacy = (
+            db.query(models.MasterVideo)
+            .filter(
+                models.MasterVideo.source_upload_id == job_id,
+                models.MasterVideo.clip_id.is_(None),
+                models.MasterVideo.r2_key.like(f"%/clip/{int(clip.id)}/%"),
+            )
+            .first()
+        )
+        if legacy is None:
+            legacy = (
+                db.query(models.MasterVideo)
+                .filter(
+                    models.MasterVideo.source_upload_id == job_id,
+                    models.MasterVideo.clip_id.is_(None),
+                    models.MasterVideo.r2_key.like(f"%clip_{int(clip.id)}/%"),
+                )
+                .first()
+            )
+        if legacy is not None:
+            legacy.clip_id = int(clip.id)
+            db.add(legacy)
+            db.commit()
+            master = legacy
+
+    # Raw uploads (Quick Publish) are CLEAN user videos — nothing was
+    # baked at render time, so the Branding worker must apply the
+    # per-channel logo AND watermark. Detect via frame_type or the
+    # meta flag raw-upload sets.
+    _is_raw_upload = (getattr(clip, "frame_type", "") or "") == "raw_upload"
+    if not _is_raw_upload:
+        try:
+            import json as _json
+            _meta = _json.loads(clip.meta) if clip.meta else {}
+            _is_raw_upload = bool(
+                isinstance(_meta, dict) and _meta.get("raw_upload")
+            )
+        except Exception:
+            pass
+
+    # An existing master whose key is the old placeholder shape is
+    # BROKEN for the branding worker (it can't download bytes that were
+    # never uploaded — every dispatch fails with StorageWriteError and
+    # the job burns its retries). Repair it on this publish instead of
+    # re-dispatching into the same wall.
+    _needs_repair = bool(
+        master is not None
+        and (master.r2_key or "").startswith("legacy/clip/")
+    )
+    if _needs_repair:
+        try:
+            from pipeline_core.storage import get_storage_provider as _gsp
+            _needs_repair = not _gsp().exists(master.r2_key)
+        except Exception:
+            _needs_repair = True  # can't verify → resolve a real key
+
+    if master is None or _needs_repair:
+        # Synthesise (or repair) the transitional MasterVideo row.
+        # clean_master semantics:
+        #   * Raw uploads (Quick Publish): True — the user's finished
+        #     video has NO Kaizer branding; Branding applies the full
+        #     per-channel logo + watermark pass.
+        #   * Rendered clips with KAIZER_CLEAN_MASTER=1 (post-cutover
+        #     V4): ALSO True — the render skipped the logo bake, so
+        #     Branding owns the logo pass.
+        #   * Pre-cutover legacy renders (flag off): False — logo is
+        #     already baked; Branding applies text-only.
+        try:
+            import os
+            file_path = (clip.file_path or "").strip()
+            local_ok = bool(file_path and os.path.exists(file_path))
+            storage_key = (getattr(clip, "storage_key", "") or "").strip()
+
+            # The Branding worker downloads the master via the storage
+            # provider, so a REAL key is required. The raw-upload
+            # endpoint mirrors to storage and (on R2) deletes the local
+            # file — so "local file missing" is NORMAL there. Only fail
+            # when we have neither bytes source.
+            if not local_ok and not storage_key:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Clip file unavailable (no local file at "
+                        f"{file_path!r} and no storage key). "
+                        "Re-render or re-upload before publishing."
+                    ),
+                )
+
+            file_bytes = (
+                int(os.path.getsize(file_path)) if local_ok else 1
+            )
+            duration = float(getattr(clip, "duration", None) or 0.0)
+            # Best-effort dimensions: probe only when a local file
+            # exists; the v2 path uses these for analytics only.
+            width, height = 1920, 1080
+            if local_ok:
+                try:
+                    import subprocess
+                    r = subprocess.run(
+                        [
+                            "ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0:s=x", file_path,
+                        ],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        parts = r.stdout.strip().split("x")
+                        if len(parts) == 2:
+                            width = int(parts[0])
+                            height = int(parts[1])
+                except Exception:
+                    pass
+
+            # Resolve the master's storage key — for EVERY clip kind.
+            # Precedence:
+            #   1. clip.storage_key — an already-mirrored object.
+            #   2. Upload the local rendered file NOW. This is the
+            #      normal path for V4 clips on a local-storage dev box;
+            #      the placeholder-key shape is reused as the real key
+            #      so previously-synthesised rows heal automatically.
+            r2_key = storage_key
+            if not r2_key and local_ok:
+                from pipeline_core.storage import get_storage_provider
+                upload_key = f"legacy/clip/{clip.id}/master.mp4"
+                if _is_raw_upload:
+                    _user_id = int(getattr(user, "id", 0) or 0)
+                    upload_key = (
+                        f"raw_uploads/{_user_id}/clip_{clip.id}/master.mp4"
+                    )
+                stored = get_storage_provider().upload(
+                    file_path, upload_key, content_type="video/mp4",
+                )
+                r2_key = stored.key
+                clip.storage_key = stored.key
+                clip.storage_url = stored.url
+                db.add(clip)
+                # Persist the template's logo/watermark slot sidecar next to the
+                # master so the publish branding worker can drop each channel's
+                # logo at the template's designed spot (else it defaults to a
+                # corner, leaving the marked slot empty). No-op when absent.
+                try:
+                    _sc = file_path + ".slots.json"
+                    if os.path.isfile(_sc):
+                        get_storage_provider().upload(
+                            _sc, upload_key + ".slots.json",
+                            content_type="application/json",
+                        )
+                except Exception:
+                    pass
+            if not r2_key:
+                # storage_key absent AND no local file was caught above;
+                # absent AND upload raised lands in the except below.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Could not place clip_id={clip.id} into storage "
+                        "for publishing. Re-render or re-upload."
+                    ),
+                )
+
+            _clean = bool(
+                _is_raw_upload
+                or (os.environ.get("KAIZER_CLEAN_MASTER", "0") or "0").strip() == "1"
+            )
+            _pipe_ver = (
+                "quick_publish" if _is_raw_upload
+                else ("v4_clean" if _clean else "v4_legacy_branded")
+            )
+            if master is None:
+                master = models.MasterVideo(
+                    source_upload_id=job_id,
+                    clip_id=int(clip.id),
+                    r2_key=r2_key,
+                    duration_seconds=max(0.1, duration),
+                    bytes=max(1, file_bytes),
+                    width=width,
+                    height=height,
+                    status="ready",
+                    pipeline_version=_pipe_ver,
+                    clean_master=_clean,
+                )
+                db.add(master)
+            else:
+                # Repair-in-place: future dispatches of EXISTING jobs
+                # read this row, so healing it un-bricks their retries.
+                master.r2_key = r2_key
+                master.bytes = max(1, file_bytes)
+                master.duration_seconds = max(0.1, duration)
+                master.clean_master = _clean
+                master.pipeline_version = _pipe_ver
+                master.status = "ready"
+                db.add(master)
+            db.commit()
+            db.refresh(master)
+            _log.info(
+                "legacy_to_v2_redirect: %s MasterVideo id=%s for "
+                "clip_id=%s (clean_master=%s, r2_key=%s)",
+                ("repaired" if _needs_repair else "synthesised"),
+                master.id, clip.id, master.clean_master, r2_key,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            db.rollback()
+            _log.exception(
+                "legacy_to_v2_redirect: failed to synthesise MasterVideo "
+                "for clip_id=%s: %s", clip.id, exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to materialise MasterVideo for clip_id={clip.id}: {exc}",
+            )
+
+    # ── 5. Build FanoutTargets ───────────────────────────────────────────
+    # Stable version strings for idempotency:
+    #   brand_profile_version = "legacy_clip_{clip_id}"
+    #   seo_version = "clip_{clip_id}_v{seo_variant_override or 0}"
+    #   metadata_version = sha256 of payload metadata signature
+    import hashlib as _hashlib
+
+    # Fold brand_mode into the brand version so the idempotency key differs
+    # when the same clip is re-published to the same channel under a different
+    # branding mode (per_channel vs as_is) — otherwise the second publish
+    # would be deduped as a no-op.
+    brand_v = (
+        f"legacyclip{clip.id}_{payload.brand_mode or 'per_channel'}"
+        f"_{payload.brand_placement or 'template'}"
+    )[:64]
+    seo_v_base = (
+        f"{clip.id}_v{payload.seo_variant_override or 0}_"
+        f"{payload.seo_source_clip_id or 0}_"
+        f"{int(bool(payload.use_seo))}"
+    )
+    seo_v = _hashlib.sha256(seo_v_base.encode("utf-8")).hexdigest()[:24]
+    metadata_signature = (
+        f"{payload.title or ''}|"
+        f"{payload.description or ''}|"
+        f"{','.join(payload.tags or [])}|"
+        f"{payload.category_id or '25'}|"
+        f"{int(payload.made_for_kids)}|"
+        f"{payload.privacy_status}|"
+        f"{payload.publish_at.isoformat() if payload.publish_at else ''}|"
+        f"{payload.publish_kind}"
+    )
+    metadata_v = _hashlib.sha256(metadata_signature.encode("utf-8")).hexdigest()[:24]
+
+    targets: list[_fanout.FanoutTarget] = []
+    for cid in target_ids:
+        ch = by_id[cid]
+        # Resolve effective upload_provider per-channel, mirroring legacy
+        # precedence (per-channel override > batch override > channel default).
+        effective_provider = payload.upload_provider
+        if payload.upload_provider_by_channel:
+            ch_key = str(ch.id)
+            if ch_key in payload.upload_provider_by_channel:
+                effective_provider = payload.upload_provider_by_channel[ch_key]
+        if effective_provider is None:
+            effective_provider = getattr(ch, "upload_provider", None)
+
+        upload_path = _map_legacy_upload_provider(effective_provider)
+        postiz_iid = None
+        if (effective_provider or "").strip().lower() == "postiz":
+            # Route to Postiz: resolve WHICH connected Postiz channel this maps
+            # to. Precedence:
+            #   1. explicit binding from the request (frontend name-matched the
+            #      channel to a LIVE Postiz integration the DB may not know yet),
+            #   2. the channel's persisted postiz_integration_id,
+            #   3. auto-match by name/handle against team-owned DB integrations.
+            # Whatever resolves is persisted onto the channel so future
+            # publishes + the production auto-fallback resolve it natively.
+            postiz_iid = None
+            if payload.postiz_integration_by_channel:
+                postiz_iid = (payload.postiz_integration_by_channel.get(str(ch.id)) or "").strip() or None
+            if not postiz_iid:
+                postiz_iid = (getattr(ch, "postiz_integration_id", "") or "").strip() or None
+            if not postiz_iid:
+                postiz_iid = _resolve_postiz_integration_for_channel(db, user, ch)
+            if postiz_iid and (getattr(ch, "postiz_integration_id", "") or "").strip() != postiz_iid:
+                ch.postiz_integration_id = postiz_iid
+                db.add(ch)
+            if postiz_iid:
+                upload_path = "postiz"
+            else:
+                # FAIL-CLOSED: the user explicitly chose to deliver this channel
+                # via Postiz. We must NOT silently fall back to a native YouTube
+                # upload (that burns YT quota and posts somewhere the user didn't
+                # intend). Error loudly so they re-pick the channel instead.
+                _log.warning(
+                    "publish: channel=%s (%r) requested Postiz but no matching "
+                    "Postiz channel resolved — refusing to fall back to native.",
+                    ch.id, getattr(ch, "name", ""),
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Channel '{getattr(ch, 'name', '')}' is set to publish via "
+                        f"Postiz, but no matching Postiz channel was found. Re-select "
+                        f"it in the Postiz list (matched by name) and try again — "
+                        f"nothing was uploaded."
+                    ),
+                )
+        publish_kind = payload.publish_kind or "video"
+
+        # Shorts MUST have thumbnail_source=None; videos require
+        # 'pipeline_generated' as the legacy implicit default — unless
+        # Quick Publish stored a user/AI thumbnail on the clip
+        # (clip.meta.publish_thumbnail_key), in which case the dispatch
+        # layer downloads it and runs thumbnails.set after the upload.
+        if publish_kind == "short":
+            thumb_src = None
+            thumb_key = None
+        else:
+            thumb_src = "pipeline_generated"
+            thumb_key = None
+            try:
+                import json as _json
+                _cm = _json.loads(clip.meta) if clip.meta else {}
+                _ptk = (
+                    (_cm.get("publish_thumbnail_key") or "").strip()
+                    if isinstance(_cm, dict) else ""
+                )
+                if _ptk:
+                    thumb_src = "user_uploaded"
+                    thumb_key = _ptk
+            except Exception:
+                pass
+
+        targets.append(
+            _fanout.FanoutTarget(
+                channel_id=int(ch.id),
+                upload_path=upload_path,
+                publish_kind=publish_kind,
+                brand_profile_id=None,
+                postiz_integration_id=postiz_iid,
+                thumbnail_source=thumb_src,
+                thumbnail_r2_key=thumb_key,
+                scheduled_at=payload.publish_at,
+                privacy_status=payload.privacy_status,
+                brand_mode=(payload.brand_mode or "per_channel"),
+                brand_placement=(payload.brand_placement or "template"),
+                brand_profile_version=brand_v,
+                seo_version=seo_v,
+                metadata_version=metadata_v,
+            )
+        )
+
+    request = _fanout.PublishTaskRequest(
+        master_video_id=int(master.id),
+        targets=targets,
+        priority="normal",
+    )
+
+    # ── 6. Dispatch through the v2 fanout service ────────────────────────
+    try:
+        result = _fanout.create_publish_task(db, user, request)
+        db.commit()
+    except _fanout.DuplicatePublishVersionError as exc:
+        # Dedupe-by-design: return the same job rows the legacy frontend
+        # would have seen if this were a no-op re-publish.
+        #
+        # ROLLBACK (not commit): the fanout flushed a PublishTask row as
+        # 'fanning_out' before hitting the duplicate, with ZERO jobs
+        # attached. Committing here persisted that as a PHANTOM publish
+        # stuck at "Starting / 0%" forever (it has no jobs for the worker
+        # to pick up). Rolling back discards the orphan; the SELECT below
+        # re-reads the genuinely-existing task on a clean session.
+        db.rollback()
+        existing_jobs = (
+            db.query(models.UploadJobV2)
+            .filter(models.UploadJobV2.publish_task_id == exc.existing_publish_task_id)
+            .order_by(models.UploadJobV2.id.asc())
+            .all()
+        )
+        _log.info(
+            "legacy_to_v2_redirect: dedupe-by-design — returning existing "
+            "publish_task_id=%s (%d jobs)",
+            exc.existing_publish_task_id, len(existing_jobs),
+        )
+        return _v2_jobs_to_legacy_shape(
+            db, existing_jobs, clip, by_id, already_published=True,
+        )
+    except _credits.InsufficientCreditsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "insufficient_credits",
+                "message": str(exc),
+                "balance": int(getattr(exc, "balance", 0)),
+                "needed": int(getattr(exc, "needed", 0)),
+            },
+        )
+    except _fanout.PlanTierViolationError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=403,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+    except _fanout.MasterVideoNotReadyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+    except _fanout.FanoutError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        _log.exception(
+            "legacy_to_v2_redirect: fanout failed for clip_id=%s: %s",
+            clip.id, exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Publish failed: {exc}",
+        )
+
+    # ── 7. Serialise the v2 result into legacy response shape ────────────
+    created_jobs = (
+        db.query(models.UploadJobV2)
+        .filter(models.UploadJobV2.id.in_(result.upload_job_ids))
+        .order_by(models.UploadJobV2.id.asc())
+        .all()
+    )
+    _log.info(
+        "legacy_to_v2_redirect: created publish_task_id=%s upload_job_ids=%s "
+        "(skipped %s already-published channel(s))",
+        result.publish_task_id, result.upload_job_ids,
+        getattr(result, "skipped_count", 0),
+    )
+    out = _v2_jobs_to_legacy_shape(db, created_jobs, clip, by_id)
+    # Partial publish: some channels were brand-new (uploaded), others were
+    # already published with this version (skipped). Surface the skip count
+    # so the UI can say "published to the new channels; N already had it"
+    # instead of looking like it ignored the rest.
+    skipped = int(getattr(result, "skipped_count", 0) or 0)
+    if skipped and isinstance(out, dict):
+        out["skipped_already_published"] = skipped
+    return out
+
+
+def _v2_jobs_to_legacy_shape(
+    db: Session,
+    v2_jobs: list,
+    clip: "models.Clip",
+    by_id: dict,
+    *,
+    already_published: bool = False,
+):
+    """Render a list of ``UploadJobV2`` rows into the same response
+    shape ``_to_dict`` produces for the legacy ``UploadJob``.
+
+    Single target → flat dict; multiple → ``{jobs: [...], count: n}``.
+
+    ``already_published=True`` marks a dedupe-by-design no-op (the clip
+    was already published to the selected channel(s) with the same
+    video / SEO / privacy). We attach ``already_published`` + a
+    human-readable ``message`` so the UI can show a clear notice instead
+    of silently redirecting — otherwise the user thinks publish broke.
+    """
+    def _to_legacy_shape(j) -> dict:
+        ch = by_id.get(j.channel_id)
+        return {
+            "id": int(j.id),
+            "clip_id": int(clip.id),
+            "channel_id": int(j.channel_id) if j.channel_id is not None else None,
+            "channel_name": ch.name if ch else None,
+            "clip_filename": getattr(clip, "filename", None),
+            "clip_thumb_url": (
+                (getattr(clip, "thumb_storage_url", "") or "")
+                or (f"/api/file/?path={clip.thumb_path}" if getattr(clip, "thumb_path", None) else "")
+            ),
+            "status": j.status,
+            "privacy_status": getattr(j, "privacy_status", "private"),
+            "publish_kind": j.publish_kind or "video",
+            "publish_at": j.publish_at.isoformat() if getattr(j, "publish_at", None) else None,
+            "title": getattr(j, "title", None),
+            "description": getattr(j, "description", None),
+            "tags": list(getattr(j, "tags", None) or []),
+            "category_id": getattr(j, "category_id", None) or "25",
+            "made_for_kids": bool(getattr(j, "made_for_kids", False)),
+            "video_id": j.youtube_video_id or None,
+            "video_url": (
+                f"https://youtu.be/{j.youtube_video_id}" if j.youtube_video_id else None
+            ),
+            # Mirror legacy: v2's upload_path maps back to a legacy-ish hint.
+            "upload_provider": (
+                "native_rtmp" if (j.upload_path or "") == "rtmp" else "kaizer"
+            ),
+            "bytes_uploaded": int(getattr(j, "bytes_uploaded", 0) or 0),
+            "bytes_total": 0,
+            "progress_pct": 0.0,
+            "attempts": int(getattr(j, "attempts", 0) or 0),
+            "last_error": getattr(j, "last_error", "") or "",
+            "log": "",
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+            # v2-only fields surfaced for diagnostics — harmless to legacy callers.
+            "v2_publish_task_id": int(j.publish_task_id),
+            "v2_idempotency_key": j.idempotency_key,
+            # Job-wise Publishes UI deep-link (additive): the modal
+            # navigates to /uploads/{publish_task_id} after publishing.
+            "publish_task_id": int(j.publish_task_id),
+        }
+
+    _n_ch = len({j.channel_id for j in v2_jobs}) if v2_jobs else 0
+    _dupe_msg = (
+        f"This clip is already published to "
+        f"{_n_ch} channel{'s' if _n_ch != 1 else ''} with the same video, "
+        f"SEO and privacy — so no new upload was created. Change the SEO, "
+        f"privacy, or thumbnail to publish a new version, or open the "
+        f"existing publish below."
+        if _n_ch else
+        "This clip was already published with these exact settings — no "
+        "new upload was created."
+    )
+    if len(v2_jobs) == 1:
+        out = _to_legacy_shape(v2_jobs[0])
+        if already_published:
+            out["already_published"] = True
+            out["message"] = _dupe_msg
+        return out
+    out = {
+        "jobs": [_to_legacy_shape(j) for j in v2_jobs],
+        "count": len(v2_jobs),
+        "publish_task_id": (
+            int(v2_jobs[0].publish_task_id) if v2_jobs else None
+        ),
+    }
+    if already_published:
+        out["already_published"] = True
+        out["message"] = _dupe_msg
+    return out
+
+
+class _PublishedStatusRequest(BaseModel):
+    clip_ids: list[int] = []
+
+
+@router.post("/clips/published-status")
+def clips_published_status(
+    payload: _PublishedStatusRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Which of the given clips are ALREADY published, broken down per
+    channel. The bulk-publish modal calls this to badge + auto-deselect
+    channels that already have the clip(s), so the user publishes only to
+    the NEW channels instead of the whole batch quietly de-duping.
+
+    Tenant-scoped to the caller's own clips/jobs. Returns:
+        {"clip_count": N,
+         "by_channel": {"<channel_id>": {"channel_id", "count",
+                                         "clip_ids", "video_ids"}}}
+    where ``count`` is how many of the requested clips already have a
+    COMPLETED upload on that channel.
+    """
+    clip_ids = sorted({int(c) for c in (payload.clip_ids or []) if c is not None})
+    if not clip_ids:
+        return {"clip_count": 0, "by_channel": {}}
+    # Tenant isolation: only the caller's own clips (clip → job → user).
+    owned_ids = [
+        r[0] for r in (
+            db.query(models.Clip.id)
+            .join(models.Job, models.Job.id == models.Clip.job_id)
+            .filter(models.Clip.id.in_(clip_ids), models.Job.user_id == user.id)
+            .all()
+        )
+    ]
+    if not owned_ids:
+        return {"clip_count": 0, "by_channel": {}}
+    rows = (
+        db.query(
+            models.UploadJobV2.channel_id,
+            models.MasterVideo.clip_id,
+            models.UploadJobV2.youtube_video_id,
+        )
+        .join(models.PublishTask, models.PublishTask.id == models.UploadJobV2.publish_task_id)
+        .join(models.MasterVideo, models.MasterVideo.id == models.PublishTask.master_video_id)
+        .filter(
+            models.MasterVideo.clip_id.in_(owned_ids),
+            models.UploadJobV2.status == "completed",
+            models.UploadJobV2.user_id == int(user.id),
+        )
+        .all()
+    )
+    by_channel: dict = {}
+    for ch_id, clip_id, vid in rows:
+        if ch_id is None:
+            continue
+        key = str(int(ch_id))
+        e = by_channel.setdefault(
+            key, {"channel_id": int(ch_id), "clip_ids": [], "video_ids": []},
+        )
+        if int(clip_id) not in e["clip_ids"]:
+            e["clip_ids"].append(int(clip_id))
+        if vid and vid not in e["video_ids"]:
+            e["video_ids"].append(vid)
+    for e in by_channel.values():
+        e["count"] = len(e["clip_ids"])
+    return {"clip_count": len(owned_ids), "by_channel": by_channel}
+
+
 @router.post("/clips/{clip_id}/publish")
 def publish_clip(
     clip_id: int,
@@ -284,7 +1110,16 @@ def publish_clip(
     Accepts either the legacy `channel_id` (single) or the newer `channel_ids`
     list (fan-out → one UploadJob per entry).  Returns a single dict when only
     one target was requested, or `{jobs: [...]}` for a fan-out.
+
+    Phase 3 cutover: when ``KAIZER_NEW_PUBLISH_PATH=1``, this handler
+    delegates to ``_legacy_to_v2_redirect`` which routes through
+    ``services.fanout.create_publish_task``. The response shape stays
+    identical so the existing frontend works unchanged. Default is
+    unchanged — flip the flag to opt in to the new path.
     """
+    if _legacy_publish_to_v2_enabled():
+        return _legacy_to_v2_redirect(db, user, clip_id, payload)
+
     clip = db.query(models.Clip).filter(models.Clip.id == clip_id).first()
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -562,5 +1397,25 @@ def stream_log(upload_id: int):
 
 @router.get("/quota")
 def get_quota(db: Session = Depends(get_db)):
-    """Lightweight quota snapshot for the UI."""
-    return quota.snapshot(db)
+    """Lightweight quota snapshot for the UI.
+
+    Quota-truth fix: serve the SAME snapshot the v2 gate enforces —
+    cap resolved via services/quota_sync (Google's real assigned limit,
+    hourly-synced), usage from the production 'oauth' bucket.
+
+    Returns BOTH buckets so the UI can show the right number:
+      - flat ``{date, used, limit, remaining}`` = the 10,000 "Queries" pool
+        (kept for backward-compat with existing consumers),
+      - ``queries`` = same Queries-pool snapshot,
+      - ``uploads`` = the SEPARATE videos.insert 100/day bucket
+        ``{date, used, cap:100, remaining}`` — the real "X / 100 uploads
+        today" the Uploads page should display (uploads do NOT consume the
+        10,000 Queries pool).
+    """
+    from youtube import quota_v2 as _quota_v2
+    _queries = _quota_v2.snapshot(db)
+    return {
+        **_queries,
+        "queries": _queries,
+        "uploads": _quota_v2.uploads_snapshot(db),
+    }

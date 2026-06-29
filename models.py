@@ -23,6 +23,21 @@ class User(Base):
     google_sub    = Column(String(64),  nullable=True, unique=True, index=True)
     is_active     = Column(Boolean, default=True)
     is_admin      = Column(Boolean, default=False)
+    # Creative role: same permissions as a normal user PLUS the ability
+    # to upload videos to the shared company Library (see LibraryItem
+    # below). Admins implicitly have this. Toggled by an admin via the
+    # admin UI or a one-shot SQL update.
+    is_creative   = Column(Boolean, default=False, nullable=False)
+    # Profile picture (image or GIF). Stored on R2 at
+    # ``library/users/<id>/avatar.<ext>``. URL minted on demand by the
+    # storage provider; empty = show initials fallback. Used everywhere
+    # a creator is rendered.
+    avatar_key    = Column(String(500), default="", nullable=False)
+    # Cached aggregate of the creator's per-user ratings. Sum and count
+    # bumped by CreatorRating writes so list endpoints never have to
+    # GROUP BY at query time.
+    creator_rating_sum   = Column(Integer, default=0, nullable=False)
+    creator_rating_count = Column(Integer, default=0, nullable=False)
     # Cross-promo links used by SEO to populate "follow me" footer in descriptions.
     # Free-form dict: {"twitter":"@...", "instagram":"...", "whatsapp_community":"...", "website":"...", ...}
     socials       = Column(JSON, default=dict)
@@ -59,6 +74,17 @@ class User(Base):
     # extend the schema without an Alembic migration on every iteration.
     v4_defaults = Column(Text, nullable=True)
 
+    # ── Upload Rewrite v2: plan-tier link ─────────────────────────────
+    # FK to plan_tiers row (free | pro | enterprise). Drives slot caps,
+    # monthly credit allotment, direct-path gating. Nullable for now to
+    # keep the migration safe; _migrate_schema() backfills existing rows
+    # to the 'pro' tier id immediately after the table is created and
+    # seeded. See docs/upload-rewrite/CONTRACTS.md §3.8 + DECISIONS.md
+    # Decision 8. The legacy ``plan`` string column above stays during
+    # the transition and is dropped in Phase 3.
+    plan_tier_id  = Column(Integer, ForeignKey("plan_tiers.id", ondelete="SET NULL"), nullable=True, index=True)
+    plan_tier     = relationship("PlanTier", foreign_keys=[plan_tier_id])
+
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -68,6 +94,19 @@ class Job(Base):
     status       = Column(String(20), default="pending")   # pending | running | done | failed | cancelled
     platform     = Column(String(50))
     frame_layout = Column(String(50))
+    # Custom-template per-slot media (services/custom_templates). JSON map
+    # {slot_key: asset_id} for the slots the user filled; the MAIN one
+    # (main_media_slot) is the clip Kaizer AI-trims — the rest are used as-is.
+    template_media  = Column(JSON, default=dict)
+    main_media_slot = Column(String(64), default="")
+    # Per-slot TEXT overrides set in the custom-template editor. JSON {slot_key: text} —
+    # these REPLACE the AI/filler-generated text for that slot at render (operator retypes
+    # the headline/ticker/etc.); absent slots fall back to the filler. Read by BOTH the
+    # orchestrator render and the editor re-render.
+    template_overrides = Column(JSON, default=dict)
+    # "Full form video" (16:9) custom template, e.g. "custom:<id>" — separate from
+    # frame_layout (which is the 9:16 shorts template). "" = built-in bulletin.
+    fullform_layout = Column(String(50), default="")
     video_name   = Column(String(255))
     # V2 Beta (Phase 14 / D-13.11): user-supplied human label for the
     # job. Shown in JobsList + JobDetail. Defaults to first 80 chars
@@ -113,6 +152,97 @@ class Job(Base):
     # "gemini" (the default) when this field is NULL or names an
     # unknown provider. Stays NULL for V1 platforms.
     stage_2_provider = Column(String(20), default="gemini", nullable=True)
+
+    # V4 only: which model decided Step 1's KEEP/CUT plan.
+    # "claude" (Opus 4.7) or "gemini" (2.5 Flash on Vertex).
+    # Picked per-job in the new-job wizard so the operator can A/B
+    # quality. NULL on pre-rollout rows; trim_engine._select_planner
+    # falls back to "claude" when this is NULL or unknown. Stays
+    # NULL for non-V4 platforms.
+    v4_trim_planner  = Column(String(20), default="claude", nullable=True)
+
+    # V4 only: which provider generated per-story images.
+    # "auto" (V1 multi-source chain — Google CSE / DDG / Pexels /
+    # OpenAI), "gemini" (Nano Banana — gemini-2.5-flash-image), or
+    # "openai" (gpt-image-1). NULL on pre-rollout rows; the dispatcher
+    # falls back to "auto". Stays NULL for non-V4 platforms.
+    v4_image_provider = Column(String(20), default="auto", nullable=True)
+
+    # V4 only: operator-supplied description text (Telugu / English /
+    # any language). When NON-EMPTY, the orchestrator switches to
+    # "source-preserved" mode: the bulletin is kept AS-IS (no Claude
+    # KEEP/CUT), shorts are still carved, and the SEO description is
+    # the operator's verbatim text. Used when the operator already has
+    # a polished video they don't want re-edited. NULL = legacy flow
+    # (Claude trim plan + AI-generated SEO description). Stays NULL
+    # for non-V4 platforms.
+    v4_predefined_description = Column(Text, default=None, nullable=True)
+
+    # V4 only: which outputs the operator chose to render —
+    #   "both" (full video + shorts), "full-only" (bulletin, no shorts),
+    #   or "shorts-only" (shorts/reels, no bulletin). The orchestrator
+    #   gates rendering on this and also stamps it onto canvas.json so
+    #   editor re-renders honour the original choice. NULL/"both" for
+    #   legacy + non-V4 rows.
+    v4_output_format = Column(String(20), default="both", nullable=True)
+
+    # V4 only: the original publish target the operator picked in the wizard
+    #   ("instagram" / "youtube" / "facebook"). Reel/Short/Full all run on the
+    #   same V4 engine, so this is the ONLY record of which platform was
+    #   intended — the editor uses it to lead with that platform's SEO
+    #   (Instagram caption+hashtags vs YouTube title+tags). NULL/"youtube" for
+    #   legacy + non-V4 rows.
+    v4_target_platform = Column(String(20), default="youtube", nullable=True)
+
+    # V4 only (Stage 2): DEFER the heavy compose. When true, the pipeline produces the raw
+    # cut video + canvas.json scene + Clip rows but skips the up-front MP4 render; the render
+    # then happens on demand ("export") in the editor. Edit-first jobs finish fast. Default off
+    # so existing/auto-publish jobs are unaffected.
+    v4_defer_render = Column(Boolean, default=False, nullable=True)
+
+    # V4 only: the channels the operator chose AT GENERATE TIME to publish
+    # this job to (JSON list of Channel ids, e.g. "[3,7,12]"). Recorded by
+    # the New Job wizard's "Choose channels" step so the editor + Publish
+    # flow know the intended targets up front. NULL = not chosen at generate
+    # (channels picked later at publish, the legacy flow). The master render
+    # is channel-agnostic; this only scopes per-channel SEO/branding/publish.
+    target_channel_ids = Column(Text, default=None, nullable=True)
+
+    # PER-CHANNEL intro overrides for this job: JSON map {"<channel_id>":
+    # <UserAsset id>, ...}. A channel present here uses THAT intro for this
+    # job; a channel ABSENT uses its own assigned intro (the default). Chosen
+    # inline per channel at job creation (its own / platform-demo / upload).
+    # The branding resolver folds the looked-up asset into the version hash so
+    # each channel's override forks its brand cache cleanly.
+    intro_overrides = Column(Text, default=None, nullable=True)
+
+    # PER-JOB custom-template HTML overrides (custom:<id> renders only). JSON map
+    # {"<target>:<index>": "<html>", ...} where target is "bulletin"|"short" and index
+    # is the output index. When present for an output, the renderer uses THIS HTML
+    # verbatim (the operator visually edited the template for this job in the inline
+    # builder — moved/resized/recoloured/retyped) instead of the parent template +
+    # filler. The PARENT template is never modified; only this job is affected. NULL =
+    # no overrides (normal path). HTML is sanitized (scripts/external URLs stripped)
+    # on save, same as an uploaded template. Column(JSON) (migrated as TEXT, the same
+    # pattern as template_overrides/template_media) — read via _jdict, assign a fresh dict.
+    custom_html_overrides = Column(JSON, default=dict)
+
+    # (Legacy/unused) single per-job intro override — superseded by the
+    # per-channel ``intro_overrides`` map above; kept so the column isn't
+    # dropped. Always NULL on new jobs.
+    intro_asset_id = Column(
+        Integer, ForeignKey("user_assets.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
+    # Wave 2 (API scale): cached cover image for the jobs list. The
+    # list endpoint's _resolve_thumb walk does 5+ filesystem stat()
+    # calls per job; once a thumb resolves we write it back here so
+    # subsequent listings read two columns instead of hitting disk.
+    # NULL until the first listing after the job's thumbs exist
+    # (running jobs, pre-Wave-2 rows). thumb_aspect is "16:9"/"9:16".
+    thumb_url    = Column(String(500), nullable=True)
+    thumb_aspect = Column(String(8), nullable=True)
 
     clips = relationship("Clip", back_populates="job", cascade="all, delete")
 
@@ -162,13 +292,22 @@ class Clip(Base):
 class Channel(Base):
     __tablename__ = "channels"
     # Profile names are unique PER USER, not globally — two users can both
-    # have a "Kaizer News Telugu" style profile.
+    # have a "Kaizer X Telugu" style profile.
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_channel_user_name"),)
 
     id                 = Column(Integer, primary_key=True, index=True)
     user_id            = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     name               = Column(String(255), nullable=False, index=True)
     handle             = Column(String(100), default="")
+    # What this channel IS — the durable distinction the UI's two tabs rely on:
+    #   "account" = a YouTube channel the user OWNS and publishes to (carries
+    #               branding/logo/watermark/socials).
+    #   "style"   = a competitor / style reference, used ONLY to mine SEO voice;
+    #               never published to.
+    # Set explicitly at creation. A DISCONNECTED account KEEPS kind="account"
+    # (only its token is removed) so it never falls into the style list when
+    # its token disappears — the bug this column fixes.
+    kind               = Column(String(10), default="account", nullable=True, index=True)
     language           = Column(String(10), default="te")
     title_formula      = Column(Text, default="")
     desc_style         = Column(String(50), default="hook_first")
@@ -179,6 +318,24 @@ class Channel(Base):
     # a UserAsset the user picked from their Assets library.  Null = no
     # logo (the SaaS default — users opt in via the Style Profiles page).
     logo_asset_id      = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
+    # Optional per-channel INTRO video, concatenated at the HEAD of the
+    # branded clip in the branding pass (anti-duplicate lever: a unique
+    # intro per channel changes the opening frames + adds distinct head
+    # audio). FK to a UserAsset the user uploaded/picked. Null = no intro
+    # (the default). BrandProfile.intro_asset_id mirrors this for the
+    # profile-based resolve path; this column serves the common
+    # synthesise-from-legacy-columns path (most channels have no BrandProfile).
+    intro_asset_id     = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True, index=True)
+    # ── Per-channel YouTube publish defaults (set from Kaizer so the
+    # operator never opens YouTube Studio). Applied to every upload to this
+    # channel at publish time. Only fields the YouTube Data API can actually
+    # set live here — monetization/comments/remixing/AI-disclosure are
+    # Studio-only / channel-default and are NOT modelled. ──
+    yt_category_id     = Column(String(10),  nullable=True)   # e.g. "25" News&Politics; null=default
+    yt_playlist_id     = Column(String(64),  nullable=True)   # YouTube playlist id; null=none
+    yt_default_language= Column(String(10),  nullable=True)   # e.g. "te"; null=default "te"
+    yt_made_for_kids   = Column(Boolean,     nullable=True)   # null=inherit default (False)
+    yt_license         = Column(String(20),  nullable=True)   # "youtube" | "creativeCommon"; null=youtube
     mandatory_hashtags = Column(JSON, default=list)
     is_priority        = Column(Boolean, default=False)
     # Per-channel upload route override.  Null = use the system-wide
@@ -188,6 +345,11 @@ class Channel(Base):
     # paths side-by-side, or when one channel's google project has
     # exhausted its daily quota.
     upload_provider    = Column(String(20), nullable=True)  # "postiz" | "kaizer" | "native_rtmp" | null
+    # Postiz integration id this channel maps to (from Postiz's
+    # GET /public/v1/integrations). Set when the user picks Postiz as the
+    # delivery for this channel; the v2 dispatch routes upload_path='postiz'
+    # jobs to this integration. NULL = not bound (postiz delivery inert).
+    postiz_integration_id = Column(String(64), nullable=True)
     # Per-channel watermark — applied at upload time (before videos.insert)
     # so the same rendered file can ship to multiple destinations with
     # each channel's own brand stamp. Empty text = logo-only watermark
@@ -551,6 +713,52 @@ class ClipPerformance(Base):
     sampled_at     = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class TrainingSample(Base):
+    """ONE training-ready row per published video: the content + the exact SEO
+    that shipped (FEATURES), joined to the measured outcome (LABELS), plus meta.
+
+    Snapshotted at poll time (and backfillable) so it's self-contained — the
+    features reflect what actually published and survive later edits/deletes,
+    and the export needs ZERO cleaning: feed it straight to a model. One row
+    per ``video_id`` (upserted to the LATEST outcome)."""
+    __tablename__ = "training_samples"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    # ── identity / meta ──
+    video_id        = Column(String(50), unique=True, index=True)
+    user_id         = Column(Integer, index=True, nullable=True)
+    channel_id      = Column(Integer, index=True, nullable=True)
+    clip_id         = Column(Integer, nullable=True)
+    upload_job_id   = Column(Integer, nullable=True)
+    channel_name    = Column(String(255), default="")
+    platform        = Column(String(20), default="youtube")  # youtube | instagram | facebook
+    language        = Column(String(10), default="")
+    kind            = Column(String(20), default="")         # bulletin | short layout
+    # ── FEATURES (input) — snapshot of what was published ──
+    content_text    = Column(Text, default="")               # story headline / clip text
+    seo_title       = Column(Text, default="")
+    seo_description = Column(Text, default="")
+    seo_keywords    = Column(JSON, default=list)
+    seo_hashtags    = Column(JSON, default=list)
+    style_source_id = Column(Integer, nullable=True)         # competitor style used (or NULL)
+    # derived numeric features — ready for ML, no parsing at train time
+    title_len       = Column(Integer, default=0)
+    desc_len        = Column(Integer, default=0)
+    keyword_count   = Column(Integer, default=0)
+    hashtag_count   = Column(Integer, default=0)
+    seo_score       = Column(Integer, default=0)             # gen-time SEO score
+    # ── LABELS (outcome) ──
+    views           = Column(Integer, default=0)
+    likes           = Column(Integer, default=0)
+    comments        = Column(Integer, default=0)
+    hours_since_publish = Column(Float, default=0.0)
+    views_per_hour  = Column(Float, default=0.0)             # derived label
+    ctr             = Column(Float, nullable=True)           # YouTube Analytics, when scoped
+    # ── bookkeeping ──
+    first_seen_at   = Column(DateTime(timezone=True), server_default=func.now())
+    captured_at     = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase C — Thumbnail A/B variants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,6 +841,84 @@ class ChannelVideo(Base):
                                  onupdate=func.now())
 
 
+class AnalyticsAiReport(Base):
+    """Cached AI-generated analytics report (the "AI Coach").
+
+    One row per (user, scope) generation — ``scope`` is a
+    google_channel_id for a single-channel report or the literal
+    ``"all"`` for the cross-channel overview. The payload is the
+    SCHEMA-VALIDATED JSON the LLM returned (never raw model output),
+    so re-rendering a cached report can never inject anything the
+    validator didn't approve. Reports are reused while fresh to keep
+    LLM spend and abuse surface low.
+    """
+    __tablename__ = "analytics_ai_reports"
+    __table_args__ = (
+        Index("ix_ai_reports_user_scope", "user_id", "scope"),
+    )
+
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    scope      = Column(String(64), nullable=False, default="all")
+    provider   = Column(String(16), default="")          # "gemini" | "claude"
+    payload    = Column(JSON, default=dict)              # validated AiReport JSON
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PostizIntegration(Base):
+    """Per-user ownership of a social channel connected through the
+    business's SINGLE Postiz org (the env POSTIZ_API_KEY).
+
+    Postiz itself has no notion of our users — every channel a user
+    connects lands in that one org. This table is how Kaizer enforces
+    per-user isolation: a user may only see / bind / publish-to /
+    disconnect the integrations THEY connected. ``integration_id`` is
+    Postiz's GET /public/v1/integrations id and is GLOBALLY UNIQUE here
+    (one Postiz channel belongs to exactly one Kaizer user), so two users
+    can never claim the same channel.
+
+    Binding a Kaizer channel to one of these for delivery is OPT-IN — by
+    default every channel uploads natively (our own YouTube quota). In
+    'production' delivery mode it also serves as the auto-fallback target
+    when the YouTube quota is exhausted.
+    """
+    __tablename__ = "postiz_integrations"
+    __table_args__ = (
+        UniqueConstraint("integration_id", name="uq_postiz_integration_id"),
+        Index("ix_postiz_int_user", "user_id"),
+    )
+
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    integration_id = Column(String(64), nullable=False)
+    provider       = Column(String(40), default="")     # instagram | facebook | youtube | x | …
+    name           = Column(String(255), default="")    # Postiz display label
+    identifier     = Column(String(255), default="")    # @handle / platform id
+    picture        = Column(String(500), default="")    # avatar URL (optional)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PostizConnectSession(Base):
+    """Short-lived pre-connect snapshot for the Postiz connect→finalize
+    handshake — DB-backed (NOT process memory) so it survives across uvicorn
+    workers. Connects are serialized only ACROSS teams (the router blocks a
+    DIFFERENT team mid-connecting the same provider), so teammates can connect
+    the same platform concurrently while a different team is asked to retry —
+    keeping cross-team attribution unambiguous. Rows are pruned by TTL on the
+    next connect.
+    """
+    __tablename__ = "postiz_connect_sessions"
+    __table_args__ = (
+        Index("ix_postiz_connect_provider", "provider", "created_ts"),
+    )
+
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    provider   = Column(String(40), nullable=False)
+    before_ids = Column(JSON, default=list)   # org integration ids before this connect
+    created_ts = Column(Float, nullable=False)  # time.time() at connect (TTL clock)
+
+
 class UserAsset(Base):
     """Images / logos a user uploads to reuse across clips.
 
@@ -678,6 +964,136 @@ class UserAsset(Base):
     # Optional: separate R2 URL for the generated thumbnail. If empty,
     # _to_dict falls back to storage_url so legacy rows still render.
     thumb_storage_url = Column(String(500), default="")
+
+
+class LibraryItem(Base):
+    """Shared "company library" of source videos that any logged-in user
+    can pick from when starting a new job. Uploaded exclusively by
+    ``is_creative`` or ``is_admin`` users — normal users can browse +
+    "Use" only.
+
+    Single source of truth = Cloudflare R2. Both local-dev and prod
+    instances read/write the same bucket so a creative uploads once
+    and every user (regardless of which deployment they're on) sees it.
+    The video + thumbnail live at:
+
+        library/<id>/video.<ext>
+        library/<id>/thumb.jpg
+
+    ``deleted_at`` is soft-delete only — the row stays for audit and
+    the R2 object stays for 30 days before a separate sweep deletes it.
+    """
+    __tablename__ = "library_items"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    # Creative user who uploaded it. ForeignKey is nullable so deleting
+    # a creator account doesn't cascade-wipe the library.
+    uploader_id   = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"),
+                            nullable=True, index=True)
+    # User-supplied title. Falls back to original filename when blank.
+    title         = Column(String(200), nullable=False, default="")
+    description   = Column(Text, default="")
+    # R2 object keys (relative to bucket root; the prefix env var is
+    # applied transparently by R2Storage._k). Empty until upload finishes.
+    video_key     = Column(String(500), nullable=False, default="")
+    thumb_key     = Column(String(500), default="")
+    # Watermarked copy for free-tier downloads. Generated lazily on the
+    # first free-user download request and cached on R2 — paid users
+    # never trigger this render. Empty = not yet generated.
+    watermark_key = Column(String(500), default="")
+    # Cached metadata so the listing endpoint doesn't probe ffprobe on
+    # every fetch. Populated at upload time.
+    duration_secs = Column(Float, default=0)
+    file_size     = Column(Integer, default=0)
+    width         = Column(Integer, default=0)
+    height        = Column(Integer, default=0)
+    # Original filename — surfaced to the user when title is blank.
+    original_name = Column(String(255), default="")
+    # Tracks how many jobs have been kicked off from this item — useful
+    # signal for creatives to see what's getting used.
+    use_count     = Column(Integer, default=0, nullable=False)
+    # Watch count — incremented on every play-ticket request (the call
+    # the <video> tag makes before streaming). Shown on the card so
+    # creators see what's popular.
+    watch_count   = Column(Integer, default=0, nullable=False)
+    # Optional FK to a LibraryCategory. ondelete=SET NULL so deleting a
+    # category never touches the videos — they just become uncategorized.
+    # category_id is what the row is bound to (NOT the name) so renames
+    # are free.
+    category_id   = Column(Integer,
+                            ForeignKey("library_categories.id", ondelete="SET NULL"),
+                            nullable=True, index=True)
+    # Cached aggregate of per-video ratings. Sum + count denormalized
+    # here so the list endpoint never has to GROUP BY ratings.
+    rating_sum    = Column(Integer, default=0, nullable=False)
+    rating_count  = Column(Integer, default=0, nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    deleted_at    = Column(DateTime(timezone=True), nullable=True)
+
+
+class LibraryCategory(Base):
+    """Operator-managed category taxonomy for the company library.
+
+    Videos reference categories by id (NEVER name) so admins can rename
+    a category and every existing video keeps its binding. Soft-delete
+    means a deleted category just stops appearing in pickers; videos
+    that used it have their ``category_id`` set NULL via the FK's
+    ``ondelete='SET NULL'`` rule — no orphans, no data loss.
+    """
+    __tablename__ = "library_categories"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    name        = Column(String(80), nullable=False, default="")
+    # Optional accent colour for chips. Free-form CSS string ("#c0392b"
+    # or named token).
+    color       = Column(String(20), default="")
+    sort_order  = Column(Integer, default=0, nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    deleted_at  = Column(DateTime(timezone=True), nullable=True)
+
+
+class LibraryItemRating(Base):
+    """One rating per (item, user). Upsert pattern — re-rating updates
+    the same row. The library item's cached ``rating_sum`` /
+    ``rating_count`` get adjusted by the delta at upsert time."""
+    __tablename__ = "library_item_ratings"
+    __table_args__ = (
+        UniqueConstraint("item_id", "user_id", name="uq_libitem_rating_user"),
+    )
+
+    id         = Column(Integer, primary_key=True, index=True)
+    item_id    = Column(Integer,
+                          ForeignKey("library_items.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    user_id    = Column(Integer,
+                          ForeignKey("users.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    stars      = Column(Integer, nullable=False, default=5)   # 1..5
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                          onupdate=func.now())
+
+
+class CreatorRating(Base):
+    """One rating per (creator, rater) — same upsert pattern as
+    LibraryItemRating. Updates the User row's cached creator
+    aggregate."""
+    __tablename__ = "creator_ratings"
+    __table_args__ = (
+        UniqueConstraint("creator_id", "rater_id", name="uq_creator_rating_pair"),
+    )
+
+    id         = Column(Integer, primary_key=True, index=True)
+    creator_id = Column(Integer,
+                          ForeignKey("users.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    rater_id   = Column(Integer,
+                          ForeignKey("users.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    stars      = Column(Integer, nullable=False, default=5)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                          onupdate=func.now())
 
 
 class CompetitorChannel(Base):
@@ -907,6 +1323,38 @@ class OpenAiCall(Base):
     prompt_tokens  = Column(Integer,     default=0)
     output_tokens  = Column(Integer,     default=0)
     total_tokens   = Column(Integer,     default=0)
+    cost_usd       = Column(Float,       default=0.0)      # best-effort from a hardcoded price table
+    latency_ms     = Column(Integer,     default=0)
+    status         = Column(String(16),  default="ok")     # ok / error / rate_limited
+    error          = Column(Text,        default="")
+    created_at     = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AnthropicCall(Base):
+    """One row per Claude/Anthropic API call (cut-planning, SEO, thumbnail
+    direction, Express). Mirrors ``gemini_calls`` / ``openai_calls`` so the
+    admin Usage page sums Gemini + OpenAI + Claude spend side-by-side.
+
+    Token columns use the SAME names as the other two tables
+    (``prompt_tokens``/``output_tokens``/``total_tokens``) so the admin
+    aggregation stays uniform; Anthropic's ``input_tokens`` maps to
+    ``prompt_tokens``. Cache columns are Anthropic-specific (prompt caching)
+    and default to 0 for non-cached calls.
+    """
+    __tablename__ = "anthropic_calls"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id         = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"),  nullable=True, index=True)
+    clip_id        = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"), nullable=True, index=True)
+    model          = Column(String(64),  nullable=False)   # claude-opus-4-7 / claude-sonnet-4-6 / ...
+    purpose        = Column(String(64),  default="")       # cut-plan / seo / thumbnail / express / ...
+    prompt_tokens  = Column(Integer,     default=0)        # = Anthropic input_tokens
+    output_tokens  = Column(Integer,     default=0)
+    total_tokens   = Column(Integer,     default=0)
+    # Anthropic prompt-caching accounting (NULL/0 when caching not used).
+    cache_read_tokens  = Column(Integer, default=0)
+    cache_write_tokens = Column(Integer, default=0)
     cost_usd       = Column(Float,       default=0.0)      # best-effort from a hardcoded price table
     latency_ms     = Column(Integer,     default=0)
     status         = Column(String(16),  default="ok")     # ok / error / rate_limited
@@ -1257,3 +1705,422 @@ class JobFeedback(Base):
     rating       = Column(Integer, nullable=False)
     comment      = Column(Text, default="")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Upload Rewrite v2 — new tables for the PublishTask → Fanout → Scheduler
+# → BrandingWorker → UploadWorker pipeline. See docs/upload-rewrite/.
+# Additive ONLY. Old `upload_jobs` table is preserved during cutover.
+#
+# Spec sources of truth:
+#   - docs/upload-rewrite/CONTRACTS.md §3 (schema)
+#   - docs/upload-rewrite/DECISIONS.md Decisions 3, 4, 6, 8 (plan-tier seed)
+#
+# All foreign keys here reference existing tables (jobs, users, channels,
+# oauth_tokens, clips, user_assets) but use SET NULL / CASCADE semantics
+# matching the brief: a deleted user wipes their entire publish history;
+# a deleted asset just NULL-outs the brand profile column.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class PlanTier(Base):
+    """Subscription tier definition — drives slot caps + monthly credit
+    allotments + direct-path gating. Three rows are seeded by
+    main._migrate_schema() at startup: ``free``, ``pro``, ``enterprise``.
+    Values from DECISIONS.md Decisions 3 + 4 + 6.
+
+    Convention: ``-1`` means *unlimited* for the cap columns so the
+    column stays INT-typed without NULL juggling at the call sites.
+    """
+    __tablename__ = "plan_tiers"
+
+    id                       = Column(Integer, primary_key=True, index=True)
+    # Tier name — one of {'free','pro','enterprise'}. Unique because the
+    # F-agent's credit allotment lookup is keyed by name.
+    name                     = Column(String(16), unique=True, nullable=False, index=True)
+    monthly_credit_allotment = Column(Integer, nullable=False)
+    slot_cap_active_uploads  = Column(Integer, nullable=False)
+    # Decision 6: Free is RTMP-only. Pro+ may pick Direct.
+    direct_path_allowed      = Column(Boolean, nullable=False, default=True)
+    # -1 sentinel = unlimited.
+    max_channels             = Column(Integer, nullable=False)
+    max_publishes_per_day    = Column(Integer, nullable=False)
+    created_at               = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at               = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class BrandProfile(Base):
+    """Per-owner branding template (logo + watermark + colors + fonts +
+    intro/outro + socials). Owner is polymorphic — ``owner_kind`` is one
+    of {'user','channel','oauth_token'} and ``owner_id`` is the matching
+    row id in that table. The D-agent's resolver walks oauth_token →
+    channel → user in that precedence order, matching the existing
+    ``pipeline_v4/watermark.py:_resolve_channel_logo`` behaviour.
+
+    ``owner_id`` is intentionally a soft FK (no REFERENCES clause)
+    because Postgres cannot enforce a single FK across three different
+    parent tables. The resolver validates at write time.
+
+    ``version`` is a short hash recomputed by the D-agent on every save;
+    feeds into ``upload_jobs_v2.publish_version``.
+    """
+    __tablename__ = "brand_profiles"
+    __table_args__ = (
+        Index("ix_brand_profiles_owner", "owner_kind", "owner_id"),
+    )
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    owner_kind         = Column(String(16), nullable=False)
+    owner_id           = Column(Integer, nullable=False)
+    name               = Column(String(120), nullable=False)
+    # Short content hash; recomputed on save by the D-agent resolver.
+    version            = Column(String(40), nullable=False)
+    logo_asset_id      = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True)
+    watermark_text     = Column(String(64), nullable=True)
+    watermark_opacity  = Column(Float, default=0.35)
+    watermark_position = Column(String(16), default="lower-center")
+    # JSON-as-text for SQLite/Postgres compatibility — Postgres can read
+    # a TEXT column as JSON via ::json cast when needed.
+    colors_json        = Column(Text, nullable=True)
+    fonts_json         = Column(Text, nullable=True)
+    intro_asset_id     = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True)
+    outro_asset_id     = Column(Integer, ForeignKey("user_assets.id", ondelete="SET NULL"), nullable=True)
+    socials_json       = Column(Text, nullable=True)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MasterVideo(Base):
+    """Clean, unbranded rendered output of the V4 pipeline. Distinct
+    from the raw ``SourceUpload`` (= a ``Job`` row) and from per-channel
+    ``Clip`` rows. One MasterVideo per rendered Job — a single MasterVideo
+    fans out to N channels via PublishTask, each with its own branding
+    pass cached in R2.
+
+    ``source_upload_id`` is unique so the same Job cannot produce two
+    MasterVideo rows. ``clean_master=False`` rows exist only during the
+    KAIZER_CLEAN_MASTER=0 → 1 transition window; once Phase 2 cutover
+    completes, the Branding Worker refuses to process False rows.
+    """
+    __tablename__ = "master_videos"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    # NOTE: source_upload_id is NO LONGER unique. A V4 job produces
+    # MULTIPLE distinct output files (1 Full Video + N shorts); the
+    # legacy→v2 bridge needs ONE MasterVideo PER CLIP (each its own
+    # file), so several masters can share one job. Per-clip identity is
+    # ``clip_id`` below; the old per-job uniqueness caused the bulletin
+    # and every short to collapse onto one master → the same video got
+    # posted multiple times.
+    source_upload_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"),
+                              nullable=False, index=True)
+    # The specific Clip (rendered output) this master is the clean
+    # source for. Nullable for the native v2 path (one master per job,
+    # no Clip); set for every legacy-bridge master.
+    clip_id          = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"),
+                              nullable=True, index=True)
+    r2_key           = Column(Text, nullable=False)
+    duration_seconds = Column(Float, nullable=False)
+    bytes            = Column(BigInteger, nullable=False)
+    width            = Column(Integer, nullable=False)
+    height           = Column(Integer, nullable=False)
+    # staging | ready | failed
+    status           = Column(String(16), nullable=False, default="staging")
+    # 'v4_clean' (KAIZER_CLEAN_MASTER=1) or 'v4_legacy_branded' (KAIZER_CLEAN_MASTER=0).
+    pipeline_version = Column(String(16), nullable=False)
+    clean_master     = Column(Boolean, nullable=False, default=True)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PublishTask(Base):
+    """One user's intent to publish one MasterVideo to N channels. The
+    Fanout service (B-agent) creates exactly one PublishTask per
+    ``POST /api/publish-tasks`` call, then explodes into N
+    ``UploadJobV2`` rows in the same transaction. ``target_count`` is
+    frozen at creation; ``completed_count``/``failed_count`` are bumped
+    atomically by the F-agent on every terminal UploadJob transition.
+
+    Status terminal transitions when ``completed_count + failed_count
+    == target_count``: all-success → 'completed', all-fail → 'failed',
+    mixed → 'partial_failed'.
+    """
+    __tablename__ = "publish_tasks"
+    __table_args__ = (
+        Index("ix_publish_tasks_user_status_priority", "user_id", "status", "priority"),
+    )
+
+    id              = Column(Integer, primary_key=True, index=True)
+    user_id         = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                             nullable=False, index=True)
+    master_video_id = Column(Integer, ForeignKey("master_videos.id", ondelete="CASCADE"),
+                             nullable=False, index=True)
+    # critical | high | normal | low — scheduler dispatches by this rank.
+    priority        = Column(String(16), nullable=False, default="normal")
+    # queued | fanning_out | dispatched | completed | partial_failed | failed | cancelled
+    status          = Column(String(20), nullable=False, default="queued")
+    target_count    = Column(Integer, nullable=False, default=0)
+    completed_count = Column(Integer, nullable=False, default=0)
+    failed_count    = Column(Integer, nullable=False, default=0)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at      = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UploadJobV2(Base):
+    """Refactored per-channel upload job — the v2 of the legacy
+    ``upload_jobs`` table. Lives alongside the old one during cutover
+    so rollback is trivial (drop the new table, legacy code is
+    untouched).
+
+    Key differences from legacy ``UploadJob``:
+      - parented by ``publish_task_id`` (not by ``clip_id`` alone)
+      - explicit ``upload_path`` enum ('direct' | 'rtmp') replaces the
+        old ``upload_provider`` polymorphism
+      - first-class ``publish_kind`` ('video' | 'short') — Shorts skip
+        the thumbnail step entirely (brief §2)
+      - ``idempotency_key`` UNIQUE — dedupe before + after at the DB layer
+      - ``predicted_quota_units`` + ``predicted_credit_cost`` reserved
+        up front; ``actual_quota_units`` filled by the F-agent's
+        reconciliation pass against Google's reported usage
+      - ``priority_at_dispatch`` is frozen by the scheduler when the
+        job is released so per-tier accounting stays honest even when
+        aging promoted the effective priority later
+
+    ``thumbnail_source`` MUST be NULL when ``publish_kind='short'`` —
+    YouTube API does not support custom thumbnails on Shorts. The
+    F-agent enforces this in code (defense in depth on top of the
+    Postgres-side CHECK constraint we add via raw SQL in Phase 3).
+    """
+    __tablename__ = "upload_jobs_v2"
+
+    id                      = Column(Integer, primary_key=True, index=True)
+    publish_task_id         = Column(Integer, ForeignKey("publish_tasks.id", ondelete="CASCADE"),
+                                     nullable=False, index=True)
+    # Legacy bridge: lets the V2 path still reference the originating Clip
+    # row during the transition. Phase 3 may drop this column.
+    clip_id                 = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"),
+                                     nullable=True)
+    channel_id              = Column(Integer, ForeignKey("channels.id", ondelete="SET NULL"),
+                                     nullable=False, index=True)
+    # Resolved at dispatch by the scheduler from the channel; NULL until
+    # then so a deleted token doesn't cascade-kill in-flight rows.
+    oauth_token_id          = Column(Integer, ForeignKey("oauth_tokens.id", ondelete="SET NULL"),
+                                     nullable=True, index=True)
+    brand_profile_id        = Column(Integer, ForeignKey("brand_profiles.id", ondelete="SET NULL"),
+                                     nullable=True, index=True)
+    # direct (videos.insert, 1600u) | rtmp (liveBroadcasts*, ~150u)
+    # | postiz (hand the branded artifact to Postiz, 0 YouTube quota)
+    upload_path             = Column(String(8), nullable=False, index=True)
+    # Postiz integration id (copied from Channel.postiz_integration_id at
+    # fanout) — the target integration for upload_path='postiz' jobs.
+    # NULL for direct/rtmp.
+    postiz_integration_id   = Column(String(64), nullable=True)
+    # video | short
+    publish_kind            = Column(String(8), nullable=False)
+    # pipeline_generated | user_override | user_uploaded — NULL when
+    # publish_kind='short' (Shorts skip the thumbnail step entirely).
+    thumbnail_source        = Column(String(24), nullable=True)
+    thumbnail_r2_key        = Column(Text, nullable=True)
+    branded_artifact_r2_key = Column(Text, nullable=True)
+    # queued | claimed | branding | ready_to_upload | uploading |
+    # completed | failed | cancelled | parked_quota
+    # ('claimed' = durable-queue worker holds the lease; retry is
+    #  expressed as status='queued' with next_attempt_at in the future)
+    status                  = Column(String(20), nullable=False, default="queued", index=True)
+    # Branding mode at upload: 'per_channel' (apply this channel's logo +
+    # watermark + socials at upload, the default) | 'as_is' (the source video
+    # is ALREADY branded — upload it verbatim to every channel, no overlay).
+    brand_mode              = Column(String(16), nullable=False, default="per_channel",
+                                     server_default="per_channel")
+    # Logo/watermark PLACEMENT when overlaying (brand_mode='per_channel'):
+    # 'template' (use the template's marked slot if it has one — designer intent,
+    # the default) | 'channel' (ignore the slot, use this channel's own position
+    # setting / default corner). Content (which logo, the text, opacity) always
+    # comes from the channel either way; this only chooses WHERE.
+    brand_placement         = Column(String(16), nullable=False, default="template",
+                                     server_default="template")
+    attempts                = Column(Integer, nullable=False, default=0)
+    last_error              = Column(Text, nullable=True)
+    # SHA256(master_video_id|channel_id|publish_version) as hex.
+    idempotency_key         = Column(String(64), unique=True, nullable=False)
+    publish_version         = Column(String(40), nullable=False)
+    youtube_video_id        = Column(String(32), nullable=True, index=True)
+    # Publish intent carried from the PublishRequest through fan-out so
+    # dispatch honours the user's choice instead of hard-defaulting to
+    # private. 'public' | 'unlisted' | 'private'. publish_at (UTC, when
+    # set) schedules a private→public flip at YouTube.
+    privacy_status          = Column(String(20), nullable=False, default="private",
+                                     server_default="private")
+    publish_at              = Column(DateTime(timezone=True), nullable=True)
+    predicted_quota_units   = Column(Integer, nullable=False)
+    predicted_credit_cost   = Column(Integer, nullable=False)
+    # Filled by F-agent reconciliation pass.
+    actual_quota_units      = Column(Integer, nullable=True)
+    bytes_uploaded          = Column(BigInteger, nullable=False, default=0)
+    # Resumable session URI — gap in DISCOVERY §2 the E-agent closes by
+    # persisting after request.execute() returns the URI.
+    upload_uri              = Column(Text, nullable=True)
+    # ── Durable queue (Postgres SKIP LOCKED) ────────────────────────
+    # Claimable when status='queued' AND next_attempt_at <= now().
+    # Retry backoff = future next_attempt_at; no extra status needed.
+    next_attempt_at         = Column(DateTime(timezone=True), nullable=False,
+                                     server_default=func.now())
+    # Crash detection: a worker renews this while it holds the job.
+    # The reaper requeues any active-status row whose lease expired.
+    lease_expires_at        = Column(DateTime(timezone=True), nullable=True)
+    # worker_id (host:pid:uuid) fencing token — every status/progress
+    # write is guarded with "AND claimed_by = :worker_id" so a zombie
+    # thread can never clobber a reclaimed job.
+    claimed_by              = Column(String(64), nullable=True)
+    # Denormalized from publish_tasks at fanout INSERT time so the hot
+    # claim query + per-user active-cap aggregate need no joins.
+    # Soft reference (no FK) — publish_tasks.user_id is the truth.
+    user_id                 = Column(Integer, nullable=True, index=True)
+    priority                = Column(String(16), nullable=False,
+                                     default="normal", server_default="normal")
+    # Frozen at scheduler release; aging may change effective priority
+    # in the live queue but the books use the snapshot here.
+    priority_at_dispatch    = Column(String(16), nullable=True)
+    dispatched_at           = Column(DateTime(timezone=True), nullable=True)
+    started_at              = Column(DateTime(timezone=True), nullable=True)
+    finished_at             = Column(DateTime(timezone=True), nullable=True)
+    created_at              = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at              = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PublishAttempt(Base):
+    """Idempotency log — one row per upload attempt against a given
+    ``idempotency_key``. The UNIQUE constraint is the database-level
+    dedupe guarantee: two workers picking up the same key simultaneously
+    cannot both ``INSERT … ON CONFLICT DO NOTHING`` and proceed to
+    ``videos.insert``.
+
+    Status:
+      - in_flight: worker registered the attempt and is uploading now
+      - completed: upload succeeded, ``youtube_video_id`` is populated
+      - failed: permanent failure; caller may retry (creates new row)
+      - recovered: F-agent's ``recover_orphans`` confirmed via
+        ``videos.list`` (1 unit; NEVER ``search.list``, brief §2 + §9)
+        that the upload landed on YouTube even though the worker died
+        before recording success
+    """
+    __tablename__ = "publish_attempts"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    upload_job_id    = Column(Integer, ForeignKey("upload_jobs_v2.id", ondelete="CASCADE"),
+                              nullable=False, index=True)
+    # Same value as upload_jobs_v2.idempotency_key for the parent.
+    idempotency_key  = Column(String(64), unique=True, nullable=False)
+    youtube_video_id = Column(String(32), nullable=True)
+    # in_flight | completed | failed | recovered
+    status           = Column(String(16), nullable=False)
+    # 1-based.
+    attempt_no       = Column(Integer, nullable=False)
+    worker_id        = Column(String(64), nullable=False)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at       = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CreditLedger(Base):
+    """Append-only signed credit ledger. ``balance_after`` is
+    denormalised (last-row-wins per user) so a user's current balance
+    is a single index lookup, not a sum over history.
+
+    When ``reason`` is ``upload_direct`` or ``upload_rtmp`` both
+    ``path`` and ``publish_kind`` MUST be populated (the F-agent
+    enforces this in code). For ``monthly_allotment``, ``refund``, and
+    ``admin_adjustment`` they stay NULL.
+    """
+    __tablename__ = "credit_ledger"
+
+    id                    = Column(Integer, primary_key=True, index=True)
+    user_id               = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                                   nullable=False, index=True)
+    # Signed: negative for upload spend, positive for allotment / refund.
+    delta                 = Column(Integer, nullable=False)
+    # monthly_allotment | upload_direct | upload_rtmp | refund | admin_adjustment
+    reason                = Column(String(32), nullable=False)
+    upload_job_id         = Column(Integer, ForeignKey("upload_jobs_v2.id", ondelete="SET NULL"),
+                                   nullable=True, index=True)
+    # direct | rtmp — only when reason is one of the upload_* values.
+    path                  = Column(String(8), nullable=True)
+    publish_kind          = Column(String(8), nullable=True)
+    predicted_quota_units = Column(Integer, nullable=True)
+    balance_after         = Column(Integer, nullable=False)
+    created_at            = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class QuotaBurnLog(Base):
+    """Predicted-vs-actual reconciliation log for every YouTube API
+    call we make through the new upload path. Orthogonal to the
+    existing ``youtube_api_calls`` forensic log (which stays unchanged,
+    brief §0 + §4) — that one captures every API call ever made; this
+    one specifically captures the *delta* between what ``reserve()``
+    gated on and what Google actually charged.
+
+    The F-agent's reconciliation pass (Phase 2) fills
+    ``reconciled_actual_cost`` + ``reconciled_at`` from Google's
+    reported usage. The brief is firm: never treat the published
+    1,600-unit ``videos.insert`` cost as truth.
+    """
+    __tablename__ = "quota_burn_log"
+
+    id                     = Column(Integer, primary_key=True, index=True)
+    # NULL for non-upload calls (e.g. recovery probes via videos.list).
+    upload_job_id          = Column(Integer, ForeignKey("upload_jobs_v2.id", ondelete="SET NULL"),
+                                    nullable=True, index=True)
+    # e.g. 'videos.insert', 'thumbnails.set', 'liveBroadcasts.insert'.
+    operation              = Column(String(40), nullable=False)
+    predicted_cost         = Column(Integer, nullable=False)
+    # success | transient_error | quota_exceeded | permanent_error
+    observed_outcome       = Column(String(20), nullable=False)
+    http_status            = Column(Integer, nullable=True)
+    was_quota_exceeded     = Column(Boolean, nullable=False, default=False)
+    reconciled_actual_cost = Column(Integer, nullable=True)
+    reconciled_at          = Column(DateTime(timezone=True), nullable=True)
+    created_at             = Column(DateTime(timezone=True), server_default=func.now(),
+                                    nullable=False, index=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom (developer-uploaded) HTML/CSS video templates
+# ─────────────────────────────────────────────────────────────────────────────
+class CustomTemplate(Base):
+    """A developer-uploaded HTML/CSS template (see services/custom_templates/).
+
+    The uploaded bundle (HTML + CSS + assets) is extracted to ``dir_path``; the
+    parsed contract (canvas + discovered video/image/text slots) is snapshotted in
+    ``contract_json`` so the picker and render pipeline understand it without
+    re-parsing. ``visibility`` is the uploader's choice — ``private`` (only the
+    owner) or ``public`` (the shared library). Jobs reference a template as the
+    string ``custom:<id>`` in the existing ``frame_layout`` field (no schema change
+    to jobs/clips)."""
+    __tablename__ = "custom_templates"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    owner_id      = Column(Integer, index=True, nullable=True)      # users.id
+    name          = Column(String(120), default="")
+    slug          = Column(String(140), unique=True, index=True)
+    visibility    = Column(String(10), default="private")          # private | public
+    status        = Column(String(12), default="ready")            # ready | invalid | disabled
+    # storage
+    dir_path      = Column(String(500), default="")                # extracted bundle dir
+    entry_rel     = Column(String(300), default="index.html")
+    preview_path  = Column(String(500), default="")                # generated preview image
+    # contract (machine understanding of the template)
+    canvas_w      = Column(Integer, default=1080)
+    canvas_h      = Column(Integer, default=1920)
+    contract_json = Column(JSON, default=dict)                     # {canvas, slots, warnings}
+    # builder: id of the template this was forked/derived from (NULL = an original).
+    # Drives the "Built on <name>" attribution shown on public forks.
+    derived_from  = Column(Integer, nullable=True)
+    # meta
+    description   = Column(Text, default="")
+    when_to_use   = Column(Text, default="")    # shown in the preview modal
+    how_to_use    = Column(Text, default="")    # shown in the preview modal
+    use_count     = Column(Integer, default=0)
+    rating_sum    = Column(Integer, default=0)  # community rating (sum of 1..5 stars)
+    rating_count  = Column(Integer, default=0)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at    = Column(DateTime(timezone=True), server_default=func.now(),
+                           onupdate=func.now())

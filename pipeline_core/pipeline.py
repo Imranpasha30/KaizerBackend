@@ -1,5 +1,5 @@
 """
-KAIZER NEWS — API-Based Production Pipeline
+KAIZER X — API-Based Production Pipeline
 =============================================
 Architecture:
     Video → Gemini 2.0 Flash  (cut timestamps + summary + image keywords)
@@ -473,7 +473,7 @@ def _fte(text):
 
 def _ascii_text(text, max_len=60):
     clean = "".join(c for c in str(text) if ord(c) < 128)
-    return clean[:max_len].strip() or "KAIZER NEWS"
+    return clean[:max_len].strip() or "KAIZER X"
 
 
 def get_video_info(path):
@@ -1367,7 +1367,7 @@ def generate_title_chatgpt(summary: str, people: list, topics: list, language: s
 
     if not OPENAI_API_KEY:
         print("    No OPENAI_API_KEY — truncating summary to flash headline")
-        words = (summary or "KAIZER NEWS").split()
+        words = (summary or "KAIZER X").split()
         short = " ".join(words[:7])
         return {
             "title_native":  short,
@@ -2460,7 +2460,7 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
     if not image_path or not os.path.exists(str(image_path)):
         image_path = os.path.join(clip_dir, f"_card_{clip_name}.jpg")
         generate_news_card(
-            _ascii_text(title_text or "KAIZER NEWS", 40),
+            _ascii_text(title_text or "KAIZER X", 40),
             image_path, w, IMAGE_H,
         )
 
@@ -2491,7 +2491,7 @@ def compose_clip(raw_clip_path, image_path, title_text, out_path, preset,
     # doesn't shape Telugu correctly on Windows (no HarfBuzz in Windows FFmpeg builds)
     _use_ffmpeg_text = False
     card_result = generate_torn_paper_card(
-        title_text or "KAIZER NEWS",
+        title_text or "KAIZER X",
         width=w, height=CARD_H,
         font_path=tel_font, out_path=card_path,
         seed=_card_seed,
@@ -2662,7 +2662,7 @@ def compose_clip_clean_card(
     if not image_path or not os.path.exists(str(image_path)):
         _gen_card = os.path.join(clip_dir, f"_clean_card_{clip_name}.jpg")
         generate_news_card(
-            _ascii_text(title_text or "KAIZER NEWS", 40),
+            _ascii_text(title_text or "KAIZER X", 40),
             _gen_card, IMAGE_W, IMAGE_H,
         )
         image_path = _gen_card
@@ -2697,7 +2697,7 @@ def compose_clip_clean_card(
     # Auto-size: aim for 2 lines max — pick the largest size that fits
     # in (text_area_w, HEADLINE_H) without overflow. compose_clip uses
     # a similar shrink-loop via PIL.textbbox; we reuse it here.
-    words = str(title_text or "KAIZER NEWS").split()
+    words = str(title_text or "KAIZER X").split()
 
     def _fit_size():
         from PIL import ImageDraw as _ID, Image as _IM
@@ -3027,7 +3027,24 @@ html,body{{width:{area_w}px;height:{area_h}px;margin:0;padding:0;
   padding:22px 28px;
   filter:drop-shadow(2px 2px 0 rgba(0,0,0,0.7));}}
 </style></head><body><div id="t">{_title_html}</div>
-<script>document.fonts.ready.then(function(){{window._done=true;}});</script>
+<script>
+// Auto shrink-to-fit: after the webfont loads, reduce the headline font size
+// until the text fits the card box (height AND width), down to a floor — so a
+// long headline NEVER spills out of the torn/clean card (operator bug). When
+// the headline already fits at the requested size the loop breaks on the first
+// check and the font is unchanged → byte-identical output for fitting titles.
+document.fonts.ready.then(function(){{
+  var el = document.getElementById('t');
+  var fs = {fnt_sz};
+  var MIN = 20;
+  for (var i = 0; i < 80 && fs > MIN; i++) {{
+    if (el.scrollHeight <= el.clientHeight && el.scrollWidth <= el.clientWidth) break;
+    fs -= 2;
+    el.style.fontSize = fs + 'px';
+  }}
+  window._done = true;
+}});
+</script>
 </body></html>"""
 
     try:
@@ -3047,7 +3064,7 @@ def compose_follow_bar(raw_clip_path, out_path, preset,
                        title_text='', font_file=None,
                        text_color='#ffff00', text_size=60,
                        bg_color='#1a0a2e',
-                       follow_text='FOLLOW KAIZER NEWS TELUGU',
+                       follow_text='FOLLOW KAIZER X TELUGU',
                        follow_text_color='#ffffff',
                        social_logos=None,
                        video_logo=None,
@@ -3767,7 +3784,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     lang_cfg = _langs.get(language)
 
     print("=" * 60)
-    print("  KAIZER NEWS — API Pipeline")
+    print("  KAIZER X — API Pipeline")
     print("=" * 60)
 
     # ── Validate video ─────────────────────────────────────
@@ -4177,7 +4194,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             ticker_path = os.path.join(bulletin_dir, "_ticker.png")
             ticker_inputs = [lang_cfg.font_primary] if lang_cfg.font_primary else []
             ticker_extra = {
-                "headlines": all_headlines or ["KAIZER NEWS"],
+                "headlines": all_headlines or ["KAIZER X"],
                 "lang":      lang_cfg.code,
             }
             if compose_deps.is_fresh(ticker_path, ticker_inputs, ticker_extra, min_size=1000):
@@ -4185,7 +4202,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             else:
                 try:
                     render_ticker(
-                        all_headlines or ["KAIZER NEWS"],
+                        all_headlines or ["KAIZER X"],
                         lang_cfg.code, lang_cfg.font_primary,
                         ticker_path,
                     )
@@ -4197,12 +4214,12 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             # ── 3) Render channel bug once.
             bug_path = os.path.join(bulletin_dir, "_bug.png")
             bug_inputs = [DEFAULT_LOGO] if DEFAULT_LOGO else []
-            bug_extra = {"channel_name": "KAIZER NEWS"}
+            bug_extra = {"channel_name": "KAIZER X"}
             if compose_deps.is_fresh(bug_path, bug_inputs, bug_extra, min_size=500):
                 print(f"    [bulletin] channel bug cached (skipping)")
             else:
                 try:
-                    render_channel_bug("KAIZER NEWS", DEFAULT_LOGO or None, bug_path)
+                    render_channel_bug("KAIZER X", DEFAULT_LOGO or None, bug_path)
                     compose_deps.mark_built(bug_path, bug_inputs, bug_extra)
                 except Exception as exc:
                     print(f"    [bulletin][warn] channel bug render failed: {exc}")
@@ -4261,7 +4278,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
                 importance = int(c.get("importance") or 5)
                 kicker = "BREAKING" if importance >= 8 else "NEWS"
                 story_meta = StoryMeta(
-                    title=(_clip_text(c) or "KAIZER NEWS")[:200],
+                    title=(_clip_text(c) or "KAIZER X")[:200],
                     kicker=kicker,
                     language=lang_cfg.code,
                     story_index=i,
@@ -4487,7 +4504,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
     else:
         print(f"\n  [3/{TOTAL}] Generating {lang_cfg.name_english} headline ...")
         title_result = generate_title_chatgpt(summary, people, topics, language=lang_cfg.code)
-    title_native = title_result.get("title_native") or title_result.get("title_telugu", "KAIZER NEWS")
+    title_native = title_result.get("title_native") or title_result.get("title_telugu", "KAIZER X")
     title_en = title_result.get("title_english", "")
     # Legacy alias — several downstream code paths still read title_te
     title_te = title_native
@@ -4545,7 +4562,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
         lang_font_basename = "NotoSansTelugu-Bold.ttf"
     else:
         lang_font_basename = os.path.basename(lang_cfg.font_primary) or "NotoSans-Bold.ttf"
-    lang_follow_text = lang_cfg.follow_bar_text or "FOLLOW KAIZER NEWS"
+    lang_follow_text = lang_cfg.follow_bar_text or "FOLLOW KAIZER X"
 
     # ── Per-clip compose worker ─────────────────────────────────────
     # Each iteration is fully independent — different out_path, thumb,
@@ -4567,7 +4584,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
         out_path = os.path.join(OUTPUT_DIR, f"clip_{i+1:02d}.mp4")
         img = images[i] if i < len(images) else images[-1]
-        card_text = title_native or "KAIZER NEWS"
+        card_text = title_native or "KAIZER X"
 
         print(f"    Composing clip {i+1} ({frame_layout}, font={lang_font_basename}) ...")
 
@@ -4769,7 +4786,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
     # Save readable report
     report_lines = [
-        "KAIZER NEWS — API Pipeline Report",
+        "KAIZER X — API Pipeline Report",
         "=" * 50,
         f"Date       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Video      : {os.path.basename(video_path)}",
@@ -4839,7 +4856,7 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
 
 if __name__ == "__main__":
     import argparse as _ap
-    _parser = _ap.ArgumentParser(description="KAIZER NEWS Pipeline")
+    _parser = _ap.ArgumentParser(description="KAIZER X Pipeline")
     _parser.add_argument("video", nargs="?", help="Path to video file")
     _parser.add_argument("--platform", default=None, choices=list(PLATFORM_PRESETS.keys()),
                          help="Platform preset key")

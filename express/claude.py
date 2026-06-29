@@ -25,6 +25,27 @@ import os
 
 import httpx
 
+# Claude usage logging — best-effort, never breaks an Express call.
+try:
+    from learning.claude_log import log_anthropic_call as _log_anthropic
+except Exception:
+    _log_anthropic = None
+
+from contextlib import contextmanager as _contextmanager
+
+
+class _NoopCall:
+    def record(self, *a, **k): pass
+
+
+@_contextmanager
+def _anthropic_log(model: str, purpose: str):
+    if _log_anthropic is None:
+        yield _NoopCall()
+        return
+    with _log_anthropic(db=None, model=model, purpose=purpose) as c:
+        yield c
+
 
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 # Default matches teammate's model id, but is overridable via env so
@@ -67,31 +88,35 @@ def _post(
     effective_key = api_key or _env_key()
     if not effective_key:
         raise ClaudeError("ANTHROPIC_API_KEY missing")
-    try:
-        with httpx.Client(timeout=httpx.Timeout(timeout_s, connect=15)) as cli:
-            r = cli.post(
-                CLAUDE_URL,
-                headers={
-                    "x-api-key":         effective_key,
-                    "anthropic-version": ANTHROPIC_VERSION,
-                    "content-type":      "application/json",
-                },
-                json={
-                    "model":      _model(),
-                    "max_tokens": max_tokens,
-                    "messages":   [{"role": "user", "content": prompt}],
-                },
-            )
-    except httpx.HTTPError as exc:
-        raise ClaudeError(f"network error: {exc}") from exc
+    _model_name = _model()
+    with _anthropic_log(model=_model_name, purpose="express") as _acall:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(timeout_s, connect=15)) as cli:
+                r = cli.post(
+                    CLAUDE_URL,
+                    headers={
+                        "x-api-key":         effective_key,
+                        "anthropic-version": ANTHROPIC_VERSION,
+                        "content-type":      "application/json",
+                    },
+                    json={
+                        "model":      _model_name,
+                        "max_tokens": max_tokens,
+                        "messages":   [{"role": "user", "content": prompt}],
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise ClaudeError(f"network error: {exc}") from exc
 
-    if r.status_code >= 400:
-        raise ClaudeError(f"claude HTTP {r.status_code}: {r.text[:600]}")
+        if r.status_code >= 400:
+            raise ClaudeError(f"claude HTTP {r.status_code}: {r.text[:600]}")
 
-    try:
-        data = r.json()
-    except ValueError as exc:
-        raise ClaudeError(f"non-JSON response: {r.text[:300]}") from exc
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise ClaudeError(f"non-JSON response: {r.text[:300]}") from exc
+        # Record token usage (the /v1/messages JSON body carries `usage`).
+        _acall.record(data)
 
     blocks = data.get("content") or []
     if not blocks:
@@ -198,7 +223,7 @@ def write_seo(
     )
 
     prompt = (
-        'You are a senior YouTube SEO editor for "Kaizer News".\n'
+        'You are a senior YouTube SEO editor for "Kaizer X".\n'
         "OUTPUT FORMAT: Single JSON object only. Start with { end with }. No prose, no fences.\n"
         'Schema: { "title": string ≤100 chars, "description": string, "tags": string[] }.\n'
         "Title and description MUST include specific named entities (people, places, events) "
@@ -322,7 +347,7 @@ def plan_longform_trim(
     )
 
     prompt = (
-        'You are a video editor for a Telugu news channel ("Kaizer News"). Below is a numbered '
+        'You are a video editor for a Telugu news channel ("Kaizer X"). Below is a numbered '
         f'list of transcript segments from a {round(duration or 0)}-second video, each with its '
         'start/end time. Your job: identify which segments to KEEP and which to CUT, producing '
         'a tight, engaging final cut.\n\n'
@@ -526,7 +551,7 @@ def plan_shorts(
 
     prompt = (
         'You are a YouTube Shorts editor for a Telugu news channel '
-        '("KAIZER NEWS"). The transcript below comes from a long video. '
+        '("KAIZER X"). The transcript below comes from a long video. '
         f'Pick the {count} most engaging, self-contained moments — each '
         'between 15 and 60 seconds long — that would each work as a YouTube Short.\n\n'
         '**CRITICAL — NAMED ENTITY EXTRACTION:**\n'

@@ -49,6 +49,55 @@ def channels_summary(
     return calibrator.channel_summary(db, user_id=user.id)
 
 
+@router.get("/seo-learning")
+def seo_learning(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Per-channel SEO feedback-loop learning — powers the channel-wise
+    Insights tab. For each connected channel: what the system has learnt from
+    past performance (its 'winning keywords'), which signal it's using (CTR
+    once that channel is re-approved for analytics, else views), how much data
+    it has, and whether it's actively shaping SEO yet. Read-only; safe."""
+    from seo.performance_profile import build_channel_profile
+    from analytics.ctr import token_has_analytics_scope
+
+    out = []
+    all_chans = db.query(models.Channel).filter(models.Channel.user_id == user.id).all()
+    # Only OUR connected publish channels learn from their OWN results here.
+    # Style-reference / competitor channels (no usable OAuth) are analysed
+    # separately via their PUBLIC performance (learning/corpus.py) — they do not
+    # belong in "what WE learnt", so keep them out of this tab.
+    chans = [c for c in all_chans
+             if c.oauth_token is not None and bool(c.oauth_token.refresh_token_enc)]
+    for ch in chans:
+        try:
+            prof = build_channel_profile(db, ch.id)
+        except Exception:
+            prof = {"ready": False, "n_videos": 0, "winning_keywords": [], "signal": "views_per_hour"}
+        tok = (db.query(models.OAuthToken)
+                 .filter(models.OAuthToken.channel_id == ch.id).first())
+        out.append({
+            "channel_id": ch.id,
+            "channel_name": ch.name,
+            "ready": bool(prof.get("ready")),
+            "signal": prof.get("signal", "views_per_hour"),
+            "ctr_unlocked": bool(tok and token_has_analytics_scope(tok)),
+            "videos_sampled": prof.get("n_videos", 0),
+            "winning_keywords": prof.get("winning_keywords", []),
+            "top_titles": prof.get("top_titles", []),
+            "top_views_per_hour": prof.get("top_views_per_hour"),
+            "status": "learning" if prof.get("ready") else "collecting data",
+        })
+    # Learning channels first, then most data.
+    out.sort(key=lambda c: (not c["ready"], -c["videos_sampled"]))
+    return {
+        "channels": out,
+        "note": "Each channel learns from its own results. CTR is used once you "
+                "re-approve that channel for analytics; views are used until then.",
+    }
+
+
 # ─── Phase 2: full-channel video catalogue ────────────────────────────
 
 

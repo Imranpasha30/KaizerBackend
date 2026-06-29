@@ -369,6 +369,16 @@ def _process_redis(consumer: str, msg_id: str, job_id: int, priority: str) -> No
                                 reason=(row.last_error or "")[:500] or "no last_error recorded")
                 elif outcome == "cancelled":
                     ack_upload_job(msg_id, priority)
+                elif outcome == "provider_failed":
+                    # Terminal upstream-config error (dead Postiz
+                    # subscription, revoked OAuth, deleted channel).
+                    # Retry without operator action will hit the same
+                    # error so we ACK + DLQ — same treatment as
+                    # `failed` but distinct outcome label so dashboards
+                    # can split honest config issues from generic
+                    # upload failures.
+                    send_to_dlq(msg_id, job_id, priority,
+                                reason=(row.last_error or "")[:500] or "provider_failed")
                 elif outcome == "queued":
                     # Backlog item 94: do NOT auto-re-enqueue here.
                     # The previous code did `enqueue_upload_job(...)`
@@ -396,7 +406,17 @@ def _process_redis(consumer: str, msg_id: str, job_id: int, priority: str) -> No
 def _pick_next() -> Optional[int]:
     """Legacy DB-poll picker — used only when Redis is unavailable.
 
-    Atomically claim the next queued row (oldest first, respecting backoff).
+    Atomically claim the next queued row. Ordering rule:
+
+      Drain all uploads for one clip-job before starting another.
+
+    Concretely: the queued row whose Clip.job_id has the *earliest*
+    first-queued timestamp wins, and within that job we still take the
+    oldest UploadJob first. This stops two parallel publishes from
+    interleaving — once a user kicks off job N's uploads they finish
+    (or fail) before job N+1's uploads start, which matches the
+    one-job-at-a-time mental model the editor shows.
+
     Two workers hitting the same row is prevented in this fallback by
     single-process deployment; the Redis path uses consumer groups
     instead, which handle multi-worker correctly.
@@ -404,15 +424,49 @@ def _pick_next() -> Optional[int]:
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-        row = (
-            db.query(models.UploadJob)
+        # Find the active clip-job: the one with a queued upload that was
+        # created earliest. Subquery joins UploadJob → Clip and finds
+        # MIN(created_at) per Clip.job_id (across rows still queued).
+        from sqlalchemy import func
+        backoff_clause = or_(
+            models.UploadJob.last_error == "",
+            models.UploadJob.last_error.is_(None),
+            models.UploadJob.updated_at < now - timedelta(seconds=5),
+        )
+        # Earliest active clip-job: the Clip.job_id whose oldest queued
+        # UploadJob was created first.
+        active = (
+            db.query(
+                models.Clip.job_id.label("cj"),
+                func.min(models.UploadJob.created_at).label("first_q"),
+            )
+              .join(models.Clip, models.Clip.id == models.UploadJob.clip_id)
               .filter(models.UploadJob.status == "queued")
-              .filter(or_(models.UploadJob.last_error == "",
-                          models.UploadJob.last_error.is_(None),
-                          models.UploadJob.updated_at < now - timedelta(seconds=5)))
-              .order_by(models.UploadJob.created_at.asc())
+              .filter(backoff_clause)
+              .group_by(models.Clip.job_id)
+              .order_by(func.min(models.UploadJob.created_at).asc())
               .first()
         )
+        if not active or active.cj is None:
+            # No clip-grouped work — fall back to oldest queued row so we
+            # still drain orphan jobs (uploads whose clip lacks a job_id).
+            row = (
+                db.query(models.UploadJob)
+                  .filter(models.UploadJob.status == "queued")
+                  .filter(backoff_clause)
+                  .order_by(models.UploadJob.created_at.asc())
+                  .first()
+            )
+        else:
+            row = (
+                db.query(models.UploadJob)
+                  .join(models.Clip, models.Clip.id == models.UploadJob.clip_id)
+                  .filter(models.UploadJob.status == "queued")
+                  .filter(backoff_clause)
+                  .filter(models.Clip.job_id == active.cj)
+                  .order_by(models.UploadJob.created_at.asc())
+                  .first()
+            )
         if not row:
             return None
         row.status = "uploading"
@@ -853,35 +907,53 @@ def _process(job_id: int) -> None:
         # get ITS OWN logo burned in just before upload.  Resolves the
         # destination channel's OAuthToken.logo_asset_id → file → ffmpeg
         # overlay.  If anything fails, falls back to the resolved clip path.
+        #
+        # KAIZER_CLEAN_MASTER (Decision 1, see docs/upload-rewrite/DECISIONS.md):
+        # when "1", skip this overlay entirely. The Phase 2 Branding
+        # Worker (services/branding.process_upload_job) has already
+        # written a branded artifact to R2; the new upload_dispatch
+        # path reads from that artifact, and this legacy worker isn't
+        # invoked. But the legacy code path may still fire during the
+        # KAIZER_CLEAN_MASTER=0 → 1 transition, so the guard is
+        # belt-and-braces. Read the env at call time so flips don't
+        # need a process restart. Default "0" (Decision 12).
         upload_path = resolved_clip_path
-        try:
-            dest_channel = db.query(models.Channel).filter(
-                models.Channel.id == job.channel_id,
-            ).first()
-            dest_tok = dest_channel.oauth_token if dest_channel else None
-            if dest_tok and dest_tok.logo_asset_id:
-                logo_asset = db.query(models.UserAsset).filter(
-                    models.UserAsset.id == dest_tok.logo_asset_id,
+        _clean_master = os.environ.get("KAIZER_CLEAN_MASTER", "0").strip() == "1"
+        if _clean_master:
+            log.info(
+                "worker: KAIZER_CLEAN_MASTER=1 — skipping per-destination "
+                "logo overlay for job=%s (branding worker handles it)",
+                getattr(job, "id", "?"),
+            )
+        else:
+            try:
+                dest_channel = db.query(models.Channel).filter(
+                    models.Channel.id == job.channel_id,
                 ).first()
-                # Resolve via shared helper — handles R2 download when the
-                # logo isn't on this container's disk (Railway redeploy,
-                # asset uploaded from a different host, etc.). Returns ""
-                # when the asset has no bytes anywhere.
-                from asset_resolver import materialize_asset_locally
-                logo_local = materialize_asset_locally(logo_asset)
-                if logo_local:
-                    _append_log(job, f"overlaying destination logo ({logo_asset.filename})…")
-                    from youtube import logo_overlay
-                    upload_path = logo_overlay.overlay_logo(
-                        resolved_clip_path, logo_local
-                    )
-                    if upload_path != resolved_clip_path:
-                        _append_log(job, "logo overlay applied")
-                    else:
-                        _append_log(job, "logo overlay failed — uploading clean master")
-        except Exception as e:
-            _append_log(job, f"logo overlay skipped: {e}")
-            upload_path = resolved_clip_path
+                dest_tok = dest_channel.oauth_token if dest_channel else None
+                if dest_tok and dest_tok.logo_asset_id:
+                    logo_asset = db.query(models.UserAsset).filter(
+                        models.UserAsset.id == dest_tok.logo_asset_id,
+                    ).first()
+                    # Resolve via shared helper — handles R2 download when the
+                    # logo isn't on this container's disk (Railway redeploy,
+                    # asset uploaded from a different host, etc.). Returns ""
+                    # when the asset has no bytes anywhere.
+                    from asset_resolver import materialize_asset_locally
+                    logo_local = materialize_asset_locally(logo_asset)
+                    if logo_local:
+                        _append_log(job, f"overlaying destination logo ({logo_asset.filename})…")
+                        from youtube import logo_overlay
+                        upload_path = logo_overlay.overlay_logo(
+                            resolved_clip_path, logo_local
+                        )
+                        if upload_path != resolved_clip_path:
+                            _append_log(job, "logo overlay applied")
+                        else:
+                            _append_log(job, "logo overlay failed — uploading clean master")
+            except Exception as e:
+                _append_log(job, f"logo overlay skipped: {e}")
+                upload_path = resolved_clip_path
 
         try:
             video_id = uploader.upload_video(creds, job, upload_path, db, progress_cb=_progress)

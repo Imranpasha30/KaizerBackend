@@ -7,22 +7,22 @@ set from the Chrome extension reference implementation.
 
 DEFAULT_CHANNELS = [
     {
-        "name": "Kaizer News Telugu",
-        "handle": "@KaizerNewsTelugu",
+        "name": "Kaizer X Telugu",
+        "handle": "@KaizerXTelugu",
         "language": "te",
-        "title_formula": "English Hook (తెలుగు అనువాదం) | Kaizer News Telugu",
+        "title_formula": "English Hook (తెలుగు అనువాదం) | Kaizer X Telugu",
         "desc_style": "hook_first",
         "footer": (
-            "📺 Subscribe Kaizer News Telugu for real-time breaking news.\n"
+            "📺 Subscribe Kaizer X Telugu for real-time breaking news.\n"
             "🔔 Hit the bell for politics, cinema & national updates.\n"
-            "#KaizerNews #TeluguNews"
+            "#KaizerX #TeluguNews"
         ),
         "fixed_tags": [
-            "kaizer news", "kaizer news telugu", "telugu news",
+            "kaizer x", "kaizer x telugu", "telugu news",
             "latest news telugu", "breaking news telugu", "telugu news today",
         ],
-        "hashtags": ["#KaizerNews", "#TeluguNews", "#LatestNews", "#BreakingNews", "#Telugu"],
-        "mandatory_hashtags": ["#KaizerNews", "#TeluguNews"],
+        "hashtags": ["#KaizerX", "#TeluguNews", "#LatestNews", "#BreakingNews", "#Telugu"],
+        "mandatory_hashtags": ["#KaizerX", "#TeluguNews"],
         "is_priority": True,
     },
     {

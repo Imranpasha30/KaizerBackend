@@ -42,12 +42,26 @@ class GoogleIn(BaseModel):
 
 def _public_user(u: models.User) -> dict:
     raw_socials = getattr(u, "socials", None) or {}
+    avatar_url = ""
+    try:
+        from routers.profile import user_avatar_url as _avatar_url
+        avatar_url = _avatar_url(u)
+    except Exception:
+        avatar_url = ""
+    rating_count = int(getattr(u, "creator_rating_count", 0) or 0)
+    rating_sum   = int(getattr(u, "creator_rating_sum",   0) or 0)
+    rating_avg   = round(rating_sum / rating_count, 2) if rating_count else 0.0
     return {
         "id":     u.id,
         "email":  u.email,
         "name":   u.name or u.email.split("@")[0],
         "google": bool(u.google_sub),
         "is_admin": bool(u.is_admin),
+        "is_creative": bool(getattr(u, "is_creative", False)),
+        "plan":   (getattr(u, "plan", None) or "free"),
+        "avatar_url":   avatar_url,
+        "creator_rating_avg":   rating_avg,
+        "creator_rating_count": rating_count,
         "socials": raw_socials if isinstance(raw_socials, dict) else {},
         "created_at":    u.created_at.isoformat() if u.created_at else None,
         "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
@@ -59,6 +73,18 @@ def _with_token(u: models.User) -> dict:
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────
+
+def _default_plan_tier_id(db) -> "int | None":
+    """Tier assigned to every brand-new account = Free. Without this, new
+    users land with plan_tier_id NULL and publishing 400s with
+    'plan_tier_unknown'. Returns None only if the plan_tiers table isn't
+    seeded (then the publish flow prompts to pick a plan)."""
+    try:
+        t = db.query(models.PlanTier).filter(models.PlanTier.name == "free").first()
+        return t.id if t else None
+    except Exception:
+        return None
+
 
 @router.post("/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
@@ -73,6 +99,7 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         name=(payload.name or "").strip(),
         password_hash=_auth.hash_password(payload.password),
         is_active=True,
+        plan_tier_id=_default_plan_tier_id(db),
     )
     db.add(u); db.commit(); db.refresh(u)
     u.last_login_at = datetime.now(timezone.utc)
@@ -168,6 +195,7 @@ def google_signin(payload: GoogleIn, db: Session = Depends(get_db)):
                 email=email, name=name,
                 google_sub=sub, password_hash=None,
                 is_active=True,
+                plan_tier_id=_default_plan_tier_id(db),
             )
             db.add(u)
     if not u.is_active:

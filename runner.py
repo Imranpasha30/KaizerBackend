@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import threading
 import subprocess
 from pathlib import Path
@@ -25,6 +26,183 @@ _PIPELINE_CONCURRENCY = max(1, int(os.getenv("KAIZER_PIPELINE_CONCURRENCY", "2")
 _PIPELINE_SEMAPHORE = threading.BoundedSemaphore(_PIPELINE_CONCURRENCY)
 
 
+# ─── Wave 4 item I: fair render queue + disk/temp hygiene ────────────
+# All of it is flag-gated / default-safe:
+#   - KAIZER_FAIR_RENDER_QUEUE unset/0 → _acquire_render_slot is a bare
+#     semaphore acquire — today's EXACT FIFO behaviour.
+#   - KAIZER_FAIR_RENDER_QUEUE=1 → per-user round-robin ordering via
+#     services.render_queue claims, with one slot reserved for
+#     lane='interactive' when KAIZER_PIPELINE_CONCURRENCY >= 2.
+#   - Disk guard (KAIZER_MIN_FREE_DISK_GB, default 10) refuses to start
+#     a render on a nearly-full disk and fails the job with a clear
+#     error instead of letting ffmpeg die midway.
+#   - Startup once-only: render_queue.ensure_schema() (idempotent
+#     ALTERs) + sweep of orphaned kaizer_* temp dirs older than 24h.
+
+def _fair_queue_enabled() -> bool:
+    return (os.getenv("KAIZER_FAIR_RENDER_QUEUE", "0") or "0").strip() == "1"
+
+
+_STARTUP_LOCK = threading.Lock()
+_STARTUP_DONE = False
+
+
+def _startup_once() -> None:
+    """One-time runner-side init, executed lazily on the first
+    run_pipeline call (so importing runner never touches the DB).
+    Every step is best-effort — failures never block a render."""
+    global _STARTUP_DONE
+    with _STARTUP_LOCK:
+        if _STARTUP_DONE:
+            return
+        _STARTUP_DONE = True
+    try:
+        from services import render_queue
+        render_queue.ensure_schema()
+    except Exception as exc:
+        print(f"[runner] render-queue schema init skipped: {exc}")
+    try:
+        from services import render_queue
+        swept = render_queue.sweep_orphaned_tempdirs(max_age_hours=24)
+        if swept:
+            print(f"[runner] swept {swept} orphaned kaizer_* temp dir(s)")
+    except Exception as exc:
+        print(f"[runner] temp-dir sweep skipped: {exc}")
+
+
+# Jobs whose worker threads are waiting for a fair-queue turn in THIS
+# process (job_id -> lane). Scoping claims to live waiters means a
+# zombie 'pending' row from a crashed process can never deadlock new
+# work. Guarded by _FAIR_LOCK, as is _BATCH_RUNNING.
+_FAIR_LOCK = threading.Lock()
+_WAITING: dict[int, str] = {}
+_BATCH_RUNNING = 0
+
+
+def _worker_id() -> str:
+    import socket
+    try:
+        host = socket.gethostname()
+    except Exception:
+        host = "host"
+    return f"{host}-pid{os.getpid()}"[:64]
+
+
+def _acquire_render_slot(job_id: int, lane: str = "batch") -> None:
+    """Block until this job may start.
+
+    Flag off (default): plain semaphore acquire — byte-identical to the
+    pre-Wave-4 ordering.
+
+    Flag on: poll services.render_queue.claim_next_render with
+    only_job_id=<this job> — the claim succeeds only when this job is
+    the per-user round-robin head among the jobs THIS process is
+    waiting on AND its owner is under the per-user running cap. Batch
+    jobs additionally cap at (concurrency - 1) running slots when
+    concurrency >= 2, reserving one slot for lane='interactive'.
+    Interactive jobs order among themselves (lane filter) so they can
+    use the reserved slot without queueing behind the batch backlog.
+    """
+    global _BATCH_RUNNING
+    lane = (lane or "batch").strip().lower()
+    if not _fair_queue_enabled():
+        _PIPELINE_SEMAPHORE.acquire()
+        return
+
+    from services import render_queue
+    wid = _worker_id()
+    batch_cap = (_PIPELINE_CONCURRENCY - 1
+                 if _PIPELINE_CONCURRENCY >= 2 else _PIPELINE_CONCURRENCY)
+    with _FAIR_LOCK:
+        _WAITING[job_id] = lane
+    try:
+        while True:
+            if lane != "interactive":
+                with _FAIR_LOCK:
+                    batch_full = _BATCH_RUNNING >= batch_cap
+                if batch_full:
+                    time.sleep(2.0)
+                    continue
+            with _FAIR_LOCK:
+                cands = list(_WAITING.keys())
+            try:
+                got = render_queue.claim_next_render(
+                    wid,
+                    lane_filter=("interactive" if lane == "interactive" else None),
+                    candidate_ids=cands,
+                    only_job_id=job_id,
+                )
+            except Exception as exc:
+                # Fail open: queue infrastructure must never wedge a
+                # render — degrade to plain FIFO for this job.
+                print(f"[runner] fair-queue claim failed ({exc}); "
+                      f"falling back to FIFO for job {job_id}")
+                got = job_id
+            if got == job_id:
+                break
+            time.sleep(2.0)
+    finally:
+        with _FAIR_LOCK:
+            _WAITING.pop(job_id, None)
+    if lane != "interactive":
+        with _FAIR_LOCK:
+            _BATCH_RUNNING += 1
+    _PIPELINE_SEMAPHORE.acquire()
+
+
+def _release_render_slot(job_id: int, lane: str = "batch") -> None:
+    """Counterpart of _acquire_render_slot — always release the
+    semaphore; under the fair queue also drop the batch counter and
+    clear the DB claim (best-effort; the lease expiry covers crashes)."""
+    global _BATCH_RUNNING
+    lane = (lane or "batch").strip().lower()
+    try:
+        _PIPELINE_SEMAPHORE.release()
+    except ValueError:
+        pass
+    if _fair_queue_enabled():
+        if lane != "interactive":
+            with _FAIR_LOCK:
+                _BATCH_RUNNING = max(0, _BATCH_RUNNING - 1)
+        try:
+            from services import render_queue
+            render_queue.release_claim(job_id)
+        except Exception:
+            pass
+
+
+def _disk_guard_or_fail(job_id: int, db_session_factory) -> bool:
+    """Refuse to start a render when the output volume is nearly full
+    (KAIZER_MIN_FREE_DISK_GB, default 10). Returns True when the render
+    may proceed; on refusal marks the job failed with a clear error and
+    returns False. A failed disk probe NEVER blocks (fail-open)."""
+    try:
+        from services import render_queue
+        ok, msg = render_queue.disk_guard_ok(OUTPUT_ROOT)
+    except Exception as exc:
+        print(f"[runner] disk guard skipped: {exc}")
+        return True
+    if ok:
+        return True
+    print(f"[runner] disk guard BLOCKED job {job_id}: {msg}")
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        from models import Job as _Job
+        db = db_session_factory()
+        try:
+            j = db.query(_Job).filter(_Job.id == job_id).first()
+            if j:
+                j.status = "failed"
+                j.error = msg
+                j.finished_at = _dt.now(_tz.utc)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[runner] disk-guard status write failed: {exc}")
+    return False
+
+
 # ─── User-initiated cancellation ─────────────────────────────────────
 # Maps job_id → currently-running subprocess.Popen so the cancel API
 # endpoint can find the process to terminate. Populated when the
@@ -33,110 +211,10 @@ _ACTIVE_PROCS_LOCK = threading.Lock()
 _ACTIVE_PROCS: dict[int, subprocess.Popen] = {}
 
 
-# ── Step 11.4: V2 Inngest event dispatcher ───────────────────────────
-def _dispatch_v2_inngest_event(
-    *,
-    job_id: int,
-    video_path: str,
-    language: str,
-    platform: str,
-    frame: str,
-    stt_provider: str,
-    db_session_factory,
-    transition_style: str = "smart_cut",
-    stage_2_provider: str = "gemini",
-) -> None:
-    """Fire ``video/v2/uploaded`` so the Inngest V2 worker picks up.
-
-    Idempotency key per Step 10 D-10.10: ``f"job-{job_id}"`` --
-    duplicate sends within Inngest's window are deduplicated.
-
-    Lazy import of pipeline_v2.inngest_client (i) avoids a
-    module-load circular if V2 wiring evolves and (ii) means
-    legacy V1-only runners that never call this path don't pay the
-    inngest SDK import cost.
-
-    Marks Job.status='running' synchronously so the UI shows the
-    job leaving 'pending' immediately, even before the Inngest
-    worker picks up the event. (The worker writes Job.current_stage
-    + final status as it progresses.)
-    """
-    # Lazy imports to keep V1-only call sites unaffected.
-    import sys as _sys
-    import os as _os
-    _pipeline_v2_dir = _os.path.join(
-        _os.path.dirname(_os.path.abspath(__file__)),
-        "pipeline_v2",
-    )
-    if _pipeline_v2_dir not in _sys.path:
-        _sys.path.insert(0, _pipeline_v2_dir)
-    from inngest import Event
-    from pipeline_v2.inngest_client import get_client
-
-    # Mark the job as running + reset cancel flag in DB so the UI's
-    # status badge flips off "pending" right away.
-    try:
-        from models import Job
-        from datetime import datetime as _dt, timezone as _tz
-        db = db_session_factory()
-        try:
-            db.query(Job).filter(Job.id == job_id).update(
-                {
-                    "status":           "running",
-                    "started_at":       _dt.now(_tz.utc),
-                    "cancel_requested": False,
-                },
-                synchronize_session=False,
-            )
-            db.commit()
-        finally:
-            db.close()
-    except Exception as _db_exc:
-        print(
-            f"[runner.v2] Job.status='running' DB write failed for "
-            f"job_id={job_id} (non-fatal; Inngest worker will keep "
-            f"writing status as it progresses): {_db_exc}"
-        )
-
-    # Build the event payload (D-10.13 / Step 10 event contract).
-    event_data = {
-        "job_id":       int(job_id),
-        "video_path":   str(video_path),
-        "language":     language or "te",
-        "platform":     platform,
-        "frame_layout": frame or "torn_card",
-        "stt_provider": stt_provider or "",
-        # Item 104: operator's bulletin transition selection. Catalog
-        # validated in main.create_job; the worker re-validates via
-        # resolve_for_render so a stale event survives a catalog edit.
-        "transition_style": transition_style or "smart_cut",
-        # Item 114: operator's Stage 2 provider selection.
-        # ("gemini" | "claude"). Validated in main.create_job; the
-        # orchestrator falls back to "gemini" if the value is blank
-        # or unknown at consumption time.
-        "stage_2_provider": stage_2_provider or "gemini",
-        # preset is caller-supplied via Stage 4; we ship the PLATFORMS
-        # entry shape from main.py for the V2 platform. Looking it up
-        # here avoids pulling main into runner's import graph (would
-        # be circular). Stage 4's defaults handle missing fields.
-        "preset": {
-            "label": "Full Video + Shorts (V2 Beta)",
-            "width":  1080, "height": 1920,
-            "min_dur": 15, "max_dur": 60, "ideal_dur": 45,
-            "vertical": True,
-        },
-    }
-
-    client = get_client()
-    client.send_sync(events=Event(
-        name="video/v2/uploaded",
-        data=event_data,
-        id=f"job-{job_id}",   # D-10.10: idempotency key
-    ))
-    print(
-        f"[runner.v2] Inngest event sent: name=video/v2/uploaded "
-        f"job_id={job_id} stt_provider={stt_provider!r}"
-    )
+# ── V2 Inngest event dispatcher — REMOVED 2026-06-17 ─────────────────
+# The Inngest-orchestrated render pipeline v2 was retired; _dispatch_v2_inngest_event
+# and the pipeline_v2 package are gone. run_pipeline normalises any stale
+# v2/v3 platform onto V4 (the single render path).
 
 
 def _register_proc(job_id: int, proc: subprocess.Popen) -> None:
@@ -249,7 +327,44 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  stage_2_provider: str = "gemini",
                  v4_bg_video_path: Optional[str] = None,
                  v4_bg_video_volume: float = 0.0,
-                 v4_bg_intro_seconds: float = 0.0):
+                 v4_bg_intro_seconds: float = 0.0,
+                 # V4 only: which model decides Step 1's KEEP/CUT plan.
+                 # "claude" (default, Opus 4.7) or "gemini" (2.5 Flash on
+                 # Vertex). Picked per-job in the new-job wizard so the
+                 # operator can A/B quality. Forwarded to the orchestrator
+                 # subprocess via KAIZER_V4_TRIM_PLANNER env var. Ignored
+                 # by non-V4 platforms.
+                 v4_trim_planner: str = "claude",
+                 # V4 only: which provider generates story images.
+                 # "auto" (default — V1 multi-source chain),
+                 # "gemini" (Nano Banana), or "openai" (gpt-image-1).
+                 # Forwarded via KAIZER_V4_IMAGE_PROVIDER env. Ignored
+                 # by non-V4 platforms.
+                 v4_image_provider: str = "auto",
+                 # V4 only: operator-supplied bulletin description.
+                 # When non-empty the orchestrator preserves the source
+                 # video AS-IS (no Claude KEEP/CUT) and uses this text
+                 # as the bulletin SEO description. Any language.
+                 # Forwarded via KAIZER_V4_PREDEFINED_DESCRIPTION env.
+                 v4_predefined_description: str = "",
+                 # V4 only: which outputs to render.
+                 #   "both"        (default) — full video (bulletin) + shorts
+                 #   "full-only"   — render the bulletin, skip ALL shorts work
+                 #   "shorts-only" — render shorts, skip the bulletin/full video
+                 # Forwarded via KAIZER_V4_OUTPUT_FORMAT env. Ignored by
+                 # non-V4 platforms. The orchestrator also persists the choice
+                 # into canvas.json so editor re-renders honour it.
+                 v4_output_format: str = "both",
+                 # V4 Stage 2: defer the up-front compose (edit-first; export on demand).
+                 # Forwarded as KAIZER_V4_DEFER_RENDER. Default off.
+                 v4_defer_render: bool = False,
+                 # V4 only: shorts-per-job ceiling (default 8). Forwarded as
+                 # KAIZER_V4_MAX_SHORTS; the orchestrator caps the candidate list.
+                 v4_max_shorts: int = 8,
+                 # "Full form video" (16:9) custom template, e.g. "custom:<id>".
+                 # Forwarded via KAIZER_V4_FULLFORM_LAYOUT; the orchestrator renders
+                 # the full video through the custom engine instead of the bulletin.
+                 fullform_layout: str = ""):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -275,72 +390,22 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
       The 4 V1 platforms fall through to the existing subprocess
       path unchanged.
     """
-    if platform == "full_video_shorts_v2":
-        _dispatch_v2_inngest_event(
-            job_id=job_id,
-            video_path=video_path,
-            language=language,
-            platform=platform,
-            frame=frame,
-            stt_provider=stt_provider,
-            transition_style=transition_style,
-            stage_2_provider=stage_2_provider,
-            db_session_factory=db_session_factory,
-        )
-        return   # V2 worker takes over; no subprocess spawn
-
-    if platform == "full_video_shorts_v3":
-        # V3: linear pipeline (Deepgram word-STT + Claude word-edit + V1
-        # render). No Inngest. Spawn as a detached Python subprocess so
-        # the runner returns immediately and uvicorn's request thread is
-        # not blocked. The orchestrator updates the Job row's status.
-        out_dir = OUTPUT_ROOT / "full_video_shorts_v3" / f"job_{job_id}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
-        if not Path(venv_python).exists():
-            venv_python = sys.executable
-        # V3 provider: "claude" or "gemini". Same prompt + same V1 output
-        # schema; only the LLM differs. Default to claude (lower T, stronger
-        # rule-following). UI exposes this via the V3 form's stage_2_provider
-        # field (same field name V2 already uses).
-        _v3_provider = (stage_2_provider or "claude").strip().lower()
-        if _v3_provider not in ("claude", "gemini"):
-            _v3_provider = "claude"
-        cmd = [
-            venv_python, "-m", "pipeline_v3.pipeline_v3.orchestrator",
-            "--job-id", str(job_id),
-            "--source-video", video_path,
-            "--output-dir", str(out_dir),
-            "--language", language or "te",
-            "--frame", frame or "torn_card",
-            "--stage-2-provider", _v3_provider,
-        ]
-        # Detach: don't capture stdout/stderr in this thread; write to log files
-        log_out = open(out_dir / "stdout.log", "w", encoding="utf-8")
-        log_err = open(out_dir / "stderr.log", "w", encoding="utf-8")
-        # The semaphore MUST be held for the entire subprocess lifetime,
-        # not just for spawn -- otherwise 10 parallel submissions all
-        # spawn instantly and contend for the GPU. We run the
-        # acquire+spawn+wait in a daemon thread so the HTTP submit
-        # returns immediately while the subprocess (or its queued wait)
-        # makes progress in the background.
-        def _v3_worker():
-            with _PIPELINE_SEMAPHORE:
-                proc = subprocess.Popen(
-                    cmd, cwd=str(BASE_DIR),
-                    stdout=log_out, stderr=log_err,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-                _register_proc(job_id, proc)
-                print(f"[runner.v3] subprocess spawned pid={proc.pid} job_id={job_id} -> {out_dir}", flush=True)
-                try:
-                    rc = proc.wait()
-                    print(f"[runner.v3] job_id={job_id} subprocess exited rc={rc}", flush=True)
-                finally:
-                    _deregister_proc(job_id)
-                    log_out.close(); log_err.close()
-        threading.Thread(target=_v3_worker, daemon=True).start()
-        return   # V3 worker queued; subprocess runs when semaphore is available
+    # V4 is the SINGLE render path (2026-06-17). The frontend already remaps
+    # every platform tile to full_video_shorts_v4 + a v4_output_format (see
+    # NewJob.LEGACY_TO_V4_PRESET); this is the defensive backstop for direct-API
+    # / stale submissions so NOTHING reaches the retired v2/v3 dispatch or the
+    # legacy V1 CLI fall-through below. Derive the output format from the
+    # original tile unless the caller already set a non-default one.
+    _LEGACY_TO_V4_FORMAT = {
+        "instagram_reel": "shorts-only", "youtube_short": "shorts-only",
+        "facebook_reel": "shorts-only", "youtube_full": "full-only",
+        "youtube_full_plus_shorts": "both",
+        "full_video_shorts_v2": "both", "full_video_shorts_v3": "both",
+    }
+    if platform != "full_video_shorts_v4" and platform in _LEGACY_TO_V4_FORMAT:
+        if not (v4_output_format or "").strip() or v4_output_format == "both":
+            v4_output_format = _LEGACY_TO_V4_FORMAT[platform]
+        platform = "full_video_shorts_v4"
 
     if platform == "full_video_shorts_v4":
         # V4: trim+canvas architecture (single atomic trim, then atomic
@@ -349,6 +414,16 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         # the Job row's status and log.
         out_dir = OUTPUT_ROOT / "full_video_shorts_v4" / f"job_{job_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Bound local render-scratch growth: keep only the most recent N
+        # per-job dirs (finished masters already live in storage / R2). Never
+        # touches DB-referenced media dirs. Best-effort — never blocks a render.
+        try:
+            from services import render_queue as _rq
+            swept = _rq.sweep_old_render_outputs(OUTPUT_ROOT)
+            if swept:
+                print(f"[runner.v4] swept {swept} old render-output dir(s)", flush=True)
+        except Exception as _exc:
+            print(f"[runner.v4] render-output sweep skipped: {_exc}", flush=True)
         venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
         if not Path(venv_python).exists():
             venv_python = sys.executable
@@ -381,6 +456,60 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             _env["KAIZER_V4_BG_VIDEO_PATH"] = v4_bg_video_path
             _env["KAIZER_V4_BG_VIDEO_VOLUME"] = f"{max(0.0, min(1.0, v4_bg_video_volume or 0.0)):.3f}"
             _env["KAIZER_V4_BG_INTRO_SECONDS"] = f"{max(0.0, min(30.0, v4_bg_intro_seconds or 0.0)):.3f}"
+        # KEEP/CUT planner choice — forwarded to trim_engine._select_planner.
+        # Validate here so a stale frontend can't pass garbage and silently
+        # downgrade quality (the planner's own fallback covers env typos).
+        _planner = (v4_trim_planner or "claude").strip().lower()
+        if _planner not in {"claude", "gemini"}:
+            _planner = "claude"
+        _env["KAIZER_V4_TRIM_PLANNER"] = _planner
+        # Image-provider pick. Same validation pattern.
+        _imgp = (v4_image_provider or "auto").strip().lower()
+        if _imgp not in {"auto", "gemini", "openai"}:
+            _imgp = "auto"
+        _env["KAIZER_V4_IMAGE_PROVIDER"] = _imgp
+        # Output-format pick (full video / shorts / both). Same validate-here
+        # pattern so a stale frontend can't pass garbage. The orchestrator
+        # falls back to canvas.output_format, then "both", if this is absent.
+        _ofmt = (v4_output_format or "both").strip().lower()
+        if _ofmt not in {"both", "full-only", "shorts-only"}:
+            _ofmt = "both"
+        _env["KAIZER_V4_OUTPUT_FORMAT"] = _ofmt
+        # V4 Stage 2: per-job defer toggle (a globally-set KAIZER_V4_DEFER_RENDER is already
+        # inherited via {**os.environ}). When set, the orchestrator skips the up-front compose.
+        if v4_defer_render:
+            _env["KAIZER_V4_DEFER_RENDER"] = "1"
+        # Short template the operator picked (frame_layout). Without this the
+        # orchestrator always hardcoded torn_card for shorts regardless of the
+        # selection (the reported bug). Validate against the supported V1
+        # shorts layouts so a stale frontend can't pass garbage.
+        _slay = (frame or "torn_card").strip().lower()
+        # Also allow a developer-uploaded template ("custom:<id>").
+        _slay_custom = _slay.startswith("custom:") and _slay.split(":", 1)[1].isdigit()
+        if _slay not in {"torn_card", "clean_card", "split_frame", "follow_bar"} and not _slay_custom:
+            _slay = "torn_card"
+        _env["KAIZER_V4_SHORT_LAYOUT"] = _slay
+        # "Full form video" (16:9) custom template — only forwarded when it's a valid
+        # custom key; otherwise the orchestrator renders the built-in bulletin.
+        _ffl = (fullform_layout or "").strip().lower()
+        if _ffl.startswith("custom:") and _ffl.split(":", 1)[1].isdigit():
+            _env["KAIZER_V4_FULLFORM_LAYOUT"] = _ffl
+        # Shorts-per-job ceiling (default 8; operator can opt into more).
+        try:
+            _ms = int(v4_max_shorts or 8)
+        except (TypeError, ValueError):
+            _ms = 8
+        _env["KAIZER_V4_MAX_SHORTS"] = str(max(1, min(50, _ms)))
+
+        # Predefined description. Encoded as base64-utf8 because env
+        # vars on Windows can't reliably carry newlines + non-ASCII
+        # (Telugu / Hindi). Orchestrator decodes via _decode_predef.
+        _pre = (v4_predefined_description or "").strip()
+        if _pre:
+            import base64 as _b64
+            _env["KAIZER_V4_PREDEFINED_DESCRIPTION"] = _b64.b64encode(
+                _pre.encode("utf-8")
+            ).decode("ascii")
         # Stash output_dir on the Job row up-front so the V4 editor can
         # find canvas.json even before the subprocess writes it. Also
         # stamp started_at so the JobDetail "elapsed - live" badge has a
@@ -399,7 +528,12 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         except Exception as exc:
             print(f"[runner.v4] could not stash output_dir on job: {exc}")
         def _v4_worker():
-            with _PIPELINE_SEMAPHORE:
+            _startup_once()
+            _acquire_render_slot(job_id)
+            try:
+                if not _disk_guard_or_fail(job_id, db_session_factory):
+                    log_out.close(); log_err.close()
+                    return
                 proc = subprocess.Popen(
                     cmd, cwd=str(BASE_DIR),
                     stdout=log_out, stderr=log_err,
@@ -414,6 +548,8 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                 finally:
                     _deregister_proc(job_id)
                     log_out.close(); log_err.close()
+            finally:
+                _release_render_slot(job_id)
         threading.Thread(target=_v4_worker, daemon=True).start()
         return   # V4 worker queued; subprocess runs when semaphore is available
 
@@ -762,10 +898,20 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                         os.remove(video_path)
                     except OSError as _e:
                         print(f"[runner] cleanup: failed to remove source {video_path!r}: {_e}")
-                # 2. Pipeline output dir — only when an external backend
-                # owns the bytes. ``STORAGE_BACKEND=local`` keeps them.
+                # 2. Pipeline output dir — render outputs are NEVER auto-
+                # deleted by default. The operator prunes old renders manually
+                # (explicit request, 2026-06-16). Auto-delete only happens when
+                # BOTH (a) an external backend owns the bytes
+                # (STORAGE_BACKEND != local, e.g. R2 on an ephemeral container)
+                # AND (b) the operator explicitly opts in with
+                # KAIZER_DELETE_RENDER_OUTPUT=1. Otherwise every render stays on
+                # disk so the canvas editor / publish flow can always find it.
                 _backend = (os.environ.get("STORAGE_BACKEND", "local") or "").strip().lower()
-                if _backend != "local":
+                _allow_output_delete = (
+                    os.environ.get("KAIZER_DELETE_RENDER_OUTPUT", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
+                )
+                if _backend != "local" and _allow_output_delete:
                     try:
                         db_clean = db_session_factory()
                         j_clean = db_clean.query(Job).filter(Job.id == job_id).first()
@@ -779,7 +925,8 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                     except Exception as _e:
                         print(f"[runner] cleanup: output_dir removal warning: {_e}")
                 else:
-                    print(f"[runner] cleanup: STORAGE_BACKEND=local — keeping output dir on disk")
+                    print("[runner] cleanup: keeping render output on disk "
+                          "(auto-delete disabled — prune manually)")
             except Exception as _cleanup_e:
                 # Cleanup failures are never fatal — container will get
                 # wiped on next redeploy worst case.
@@ -795,6 +942,7 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         state, then block on the semaphore until a slot frees up, then
         run the actual pipeline subprocess via _run.
         """
+        _startup_once()
         try:
             db_pre = db_session_factory()
             from models import Job as _Job
@@ -807,8 +955,13 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             # Status update is best-effort; don't block the run on it.
             print(f"[runner] queued-status update skipped: {_e}")
 
-        with _PIPELINE_SEMAPHORE:
+        _acquire_render_slot(job_id)
+        try:
+            if not _disk_guard_or_fail(job_id, db_session_factory):
+                return
             _run()
+        finally:
+            _release_render_slot(job_id)
 
     threading.Thread(target=_run_throttled, daemon=True).start()
 

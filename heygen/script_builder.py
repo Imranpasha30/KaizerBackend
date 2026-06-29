@@ -7,7 +7,7 @@ Why a builder (and not just feed the raw transcript to HeyGen):
   - The original speaker's filler, asides, ad reads, channel intro
     rhetoric, "subscribe + like" tags etc. don't belong in the
     Kaizer avatar's narration. They distract from the news.
-  - We want the avatar to sound like a Kaizer News anchor — same
+  - We want the avatar to sound like a Kaizer X anchor — same
     diction, same tonality the channel's existing content uses.
 
 Strategy
@@ -34,10 +34,10 @@ _SCRIPT_MODEL = os.environ.get("KAIZER_TOPIC_MODEL", "gemini-2.5-flash")
 _SCRIPT_MAX_CHARS = 700
 
 
-_PROMPT_TEMPLATE = """You are a Telugu news scriptwriter for Kaizer News.
+_PROMPT_TEMPLATE = """You are a Telugu news scriptwriter for Kaizer X.
 
 Rewrite the source material below into a SINGLE continuous narration
-spoken by a Kaizer News anchor on camera. The narration must:
+spoken by a Kaizer X anchor on camera. The narration must:
 
   - Be in **pure {language_name}** ({language_code}). This is the
     HARDEST constraint. The source transcript may be English, Hindi,
@@ -56,7 +56,7 @@ spoken by a Kaizer News anchor on camera. The narration must:
     transcript is noisy / off-topic / has Whisper transcription
     errors. Trust the title + summary OVER the transcript on conflict.
   - End with a concrete, news-style sign-off (e.g. "ఇదే వార్త, మీ
-    Kaizer News నుండి"). Do NOT promote subscribing.
+    Kaizer X నుండి"). Do NOT promote subscribing.
 
 LANGUAGE PURITY RULE (zero exceptions):
 - If the source has English news terms like "BJP", "Congress",

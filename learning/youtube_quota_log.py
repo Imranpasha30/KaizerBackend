@@ -54,7 +54,7 @@ logger = logging.getLogger("kaizer.youtube_quota_log")
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
 # Default daily cap = 10 000 units.  Uploads are the dominant cost.
 OPERATION_QUOTA: dict[str, int] = {
-    "videos.insert":       1600,   # uploading a video — by far the heaviest
+    "videos.insert":        100,   # repriced 1,600 → 100 on 2025-12-04 (own 100/day bucket)
     "videos.update":         50,
     "videos.delete":         50,
     "videos.list":            1,

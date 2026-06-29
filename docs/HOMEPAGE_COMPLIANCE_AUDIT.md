@@ -1,4 +1,4 @@
-# Homepage Compliance Audit — Kaizer News
+# Homepage Compliance Audit — Kaizer X
 
 > Audit of `https://kaizerx.com/` against Google's six homepage
 > requirements for OAuth verification. Each row says **what Google
@@ -15,8 +15,8 @@ Last updated: 2026-04-29.
 
 | Google's requirement | Our status |
 |---|---|
-| Homepage clearly identifies the app | ✅ Hero shows "KAIZER NEWS" logo + brand |
-| App name matches what's on the OAuth consent screen | ✅ "Kaizer News" matches Cloud Console branding |
+| Homepage clearly identifies the app | ✅ Hero shows "KAIZER X" logo + brand |
+| App name matches what's on the OAuth consent screen | ✅ "Kaizer X" matches Cloud Console branding |
 | Logo on homepage matches the consent-screen logo | ✅ Same K logo on both |
 
 **Action:** none.
@@ -84,7 +84,7 @@ This addresses the gap **before** Google flags it as a follow-up rejection after
 
 | Rejection reason | Why it could hit us | Mitigation |
 |---|---|---|
-| **Unresponsive homepage URL** | Railway custom domain misconfigured | Verified live: `https://kaizerx.com/` returns 200 with `<title>KAIZER NEWS — Autonomous Live Director & AI Clips</title>`. DNS via Cloudflare CNAME (proxied), Railway holds the cert. |
+| **Unresponsive homepage URL** | Railway custom domain misconfigured | Verified live: `https://kaizerx.com/` returns 200 with `<title>KAIZER X — Autonomous Live Director & AI Clips</title>`. DNS via Cloudflare CNAME (proxied), Railway holds the cert. |
 | **Homepage not registered to you** | Domain ownership not verified in Search Console | ✅ User completed Search Console domain verification (DNS TXT). Same Google account that owns the OAuth project. |
 | **Homepage redirects to a different domain** | A registrar-level forwarder pointing kaizerx.com → some other URL | None — kaizerx.com is served directly by Railway. No redirects in the chain. |
 | **Shortened / condensed link** | Using bit.ly / g.co style URL | None — `https://kaizerx.com` is a clean root domain. |

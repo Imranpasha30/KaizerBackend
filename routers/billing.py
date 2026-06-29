@@ -247,4 +247,7 @@ def dev_set_plan(
 
     user.plan = plan_key
     db.commit()
+    # Wave 2: drop the auth-cache snapshot so the new plan applies to
+    # rate limits / gating on the very next request.
+    auth.invalidate_user_cache(user.id)
     return {"plan": plan_key, "set_via": "dev"}

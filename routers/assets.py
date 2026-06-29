@@ -279,6 +279,243 @@ async def upload_asset(
     return _to_dict(row)
 
 
+class ImportSampleIn(BaseModel):
+    filename: str
+    folder_path: str = ""
+    kind: str = "video"
+
+
+@router.post("/import-sample", status_code=201)
+def import_sample_asset(
+    payload: ImportSampleIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Copy a bundled PLATFORM SAMPLE video (a demo intro/background) into the
+    user's Assets so it can be reused like any upload and referenced by asset
+    id. Powers the New Job 'platform demo intro' picker (assigned/demo/upload)."""
+    from pipeline_v4.canvas_engine import bg_video_samples_dir
+    name = Path(payload.filename or "").name
+    if not name:
+        raise HTTPException(400, "filename required")
+    src = bg_video_samples_dir() / name
+    if not src.is_file():
+        raise HTTPException(404, f"sample not found: {name}")
+    content = src.read_bytes()
+    if not content:
+        raise HTTPException(400, "sample is empty")
+    mime = mimetypes.guess_type(name)[0] or "video/mp4"
+
+    user_dir = ASSETS_ROOT / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = name.replace(" ", "_")
+    out_path = user_dir / safe_name
+    if out_path.exists():
+        stem, suf = out_path.stem, out_path.suffix
+        i = 1
+        while out_path.exists():
+            out_path = user_dir / f"{stem}_{i}{suf}"
+            i += 1
+    out_path.write_bytes(content)
+    thumb_path, w, h = _thumb_for(out_path)
+
+    storage_backend = storage_key = storage_url = thumb_storage_url = ""
+    try:
+        storage = get_storage_provider()
+        rel_dir = f"user_assets/{user.id}/"
+        obj = storage.upload(str(out_path), rel_dir + out_path.name, content_type=mime)
+        storage_backend, storage_key, storage_url = storage.name, obj.key, obj.url
+        if thumb_path:
+            thumb_storage_url = storage.upload(
+                thumb_path, rel_dir + Path(thumb_path).name, content_type="image/jpeg",
+            ).url
+        if storage.name != "local":
+            try:
+                out_path.unlink(missing_ok=True)
+                if thumb_path and Path(thumb_path).exists():
+                    Path(thumb_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[assets] import-sample storage upload failed for {out_path.name}: {exc}")
+
+    row = models.UserAsset(
+        user_id=user.id, filename=out_path.name, file_path=str(out_path.resolve()),
+        thumb_path=thumb_path, kind=(payload.kind or "video"), mime=mime,
+        size_bytes=len(content), width=w, height=h, is_default_ad=False, tags=[],
+        folder_path=_normalize_folder(payload.folder_path),
+        storage_backend=storage_backend, storage_key=storage_key,
+        storage_url=storage_url, thumb_storage_url=thumb_storage_url,
+    )
+    db.add(row); db.commit(); db.refresh(row)
+    return _to_dict(row)
+
+
+def _persist_ai_image(db: Session, user: models.User, out_path: Path, folder_path: str) -> dict:
+    """Save a freshly-generated image file as a UserAsset (storage + thumb + row), mirroring
+    /upload. Used by both the single and the batch AI-image routes. Returns the asset dict."""
+    mime = "image/jpeg"
+    size_bytes = out_path.stat().st_size
+    thumb_path, w, h = _thumb_for(out_path)
+    storage_backend = storage_key = storage_url = thumb_storage_url = ""
+    try:
+        storage = get_storage_provider()
+        rel_dir = f"user_assets/{user.id}/"
+        obj = storage.upload(str(out_path), rel_dir + out_path.name, content_type=mime)
+        storage_backend, storage_key, storage_url = storage.name, obj.key, obj.url
+        if thumb_path:
+            thumb_storage_url = storage.upload(
+                thumb_path, rel_dir + Path(thumb_path).name, content_type="image/jpeg").url
+        if storage.name != "local":
+            try:
+                out_path.unlink(missing_ok=True)
+                if thumb_path and Path(thumb_path).exists():
+                    Path(thumb_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[assets] ai-generate storage upload failed for {out_path.name}: {exc}")
+
+    row = models.UserAsset(
+        user_id=user.id, filename=out_path.name, file_path=str(out_path.resolve()),
+        thumb_path=thumb_path, kind="image", mime=mime, size_bytes=size_bytes, width=w, height=h,
+        is_default_ad=False, tags=["ai-generated"], folder_path=_normalize_folder(folder_path),
+        storage_backend=storage_backend, storage_key=storage_key,
+        storage_url=storage_url, thumb_storage_url=thumb_storage_url,
+    )
+    db.add(row); db.commit(); db.refresh(row)
+    return _to_dict(row)
+
+
+class AiGenerateImageIn(BaseModel):
+    # The STORY/topic of the video being uploaded — the image is generated to MATCH it: a
+    # story-aware prompt writer turns the story into a relevant, tasteful image prompt first,
+    # so the result fits the content (NOT a literal take on a raw prompt).
+    story: str = ""
+    prompt: str = ""          # back-compat alias; treated as the story when `story` is empty
+    title: str = ""
+    language: str = "te"
+    width: int = 1280
+    height: int = 720
+    folder_path: str = ""
+
+
+@router.post("/ai-generate", status_code=201)
+def ai_generate_asset(
+    payload: AiGenerateImageIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Generate an image RELEVANT TO THE STORY (story-aware: the writer turns the story/topic into
+    a tasteful on-topic image prompt, then renders) and save it as a USER ASSET, so it can be picked
+    into a template slot exactly like an upload. Job-agnostic — the New Job media step runs before a
+    job exists, so the operator supplies the story/topic. Returns the same asset dict as /upload."""
+    story = (payload.story or payload.prompt or "").strip()
+    if not story:
+        raise HTTPException(400, "Tell me what the video / story is about so the image matches it.")
+    from pipeline_v4 import image_ai as _iai
+
+    user_dir = ASSETS_ROOT / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    base = "ai_" + "".join(c if (c.isalnum() or c in "-_") else "_" for c in story[:40]).strip("_")
+    out_path = user_dir / f"{base or 'ai_image'}.jpg"
+    i = 1
+    while out_path.exists():
+        out_path = user_dir / f"{(base or 'ai_image')}_{i}.jpg"
+        i += 1
+    w_req = max(256, min(int(payload.width or 1280), 2048))
+    h_req = max(256, min(int(payload.height or 720), 2048))
+
+    # Story-aware: write_image_prompt turns the story into a relevant image prompt, THEN renders —
+    # so the image fits the content instead of being a literal take on a raw prompt.
+    saved, _final_prompt = _iai.make_image_for_story(
+        title_native=(payload.title or story)[:200],
+        summary=story[:1200],
+        language=(payload.language or "te"),
+        out_path=str(out_path), width=w_req, height=h_req,
+    )
+    if not saved or not out_path.is_file():
+        raw = getattr(_iai.generate_image, "last_error", "") or ""
+        hint = ""
+        if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
+            hint = "Image quota/credits exhausted — top up GCP/Gemini billing."
+        elif "PERMISSION_DENIED" in raw or " 403" in raw:
+            hint = "Vertex AI permission denied — check the service account's role."
+        raise HTTPException(502, hint or (raw[:300] if raw else "Image generation returned nothing — try again."))
+
+    return _persist_ai_image(db, user, out_path, payload.folder_path)
+
+
+# Max images one batch may generate — cost guard ("8 images" was the operator's example;
+# raise via env if a story ever needs more). The planner picks fewer when the story is simpler.
+_AI_BATCH_MAX = max(1, min(int(os.environ.get("KAIZER_AI_IMAGE_MAX", "8") or 8), 12))
+
+
+class AiGenerateBatchIn(BaseModel):
+    # Same story-aware contract as the single route, but produces a SEQUENCE of distinct
+    # images (one per visual beat of the story) — for a carousel / slideshow whose length is
+    # driven by the story, not a fixed template count.
+    story: str = ""
+    prompt: str = ""             # back-compat alias; treated as the story when `story` is empty
+    title: str = ""
+    language: str = "te"
+    count: Optional[int] = None  # None = let the planner decide how many beats (1.._AI_BATCH_MAX)
+    width: int = 1280
+    height: int = 720
+    folder_path: str = ""
+
+
+@router.post("/ai-generate-batch", status_code=201)
+def ai_generate_asset_batch(
+    payload: AiGenerateBatchIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Generate a STORY-DRIVEN SEQUENCE of relevant images (distinct beats) and save each as a
+    USER ASSET. ``count`` forces an exact number (capped at _AI_BATCH_MAX); omit it and the
+    planner decides how many the story needs. Returns ``{assets:[…], prompts:[…], count}`` so the
+    caller can drop them into a single slot (1 image) or a carousel (N). Owner-scoped — every
+    asset belongs to this user."""
+    story = (payload.story or payload.prompt or "").strip()
+    if not story:
+        raise HTTPException(400, "Tell me what the video / story is about so the images match it.")
+    want = None
+    if payload.count is not None:
+        want = max(1, min(int(payload.count), _AI_BATCH_MAX))
+    from pipeline_v4 import image_ai as _iai
+
+    user_dir = ASSETS_ROOT / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    slug = "".join(c if (c.isalnum() or c in "-_") else "_" for c in story[:32]).strip("_") or "image"
+    # A fresh base prefix so a re-run for the same story doesn't overwrite earlier files.
+    k = 1
+    base = f"ai_{slug}"
+    while any(user_dir.glob(f"{base}_*.jpg")):
+        base = f"ai_{slug}_b{k}"; k += 1
+    w_req = max(256, min(int(payload.width or 1280), 2048))
+    h_req = max(256, min(int(payload.height or 720), 2048))
+
+    pairs = _iai.make_images_for_story(
+        title_native=(payload.title or story)[:200], summary=story[:1200],
+        language=(payload.language or "te"), count=want, out_dir=str(user_dir), base=base,
+        width=w_req, height=h_req, max_images=_AI_BATCH_MAX,
+    )
+    if not pairs:
+        raw = getattr(_iai.generate_image, "last_error", "") or ""
+        hint = ""
+        if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
+            hint = "Image quota/credits exhausted — top up GCP/Gemini billing."
+        elif "PERMISSION_DENIED" in raw or " 403" in raw:
+            hint = "Vertex AI permission denied — check the service account's role."
+        raise HTTPException(502, hint or (raw[:300] if raw else "Image generation returned nothing — try again."))
+
+    assets, prompts = [], []
+    for path, prompt in pairs:
+        assets.append(_persist_ai_image(db, user, Path(path), payload.folder_path))
+        prompts.append(prompt)
+    return {"assets": assets, "prompts": prompts, "count": len(assets)}
+
+
 class AssetPatch(BaseModel):
     is_default_ad: Optional[bool] = None
     tags:          Optional[List[str]] = None

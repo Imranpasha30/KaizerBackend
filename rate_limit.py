@@ -41,6 +41,7 @@ Failure mode:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional, Tuple
 
@@ -193,6 +194,22 @@ def check_rate(
 # ── Plan-aware lookup ───────────────────────────────────────────
 def _plan_limits(plan: Optional[str], bucket: str) -> Tuple[int, float]:
     p = (plan or DEFAULT_PLAN).strip().lower()
+    # Wave 2: ops-tunable override without a deploy.
+    #   KAIZER_RL_<PLAN>_<BUCKET>="burst,rate_per_s"
+    # e.g. KAIZER_RL_FREE_CREATE="10,0.166" → burst 10, ~10/min sustained.
+    # The "_anon" plan maps to KAIZER_RL_ANON_<BUCKET>. Re-read every
+    # call so an env flip applies immediately.
+    env_key = f"KAIZER_RL_{p.lstrip('_').upper()}_{bucket.upper()}"
+    raw = (os.getenv(env_key, "") or "").strip()
+    if raw:
+        try:
+            burst_s, rate_s = raw.split(",", 1)
+            return max(1, int(float(burst_s))), float(rate_s)
+        except (ValueError, TypeError):
+            logger.warning(
+                "rate_limit: bad %s=%r (want 'burst,rate_per_s'); "
+                "falling back to the plan table", env_key, raw,
+            )
     cfg = PLAN_LIMITS.get(p) or PLAN_LIMITS[DEFAULT_PLAN]
     spec = cfg.get(bucket)
     if not spec:

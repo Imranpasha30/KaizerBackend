@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -104,6 +106,85 @@ def ensure_legacy_user(db: Session) -> models.User:
     return u
 
 
+# ─── current_user TTL cache (Wave 2 — API scale) ─────────────────────────
+# Every authenticated request used to cost one SELECT on users. At 10k
+# concurrent users polling job status, that's thousands of identical
+# point-reads per second. We cache a DETACHED snapshot of the User row
+# (expunged from its loading session) for a short TTL and re-attach a
+# copy to each request's session via merge(load=False) — zero SQL on the
+# hit path, and downstream relationship traversal / mutation + commit
+# still work because the returned instance is session-bound.
+#
+# Staleness: plan changes and admin toggles invalidate explicitly via
+# invalidate_user_cache(); anything else (Stripe webhooks, direct DB
+# edits) becomes visible within the TTL, which is acceptable for fields
+# like plan/is_admin that change a few times per account lifetime.
+# Set KAIZER_AUTH_CACHE_TTL_SECONDS=0 to disable entirely.
+
+_user_cache: dict[int, tuple[float, "models.User"]] = {}
+_user_cache_lock = threading.Lock()
+_USER_CACHE_MAX = 5000  # prune stale entries past this many users
+
+
+def _auth_cache_ttl() -> float:
+    """Re-read per request so an ops flip doesn't require a restart."""
+    try:
+        return float(os.getenv("KAIZER_AUTH_CACHE_TTL_SECONDS", "60") or "60")
+    except ValueError:
+        return 60.0
+
+
+def invalidate_user_cache(user_id: int) -> None:
+    """Drop one user's cached snapshot — call after mutating their row
+    (plan change, admin toggle, deactivation) so the change is visible
+    on the very next request instead of after the TTL."""
+    with _user_cache_lock:
+        _user_cache.pop(int(user_id), None)
+
+
+def _cache_get_user(db: Session, user_id: int) -> Optional["models.User"]:
+    """Cache hit → a session-bound copy of the snapshot; miss → None."""
+    ttl = _auth_cache_ttl()
+    if ttl <= 0:
+        return None
+    with _user_cache_lock:
+        entry = _user_cache.get(user_id)
+        if entry is None:
+            return None
+        ts, snapshot = entry
+        if (time.monotonic() - ts) >= ttl:
+            _user_cache.pop(user_id, None)
+            return None
+    # merge(load=False) re-attaches the detached snapshot to THIS
+    # request's session without emitting SQL. The snapshot itself stays
+    # detached in the cache; merge hands back a per-session copy.
+    return db.merge(snapshot, load=False)
+
+
+def _cache_put_user(db: Session, u: "models.User") -> "models.User":
+    """Detach ``u`` into the cache; hand back a session-bound copy.
+
+    expunge() makes the freshly-loaded instance detached (safe to share
+    across requests — nothing can lazy-load through it), then
+    merge(load=False) re-attaches a copy for the current request so the
+    caller's behaviour is identical to the uncached path.
+    """
+    if _auth_cache_ttl() <= 0:
+        return u
+    db.expunge(u)
+    with _user_cache_lock:
+        if len(_user_cache) > _USER_CACHE_MAX:
+            # Bound the dict: stale entries go first; if everything is
+            # somehow fresh, wipe it all — it's just a cache.
+            now, ttl = time.monotonic(), _auth_cache_ttl()
+            for k in [k for k, (ts, _) in _user_cache.items() if now - ts >= ttl]:
+                _user_cache.pop(k, None)
+            if len(_user_cache) > _USER_CACHE_MAX:
+                _user_cache.clear()
+        _user_cache[int(u.id)] = (time.monotonic(), u)
+    return db.merge(u, load=False)
+
+
 # ─── Dependencies ────────────────────────────────────────────────────────
 
 def current_user(
@@ -127,9 +208,15 @@ def current_user(
         if payload:
             user_id = int(payload.get("sub") or 0)
             if user_id:
+                # TTL cache first (Wave 2) — the JWT signature check
+                # above already authenticated the caller; the DB read
+                # only re-materialises the row.
+                cached = _cache_get_user(db, user_id)
+                if cached is not None and cached.is_active:
+                    return cached
                 u = db.query(models.User).filter(models.User.id == user_id).first()
                 if u and u.is_active:
-                    return u
+                    return _cache_put_user(db, u)
         # Token present but invalid — respond clearly so the frontend can log out
         if os.getenv("KAIZER_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes", "on"):
             raise HTTPException(
@@ -162,8 +249,15 @@ def current_user_optional(
     user_id = int(payload.get("sub") or 0)
     if not user_id:
         return None
+    # Same TTL cache as current_user — this path runs on every
+    # rate-limited endpoint, so it's just as hot.
+    cached = _cache_get_user(db, user_id)
+    if cached is not None:
+        return cached if cached.is_active else None
     u = db.query(models.User).filter(models.User.id == user_id).first()
-    return u if (u and u.is_active) else None
+    if u and u.is_active:
+        return _cache_put_user(db, u)
+    return None
 
 
 async def admin_required(user: "models.User" = Depends(current_user)) -> "models.User":

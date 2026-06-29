@@ -71,9 +71,61 @@ def auto_enqueue(job_id: int) -> dict:
         db.close()
 
 
+def _resolve_campaign_user(db: Session, camp: models.Campaign, job_id: int):
+    """The owner whose YouTube credentials + credits the publish runs under.
+    Prefer the campaign's owner; fall back to the job's owner."""
+    uid = getattr(camp, "user_id", None)
+    if uid is None:
+        job = db.query(models.Job).filter(models.Job.id == job_id).first()
+        uid = getattr(job, "user_id", None)
+    if uid is None:
+        return None
+    return db.query(models.User).filter(models.User.id == uid).first()
+
+
+def _detect_publish_kind(clip: models.Clip) -> str:
+    """Bulletin / full-length renders publish as 'video'; the vertical shorts
+    a V4 job emits publish as 'short'."""
+    ft = (getattr(clip, "frame_type", "") or "").lower()
+    if ft in ("bulletin", "raw_upload", "youtube_full"):
+        return "video"
+    return "short"
+
+
+def _already_published_v2(db: Session, clip_id: int, channel_id: int) -> bool:
+    """True if this clip already has a live (non-dead) V2 upload to this
+    channel — guards against double-publishing on re-runs / retries."""
+    master = (
+        db.query(models.MasterVideo)
+          .filter(models.MasterVideo.clip_id == int(clip_id))
+          .first()
+    )
+    if not master:
+        return False
+    return (
+        db.query(models.UploadJobV2.id)
+          .join(models.PublishTask,
+                models.UploadJobV2.publish_task_id == models.PublishTask.id)
+          .filter(models.PublishTask.master_video_id == master.id)
+          .filter(models.UploadJobV2.channel_id == int(channel_id))
+          .filter(models.UploadJobV2.status.notin_(["cancelled", "failed"]))
+          .first() is not None
+    )
+
+
 def _enqueue_job_on_campaign(db: Session, job_id: int, campaign_id: int) -> int:
+    """Fan a finished job's clips out to the campaign's channels via the LIVE
+    V2 publish path (MasterVideo → PublishTask → UploadJobV2 on the durable
+    queue), spaced per channel. Reuses the exact bridge the manual publish UI
+    uses, so campaigns inherit per-channel SEO, branding, scheduling, credit
+    reservation and idempotency for free."""
     camp = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
     if not camp or not camp.active:
+        return 0
+
+    user = _resolve_campaign_user(db, camp, job_id)
+    if user is None:
+        print(f"[campaigns] no owner user for campaign {campaign_id} — skipping")
         return 0
 
     clips = (
@@ -86,81 +138,62 @@ def _enqueue_job_on_campaign(db: Session, job_id: int, campaign_id: int) -> int:
     if not clips:
         return 0
 
+    if camp.auto_translate_to or camp.thumbnail_ab:
+        print(f"[campaigns] note: auto_translate_to / thumbnail_ab are not yet "
+              f"wired to the V2 publish path — skipped for campaign {campaign_id}")
+
+    # Lazy import — routers.youtube_upload pulls in services.* which would
+    # create a circular import if loaded at module top.
+    from routers.youtube_upload import PublishRequest, _legacy_to_v2_redirect
+
     queued = 0
     for channel_id in (camp.channel_ids or []):
         channel = db.query(models.Channel).filter(models.Channel.id == channel_id).first()
         if not channel:
             continue
         if not channel.oauth_token or not channel.oauth_token.refresh_token_enc:
-            continue  # skip unconnected channels silently
+            continue  # not a connected publish target — skip silently
 
         for clip in clips:
-            if _already_queued(db, clip.id, channel_id):
+            if _already_published_v2(db, clip.id, channel_id):
                 continue
 
-            # Optional daily cap
+            # Daily cap — count this channel's live + scheduled uploads today.
             if camp.daily_cap and slot_scheduler.count_scheduled_today(db, channel_id) >= camp.daily_cap:
                 break
 
-            # 1. Ensure SEO exists if requested
+            # auto-SEO: generate ONLY when the clip has none yet. The publish
+            # path composes per-channel branding onto clip.seo at dispatch.
             if camp.auto_seo and not (clip.seo or "").strip():
                 _generate_seo_inline(db, clip.id, channel_id)
                 db.refresh(clip)
 
-            # 2. Compose metadata
-            title, description, tags = _compose_metadata(clip, channel)
-
-            # 3. Pick next slot (scheduled upload → private with publishAt)
-            slot_utc = slot_scheduler.next_slot(
-                db,
-                channel_id=channel_id,
-                spacing_minutes=max(10, camp.spacing_minutes or 120),
-                quiet_start=camp.quiet_hours_start or 0,
-                quiet_end=camp.quiet_hours_end or 0,
+            payload = PublishRequest(
+                channel_ids=[int(channel_id)],
+                # VISIBILITY IS DECIDED ONLY IN THE PUBLISH PANEL (operator rule
+                # 2026-06-18). A plan must never silently force a video private.
+                # Plan-published clips go PUBLIC immediately. If the operator
+                # wants timed/scheduled release, they choose "Scheduled" in the
+                # Publish panel — the single place visibility is controlled.
+                # (Scheduled drip used to upload private + publish_at so YouTube
+                # auto-flipped it public; that hid videos as private, which is the
+                # exact confusion being removed here.)
+                privacy_status="public",
+                publish_at=None,
+                use_seo=True,
+                publish_kind=_detect_publish_kind(clip),
+                brand_mode="per_channel",
             )
-
-            # Force privacy rules: scheduled uploads are always private-until-publish
-            privacy = camp.privacy_status or "private"
-            publish_at: Optional[datetime] = slot_utc
-            if privacy != "private":
-                # YouTube requires private for publishAt to work
-                privacy = "private"
-
-            upload = models.UploadJob(
-                clip_id=clip.id,
-                channel_id=channel_id,
-                status="queued",
-                privacy_status=privacy,
-                publish_at=publish_at,
-                title=title,
-                description=description,
-                tags=tags,
-                category_id="25",
-                made_for_kids=False,
-            )
-            db.add(upload)
-            db.commit()
-            db.refresh(upload)
-            queued += 1
-
-            # Signal the worker via Redis. Campaigns are bulk fan-out
-            # work — route to the ``lo`` lane so a 500-channel campaign
-            # never blocks a paying tenant's live single upload sitting
-            # on ``hi`` or ``normal``.
             try:
-                from redis_queue import enqueue_upload_job, is_enabled as _redis_on, priority_for_user
-                if _redis_on():
-                    enqueue_upload_job(upload.id, priority=priority_for_user(None, batch=True))
-            except Exception as exc:
-                print(f"[campaigns] redis enqueue failed for upload {upload.id}: {exc}")
-
-            # 4. Phase D — translation fan-out
-            if camp.auto_translate_to:
-                _translate_and_fanout(db, clip, channel, camp, upload.id)
-
-            # 5. Phase C — thumbnail A/B variants
-            if camp.thumbnail_ab:
-                _queue_thumbnail_variants(db, clip, upload.id)
+                _legacy_to_v2_redirect(db, user, int(clip.id), payload)
+                queued += 1
+            except Exception as e:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                detail = getattr(e, "detail", None) or str(e)
+                print(f"[campaigns] publish failed clip={clip.id} ch={channel_id}: {detail}")
 
     return queued
 

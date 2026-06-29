@@ -39,6 +39,18 @@ UPLOAD_PROVIDER_VALID    = {
     "x", "linkedin", "tiktok",                # scaffolded for credentials
 }
 
+# Delivery mode — controls whether Postiz AUTO-FALLBACK is active.
+#   "testing"    → current manual behaviour: a channel uploads natively
+#                  (our own quota) UNLESS the user explicitly set it to
+#                  Postiz. NO automatic fallback. (Default — safe.)
+#   "production" → auto-fallback: native first, and when the YouTube daily
+#                  quota can't cover a target, channels that have a bound
+#                  Postiz integration are routed to Postiz automatically so
+#                  publishing never stalls while our quota is low.
+DELIVERY_MODE          = "delivery_mode"
+DELIVERY_MODE_DEFAULT  = "testing"
+DELIVERY_MODE_VALID    = {"testing", "production"}
+
 
 # ─── Read / write helpers ────────────────────────────────────────────────────
 
@@ -76,3 +88,11 @@ def get_upload_provider(db: Session) -> str:
     value so a malformed DB entry can't crash the publish flow."""
     v = get_system_setting(db, UPLOAD_PROVIDER, UPLOAD_PROVIDER_DEFAULT).strip().lower()
     return v if v in UPLOAD_PROVIDER_VALID else UPLOAD_PROVIDER_DEFAULT
+
+
+def get_delivery_mode(db: Session) -> str:
+    """Return 'testing' (default) or 'production'. Clamps malformed values
+    so the publish flow can never crash on a bad DB entry. 'production'
+    enables Postiz auto-fallback on YouTube-quota exhaustion."""
+    v = get_system_setting(db, DELIVERY_MODE, DELIVERY_MODE_DEFAULT).strip().lower()
+    return v if v in DELIVERY_MODE_VALID else DELIVERY_MODE_DEFAULT

@@ -48,6 +48,21 @@ def _run_refresh_job() -> None:
         db.close()
 
 
+def _run_insights_maintenance() -> None:
+    """Daily (Insights / Channel Doctor): refresh thumbnail CTR for every connected channel
+    (cheap Reporting-API bulk download — separate quota pool) and prune old snapshots so the
+    DB doesn't grow unbounded. Own DB session; swallows exceptions."""
+    db = SessionLocal()
+    try:
+        from insights import maintenance as _ins_maint
+        summary = _ins_maint.run_daily_maintenance(db)
+        print(f"[insights-cron] {summary}")
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.close()
+
+
 def _run_analytics_poll() -> None:
     try:
         from analytics import poller
@@ -85,6 +100,7 @@ def start() -> None:
       KAIZER_ENABLE_ANALYTICS=true       # hourly              (YT Data API)
       KAIZER_ENABLE_THUMB_AB=true        # hourly              (Gemini text calls)
       KAIZER_ENABLE_TRENDING=true        # every 2h            (Gemini text per new video)
+      KAIZER_ENABLE_INSIGHTS=true        # daily 05:30 IST     (Channel Doctor: CTR refresh + prune)
     """
     global _scheduler
     if _scheduler is not None:
@@ -138,6 +154,16 @@ def start() -> None:
             coalesce=True, max_instances=1,
         )
         enabled.append("trending every 2h")
+
+    if _flag("KAIZER_ENABLE_INSIGHTS", True):
+        sched.add_job(
+            _run_insights_maintenance,
+            CronTrigger(hour=5, minute=30, timezone=IST_TZ),   # daily 05:30 IST
+            id="insights-maintenance",
+            replace_existing=True, misfire_grace_time=3600,
+            coalesce=True, max_instances=1,
+        )
+        enabled.append("insights-maintenance daily 05:30 IST")
 
     sched.start()
     _scheduler = sched

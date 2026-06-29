@@ -52,6 +52,14 @@ def _base_url() -> str:
     return os.environ.get("POSTIZ_BASE_URL", "http://localhost:5000").rstrip("/")
 
 
+def base_url() -> str:
+    """Public accessor for the effective Postiz base URL (what this client
+    actually talks to). Exposed so admin/status endpoints report the SAME
+    value the client uses instead of a second hardcoded default that can
+    silently drift out of sync."""
+    return _base_url()
+
+
 def _api_key() -> Optional[str]:
     val = os.environ.get("POSTIZ_API_KEY", "").strip()
     return val or None
@@ -103,7 +111,7 @@ def list_integrations() -> list[dict]:
 
     Each entry typically has:
         id            — Postiz's internal integration id (UUID)
-        name          — display label (e.g. "Kaizer News Andhra")
+        name          — display label (e.g. "Kaizer X Andhra")
         provider      — "twitter", "instagram", "linkedin", "tiktok", …
         picture       — avatar URL
         identifier    — platform-side handle / channel id
@@ -130,6 +138,51 @@ def list_integrations() -> list[dict]:
         item.setdefault("provider", item.get("identifier", ""))
         out.append(item)
     return out
+
+
+def social_connect_url(provider: str, *, refresh: Optional[str] = None) -> dict:
+    """Generate an OAuth authorization URL to CONNECT a new social channel.
+
+    GET /public/v1/social/{provider}. Returns ``{"url": "<platform OAuth
+    authorize URL>"}`` — the caller opens it; the user approves on the
+    platform's OWN consent screen; Postiz finalizes the connection and the
+    channel then appears in ``list_integrations()``. ``refresh`` = an
+    existing integration id to RE-authorize instead of connecting new.
+
+    Only OAuth-based providers are supported (x, linkedin, facebook,
+    instagram, youtube, tiktok, threads, pinterest, reddit, …); external-
+    URL providers like Mastodon are not available via this endpoint.
+    """
+    prov = (provider or "").strip().lower()
+    if not prov:
+        raise PostizError("social_connect_url: provider is required")
+    url = f"{_base_url()}/public/v1/social/{prov}"
+    params = {"refresh": refresh} if refresh else None
+    try:
+        resp = requests.get(url, headers=_headers(), params=params, timeout=20)
+    except requests.RequestException as exc:
+        raise PostizError(f"Postiz connect-url unreachable at {url}: {exc}") from exc
+    return _handle(resp, "social_connect_url")
+
+
+def delete_integration(integration_id: str) -> dict:
+    """Disconnect a channel: DELETE /public/v1/integrations/{id}.
+
+    Postiz also deletes any scheduled posts on that channel. A 404 means it
+    was already gone — surfaced as ``{"already_deleted": True}`` so the
+    caller treats it as success. Returns the deleted id on success.
+    """
+    iid = (integration_id or "").strip()
+    if not iid:
+        raise PostizError("delete_integration: integration_id is required")
+    url = f"{_base_url()}/public/v1/integrations/{iid}"
+    try:
+        resp = requests.delete(url, headers=_headers(), timeout=20)
+    except requests.RequestException as exc:
+        raise PostizError(f"Postiz delete unreachable at {url}: {exc}") from exc
+    if resp.status_code == 404:
+        return {"id": iid, "already_deleted": True}
+    return _handle(resp, "delete_integration")
 
 
 def upload_file(local_path: str, mime_type: Optional[str] = None) -> dict:

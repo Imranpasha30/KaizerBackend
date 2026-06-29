@@ -28,12 +28,14 @@ Rules
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import mimetypes
 import os
 import shutil
 import tempfile
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,14 +174,27 @@ class StorageProvider(ABC):
         # 3. Download to deterministic cache path
         # ------------------------------------------------------------------
         key = url_or_key
-        # Sanitise the key to a safe filename component.
-        safe = key.replace("/", "_").replace("\\", "_").lstrip("_")
+        # Collision-free cache filename (ISOLATION INVARIANT I1). The old
+        # scheme collapsed '/' and '\\' to '_', so distinct keys such as
+        # 'a/b/v.mp4' and 'a_b_v.mp4' mapped to the SAME file — on a shared
+        # cache two different jobs could then read each other's bytes. We
+        # hash the FULL key (sha256) so every distinct key gets a unique
+        # name; a short readable stem + the original extension are kept only
+        # for debuggability.
+        _stem = key.replace("/", "_").replace("\\", "_").lstrip("_")
+        _ext = os.path.splitext(_stem)[1][:12]
+        _digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        safe = f"{_stem[:48]}.{_digest}{_ext}" if _ext else f"{_stem[:48]}.{_digest}"
         dest_dir = cache_dir or os.path.join(
             tempfile.gettempdir(), "kaizer_storage_cache"
         )
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, safe)
 
+        # A cache hit only ever observes a FULLY-written file: downloads land
+        # in a unique per-process temp file and are atomically renamed into
+        # place below, so a concurrent reader can never see a partial
+        # download (the old code returned dest_path even mid-write).
         if os.path.isfile(dest_path):
             logger.debug(
                 "storage.ensure_local: cache hit for key=%r → %s", key, dest_path
@@ -189,7 +204,19 @@ class StorageProvider(ABC):
         logger.info(
             "storage.ensure_local: downloading key=%r → %s", key, dest_path
         )
-        return self.download(key, dest_path)
+        tmp_path = os.path.join(
+            dest_dir, f".{os.getpid()}.{uuid.uuid4().hex}.part"
+        )
+        try:
+            self.download(key, tmp_path)
+            os.replace(tmp_path, dest_path)  # atomic on the same filesystem
+        finally:
+            if os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return dest_path
 
 
 # ---------------------------------------------------------------------------
@@ -434,12 +461,21 @@ class R2Storage(StorageProvider):
                         f"(import error: {exc})"
                     ) from exc
 
+                from botocore.config import Config  # type: ignore[import]
+
                 self._client = boto3.client(
                     "s3",
                     endpoint_url=self.endpoint,
                     aws_access_key_id=self.access_key_id,
                     aws_secret_access_key=self._secret_access_key,
                     region_name="auto",
+                    # Explicit timeouts so a hung TCP connection can't
+                    # stall a publish worker indefinitely (Wave 5).
+                    config=Config(
+                        connect_timeout=10,
+                        read_timeout=120,
+                        retries={"max_attempts": 3},
+                    ),
                 )
                 self._r2_logger.debug(
                     "boto3 S3 client initialised for endpoint=%r", self.endpoint

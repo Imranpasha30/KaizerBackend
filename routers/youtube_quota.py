@@ -4,10 +4,11 @@ Surfaces the YouTubeApiCall log as a per-day summary so the V4 editor
 can render a "4 / 6 uploads used today" widget without operators
 having to dig into the admin Usage page.
 
-Default daily cap is 10,000 quota units per Google Cloud project.
-videos.insert is 1,600 units = ~6 uploads/day. The operator can request
-a higher cap from Google; this dashboard makes the burn rate visible
-so they know whether they need to.
+videos.insert moved to its OWN granular bucket on 2026-06-01: 100
+uploads/day, 1 unit per call, separate from the 10,000-unit "Queries"
+pool. So uploads are tracked as a COUNT (X / 100 today), NOT as
+"10,000 ÷ 1,600 ≈ 6". The Queries pool (10,000) still covers
+thumbnails.set, list calls and the RTMP lifecycle.
 """
 from __future__ import annotations
 
@@ -45,8 +46,8 @@ def quota_today(
 ) -> dict:
     """Per-operator quota snapshot for today. Returns:
       - used / cap / remaining (units)
-      - uploads_used: count of videos.insert calls today
-      - uploads_remaining: cap / 1600, floor-divided
+      - uploads_used: count of SUCCESSFUL videos.insert calls today
+      - uploads_remaining: 100 (daily upload bucket) − uploads_used
       - by_operation: breakdown of {operation: units}
       - by_channel: breakdown of {channel_id: units}
       - last_5_uploads: most recent videos.insert rows for context
@@ -69,6 +70,9 @@ def quota_today(
           .filter(
               models.YouTubeApiCall.user_id == user.id,
               models.YouTubeApiCall.operation == "videos.insert",
+              # Only SUCCESSFUL uploads consume the 100/day bucket — a
+              # quota-rejected (403) or otherwise-failed attempt does not.
+              models.YouTubeApiCall.success.is_(True),
               models.YouTubeApiCall.created_at >= start,
               models.YouTubeApiCall.created_at < end,
           )
@@ -119,14 +123,19 @@ def quota_today(
           .all()
     )
 
-    upload_cost = 1600
+    # videos.insert has its own granular bucket: 100 uploads/day, counted
+    # 1-per-call — NOT divided out of the 10,000 Queries pool anymore.
+    uploads_cap = int(os.environ.get("KAIZER_YT_UPLOADS_DAILY_CAP", "100") or "100")
     return {
         "cap": DAILY_CAP,
         "used": used,
         "remaining": max(0, DAILY_CAP - used),
         "pct": (used / DAILY_CAP * 100) if DAILY_CAP > 0 else 0,
         "uploads_used": uploads_used,
-        "uploads_remaining_estimate": max(0, (DAILY_CAP - used) // upload_cost),
+        "uploads_cap": uploads_cap,
+        "uploads_remaining": max(0, uploads_cap - uploads_used),
+        # back-compat alias for any client still reading the old key
+        "uploads_remaining_estimate": max(0, uploads_cap - uploads_used),
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),
         "by_operation": [

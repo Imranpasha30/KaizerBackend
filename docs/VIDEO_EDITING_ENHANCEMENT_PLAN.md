@@ -1,4 +1,4 @@
-# Video-Editing Enhancement Plan for Kaizer News
+# Video-Editing Enhancement Plan for Kaizer X
 
 > **Goal**: enhance Kaizer's long-video → vertical-clip editing pipeline.
 > **Method**: research three reference projects, audit Kaizer's current
@@ -357,5 +357,5 @@ If approved as the next priority, here's the concrete delta:
 
 *Document drafted from analysis of darkzOGx/youtube-automation-agent,
 RayVentura/ShortGPT, and rushindrasinha/youtube-shorts-pipeline
-(Verticals v3) READMEs against the current Kaizer News pipeline at
+(Verticals v3) READMEs against the current Kaizer X pipeline at
 `pipeline_core/pipeline.py`.*

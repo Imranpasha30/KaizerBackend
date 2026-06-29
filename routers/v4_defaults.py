@@ -45,7 +45,7 @@ class V4Defaults(BaseModel):
     # Automation
     auto_publish: bool = False            # publish straight after render
     require_consent: bool = True          # show "Confirm upload" modal first
-    brand_suffix: str = ""                # appended to titles, e.g. " | KAIZER NEWS"
+    brand_suffix: str = ""                # appended to titles, e.g. " | KAIZER X"
 
     # Watermark — semi-transparent text/logo painted on every rendered
     # output. Mirrors the way real news channels stamp their bug onto

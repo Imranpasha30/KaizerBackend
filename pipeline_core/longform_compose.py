@@ -278,6 +278,40 @@ def _try_playwright_render_measured(
         return None
 
 
+def _ticker_text(headlines: list[str], pad_chars: int = 6) -> str:
+    sep = "  " + "★" + "  "
+    text = sep.join(h.strip() for h in headlines if h and h.strip())
+    return text or "KAIZER X"
+
+
+def estimate_ticker_width(headlines: list[str], *, pad_chars: int = 6, font_px: int = 28) -> int:
+    """Deterministic pixel width of the PNG render_ticker() produces for
+    these headlines. Lets the caller turn a seconds-per-loop speed into the
+    px/s ffmpeg's overlay needs: speed_px_s = (width + canvas_w) / seconds.
+
+    ``font_px`` scales the per-char estimate proportionally to the 28px baseline
+    (24 px/char), so a larger ticker font yields a proportionally wider PNG and
+    the speed math stays correct. Default 28 -> 24 px/char (byte-identical)."""
+    text = _ticker_text(headlines, pad_chars)
+    per_char = max(12, round(24 * (font_px / 28.0)))
+    return max(2400, per_char * (len(text) + pad_chars * 2))
+
+
+def _hex_rgb(hex_str: str) -> tuple[int, int, int]:
+    h = (hex_str or "").strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return 10, 21, 48
+
+
+def _is_light(hex_str: str) -> bool:
+    r, g, b = _hex_rgb(hex_str)
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 140
+
+
 def render_ticker(
     headlines: list[str],
     lang: str,
@@ -286,6 +320,8 @@ def render_ticker(
     *,
     height: int = _TICKER_H,
     pad_chars: int = 6,
+    bg_color: Optional[str] = None,
+    font_px: int = 28,
 ) -> str:
     """Render the scrolling-ticker source PNG.
 
@@ -293,26 +329,42 @@ def render_ticker(
     intentionally wide (a few thousand pixels) so FFmpeg's overlay can
     scroll it as one strip via an ``x`` expression. Caller drives the
     scroll speed and looping.
+
+    ``bg_color`` (hex, e.g. ``"#FFD400"``) replaces the default navy/gold
+    strip with a solid bar; the text auto-contrasts (dark on light bars).
+    None keeps the broadcast default so existing renders stay identical.
     """
-    sep = "  " + "★" + "  "
-    text = sep.join(h.strip() for h in headlines if h and h.strip())
-    if not text:
-        text = "KAIZER NEWS"
-    # Estimate width: ~24 px per character at 36 px font (rough; Playwright
-    # will lay out the real width, we just need the canvas big enough).
-    est_width = max(2400, 24 * (len(text) + pad_chars * 2))
+    text = _ticker_text(headlines, pad_chars)
+    font_px = max(10, int(font_px or 28))
+    # Estimate width: ~24 px per char at the 28px baseline, scaled by font_px
+    # (Playwright lays out the real width; we just need the canvas big enough).
+    est_width = estimate_ticker_width(headlines, pad_chars=pad_chars, font_px=font_px)
     face, family = _font_data_uri(font_path)
     safe_text = _html.escape(text)
+    # Only honor a well-formed #RGB / #RRGGBB / #RRGGBBAA value; anything else falls back to
+    # the broadcast default instead of injecting a broken CSS color.
+    if bg_color:
+        _b = bg_color.strip()
+        _hx = set("0123456789abcdefABCDEF")
+        if not (_b.startswith("#") and len(_b) in (4, 7, 9) and all(c in _hx for c in _b[1:])):
+            bg_color = None
+    if bg_color:
+        strip_bg = f"background:{bg_color};"
+        strip_border = ""
+        txt_color = "#111111" if _is_light(bg_color) else "#ffffff"
+    else:
+        strip_bg = "background:linear-gradient(180deg,#0a1530 0%,#05091e 100%);"
+        strip_border = "border-top:2px solid #ffd640;border-bottom:2px solid #ffd640;"
+        txt_color = "#ffffff"
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 {face}
 *{{margin:0;padding:0;box-sizing:border-box;}}
 html,body{{width:{est_width}px;height:{height}px;background:transparent;
   font-family:{family};}}
 .strip{{position:absolute;left:0;right:0;top:0;bottom:0;
-  background:linear-gradient(180deg,#0a1530 0%,#05091e 100%);
-  border-top:2px solid #ffd640;border-bottom:2px solid #ffd640;
+  {strip_bg}{strip_border}
   display:flex;align-items:center;padding:0 24px;
-  color:#ffffff;font-weight:700;font-size:28px;
+  color:{txt_color};font-weight:700;font-size:{font_px}px;
   white-space:nowrap;letter-spacing:0.4px;}}
 </style></head><body>
 <div class="strip">{safe_text}</div>
@@ -320,15 +372,22 @@ html,body{{width:{est_width}px;height:{height}px;background:transparent;
 </body></html>"""
     if _try_playwright_html_to_png(html, out_path, est_width, height):
         return out_path
-    # PIL fallback — single line of text on a navy bar.
+    # PIL fallback — single line of text on a solid bar.
     from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGBA", (est_width, height), (10, 21, 48, 235))
+    if bg_color:
+        r, g, b = _hex_rgb(bg_color)
+        bar_rgba = (r, g, b, 255)
+        txt_rgba = (17, 17, 17, 255) if _is_light(bg_color) else (255, 255, 255, 255)
+    else:
+        bar_rgba = (10, 21, 48, 235)
+        txt_rgba = (255, 255, 255, 255)
+    img = Image.new("RGBA", (est_width, height), bar_rgba)
     try:
-        f = ImageFont.truetype(font_path, 28) if font_path else ImageFont.load_default()
+        f = ImageFont.truetype(font_path, font_px) if font_path else ImageFont.load_default()
     except Exception:
         f = ImageFont.load_default()
     d = ImageDraw.Draw(img)
-    d.text((24, 8), text, font=f, fill=(255, 255, 255, 255))
+    d.text((24, 8), text, font=f, fill=txt_rgba)
     img.save(out_path, "PNG")
     return out_path
 
@@ -372,7 +431,7 @@ def render_channel_bug(
                          "Inter-Bold.ttf"), 22)
     except Exception:
         f = ImageFont.load_default()
-    name = (channel_name or "KAIZER NEWS")[:20]
+    name = (channel_name or "KAIZER X")[:20]
     d.text((text_x, height // 2 - 12), name, font=f, fill=(255, 255, 255, 240))
     img.save(out_path, "PNG")
     return out_path

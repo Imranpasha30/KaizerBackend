@@ -24,7 +24,7 @@ class LanguageConfig:
     font_primary: str = ""       # absolute path to bold TTF (headline/card)
     font_secondary: str = ""     # absolute path to regular TTF (body text)
     font_fallback: str = ""      # Latin for mixed content
-    follow_bar_text: str = ""    # translated "FOLLOW KAIZER NEWS"
+    follow_bar_text: str = ""    # translated "FOLLOW KAIZER X"
     news_search_seed: List[str] = field(default_factory=list)  # base image-search terms
     prompt_language_phrase: str = ""  # for Gemini prompt: "Telugu news"
     title_style_hint: str = ""   # extra guidance for title generation
@@ -50,7 +50,7 @@ LANGUAGES: Dict[str, LanguageConfig] = {
         font_primary   = _p("NotoSansTelugu-Bold.ttf") or _FALLBACK_BOLD,
         font_secondary = _p("NotoSansTelugu-Regular.ttf") or _FALLBACK_REG,
         font_fallback  = _LATIN_BOLD,
-        follow_bar_text="FOLLOW KAIZER NEWS TELUGU",
+        follow_bar_text="FOLLOW KAIZER X TELUGU",
         news_search_seed=["Telugu news today", "తెలుగు వార్తలు", "Andhra Telangana news"],
         prompt_language_phrase="Telugu",
         title_style_hint="Short, punchy Telugu news ticker headline. Use natural Telugu — no transliteration.",
@@ -130,7 +130,7 @@ LANGUAGES: Dict[str, LanguageConfig] = {
         font_primary   = _LATIN_BOLD or _FALLBACK_BOLD,
         font_secondary = _LATIN_REG or _FALLBACK_REG,
         font_fallback  = _LATIN_BOLD,
-        follow_bar_text="FOLLOW KAIZER NEWS",
+        follow_bar_text="FOLLOW KAIZER X",
         news_search_seed=["breaking news today", "world news", "top stories"],
         prompt_language_phrase="English",
         title_style_hint="Short, punchy English news ticker headline. All caps if it fits.",

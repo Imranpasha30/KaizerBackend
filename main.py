@@ -5,6 +5,7 @@ import shutil
 import mimetypes
 import asyncio
 import sys
+import threading as _threading
 from pathlib import Path
 from typing import Optional
 
@@ -20,10 +21,10 @@ if sys.platform == "win32" and hasattr(
 ):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Body
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from fastapi.responses import StreamingResponse, RedirectResponse
+from sqlalchemy.orm import Session, selectinload
 from dotenv import load_dotenv
 
 # override=True so a `.env` edit + uvicorn restart actually replaces
@@ -34,14 +35,18 @@ load_dotenv(override=True)
 
 from database import engine, SessionLocal, Base, get_db
 import models
+import insights.models  # noqa: F401 — registers insights_* tables on Base before create_all
 import runner
 import auth
+from rate_limit import rate_limited  # Wave 2 — per-tenant token buckets on heavy POSTs
 
 from routers.auth import router as auth_router
 from routers.channels import router as channels_router
 from routers.seo import router as seo_router
 from routers.youtube_oauth import router as youtube_oauth_router
 from routers.youtube_upload import router as youtube_upload_router
+from routers.publish_tasks import router as publish_tasks_router  # Phase 1.B — new publish path (KAIZER_NEW_PUBLISH_PATH gated)
+from insights.router import router as insights_router  # Insights / Trend Finder (isolated module)
 from routers.meta_oauth import router as meta_oauth_router
 from routers.linkedin_oauth import router as linkedin_oauth_router
 from routers.youtube_quota import router as youtube_quota_router
@@ -60,12 +65,20 @@ from routers.admin import router as admin_router
 from routers.work_monitor import router as work_monitor_router
 from routers.postiz import router as postiz_router
 from routers.yt_lookup import router as yt_lookup_router
+from routers.analytics_ai import router as analytics_ai_router
 from routers.bulletin_images import router as bulletin_images_router
 from routers.express_mode import router as express_mode_router
 from routers.heygen import router as heygen_router
 from routers.live_studio import router as live_studio_router
 from routers.v4_editor import router as v4_editor_router
 from routers.v4_defaults import router as v4_defaults_router
+from routers.library    import router as library_router
+from routers.profile    import router as profile_router
+from routers.metrics    import router as metrics_router            # Phase 3.G — Prometheus /metrics
+from routers.admin_upload_v2 import router as admin_upload_v2_router  # Phase 3.G — admin observability page
+from routers.ws_progress import router as ws_progress_router       # Wave 3 — WebSocket live progress
+from routers.quick_publish import router as quick_publish_router   # Quick Publish — SEO + thumbnail glue
+from routers.custom_templates import router as custom_templates_router  # developer-uploaded HTML/CSS templates
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -74,6 +87,77 @@ from learning import scheduler as corpus_scheduler
 def _migrate_schema():
     """Add missing columns to existing tables — safe to run on every startup."""
     from sqlalchemy import text, inspect
+    # Postiz connect-sessions: drop the legacy per-provider UNIQUE so a team's
+    # members can connect the same platform concurrently (team-shared model).
+    # The table is transient (short-lived rows) → drop+recreate loses nothing.
+    # Idempotent: only rebuilds when the old unique constraint is present.
+    try:
+        _insp0 = inspect(engine)
+        if "postiz_connect_sessions" in _insp0.get_table_names():
+            _uc = _insp0.get_unique_constraints("postiz_connect_sessions")
+            if any("provider" in (u.get("column_names") or []) for u in _uc):
+                with engine.begin() as _c0:
+                    _c0.execute(text("DROP TABLE postiz_connect_sessions"))
+        if "postiz_connect_sessions" not in inspect(engine).get_table_names():
+            _t = Base.metadata.tables.get("postiz_connect_sessions")
+            if _t is not None:
+                _t.create(bind=engine)
+    except Exception as _e:
+        print(f"[startup] postiz_connect_sessions migration skipped: {_e}")
+    # master_videos.source_upload_id was UNIQUE (one master per job). The model
+    # dropped that — V4 produces one master PER CLIP (the full video + each
+    # short share a job) — but an existing DB still carries the UNIQUE index,
+    # so the 2nd clip of a job fails to materialise with a UniqueViolation
+    # ("Unable to materialise MasterVideo …"). Rebuild the index non-unique.
+    try:
+        _insp1 = inspect(engine)
+        if "master_videos" in _insp1.get_table_names():
+            for _ix in _insp1.get_indexes("master_videos"):
+                if _ix.get("unique") and _ix.get("column_names") == ["source_upload_id"]:
+                    with engine.begin() as _c1:
+                        _c1.execute(text(f'DROP INDEX IF EXISTS {_ix["name"]}'))
+                        _c1.execute(text(
+                            f'CREATE INDEX IF NOT EXISTS {_ix["name"]} '
+                            f'ON master_videos (source_upload_id)'
+                        ))
+                    print(f"[startup] master_videos.source_upload_id UNIQUE → non-unique ({_ix['name']})")
+    except Exception as _e:
+        print(f"[startup] master_videos source_upload_id index fix skipped: {_e}")
+    # upload_jobs_v2 gained privacy_status + publish_at so the user's
+    # public/unlisted/private choice (and scheduled publish time) carried by
+    # the PublishRequest survives fan-out to the upload worker. Without them
+    # every V2 upload hard-defaulted to 'private' regardless of selection.
+    try:
+        _insp2 = inspect(engine)
+        if "upload_jobs_v2" in _insp2.get_table_names():
+            _ujcols = {c["name"] for c in _insp2.get_columns("upload_jobs_v2")}
+            with engine.begin() as _c2:
+                if "privacy_status" not in _ujcols:
+                    _c2.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN privacy_status "
+                        "VARCHAR(20) NOT NULL DEFAULT 'private'"))
+                    print("[startup] upload_jobs_v2.privacy_status added")
+                if "publish_at" not in _ujcols:
+                    _c2.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN publish_at "
+                        "TIMESTAMP WITH TIME ZONE"))
+                    print("[startup] upload_jobs_v2.publish_at added")
+                # brand_mode: 'per_channel' (overlay this channel's branding)
+                # | 'as_is' (source already branded — upload verbatim).
+                if "brand_mode" not in _ujcols:
+                    _c2.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN brand_mode "
+                        "VARCHAR(16) NOT NULL DEFAULT 'per_channel'"))
+                    print("[startup] upload_jobs_v2.brand_mode added")
+                # brand_placement: 'template' (use the template's logo/watermark
+                # slot) | 'channel' (use this channel's own position instead).
+                if "brand_placement" not in _ujcols:
+                    _c2.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN brand_placement "
+                        "VARCHAR(16) NOT NULL DEFAULT 'template'"))
+                    print("[startup] upload_jobs_v2.brand_placement added")
+    except Exception as _e:
+        print(f"[startup] upload_jobs_v2 privacy columns migration skipped: {_e}")
     with engine.connect() as conn:
         inspector = inspect(engine)
 
@@ -113,10 +197,67 @@ def _migrate_schema():
             # "claude"}. NULL on pre-item-114 rows; dispatcher falls
             # back to "gemini".
             "stage_2_provider":  "VARCHAR(20) DEFAULT 'gemini'",
+            # V4 only: which model decided Step 1's KEEP/CUT plan
+            # ("claude" or "gemini"). NULL on pre-rollout rows;
+            # trim_engine._select_planner falls back to "claude".
+            "v4_trim_planner":   "VARCHAR(20) DEFAULT 'claude'",
+            # V4 only: which provider generated per-story images
+            # ("auto", "gemini", or "openai"). NULL on pre-rollout
+            # rows; image_provider._selected_image_provider falls
+            # back to "auto" (V1 multi-source chain).
+            "v4_image_provider": "VARCHAR(20) DEFAULT 'auto'",
+            # V4 only: operator-supplied bulletin description.
+            # When NON-NULL the orchestrator switches to
+            # "source-preserved" mode (no Claude trim, no AI desc).
+            "v4_predefined_description": "TEXT",
+            # V4 only: render-output choice ("both" / "full-only" /
+            # "shorts-only"). NULL on pre-rollout rows; orchestrator +
+            # runner fall back to "both".
+            "v4_output_format": "VARCHAR(20) DEFAULT 'both'",
+            # V4 only: original publish target ("instagram"/"youtube"/
+            # "facebook"). Editor leads with this platform's SEO.
+            "v4_target_platform": "VARCHAR(20) DEFAULT 'youtube'",
+            # V4 Stage 2: defer the up-front MP4 render (edit-first; export on demand).
+            "v4_defer_render": "BOOLEAN DEFAULT FALSE",
+            # V4 only: channels chosen at generate time (JSON list of Channel
+            # ids). Recorded by the New Job "Choose channels" step.
+            "target_channel_ids": "TEXT",
+            # Per-job INTRO override (UserAsset id). NULL = each channel uses
+            # its own assigned intro. Set at job creation (assigned/demo/upload).
+            "intro_asset_id": "INTEGER",
+            # PER-CHANNEL intro overrides: JSON map {"<channel_id>": <asset_id>}.
+            # A channel present uses that intro for this job; absent = its own.
+            "intro_overrides": "TEXT",
+            # Custom-template per-slot media: JSON {slot_key: asset_id} + the
+            # slot whose video is the AI-trim "main".
+            "template_media":  "TEXT",
+            "main_media_slot": "VARCHAR(64)",
+            # Per-slot text overrides set in the custom-template editor (JSON {slot:text}).
+            "template_overrides": "TEXT",
+            # Per-job custom-template HTML overrides: JSON {"<target>:<index>": "<html>"}.
+            # Set when the operator visually edits the template for THIS job in the inline
+            # builder. Renderer uses it verbatim; parent template untouched. Sanitized on save.
+            "custom_html_overrides": "TEXT",
+            "fullform_layout": "VARCHAR(50)",
+            # Wave 2 (API scale): cached jobs-list cover image. Lazily
+            # backfilled by list_jobs after its first stat()-walk so
+            # subsequent listings stop hammering the filesystem. NULL =
+            # not yet resolved (running jobs, pre-Wave-2 rows).
+            "thumb_url":    "VARCHAR(500)",
+            "thumb_aspect": "VARCHAR(8)",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
                 conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}"))
+
+        # ── custom_templates: preview-modal metadata + community rating ──
+        if inspector.has_table("custom_templates"):
+            _ct_cols = {c["name"] for c in inspector.get_columns("custom_templates")}
+            for col, dtype in (("when_to_use", "TEXT"), ("how_to_use", "TEXT"),
+                               ("rating_sum", "INTEGER"), ("rating_count", "INTEGER"),
+                               ("derived_from", "INTEGER")):
+                if col not in _ct_cols:
+                    conn.execute(text(f"ALTER TABLE custom_templates ADD COLUMN {col} {dtype}"))
 
         # ── user_id on multi-tenant tables ──────────────────────────────
         for tbl in ("channels", "upload_jobs", "campaigns", "competitor_channels"):
@@ -125,6 +266,32 @@ def _migrate_schema():
                 if "user_id" not in cols:
                     conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER"))
 
+        # ── channels.kind: 'account' (own channel, publishes) vs 'style'
+        #    (competitor / style reference). Persistent so a DISCONNECTED
+        #    account (token removed) no longer looks like a style reference
+        #    and pollutes the SEO Settings tab. One-time backfill on the rows
+        #    that exist before this column: connected OR no-competitor-signal
+        #    -> 'account'; a competitor signal (handle / learned corpus /
+        #    title formula) -> 'style'.
+        if inspector.has_table("channels"):
+            ch_cols = {c["name"] for c in inspector.get_columns("channels")}
+            if "kind" not in ch_cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN kind VARCHAR(10)"))
+                conn.execute(text("""
+                    UPDATE channels SET kind = 'style'
+                    WHERE kind IS NULL
+                      AND id NOT IN (
+                          SELECT channel_id FROM oauth_tokens
+                          WHERE refresh_token_enc IS NOT NULL AND refresh_token_enc <> ''
+                      )
+                      AND (
+                          (handle IS NOT NULL AND handle <> '')
+                          OR (title_formula IS NOT NULL AND title_formula <> '')
+                          OR id IN (SELECT channel_id FROM channel_corpus)
+                      )
+                """))
+                conn.execute(text("UPDATE channels SET kind = 'account' WHERE kind IS NULL"))
+
         # ── users.heygen_avatar_id / heygen_voice_id (Trending → HeyGen) ──
         if inspector.has_table("users"):
             user_cols = {c["name"] for c in inspector.get_columns("users")}
@@ -132,6 +299,55 @@ def _migrate_schema():
                 conn.execute(text("ALTER TABLE users ADD COLUMN heygen_avatar_id VARCHAR(64)"))
             if "heygen_voice_id" not in user_cols:
                 conn.execute(text("ALTER TABLE users ADD COLUMN heygen_voice_id VARCHAR(64)"))
+            # Library role: creative users can upload to the shared
+            # company library. Defaults to FALSE for existing rows.
+            if "is_creative" not in user_cols:
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN is_creative BOOLEAN NOT NULL DEFAULT FALSE"
+                ))
+            # Profile picture (image or GIF) R2 key, plus the cached
+            # creator rating aggregate (sum + count). All additive,
+            # all default to safe zero/empty values.
+            if "avatar_key" not in user_cols:
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN avatar_key VARCHAR(500) NOT NULL DEFAULT ''"
+                ))
+            if "creator_rating_sum" not in user_cols:
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN creator_rating_sum INTEGER NOT NULL DEFAULT 0"
+                ))
+            if "creator_rating_count" not in user_cols:
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN creator_rating_count INTEGER NOT NULL DEFAULT 0"
+                ))
+
+        # ── library_items: category + cached rating aggregate ──────────
+        # Tables themselves are created by Base.metadata.create_all on
+        # first run; this guard only handles upgrades on existing rows.
+        if inspector.has_table("library_items"):
+            li_cols = {c["name"] for c in inspector.get_columns("library_items")}
+            if "category_id" not in li_cols:
+                conn.execute(text(
+                    "ALTER TABLE library_items ADD COLUMN category_id INTEGER"
+                ))
+            if "rating_sum" not in li_cols:
+                conn.execute(text(
+                    "ALTER TABLE library_items ADD COLUMN rating_sum INTEGER NOT NULL DEFAULT 0"
+                ))
+            if "rating_count" not in li_cols:
+                conn.execute(text(
+                    "ALTER TABLE library_items ADD COLUMN rating_count INTEGER NOT NULL DEFAULT 0"
+                ))
+            # Lazy-rendered watermarked copy for free-tier downloads.
+            if "watermark_key" not in li_cols:
+                conn.execute(text(
+                    "ALTER TABLE library_items ADD COLUMN watermark_key VARCHAR(500) DEFAULT ''"
+                ))
+            # Watch counter — bumped on every play-ticket request.
+            if "watch_count" not in li_cols:
+                conn.execute(text(
+                    "ALTER TABLE library_items ADD COLUMN watch_count INTEGER NOT NULL DEFAULT 0"
+                ))
 
         # ── live_streams.backup_expires_at (Live Studio 48 h preview) ──
         # Added late; live_streams table itself is created by
@@ -165,6 +381,22 @@ def _migrate_schema():
             cols = {c["name"] for c in inspector.get_columns("channels")}
             if "logo_asset_id" not in cols:
                 conn.execute(text("ALTER TABLE channels ADD COLUMN logo_asset_id INTEGER"))
+            # Per-channel INTRO video (FK user_assets) — concatenated at the
+            # head of the branded clip in the branding pass (anti-duplicate).
+            if "intro_asset_id" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN intro_asset_id INTEGER"))
+            # Per-channel YouTube publish defaults (set from Kaizer).
+            if "yt_category_id" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN yt_category_id VARCHAR(10)"))
+            if "yt_playlist_id" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN yt_playlist_id VARCHAR(64)"))
+            if "yt_default_language" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN yt_default_language VARCHAR(10)"))
+            if "yt_made_for_kids" not in cols:
+                _bt = "BOOLEAN" if engine.dialect.name == "postgresql" else "INTEGER"
+                conn.execute(text(f"ALTER TABLE channels ADD COLUMN yt_made_for_kids {_bt}"))
+            if "yt_license" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN yt_license VARCHAR(20)"))
             # Per-channel upload route override.  Null = use system default.
             if "upload_provider" not in cols:
                 conn.execute(text("ALTER TABLE channels ADD COLUMN upload_provider VARCHAR(20)"))
@@ -182,6 +414,10 @@ def _migrate_schema():
             if "socials" not in cols:
                 col_type = "JSONB" if engine.dialect.name == "postgresql" else "TEXT"
                 conn.execute(text(f"ALTER TABLE channels ADD COLUMN socials {col_type}"))
+            # Postiz delivery: the integration id this channel maps to in
+            # Postiz (GET /public/v1/integrations). NULL = not bound.
+            if "postiz_integration_id" not in cols:
+                conn.execute(text("ALTER TABLE channels ADD COLUMN postiz_integration_id VARCHAR(64)"))
 
         # ── upload_jobs.upload_provider (per-publish override) ──────────
         if inspector.has_table("upload_jobs"):
@@ -413,6 +649,224 @@ def _migrate_schema():
         if not inspector.has_table("job_feedback"):
             Base.metadata.tables["job_feedback"].create(conn)
 
+        # ── Phase 1 — Upload rewrite v2 schema (additive only) ─────────────
+        # Adds: plan_tiers, brand_profiles, master_videos, publish_tasks,
+        # upload_jobs_v2, publish_attempts, credit_ledger, quota_burn_log,
+        # and users.plan_tier_id (with Pro backfill).
+        # See docs/upload-rewrite/CONTRACTS.md §3 for column specs.
+        # See docs/upload-rewrite/DECISIONS.md Decisions 3, 4, 6, 8 for the
+        # plan_tier seed values + the Pro-default backfill rule.
+        try:
+            # 1) Create the 8 new tables. We pass the explicit table list
+            #    (rather than calling create_all() on full metadata) for two
+            #    reasons: (a) it stays surgical even if a future agent adds
+            #    a half-written table to models.py, and (b) on Postgres
+            #    this avoids the flaky "create_all sees all tables every
+            #    boot" behaviour the existing channel_videos/live_events
+            #    block above already works around.
+            upload_v2_tables = [
+                "plan_tiers",       # no FK deps
+                "master_videos",    # depends on jobs
+                "brand_profiles",   # depends on user_assets
+                "publish_tasks",    # depends on users, master_videos
+                "upload_jobs_v2",   # depends on publish_tasks, channels, oauth_tokens, brand_profiles, clips
+                "publish_attempts", # depends on upload_jobs_v2
+                "credit_ledger",    # depends on users, upload_jobs_v2
+                "quota_burn_log",   # depends on upload_jobs_v2
+            ]
+            for tbl in upload_v2_tables:
+                if not inspector.has_table(tbl):
+                    Base.metadata.tables[tbl].create(conn)
+            # Re-inspect so the seed + ADD COLUMN block below sees the
+            # freshly-created tables on a brand-new DB.
+            inspector = inspect(engine)
+
+            # 2) Seed the three PlanTier rows. Values are LOCKED by
+            #    DECISIONS.md Decisions 3 (slot caps), 4 (monthly credit
+            #    allotments), and 6 (Free is RTMP-only + 1 channel + 1
+            #    publish/day). -1 = unlimited.
+            #    Idempotent: insert one tier at a time, skip if name exists.
+            if inspector.has_table("plan_tiers"):
+                existing_tiers = {
+                    row[0] for row in conn.execute(
+                        text("SELECT name FROM plan_tiers")
+                    ).fetchall()
+                }
+                # (name, monthly_credit_allotment, slot_cap_active_uploads,
+                #  direct_path_allowed, max_channels, max_publishes_per_day)
+                _seed_bool_true = "TRUE" if engine.dialect.name == "postgresql" else "1"
+                _seed_bool_false = "FALSE" if engine.dialect.name == "postgresql" else "0"
+                tier_seeds = [
+                    ("free",       300,    5, _seed_bool_false,  1,  1),
+                    ("pro",       2000,   20, _seed_bool_true,  -1, -1),
+                    ("enterprise", 15000, 100, _seed_bool_true,  -1, -1),
+                ]
+                for (name, alloc, cap, dpa, mc, mppd) in tier_seeds:
+                    if name not in existing_tiers:
+                        conn.execute(text(
+                            "INSERT INTO plan_tiers "
+                            "(name, monthly_credit_allotment, slot_cap_active_uploads, "
+                            " direct_path_allowed, max_channels, max_publishes_per_day) "
+                            f"VALUES (:n, :a, :c, {dpa}, :mc, :mppd)"
+                        ), {"n": name, "a": alloc, "c": cap, "mc": mc, "mppd": mppd})
+
+            # 3) ADD COLUMN users.plan_tier_id — nullable INTEGER for now.
+            #    Matches the existing reflection-guarded ALTER TABLE pattern.
+            if inspector.has_table("users"):
+                ucols = {c["name"] for c in inspector.get_columns("users")}
+                if "plan_tier_id" not in ucols:
+                    conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN plan_tier_id INTEGER"
+                    ))
+
+            # 4) Backfill users.plan_tier_id → Pro tier id for any row
+            #    where it is still NULL. Locked by DECISIONS.md Decision 8:
+            #    "preserves today's behaviour exactly — no existing user is
+            #    silently slot-capped or paywalled mid-flight."
+            #    Idempotent: rows already pointing at any tier are skipped.
+            if (inspector.has_table("users")
+                    and inspector.has_table("plan_tiers")):
+                conn.execute(text(
+                    "UPDATE users SET plan_tier_id = ("
+                    "  SELECT id FROM plan_tiers WHERE name = 'pro' LIMIT 1"
+                    ") WHERE plan_tier_id IS NULL"
+                ))
+        except Exception as e:  # pragma: no cover — log + continue
+            # Match the existing convention: migration failures log to
+            # stdout but do not crash startup. The dev backend stays up
+            # so other routes keep working while the operator fixes the
+            # migration. Production Postgres operators run docs/MIGRATIONS.md
+            # by hand, so a stray exception here is dev-only noise.
+            print(f"[startup] upload-rewrite v2 migration skipped: {e}")
+
+        # ── Per-clip MasterVideo (double-post fix) ──────────────────────
+        # A V4 job produces 1 Full Video + N shorts. The old schema had
+        # ONE master per job (source_upload_id UNIQUE), so publishing the
+        # bulletin AND a short collapsed both onto one master → the same
+        # file was uploaded twice. Drop the per-job uniqueness, add a
+        # clip_id, and backfill it from the legacy r2_key shape so
+        # existing masters become per-clip.
+        try:
+            if inspector.has_table("master_videos"):
+                _is_pg = engine.dialect.name == "postgresql"
+                mcols = {c["name"] for c in inspector.get_columns("master_videos")}
+                if "clip_id" not in mcols:
+                    conn.execute(text(
+                        "ALTER TABLE master_videos ADD COLUMN clip_id INTEGER"
+                    ))
+                if _is_pg:
+                    # Drop the auto-named UNIQUE constraint on
+                    # source_upload_id (idempotent).
+                    conn.execute(text(
+                        "ALTER TABLE master_videos "
+                        "DROP CONSTRAINT IF EXISTS master_videos_source_upload_id_key"
+                    ))
+                    conn.execute(text(
+                        "CREATE INDEX IF NOT EXISTS ix_master_videos_clip_id "
+                        "ON master_videos (clip_id)"
+                    ))
+                    # Backfill clip_id from the legacy key shapes:
+                    #   legacy/clip/{id}/master.mp4
+                    #   raw_uploads/{user}/clip_{id}/master.mp4
+                    conn.execute(text(
+                        r"UPDATE master_videos SET clip_id = "
+                        r"CAST(substring(r2_key from 'legacy/clip/(\d+)/') AS INTEGER) "
+                        r"WHERE clip_id IS NULL "
+                        r"AND r2_key ~ 'legacy/clip/\d+/'"
+                    ))
+                    conn.execute(text(
+                        r"UPDATE master_videos SET clip_id = "
+                        r"CAST(substring(r2_key from 'clip_(\d+)/') AS INTEGER) "
+                        r"WHERE clip_id IS NULL "
+                        r"AND r2_key ~ 'clip_\d+/'"
+                    ))
+        except Exception as e:  # pragma: no cover
+            print(f"[startup] per-clip master migration skipped: {e}")
+
+        # ── Durable queue (Wave 1) — upload_jobs_v2 claim/lease columns ──
+        # Additive + idempotent. Harmless with KAIZER_DURABLE_QUEUE=0:
+        # next_attempt_at defaults to now(), the legacy scheduler ignores
+        # every new column. See plan "Kaizer → Enterprise Grade" Wave 1.1.
+        try:
+            if inspector.has_table("upload_jobs_v2"):
+                _is_pg = engine.dialect.name == "postgresql"
+                _ts = "TIMESTAMPTZ" if _is_pg else "TIMESTAMP"
+                _now = "now()" if _is_pg else "CURRENT_TIMESTAMP"
+                jcols = {c["name"] for c in inspector.get_columns("upload_jobs_v2")}
+                if "next_attempt_at" not in jcols:
+                    if _is_pg:
+                        conn.execute(text(
+                            f"ALTER TABLE upload_jobs_v2 ADD COLUMN "
+                            f"next_attempt_at {_ts} NOT NULL DEFAULT {_now}"
+                        ))
+                    else:
+                        # SQLite can't ADD COLUMN with a non-constant
+                        # default — add nullable, backfill below.
+                        conn.execute(text(
+                            f"ALTER TABLE upload_jobs_v2 ADD COLUMN next_attempt_at {_ts}"
+                        ))
+                if "lease_expires_at" not in jcols:
+                    conn.execute(text(
+                        f"ALTER TABLE upload_jobs_v2 ADD COLUMN lease_expires_at {_ts}"
+                    ))
+                if "claimed_by" not in jcols:
+                    conn.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN claimed_by VARCHAR(64)"
+                    ))
+                if "user_id" not in jcols:
+                    conn.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN user_id INTEGER"
+                    ))
+                if "priority" not in jcols:
+                    conn.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN "
+                        "priority VARCHAR(16) DEFAULT 'normal'"
+                    ))
+                # Postiz delivery (upload_path='postiz'): the target Postiz
+                # integration id, copied from Channel at fanout. NULL for
+                # direct/rtmp jobs.
+                if "postiz_integration_id" not in jcols:
+                    conn.execute(text(
+                        "ALTER TABLE upload_jobs_v2 ADD COLUMN "
+                        "postiz_integration_id VARCHAR(64)"
+                    ))
+
+                # Backfill denormalized user_id / priority from publish_tasks
+                # (idempotent — only touches rows still NULL/empty).
+                conn.execute(text(
+                    "UPDATE upload_jobs_v2 SET user_id = ("
+                    "  SELECT user_id FROM publish_tasks"
+                    "  WHERE publish_tasks.id = upload_jobs_v2.publish_task_id"
+                    ") WHERE user_id IS NULL"
+                ))
+                conn.execute(text(
+                    "UPDATE upload_jobs_v2 SET priority = COALESCE(("
+                    "  SELECT priority FROM publish_tasks"
+                    "  WHERE publish_tasks.id = upload_jobs_v2.publish_task_id"
+                    "), 'normal') WHERE priority IS NULL OR priority = ''"
+                ))
+                conn.execute(text(
+                    f"UPDATE upload_jobs_v2 SET next_attempt_at = {_now} "
+                    "WHERE next_attempt_at IS NULL"
+                ))
+
+                # Partial indexes — supported by both Postgres and SQLite.
+                _active = "('claimed','branding','ready_to_upload','uploading')"
+                for stmt in (
+                    "CREATE INDEX IF NOT EXISTS ix_ujv2_claim "
+                    "ON upload_jobs_v2 (next_attempt_at, created_at) "
+                    "WHERE status = 'queued'",
+                    f"CREATE INDEX IF NOT EXISTS ix_ujv2_user_active "
+                    f"ON upload_jobs_v2 (user_id) WHERE status IN {_active}",
+                    f"CREATE INDEX IF NOT EXISTS ix_ujv2_lease "
+                    f"ON upload_jobs_v2 (lease_expires_at) WHERE status IN {_active}",
+                    "CREATE INDEX IF NOT EXISTS ix_ujv2_parked "
+                    "ON upload_jobs_v2 (created_at) WHERE status = 'parked_quota'",
+                ):
+                    conn.execute(text(stmt))
+        except Exception as e:  # pragma: no cover — log + continue
+            print(f"[startup] durable-queue migration skipped: {e}")
+
         conn.commit()
 
 
@@ -446,6 +900,34 @@ def _seed_defaults():
                        {"uid": legacy.id})
             db.commit()
             print(f"[startup] Seeded {added} default channel(s) for legacy user")
+
+        # Library categories — operator-managed but seeded on first run so
+        # uploaders have something to pick from. Admins can rename/add/
+        # delete via /api/library/categories. Idempotent — only inserts
+        # if the table is empty.
+        try:
+            existing = db.query(models.LibraryCategory).count()
+        except Exception:
+            existing = 0
+        if existing == 0:
+            seeds = [
+                ("News",          "#c0392b", 10),
+                ("Sports",        "#27ae60", 20),
+                ("Entertainment", "#9b59b6", 30),
+                ("Politics",      "#34495e", 40),
+                ("Business",      "#f39c12", 50),
+                ("Technology",    "#2980b9", 60),
+                ("Lifestyle",     "#e67e22", 70),
+                ("Education",     "#16a085", 80),
+                ("Music",         "#e84393", 90),
+                ("Other",         "#7f8c8d", 99),
+            ]
+            for name, color, sort_order in seeds:
+                db.add(models.LibraryCategory(
+                    name=name, color=color, sort_order=sort_order,
+                ))
+            db.commit()
+            print(f"[startup] Seeded {len(seeds)} default library categories")
     finally:
         db.close()
 
@@ -478,6 +960,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Wave 2 (API scale): gzip JSON responses — the jobs list / status
+# payloads shrink ~10x over the wire. minimum_size skips tiny payloads
+# where the gzip header would be pure overhead. Media playback is
+# unaffected in practice: browsers send Accept-Encoding: identity for
+# <video> range requests, so /api/file/ byte-ranges stay uncompressed.
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+# ── Sync-route threadpool capacity (Wave 6 load-test finding) ───────────────
+# Most routes are sync `def` handlers, which FastAPI runs on anyio's
+# default 40-thread limiter. At 1,000+ concurrent clients that queue —
+# not the DB, not the handlers — was the p95 bottleneck. Raise it; the
+# DB pool (KAIZER_DB_POOL_SIZE/_MAX_OVERFLOW) must be sized to match.
+@app.on_event("startup")
+async def _raise_threadpool_capacity():
+    try:
+        import anyio.to_thread
+        # Default 48: load-tested sweet spot on the dev box — 100
+        # threads triggered GIL convoying (p95 12s); 48 gave p95 141ms
+        # at 200 concurrent pollers + 200 WebSockets.
+        tokens = int(os.environ.get("KAIZER_THREADPOOL_TOKENS", "48"))
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = max(40, tokens)
+        print(f"[startup] sync-route threadpool tokens = {limiter.total_tokens}")
+    except Exception as e:
+        print(f"[startup] WARN: could not raise threadpool tokens: {e}")
+
 # ── OpenTelemetry — opt-in (KAIZER_OTEL_ENABLED=true) ───────────────────────
 # Initialise the SDK and attach FastAPI auto-instrumentation BEFORE any
 # router gets registered against `app`, so every endpoint is covered.
@@ -499,6 +1009,8 @@ app.include_router(channels_router)
 app.include_router(seo_router)
 app.include_router(youtube_oauth_router)
 app.include_router(youtube_upload_router)
+app.include_router(publish_tasks_router)    # Phase 1.B — new publish path (KAIZER_NEW_PUBLISH_PATH gated; legacy route above stays on)
+app.include_router(insights_router)         # Insights / Trend Finder — channel root-cause analyzer
 app.include_router(meta_oauth_router)
 app.include_router(linkedin_oauth_router)
 app.include_router(youtube_quota_router)
@@ -518,12 +1030,23 @@ app.include_router(admin_router)           # Phase 12 — admin panel REST surfa
 app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
 app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
 app.include_router(yt_lookup_router)        # YouTube channel lookup for Style References (auth'd)
+app.include_router(analytics_ai_router)     # AI-powered Insights — coach reports + any-channel compare (auth'd + rate-limited)
 app.include_router(bulletin_images_router)  # Per-image bulletin carousel mgmt (list/replace/recompose)
 app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
 app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)
 app.include_router(live_studio_router)      # Live Studio — bulk RTMP-live publishing (multi-video × multi-channel)
 app.include_router(v4_editor_router)        # V4 — canvas editor (read/write canvas.json, re-render)
 app.include_router(v4_defaults_router)      # V4 — user auto-pipeline defaults
+app.include_router(library_router)          # Shared company Library — creative uploads + "Use" picker
+app.include_router(profile_router)          # User profile — avatar + creator rating
+app.include_router(metrics_router)          # Phase 3.G — Prometheus /metrics (NOT auth-gated; scraped over internal network)
+app.include_router(admin_upload_v2_router)  # Phase 3.G — admin observability page at /admin/upload-v2 (admin_required)
+# Wave 3 — WebSocket live progress under /api so the Vite dev proxy
+# ("/api": { ws: true }) and the production VITE_API_URL origin both
+# forward the upgrade. Routes: /api/ws/jobs/{id}, /api/ws/uploads.
+app.include_router(ws_progress_router, prefix="/api")
+app.include_router(quick_publish_router)    # Quick Publish — /api/clips/{id}/quick-*
+app.include_router(custom_templates_router) # /api/templates — developer-uploaded HTML/CSS templates
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend
@@ -531,7 +1054,12 @@ app.include_router(v4_defaults_router)      # V4 — user auto-pipeline defaults
 # Added for Wave 2 editor beta; safe to have even when the output dir is empty.
 from fastapi.staticfiles import StaticFiles as _StaticFiles
 
-_output_dir = str(BASE_DIR / "output")
+# Honor KAIZER_OUTPUT_ROOT so /media serves from the SAME local storage root
+# the renderer + storage provider write to (e.g. a dedicated D:/ test folder).
+# Falls back to BASE_DIR/output when the env var is unset.
+_output_dir = os.path.abspath(
+    os.environ.get("KAIZER_OUTPUT_ROOT") or str(BASE_DIR / "output")
+)
 os.makedirs(_output_dir, exist_ok=True)
 app.mount("/media", _StaticFiles(directory=_output_dir), name="media")
 
@@ -549,6 +1077,144 @@ async def _start_upload_worker():
 @app.on_event("shutdown")
 async def _stop_upload_worker():
     await upload_worker.stop()
+
+
+# ── Publish/Upload Rewrite v2 — Scheduler (Phase 1.C) ────────────────────────
+# In-process weighted-fair scheduler that dispatches UploadJobV2 rows the
+# Fanout service (services/fanout.py) creates. Phase 1 is a skeleton: it
+# transitions jobs through the new state machine with synthetic sleeps but
+# does NOT call YouTube. Phase 2's Upload agent replaces _run_job's body.
+# Lives behind the KAIZER_NEW_PUBLISH_PATH=0 flag at the router layer so
+# this is harmless to leave running until cutover.
+def _durable_queue_enabled() -> bool:
+    """Wave 1 flag — KAIZER_DURABLE_QUEUE=1 swaps the in-memory
+    scheduler heap + boot-only recovery + crons.py for the Postgres
+    SKIP LOCKED worker + leader-elected cron runner. Read per call so
+    a .env flip + restart is the full rollback."""
+    return (os.environ.get("KAIZER_DURABLE_QUEUE", "0") or "0").strip() == "1"
+
+
+@app.on_event("startup")
+async def _start_publish_v2_scheduler():
+    if _durable_queue_enabled():
+        try:
+            from services import publish_worker as _pw
+            await _pw.start()
+            print(f"[startup] durable publish worker running "
+                  f"(worker_id={_pw.WORKER_ID})")
+        except Exception as e:
+            print(f"[startup] WARN: durable publish worker failed to start: {e}")
+        return
+    try:
+        from services import scheduler as _publish_scheduler
+        await _publish_scheduler.start()
+        print("[startup] publish v2 scheduler running")
+    except Exception as e:
+        print(f"[startup] WARN: publish v2 scheduler failed to start: {e}")
+
+
+@app.on_event("startup")
+async def _start_pipeline_factory():
+    """Boot the staged 'factory' station pools when
+    KAIZER_PIPELINE_FACTORY_WORKERS=1. Fully additive: the existing publish
+    path is untouched, and stage-event instrumentation (the admin Pipeline
+    Flow view) works whether or not this is enabled."""
+    try:
+        from services import pipeline_factory as _pf
+        if _pf.workers_enabled():
+            _pf.start_workers()
+            print(f"[startup] pipeline factory workers running depths={_pf.depths()}")
+    except Exception as e:
+        print(f"[startup] WARN: pipeline factory failed to start: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_pipeline_factory():
+    try:
+        from services import pipeline_factory as _pf
+        _pf.stop_workers()
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _stop_publish_v2_scheduler():
+    if _durable_queue_enabled():
+        try:
+            from services import publish_worker as _pw
+            await _pw.shutdown()
+        except Exception as e:
+            print(f"[shutdown] WARN: durable publish worker shutdown failed: {e}")
+        return
+    try:
+        from services import scheduler as _publish_scheduler
+        await _publish_scheduler.shutdown()
+    except Exception as e:
+        print(f"[shutdown] WARN: publish v2 scheduler shutdown failed: {e}")
+
+
+# ── Publish/Upload Rewrite v2 — Phase 3 recovery + background crons ─────────
+# On boot, sweep ``publish_attempts`` rows whose status is 'in_flight'
+# AND older than 600 s (assume a previous worker died before us). The
+# F-agent's ``services.idempotency.recover_orphans`` does the DB-level
+# work (flipping rows to 'recovered' + parent UploadJobV2 back to
+# 'queued'); we re-enqueue them on the new scheduler.
+#
+# Plus: three background asyncio crons (branding cleanup hourly, credit
+# allotment daily, burn-log reconcile daily). The crons module's
+# ``shutdown()`` waits up to 10s for them to drain.
+#
+# Both hooks are wrapped in try/except so a corrupted row or missing
+# table CANNOT prevent FastAPI from coming up.
+@app.on_event("startup")
+async def _v2_recovery_and_crons():
+    if _durable_queue_enabled():
+        # Durable mode: boot-time recovery + crons.py are superseded.
+        # The leader-elected cron runner's lease reaper does recovery
+        # CONTINUOUSLY at runtime (60s) and the same registry carries
+        # branding cleanup / credit allotment / burn reconcile plus the
+        # new un-parker, exhausted sweep, and counter reconciler.
+        try:
+            from services import cron_runner as _cr
+            await _cr.start()
+            print("[startup] durable cron runner racing for leadership "
+                  "(reaper+unpark+exhausted+counters+branding+credits+burn)")
+        except Exception as e:
+            print(f"[startup] WARN: durable cron runner failed to start: {e}")
+        return
+
+    try:
+        from services import recovery as _v2_recovery
+        n = _v2_recovery.recover_on_startup()
+        if n:
+            print(f"[startup] v2 recovery re-queued {n} orphan(s)")
+        else:
+            print("[startup] v2 recovery: no orphans")
+    except Exception as e:
+        print(f"[startup] WARN: v2 recovery failed (non-fatal): {e}")
+
+    try:
+        from services import crons as _v2_crons
+        await _v2_crons.start()
+        print("[startup] v2 background crons running (branding+credits+burn)")
+    except Exception as e:
+        print(f"[startup] WARN: v2 crons failed to start: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_v2_crons():
+    if _durable_queue_enabled():
+        try:
+            from services import cron_runner as _cr
+            await _cr.shutdown()
+        except Exception as e:
+            print(f"[shutdown] WARN: durable cron runner shutdown failed: {e}")
+        return
+    try:
+        from services import crons as _v2_crons
+        await _v2_crons.shutdown()
+    except Exception as e:
+        print(f"[shutdown] WARN: v2 crons shutdown failed: {e}")
 
 
 # ── Channel learning cron (Phase 7) ──────────────────────────────────────────
@@ -661,54 +1327,17 @@ async def _stop_corpus_scheduler():
 PLATFORMS = {
     "instagram_reel":          {"label": "Instagram Reel", "width": 1080, "height": 1920},
     "youtube_short":           {"label": "YouTube Short",  "width": 1080, "height": 1920},
+    # Facebook Reel — vertical short, same 9:16 render as IG Reel / YT Short.
+    # The frontend remaps it to a V4 shorts-only job; the per-platform SEO
+    # gives it a Facebook-native caption at publish time.
+    "facebook_reel":           {"label": "Facebook Reel",  "width": 1080, "height": 1920},
     "youtube_full":            {"label": "YouTube Full",   "width": 1920, "height": 1080},
-    # ── Compound platform ─────────────────────────────────────────
-    # Produces BOTH a long-form bulletin (1920x1080, fixed TV9 layout)
-    # AND a set of vertical Shorts (1080x1920, user-selected frame
-    # layout) from one upload. ``create_job`` detects this key and
-    # fans out into TWO sibling Job rows so the pipeline code itself
-    # stays single-platform — no special-case branches in pipeline.py.
-    # The ``compound`` + ``expands_to`` fields are what create_job
-    # reads; the frontend uses ``label`` + ``width``/``height`` to
-    # render the picker (we show the Shorts dimensions because they
-    # drive the frame-layout step the user sees next).
-    "youtube_full_plus_shorts": {
-        "label":      "Full Video + Shorts",
-        "width":      1080,
-        "height":     1920,
-        "compound":   True,
-        "expands_to": ["youtube_full", "youtube_short"],
-    },
-    # ── V2 platform (Step 11 — Inngest-orchestrated pipeline v2) ──
-    # Produces both bulletin + shorts via the V2 multi-stage pipeline
-    # (Deepgram STT -> Gemini Pro continuity -> Gemini Flash fan-out
-    # -> render). Unlike youtube_full_plus_shorts this produces ONE
-    # Job row -- the V2 Inngest function generates both output sets
-    # internally and runner._import_clips reads the editor_meta.json
-    # the V2 adapter writes.
-    #
-    # CRITICAL: do NOT add ``compound`` or ``expands_to`` markers here.
-    # create_job uses those to fan out into sibling Job rows; for V2
-    # that fan-out would create two pending jobs (one would never be
-    # picked up by the Inngest worker -> permanent stuck "pending").
-    # Step 11.1 has a regression test that pins this absence.
-    "full_video_shorts_v2": {
-        "label":  "Full Video + Shorts (V2 Beta)",
-        "width":  1080,
-        "height": 1920,
-    },
-    # ── V3 platform — clean rewrite ──────────────────────────────────
-    # V3 architecture (2026-05-23): Deepgram word-level STT + Claude
-    # word-edit + V1 concat-demuxer render. NO Inngest. NO crossfade
-    # stitcher. NO multi-pass mux. Single linear pipeline with the V1
-    # bulletin_stitcher (concat-demuxer, -c copy) which is mathematically
-    # incapable of A/V drift. Shorts capped at 5. Concurrency: 2 jobs
-    # at once via runner.py's _PIPELINE_SEMAPHORE.
-    "full_video_shorts_v3": {
-        "label":  "Full Video + Shorts (V3)",
-        "width":  1080,
-        "height": 1920,
-    },
+    # NOTE: the old compound "youtube_full_plus_shorts" tile was RETIRED
+    # 2026-06-17 — it was redundant with the V4 "Full Video + Shorts" tile
+    # below (V4 produces both bulletin + shorts in one job via output_format
+    # "both"). runner/create_job normalise any stale submission onto V4.
+    # Also retired: legacy render platforms "full_video_shorts_v2"/"v3".
+    # Do not re-add any of them — V4 is the single render path.
     # ── V4 platform — trim + canvas architecture ────────────────────
     # V4 (2026-06-03): two atomic passes — Step 1 builds a clean
     # trimmed.mp4 (Deepgram + Claude KEEP/CUT + single filter_complex
@@ -720,19 +1349,11 @@ PLATFORMS = {
     # swaps, duration changes, and reordering only re-run Step 2
     # (~5-15 s). Same engine produces bulletin (16:9) and shorts (9:16).
     "full_video_shorts_v4": {
-        "label":  "Full Video + Shorts (V4)",
+        "label":  "Full Video + Shorts",
         "width":  1080,
         "height": 1920,
     },
 }
-
-
-# Feature-flag gate (Step 11 D-11.12). When KAIZER_V2_ENABLED is "0"
-# / "false" / "no" the V2 platform is filtered out of the picker so
-# the 4 existing platforms ship unaffected. Default ON for Beta.
-def _v2_enabled() -> bool:
-    raw = os.environ.get("KAIZER_V2_ENABLED", "1").strip().lower()
-    return raw not in ("0", "false", "no", "off", "")
 
 
 def resolve_job_name(name_input: Optional[str], video_filename: Optional[str]) -> str:
@@ -783,14 +1404,7 @@ def health():
 
 @app.get("/api/platforms/")
 def get_platforms():
-    # D-11.12: gate the V2 entry behind KAIZER_V2_ENABLED so the
-    # rest of the picker is unaffected if Beta surfaces issues.
-    if _v2_enabled():
-        return PLATFORMS
-    return {
-        k: v for k, v in PLATFORMS.items()
-        if k != "full_video_shorts_v2"
-    }
+    return PLATFORMS
 
 
 # Static catalog for the V2 STT picker (Step 11.2). The ``configured``
@@ -896,16 +1510,153 @@ def get_frames():
 
 # ── Jobs ─────────────────────────────────────────────────────────────────────
 
+def _published_videos_for_jobs(db, job_ids):
+    """Map job_id -> [{channel, video_id, watch_url, status, privacy_status}] for every YouTube
+    upload that produced a video id. Chain: Job (=MasterVideo.source_upload_id) -> MasterVideo ->
+    PublishTask -> UploadJobV2.youtube_video_id. ONE batched query for the whole list (no N+1).
+    Empty for jobs never published (running/failed/raw upload not yet posted). Used to surface the
+    watch link on Quick Publish cards + the job detail page."""
+    out: dict[int, list] = {}
+    if not job_ids:
+        return out
+    try:
+        rows = (
+            db.query(
+                models.MasterVideo.source_upload_id,
+                models.UploadJobV2.youtube_video_id,
+                models.UploadJobV2.status,
+                models.UploadJobV2.privacy_status,
+                models.Channel.name,
+            )
+            .join(models.PublishTask, models.PublishTask.master_video_id == models.MasterVideo.id)
+            .join(models.UploadJobV2, models.UploadJobV2.publish_task_id == models.PublishTask.id)
+            .outerjoin(models.Channel, models.Channel.id == models.UploadJobV2.channel_id)
+            .filter(models.MasterVideo.source_upload_id.in_(job_ids),
+                    models.UploadJobV2.youtube_video_id.isnot(None))
+            .all()
+        )
+    except Exception as exc:
+        print(f"[jobs] published-videos lookup failed: {exc}", flush=True)
+        return out
+    seen = set()
+    for jid, vid, st, priv, chname in rows:
+        if not vid:
+            continue
+        # Skip junk ids (a few legacy rows stored a UUID) — real YouTube ids are 11 url-safe chars.
+        if not (len(vid) == 11 and all(c.isalnum() or c in "-_" for c in vid)):
+            continue
+        key = (jid, vid, chname or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.setdefault(jid, []).append({
+            "channel": chname or "",
+            "video_id": vid,
+            "watch_url": f"https://youtu.be/{vid}",
+            "status": st or "",
+            "privacy_status": priv or "",
+        })
+    return out
+
+
 @app.get("/api/jobs/")
-def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+def list_jobs(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+    # Wave 2 (API scale): pagination. The response stays a bare array so
+    # existing frontends that .map() over it keep working; the default
+    # limit=50 caps the damage from a 1000-job tenant until the UI pages.
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    # selectinload kills the per-job lazy-load on j.clips (1 + N queries
+    # collapse to 2 queries regardless of job count).
     jobs = (
         db.query(models.Job)
+          .options(selectinload(models.Job.clips))
           .filter(models.Job.user_id == user.id)
           .order_by(models.Job.created_at.desc())
+          .offset(offset)
+          .limit(limit)
           .all()
     )
-    return [
-        {
+
+    # Use the SAME root the /media mount + renderer use (KAIZER_OUTPUT_ROOT),
+    # not a hardcoded BASE_DIR/output — otherwise a render written to a custom
+    # output root (e.g. a dedicated D:/ folder) fails relative_to() here and
+    # the UI wrongly reports "not rendered yet".
+    output_root = OUTPUT_ROOT.resolve()
+
+    def _resolve_thumb(j) -> tuple[Optional[str], Optional[str]]:
+        """Return (url, aspect) for the best available cover image.
+
+        Lookup order:
+          1. V4 editor's bulletin AI thumb       (16:9)
+          2. V4 first short AI thumb             (9:16)
+          3. First Clip.thumb_path that exists   (aspect from platform)
+        Returns (None, None) when nothing's available.
+        """
+        if not j.output_dir:
+            return None, None
+        out = Path(j.output_dir)
+        if not out.is_absolute():
+            out = (BASE_DIR / out).resolve()
+
+        # 1) V4 bulletin AI thumb (16:9)
+        bulletin = out / "bulletin_thumb_ai.jpg"
+        if bulletin.is_file():
+            try:
+                rel = bulletin.resolve().relative_to(output_root)
+                return f"/media/{rel.as_posix()}?t={int(bulletin.stat().st_mtime)}", "16:9"
+            except ValueError:
+                pass
+
+        # 2) First short AI thumb (9:16)
+        short1 = out / "short_01_thumb_ai.jpg"
+        if short1.is_file():
+            try:
+                rel = short1.resolve().relative_to(output_root)
+                return f"/media/{rel.as_posix()}?t={int(short1.stat().st_mtime)}", "9:16"
+            except ValueError:
+                pass
+
+        # 3) Per-clip thumb_path fallback. Walk only the first few clips
+        # to keep the per-job stat work bounded.
+        plat = (j.platform or "").lower()
+        aspect = "9:16" if ("short" in plat or "reel" in plat) else "16:9"
+        clips = sorted(j.clips, key=lambda c: c.clip_index or 0)[:3]
+        for clip in clips:
+            tp = (clip.thumb_path or "").strip()
+            if not tp:
+                continue
+            p = Path(tp) if Path(tp).is_absolute() else (BASE_DIR / tp).resolve()
+            if p.is_file():
+                try:
+                    rel = p.resolve().relative_to(output_root)
+                    return f"/media/{rel.as_posix()}?t={int(p.stat().st_mtime)}", aspect
+                except ValueError:
+                    continue
+        return None, None
+
+    # One batched lookup of YouTube watch links — ONLY for Quick Publish (raw_upload) jobs, the
+    # only cards that surface them; keeps the list payload lean for pipeline jobs (which can fan
+    # out to 30+ channels).
+    pub_by_job = _published_videos_for_jobs(
+        db, [j.id for j in jobs if (j.frame_layout or "") == "raw_upload"])
+
+    out: list[dict] = []
+    backfilled = False
+    for j in jobs:
+        # Wave 2 (API scale): prefer the cached columns; only rows that
+        # haven't resolved yet pay for the stat() walk, and the result
+        # is written back (lazy backfill — converges after one listing).
+        thumb_url, thumb_aspect = j.thumb_url, j.thumb_aspect
+        if not thumb_url:
+            thumb_url, thumb_aspect = _resolve_thumb(j)
+            if thumb_url:
+                j.thumb_url, j.thumb_aspect = thumb_url, thumb_aspect
+                backfilled = True
+        out.append({
             "id": j.id,
             "status": j.status,
             "platform": j.platform,
@@ -921,16 +1672,36 @@ def list_jobs(db: Session = Depends(get_db), user: models.User = Depends(auth.cu
             # Item 114: surface the Stage 2 provider choice so the
             # UI can show a chip on the job card.
             "stage_2_provider": (j.stage_2_provider or "gemini"),
-        }
-        for j in jobs
-    ]
+            # Grid-redesign: cover image for the jobs list. NULL when no
+            # thumb yet (pre-V4-editor, running jobs, very old rows).
+            "thumbnail_url":    thumb_url,
+            "thumbnail_aspect": thumb_aspect,
+            # Published YouTube videos for this job (Quick Publish cards link straight to them).
+            "published_videos": pub_by_job.get(j.id, []),
+        })
+    if backfilled:
+        # One commit for every row backfilled above. Failure is non-fatal
+        # — the next listing simply re-resolves from disk.
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+    return out
 
 
 @app.post("/api/jobs/create/")
 async def create_job(
-    video: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
+    # Shared Library picker: when set, the source video is fetched from
+    # R2 instead of being uploaded as a body. Mutually exclusive with
+    # ``video`` — exactly one MUST be present. The rest of the form is
+    # unchanged so the wizard's downstream steps look identical.
+    library_item_id: Optional[int] = Form(None),
     platform: str = Form(...),
-    frame_layout: str = Form(...),
+    # Optional: a full-form-only job (kind-first wizard) has NO shorts frame, so this is
+    # legitimately empty. Defaulting to "" (instead of required) avoids a 422 when the
+    # client omits/empties it; the orchestrator falls back to torn_card if shorts render.
+    frame_layout: str = Form(""),
     language: str = Form("te"),
     use_default_image: bool = Form(False),
     # Optional: pick which style-profile's logo to overlay.  Resolved to the
@@ -967,38 +1738,126 @@ async def create_job(
     v4_bg_video_path:   str = Form(""),
     v4_bg_video_volume: float = Form(0.0),
     v4_bg_intro_seconds: float = Form(0.0),
+    # V4 only: which model decides Step 1's KEEP/CUT plan.
+    # "claude" (default — Opus 4.7) or "gemini" (2.5 Flash on Vertex).
+    # Operator picks per-job in the wizard so we can A/B quality.
+    # Persisted on Job.platform_meta JSON for later display.
+    # Ignored by V1/V2 platforms.
+    v4_trim_planner:    str = Form("claude"),
+    # V4 only: which provider generates per-story images.
+    # "auto" (multi-source V1 chain), "gemini" (Nano Banana), or
+    # "openai" (gpt-image-1). Persisted on Job.v4_image_provider.
+    v4_image_provider:  str = Form("auto"),
+    # V4 only: operator-supplied description text. When non-empty,
+    # the orchestrator preserves the source video AS-IS (no Claude
+    # KEEP/CUT trim), still carves shorts, and uses this text as
+    # the bulletin SEO description verbatim. Any language.
+    v4_predefined_description: str = Form(""),
+    # V4 only: which outputs to render. "both" (default — full video +
+    # shorts), "full-only" (skip shorts), or "shorts-only" (skip the
+    # bulletin/full video). Validated below; runner forwards as
+    # KAIZER_V4_OUTPUT_FORMAT and the orchestrator gates rendering on it.
+    v4_output_format:   str = Form("both"),
+    # V4 Stage 2: defer the up-front MP4 render (edit-first; export on demand). Default off so
+    # existing/auto-publish behaviour is unchanged. Persisted on the Job + forwarded to the runner.
+    v4_defer_render:    bool = Form(False),
+    # V4 only: max shorts per job. Default 8; the operator can opt into more
+    # at job start. Runner forwards as KAIZER_V4_MAX_SHORTS; the orchestrator
+    # caps the candidate list (a CEILING — content still decides the real count).
+    v4_max_shorts:      int = Form(8),
+    # V4 only: original publish target the operator picked ("instagram" /
+    # "youtube" / "facebook"). Editor metadata only — not used for rendering.
+    v4_target_platform: str = Form("youtube"),
+    # V4 only: channels chosen AT GENERATE TIME (comma-separated Channel ids)
+    # from the New Job "Choose channels" step. Persisted on the Job so the
+    # editor + Publish flow know the intended targets. Empty = not chosen here
+    # (channels picked later at publish — the legacy flow).
+    channel_ids: str = Form(""),
+    # PER-CHANNEL intro overrides — a JSON map {"<channel_id>": <asset_id>}.
+    # A channel present uses that intro for this job; absent = its own assigned
+    # intro. Set by the New Job inline per-channel intro picker.
+    intro_overrides: str = Form(""),
+    # Custom-template per-slot media: JSON {"<slot_key>": <asset_id>} for the slots
+    # the user filled in the wizard's Media step; main_media_slot names the slot whose
+    # video is the AI-trim "main". Only meaningful when frame_layout is "custom:<id>".
+    template_media: str = Form(""),
+    main_media_slot: str = Form(""),
+    # "Full form video" (16:9) custom template, e.g. "custom:<id>".
+    fullform_layout: str = Form(""),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
+    # Wave 2 (API scale): plan-aware token bucket — each create kicks off
+    # Gemini calls + FFmpeg renders, so this is the endpoint to cap.
+    _rl=Depends(rate_limited("create")),
 ):
     import languages as _langs
     lang_cfg = _langs.get(language)  # falls back to default if invalid
 
+    # Legacy render pipelines v2 (Inngest) and v3 retired 2026-06-17 — the
+    # V4 trim+canvas engine is the single render path now. Normalise any
+    # stale submission (cached frontend, in-flight share link) onto V4 so it
+    # renders cleanly instead of 400-ing or hitting now-deleted dispatch code.
+    if platform in ("full_video_shorts_v2", "full_video_shorts_v3"):
+        platform = "full_video_shorts_v4"
+
     upload_dir = MEDIA_ROOT / "uploads"
     upload_dir.mkdir(exist_ok=True)
-    video_path = upload_dir / video.filename
 
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
+    # Exactly one of (video upload, library_item_id) must be present.
+    if (video is None or not getattr(video, "filename", "")) and not library_item_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'video' (upload) or 'library_item_id' must be provided.",
+        )
+    if video is not None and getattr(video, "filename", "") and library_item_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass 'video' OR 'library_item_id' — not both.",
+        )
+
+    # Resolve the source video to a local path + name + mime regardless
+    # of which branch we came through; everything downstream reads these.
+    if library_item_id:
+        from routers.library import fetch_library_video_to as _fetch_lib
+        video_path, _lib_item = _fetch_lib(library_item_id, upload_dir, db)
+        _src_filename     = _lib_item.original_name or video_path.name
+        _src_content_type = "video/mp4"
+    else:
+        video_path = upload_dir / video.filename
+        # Wave 2 (API scale): stream the upload to disk in 1 MiB chunks
+        # instead of buffering the whole file in RAM (a 2 GB upload used
+        # to hold 2 GB resident per concurrent request).
+        with open(video_path, "wb") as f:
+            while True:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        _src_filename     = video.filename
+        _src_content_type = video.content_type or "video/mp4"
 
     # Mirror the source video to R2 right after the local write. The
     # pipeline subprocess still reads from the local copy (faster than
     # a download round-trip), but R2 is the source of truth — if the
     # container restarts mid-render, retry can pull the source back.
     # Predictable key so retry/recovery doesn't need a DB lookup.
+    # Library-sourced jobs skip this — the source already lives in R2
+    # under library/<id>/video.<ext>.
     _src_timestamp = time.strftime("%Y%m%d_%H%M%S")
-    try:
-        from pipeline_core.storage import get_storage_provider
-        # Honours STORAGE_BACKEND — local mode mirrors to ``output/`` for
-        # parity with prod's R2 mirror. Failure is non-fatal: the user's
-        # uploaded file is still on disk; this branch only guards
-        # post-restart recovery on a horizontal-scale prod deploy.
-        get_storage_provider().upload(
-            str(video_path),
-            f"sources/{user.id}/{_src_timestamp}_{video.filename}",
-            content_type=(video.content_type or "video/mp4"),
-        )
-    except Exception as _src_exc:
-        print(f"[create_job] source video storage mirror failed (non-fatal): {_src_exc}")
+    if not library_item_id:
+        try:
+            from pipeline_core.storage import get_storage_provider
+            # Honours STORAGE_BACKEND — local mode mirrors to ``output/`` for
+            # parity with prod's R2 mirror. Failure is non-fatal: the user's
+            # uploaded file is still on disk; this branch only guards
+            # post-restart recovery on a horizontal-scale prod deploy.
+            get_storage_provider().upload(
+                str(video_path),
+                f"sources/{user.id}/{_src_timestamp}_{_src_filename}",
+                content_type=_src_content_type,
+            )
+        except Exception as _src_exc:
+            print(f"[create_job] source video storage mirror failed (non-fatal): {_src_exc}")
 
     # ── Input validation gate (Phase 1) ──────────────────────────────────────
     # Validate the uploaded file before creating a job row or starting the
@@ -1042,66 +1901,213 @@ async def create_job(
         _warning_prefix = "[input warnings] " + "; ".join(_validation_warnings) + "\n"
 
     # Phase 14 / V2 Beta (D-13.11): see resolve_job_name() below.
-    _name_clean = resolve_job_name(name, video.filename)
+    _name_clean = resolve_job_name(name, _src_filename)
 
     # Single Job row regardless of platform. The compound platform
     # ("youtube_full_plus_shorts") stores its original key here so the
     # runner can detect it and run TWO pipeline passes internally —
     # one bulletin pass + one shorts pass — both importing clips into
     # THIS same job. UI shows it as one job with mixed-aspect clips.
-    # Item 104: validate transition_style against the catalog; unknown
-    # values get coerced to "smart_cut" rather than rejected so a stale
-    # frontend can't 400 the user. The log line surfaces the coercion.
-    try:
-        from pipeline_v2.transitions import (
-            is_valid_transition as _is_valid_transition,
-            DEFAULT_TRANSITION_NAME as _DEFAULT_TRANSITION,
-        )
-        _ts = (transition_style or "").strip()
-        if not _ts or not _is_valid_transition(_ts):
-            if _ts and _ts != _DEFAULT_TRANSITION:
-                _warning_prefix = (_warning_prefix or "") + (
-                    f"[transition_style] unknown value {_ts!r} coerced "
-                    f"to {_DEFAULT_TRANSITION!r}.\n"
-                )
-            _ts = _DEFAULT_TRANSITION
-    except Exception as _trans_exc:
-        # Import failure or unexpected error: fall back to the literal
-        # default so create-job never breaks on a missing catalog.
-        import logging as _logging
-        _logging.getLogger("kaizer.transitions").warning(
-            "create_job: transition catalog lookup failed (non-fatal): %s",
-            _trans_exc,
-        )
-        _ts = "smart_cut"
+    # transition_style + stage_2_provider were knobs for the retired v2/v3
+    # render pipelines (2026-06-17). The fields are still ACCEPTED so a stale
+    # frontend never 400s, but they're vestigial — V4 ignores both. Coerce
+    # blank/unknown to the historical defaults; no pipeline_v2 catalog lookup.
+    _ts = (transition_style or "").strip() or "smart_cut"
+    _s2p = (stage_2_provider or "").strip() or "gemini"
 
-    # Item 114: same coerce-on-unknown pattern as transition_style.
+    # V4 only: validate the planner choice before persisting so a
+    # stale frontend can never set garbage. Non-V4 platforms get
+    # NULL to keep the column honest about "this row didn't use V4".
+    _trim_planner_clean = (v4_trim_planner or "claude").strip().lower()
+    if _trim_planner_clean not in {"claude", "gemini"}:
+        _trim_planner_clean = "claude"
+    _trim_planner_for_row = _trim_planner_clean if platform == "full_video_shorts_v4" else None
+
+    # Same shape for the image provider pick.
+    _image_provider_clean = (v4_image_provider or "auto").strip().lower()
+    if _image_provider_clean not in {"auto", "gemini", "openai"}:
+        _image_provider_clean = "auto"
+    _image_provider_for_row = _image_provider_clean if platform == "full_video_shorts_v4" else None
+
+    # Predefined description — V4-only, NULL stored elsewhere.
+    # 8 kB ceiling so a runaway paste can't blow up the DB row.
+    _predef_desc_clean = (v4_predefined_description or "").strip()
+    if len(_predef_desc_clean) > 8000:
+        _predef_desc_clean = _predef_desc_clean[:8000]
+    _predef_desc_for_row = _predef_desc_clean if (platform == "full_video_shorts_v4" and _predef_desc_clean) else None
+
+    # Output-format pick — V4 only. Same validate-before-persist shape.
+    _output_format_clean = (v4_output_format or "both").strip().lower()
+    if _output_format_clean not in {"both", "full-only", "shorts-only"}:
+        _output_format_clean = "both"
+    _output_format_for_row = _output_format_clean if platform == "full_video_shorts_v4" else None
+
+    # Target-platform pick — V4 only. Editor leads with this platform's SEO.
+    _target_platform_clean = (v4_target_platform or "youtube").strip().lower()
+    if _target_platform_clean not in {"youtube", "instagram", "facebook"}:
+        _target_platform_clean = "youtube"
+    _target_platform_for_row = _target_platform_clean if platform == "full_video_shorts_v4" else None
+
+    # Channels chosen at generate time (New Job "Choose channels" step).
+    # Parse the comma-separated ids → a clean de-duped JSON list, or None.
+    _chan_ids_for_row = None
     try:
-        from pipeline_v2.stages.stage_2_providers import (
-            is_valid_provider as _is_valid_provider,
-            DEFAULT_PROVIDER as _DEFAULT_S2P,
-        )
-        _s2p = (stage_2_provider or "").strip()
-        if not _s2p or not _is_valid_provider(_s2p):
-            if _s2p and _s2p != _DEFAULT_S2P:
-                _warning_prefix = (_warning_prefix or "") + (
-                    f"[stage_2_provider] unknown value {_s2p!r} coerced "
-                    f"to {_DEFAULT_S2P!r}.\n"
-                )
-            _s2p = _DEFAULT_S2P
-    except Exception as _s2p_exc:
-        import logging as _logging
-        _logging.getLogger("kaizer.stage_2_provider").warning(
-            "create_job: provider catalog lookup failed (non-fatal): %s",
-            _s2p_exc,
-        )
-        _s2p = "gemini"
+        _ids = [int(x) for x in (channel_ids or "").split(",") if x.strip().isdigit()]
+        _seen: set = set()
+        _ids = [i for i in _ids if not (i in _seen or _seen.add(i))]
+        if _ids and platform == "full_video_shorts_v4":
+            import json as _json
+            _chan_ids_for_row = _json.dumps(_ids)
+    except Exception:
+        _chan_ids_for_row = None
+
+    # PER-CHANNEL intro overrides — parse the {channel_id: asset_id} map, keep
+    # only entries where BOTH the asset and the channel belong to this user
+    # (defends against spoofed ids). None = no overrides (each channel's own).
+    _intro_overrides_for_row = None
+    try:
+        if intro_overrides and platform == "full_video_shorts_v4":
+            import json as _json
+            _raw = _json.loads(intro_overrides)
+            if isinstance(_raw, dict) and _raw:
+                _want_assets = {int(v) for v in _raw.values() if str(v).strip().lstrip("-").isdigit() and int(v) > 0}
+                _own_assets = {
+                    a.id for a in db.query(models.UserAsset.id).filter(
+                        models.UserAsset.id.in_(_want_assets or {0}),
+                        models.UserAsset.user_id == user.id,
+                    ).all()
+                } if _want_assets else set()
+                _own_channels = {
+                    c.id for c in db.query(models.Channel.id).filter(
+                        models.Channel.user_id == user.id,
+                    ).all()
+                }
+                _clean = {}
+                for k, v in _raw.items():
+                    try:
+                        cid, aid = int(k), int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if cid in _own_channels and aid in _own_assets:
+                        _clean[str(cid)] = aid
+                if _clean:
+                    _intro_overrides_for_row = _json.dumps(_clean)
+    except Exception:
+        _intro_overrides_for_row = None
+
+    # Custom-template per-slot media (only for custom:<id> templates). JSON
+    # {slot_key: asset_id}; main_media_slot names the slot that gets AI-trimmed.
+    _template_media_for_row = {}
+    _main_media_slot_for_row = ""
+    try:
+        if template_media and (str(frame_layout).startswith("custom:")
+                               or str(fullform_layout).startswith("custom:")):
+            _tm = _json.loads(template_media)
+            _raw = _tm if isinstance(_tm, dict) else {}
+            # A slot value is EITHER a scalar asset id (single image/video) OR a CAROUSEL struct
+            # {carousel:[{id,duration_s,effect,effect_duration}], fit} — a story-driven slideshow.
+            # Gather EVERY referenced id (scalars + carousel frames) for ONE ownership query, then
+            # keep only owned assets (cross-user IDOR guard). Mirrors v4_editor.save_custom_template.
+            _ref_ids = set()
+            for _v in _raw.values():
+                if isinstance(_v, dict) and _v.get("carousel"):
+                    for _fr in (_v.get("carousel") or []):
+                        try:
+                            _ref_ids.add(int(_fr.get("id")))
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        _ref_ids.add(int(_v))
+                    except Exception:
+                        pass
+            _own_ids = set()
+            if _ref_ids:
+                _own_ids = {r[0] for r in db.query(models.UserAsset.id).filter(
+                    models.UserAsset.id.in_(_ref_ids),
+                    models.UserAsset.user_id == user.id).all()}
+            for _k, _v in _raw.items():
+                if isinstance(_v, dict) and _v.get("carousel"):
+                    _frames = []
+                    for _fr in (_v.get("carousel") or []):
+                        try:
+                            _fid = int(_fr.get("id"))
+                        except Exception:
+                            continue
+                        if _fid not in _own_ids:
+                            continue
+                        _frames.append({
+                            "id": _fid,
+                            "duration_s": max(0.5, min(float(_fr.get("duration_s") or 3.0), 30.0)),
+                            "effect": str(_fr.get("effect") or "fade")[:16],
+                            "effect_duration": max(0.0, min(float(_fr.get("effect_duration") or 0.4), 2.0)),
+                        })
+                    # Cost/DoS guard: a forged payload with thousands of frames would explode the
+                    # ffmpeg overlay chain + GCP spend at render. 50 is far above any real slideshow.
+                    _frames = _frames[:50]
+                    if _frames:
+                        _template_media_for_row[str(_k)] = {"carousel": _frames,
+                                                            "fit": str(_v.get("fit") or "cover")[:10]}
+                else:
+                    try:
+                        _iv = int(_v)
+                    except Exception:
+                        continue
+                    if _iv in _own_ids:
+                        _template_media_for_row[str(_k)] = _iv
+            _main_media_slot_for_row = (main_media_slot or "").strip()[:64]
+    except Exception:
+        _template_media_for_row = {}
+
+    # SECURITY (IDOR): a custom:<id> template must be the user's OWN or PUBLIC — never
+    # render someone else's PRIVATE template by guessing its id.
+    def _custom_template(layout_val):
+        """Return the CustomTemplate row for a 'custom:<id>' value if it's available to
+        this user, or None (also None for non-custom/empty values)."""
+        s = str(layout_val or "")
+        if not s.startswith("custom:"):
+            return None
+        try:
+            _tid = int(s.split(":", 1)[1])
+        except Exception:
+            return False  # malformed -> treat as not-ok
+        _t = db.get(models.CustomTemplate, _tid)
+        if _t and _t.status != "disabled" and (_t.owner_id == user.id or _t.visibility == "public"):
+            return _t
+        return False
+
+    def _custom_template_ok(layout_val) -> bool:
+        return _custom_template(layout_val) is not False
+
+    if not _custom_template_ok(frame_layout) or (fullform_layout and not _custom_template_ok(fullform_layout)):
+        raise HTTPException(status_code=403, detail="Selected template is not available to you.")
+
+    # CRASH-GUARD: a custom template's output form is decided by its own canvas aspect
+    # (services.custom_templates.contract.aspect_kind). A full-form (16:9) template must
+    # never be rendered as a short (9:16) or vice-versa — that produces a wrong-aspect
+    # master that breaks the pipeline downstream. frame_layout is the SHORTS slot;
+    # fullform_layout is the FULL-FORM slot. Reject a mismatch up front with a clear
+    # message instead of letting it crash mid-render. (Frontend already filters by kind;
+    # this is the authoritative backstop against a forged/stale request.)
+    from services.custom_templates import aspect_kind as _aspect_kind
+    _ft = _custom_template(frame_layout)
+    if _ft:
+        if _aspect_kind(_ft.canvas_w, _ft.canvas_h) != "short":
+            raise HTTPException(status_code=400, detail=(
+                f"'{_ft.name}' is a full-form (landscape) template — it can't be used as a "
+                f"Short. Pick a 9:16 short template, or choose Full video / Both."))
+    _fft = _custom_template(fullform_layout)
+    if _fft:
+        if _aspect_kind(_fft.canvas_w, _fft.canvas_h) != "full":
+            raise HTTPException(status_code=400, detail=(
+                f"'{_fft.name}' is a short (portrait) template — it can't be used as a "
+                f"Full-form video. Pick a 16:9 full-form template, or choose Short / Both."))
 
     job = models.Job(
         user_id=user.id,
         platform=platform,
         frame_layout=frame_layout,
-        video_name=video.filename,
+        video_name=_src_filename,
         name=_name_clean,
         language=lang_cfg.code,
         status="pending",
@@ -1109,6 +2115,18 @@ async def create_job(
         output_dir=str(OUTPUT_ROOT),
         transition_style=_ts,
         stage_2_provider=_s2p,
+        v4_trim_planner=_trim_planner_for_row,
+        v4_image_provider=_image_provider_for_row,
+        v4_predefined_description=_predef_desc_for_row,
+        v4_output_format=_output_format_for_row,
+        v4_defer_render=bool(v4_defer_render),
+        v4_target_platform=_target_platform_for_row,
+        target_channel_ids=_chan_ids_for_row,
+        intro_overrides=_intro_overrides_for_row,
+        template_media=_template_media_for_row,
+        main_media_slot=_main_media_slot_for_row,
+        fullform_layout=((fullform_layout or "").strip().lower()
+                         if (fullform_layout or "").strip().lower().startswith("custom:") else ""),
     )
     db.add(job)
     db.commit()
@@ -1245,6 +2263,26 @@ async def create_job(
         v4_bg_video_path=(v4_bg_video_path or "").strip() or None,
         v4_bg_video_volume=max(0.0, min(1.0, v4_bg_video_volume or 0.0)),
         v4_bg_intro_seconds=max(0.0, min(30.0, v4_bg_intro_seconds or 0.0)),
+        # V4 only: planner pick from the wizard — runner validates +
+        # forwards as KAIZER_V4_TRIM_PLANNER env to the orchestrator.
+        v4_trim_planner=(v4_trim_planner or "claude").strip().lower(),
+        # V4 only: image-provider pick — runner forwards as
+        # KAIZER_V4_IMAGE_PROVIDER to image_provider._selected_image_provider.
+        v4_image_provider=(v4_image_provider or "auto").strip().lower(),
+        # V4 only: predefined description text — runner forwards as
+        # KAIZER_V4_PREDEFINED_DESCRIPTION env so the orchestrator
+        # switches to source-preserved mode.
+        v4_predefined_description=_predef_desc_for_row or "",
+        # V4 only: render-output choice — runner validates + forwards as
+        # KAIZER_V4_OUTPUT_FORMAT so the orchestrator skips the bulletin
+        # or the shorts accordingly.
+        v4_output_format=_output_format_for_row or "both",
+        # V4 Stage 2: defer the up-front render (persisted on the job above).
+        v4_defer_render=bool(getattr(job, "v4_defer_render", False)),
+        # V4 only: shorts-per-job ceiling (default 8; operator opt-in for more).
+        v4_max_shorts=max(1, min(50, int(v4_max_shorts or 8))),
+        # "Full form video" (16:9) custom template, e.g. "custom:<id>".
+        fullform_layout=(job.fullform_layout or ""),
         db_session_factory=SessionLocal,
     )
 
@@ -1266,6 +2304,9 @@ async def raw_upload(
     platform: str = Form("youtube_full"),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
+    # Wave 2 (API scale): same "create" bucket as /api/jobs/create/ —
+    # this endpoint also mints a Job + Clip and hits R2/ffmpeg.
+    _rl=Depends(rate_limited("create")),
 ):
     """Upload an already-edited video directly as a publishable Clip.
 
@@ -1284,8 +2325,14 @@ async def raw_upload(
 
     safe_name = Path(video.filename or "upload.mp4").name
     video_path = upload_dir / safe_name
+    # Wave 2 (API scale): chunked streaming write — never buffer the
+    # whole upload in RAM (these are full edited videos, often GBs).
     with open(video_path, "wb") as f:
-        f.write(await video.read())
+        while True:
+            chunk = await video.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
 
     # Mirror the source video to R2. We need the local file briefly for
     # the ffprobe-duration + ffmpeg-thumbnail steps below, so we keep
@@ -1435,6 +2482,9 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "status": job.status,
         "platform": job.platform,
         "frame_layout": job.frame_layout,
+        # Full-form (16:9) custom template, e.g. "custom:18". The V4 editor reads this so
+        # "Edit layout" opens the TEMPLATE editor (not the old region editor) for the bulletin.
+        "fullform_layout": (job.fullform_layout or ""),
         "video_name": job.video_name,
         "name": job.name,
         "language": job.language or "te",
@@ -1447,6 +2497,35 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
         "transition_style": (job.transition_style or "smart_cut"),
         # Item 114: surface the Stage 2 provider selection.
         "stage_2_provider": (job.stage_2_provider or "gemini"),
+        # V4 KEEP/CUT planner — NULL for non-V4 platforms. Editor reads
+        # this to render the "Planned by Claude / Gemini" badge.
+        "v4_trim_planner": job.v4_trim_planner,
+        # V4 image-provider pick — NULL for non-V4 platforms. Editor
+        # uses this for the "Images: gemini/openai/auto" badge.
+        "v4_image_provider": job.v4_image_provider,
+        # V4 source-preserved mode — non-empty when the operator
+        # supplied a verbatim bulletin description at submit time.
+        # Editor renders a "Source preserved" badge when present.
+        "v4_predefined_description": job.v4_predefined_description,
+        # V4 render-output choice ("both"/"full-only"/"shorts-only").
+        # NULL for non-V4 platforms; editor shows a "Shorts only" / etc. badge.
+        "v4_output_format": job.v4_output_format,
+        # V4 original publish target — editor leads with this platform's SEO.
+        "v4_target_platform": job.v4_target_platform,
+        # Channels chosen at generate time ("Choose channels" step) — a list
+        # of Channel ids, or [] if not chosen here. Editor/Publish default to these.
+        "target_channel_ids": (
+            (lambda raw: (json.loads(raw) if raw else []) or [])(
+                getattr(job, "target_channel_ids", None)
+            )
+        ),
+        # Per-channel intro overrides: {channel_id: asset_id} or {} = each
+        # channel uses its own assigned intro. Editor/UI read these.
+        "intro_overrides": (
+            (lambda raw: (json.loads(raw) if raw else {}) or {})(
+                getattr(job, "intro_overrides", None)
+            )
+        ),
         # Bulletin clips render first (16:9 long-form takes the lead
         # tile in the JobDetail grid), shorts follow in DB-insert
         # order. Backlog item 91 follow-up.
@@ -1456,32 +2535,134 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: models.User = Depe
                 key=lambda c: (0 if c.frame_type == "bulletin" else 1, c.id),
             )
         ],
+        # Published YouTube videos — surfaced for Quick Publish / raw-upload jobs (which have no
+        # canvas to edit, so the detail page links to YouTube instead). Empty for pipeline jobs.
+        "published_videos": (
+            _published_videos_for_jobs(db, [job.id]).get(job.id, [])
+            if (job.frame_layout or "") == "raw_upload" else []
+        ),
     }
+
+
+# Wave 2 (API scale): in-process micro-cache for the status poll. The
+# frontend polls every visible job card every few seconds; at scale
+# that's a query storm against rows that change at most once per
+# pipeline step. A 2s TTL keeps the UI feeling live while collapsing
+# the storm to ≤1 query per job per 2s per process. The cache stores
+# the FULL payload plus the owner's user_id — ownership is re-checked
+# on every hit; a mismatch falls through to the DB query (and its 404).
+_STATUS_CACHE_TTL_S = 2.0
+# Serve-stale ceiling: while ONE request refreshes an expired entry,
+# the herd may be served a copy up to this old (load-test finding: at
+# 300 pollers/job the synchronized 2s expiry caused multi-second p95
+# stampede spikes — single-flight + bounded staleness flattens them).
+_STATUS_CACHE_STALE_MAX_S = 10.0
+_STATUS_CACHE_MAX   = 1000
+_status_cache: dict[int, tuple[float, int, dict]] = {}  # job_id -> (mono_ts, owner_user_id, payload)
+_status_cache_locks: dict[int, _threading.Lock] = {}    # job_id -> refresh lock
+_status_cache_locks_guard = _threading.Lock()
+
+
+def _status_cache_get(
+    job_id: int, user_id: int, *, allow_stale: bool = False,
+) -> Optional[dict]:
+    entry = _status_cache.get(job_id)
+    if not entry:
+        return None
+    ts, owner_id, payload = entry
+    if owner_id != user_id:
+        return None
+    age = time.monotonic() - ts
+    limit = _STATUS_CACHE_STALE_MAX_S if allow_stale else _STATUS_CACHE_TTL_S
+    if age >= limit:
+        return None
+    return payload
+
+
+def _status_cache_put(job_id: int, user_id: int, payload: dict) -> None:
+    if len(_status_cache) > _STATUS_CACHE_MAX:
+        # Bound the dicts: drop anything older than 60s (long-dead polls).
+        cutoff = time.monotonic() - 60.0
+        for k in [k for k, (ts, _, _) in list(_status_cache.items()) if ts < cutoff]:
+            _status_cache.pop(k, None)
+            with _status_cache_locks_guard:
+                _status_cache_locks.pop(k, None)
+    _status_cache[job_id] = (time.monotonic(), user_id, payload)
+
+
+def _slice_status_log(payload: dict, since: int) -> dict:
+    """Apply the ``since`` incremental-log window per request — the cache
+    always holds the FULL payload. since=0 keeps the response shape
+    byte-identical for existing pollers (log_offset is purely additive)."""
+    if since <= 0:
+        return payload
+    out = dict(payload)
+    out["log_lines"] = (payload.get("log_lines") or [])[since:]
+    return out
 
 
 @app.get("/api/jobs/{job_id}/status/")
-def get_job_status(job_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
-    job = db.query(models.Job).filter(
-        models.Job.id == job_id, models.Job.user_id == user.id,
-    ).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    log_lines = (job.log or "").split("\n") if job.log else []
-    progress_pct = _estimate_progress(log_lines, job.status)
-    return {
-        "status": job.status,
-        "progress_pct": progress_pct,
-        "log_lines": log_lines,
-        "error": job.error or "",
-        "started_at":  job.started_at.isoformat()  if job.started_at  else None,
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
-        "elapsed_seconds": _elapsed_seconds(job),
-        # V2 per-step progress (Step 10.7 / Step 11.5). NULL for V1
-        # jobs + V2 jobs at start/end. UI shows
-        # "Stage X of 7: <human label>" only when this is non-null.
-        "current_stage": job.current_stage,
-        "platform": job.platform,
-    }
+def get_job_status(
+    job_id: int,
+    # Wave 2 (API scale): incremental log polling. since=N returns only
+    # log_lines[N:]; clients track the returned log_offset (total line
+    # count) and pass it back so each poll ships only new lines.
+    since: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    # auth.current_user already ran (dependency) — the cache only
+    # short-circuits the job-row query, never the auth itself.
+    cached = _status_cache_get(job_id, user.id)
+    if cached is not None:
+        return _slice_status_log(cached, since)
+
+    # Single-flight refresh: exactly ONE request re-queries an expired
+    # entry; the rest of the herd is served the stale copy (≤10s old)
+    # or waits for the refresher. Kills the synchronized-expiry
+    # stampede the load test exposed at 300 pollers/job.
+    with _status_cache_locks_guard:
+        refresh_lock = _status_cache_locks.setdefault(job_id, _threading.Lock())
+    if not refresh_lock.acquire(blocking=False):
+        stale = _status_cache_get(job_id, user.id, allow_stale=True)
+        if stale is not None:
+            return _slice_status_log(stale, since)
+        refresh_lock.acquire()  # nothing stale to serve — wait for refresh
+    try:
+        # Double-check: the refresher may have repopulated while we
+        # waited on the lock.
+        fresh = _status_cache_get(job_id, user.id)
+        if fresh is not None:
+            return _slice_status_log(fresh, since)
+
+        job = db.query(models.Job).filter(
+            models.Job.id == job_id, models.Job.user_id == user.id,
+        ).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        log_lines = (job.log or "").split("\n") if job.log else []
+        progress_pct = _estimate_progress(log_lines, job.status)
+        payload = {
+            "status": job.status,
+            "progress_pct": progress_pct,
+            "log_lines": log_lines,
+            # Total line count — clients pass this back as ?since= to poll
+            # incrementally. Additive field; old pollers ignore it.
+            "log_offset": len(log_lines),
+            "error": job.error or "",
+            "started_at":  job.started_at.isoformat()  if job.started_at  else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+            "elapsed_seconds": _elapsed_seconds(job),
+            # V2 per-step progress (Step 10.7 / Step 11.5). NULL for V1
+            # jobs + V2 jobs at start/end. UI shows
+            # "Stage X of 7: <human label>" only when this is non-null.
+            "current_stage": job.current_stage,
+            "platform": job.platform,
+        }
+        _status_cache_put(job_id, user.id, payload)
+        return _slice_status_log(payload, since)
+    finally:
+        refresh_lock.release()
 
 
 # Phase 14 / V2 Beta (D-13.14): rename a job mid-flight.
@@ -1920,7 +3101,7 @@ def _recompose_clip(clip, meta, edits, db):
     out_path = clip.file_path
     preset = meta.get("preset", {"width": 1080, "height": 1920})
     frame_type = clip.frame_type or meta.get("frame_type", "follow_bar")
-    title_text = clip.text or meta.get("text", "KAIZER NEWS")
+    title_text = clip.text or meta.get("text", "KAIZER X")
     image_path = clip.image_path or meta.get("image_path", "")
 
     card_params = json.loads(clip.card_params or "{}")
@@ -1945,7 +3126,7 @@ def _recompose_clip(clip, meta, edits, db):
             text_color=follow_params.get("text_color", card_params.get("text_color", "#ffff00")),
             text_size=int(card_params.get("font_size", 60)),
             bg_color=follow_params.get("bg_color", "#1a0a2e"),
-            follow_text=follow_params.get("follow_text", "FOLLOW KAIZER NEWS TELUGU"),
+            follow_text=follow_params.get("follow_text", "FOLLOW KAIZER X TELUGU"),
             follow_text_color=follow_params.get("follow_text_color", "#ffffff"),
             velvet_style=follow_params.get("velvet_style"),
         )
@@ -1994,8 +3175,14 @@ async def upload_image(clip_id: int, image: UploadFile = File(...), db: Session 
     img_dir.mkdir(exist_ok=True)
     img_path = img_dir / f"clip_{clip_id}_{image.filename}"
 
+    # Wave 2 (API scale): chunked streaming write (same pattern as the
+    # video uploads — images are small but the pattern costs nothing).
     with open(img_path, "wb") as f:
-        f.write(await image.read())
+        while True:
+            chunk = await image.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
 
     clip.image_path = str(img_path)
 
@@ -2095,6 +3282,29 @@ async def download_with_logo(
             models.UserAsset.user_id == user.id,
         ).first()
         logo_path = _materialize_asset_locally(la)
+
+    # Wave 2 (API scale): when there's no logo to burn and the clip only
+    # exists in R2 (prod's ephemeral disk), redirect to a signed URL
+    # instead of downloading the file just to re-stream it through
+    # Python. Logo overlays and local/beta renders keep the existing
+    # path — those genuinely need local bytes. (302 on POST → browsers
+    # re-issue as GET, which is exactly what the signed URL expects.)
+    if (
+        not logo_path
+        and (os.getenv("STORAGE_BACKEND", "local") or "local").strip().lower() == "r2"
+        and (clip.storage_key or "").strip()
+        and not (clip.file_path and _Path(clip.file_path).exists())
+        and not (BASE_DIR / "output" / "beta_renders" / f"clip_{clip_id}" / "latest.json").exists()
+    ):
+        try:
+            from pipeline_core.storage import get_storage_provider
+            url = get_storage_provider(clip.storage_backend or None).get_url(
+                clip.storage_key, signed=True,
+            )
+            return RedirectResponse(url, status_code=302)
+        except Exception as exc:
+            # Fall through to the download + stream path on any failure.
+            print(f"[download-with-logo] R2 redirect failed (falling back): {exc}")
 
     # Get clip on local disk — download from R2 if not already there.
     cleanup_dirs: list[str] = []
@@ -2381,11 +3591,61 @@ def _is_safe_path(p: Path) -> bool:
     return False
 
 
+def _r2_redirect_for_path(db: Session, raw_path: str) -> Optional[RedirectResponse]:
+    """Wave 2 (API scale): map an /api/file/?path=… request onto a Clip
+    row's R2 object and 302 to it instead of proxying bytes through
+    Python (one uvicorn worker can only stream so many 100 MB clips at
+    once). Matches the exact path strings _clip_dict._furl builds URLs
+    from. Returns None when nothing matches — caller falls through to
+    the local streaming path unchanged.
+    """
+    try:
+        clip = (
+            db.query(models.Clip)
+              .filter(
+                  (models.Clip.file_path == raw_path)
+                  | (models.Clip.thumb_path == raw_path)
+                  | (models.Clip.image_path == raw_path)
+              )
+              .first()
+        )
+        if clip is None:
+            return None
+        # Rendered video → mint a fresh signed URL from the key (URLs
+        # stored at upload time may be expired signatures when
+        # R2_PUBLIC_BASE_URL is unset).
+        if raw_path == (clip.file_path or "") and (clip.storage_key or "").strip():
+            from pipeline_core.storage import get_storage_provider
+            url = get_storage_provider(clip.storage_backend or None).get_url(
+                clip.storage_key, signed=True,
+            )
+            return RedirectResponse(url, status_code=302)
+        # Thumb / editorial image only persist a URL (no key column) —
+        # redirect when one was captured at upload time.
+        if raw_path == (clip.thumb_path or "") and (clip.thumb_storage_url or "").strip():
+            return RedirectResponse(clip.thumb_storage_url, status_code=302)
+        if raw_path == (clip.image_path or "") and (clip.image_storage_url or "").strip():
+            return RedirectResponse(clip.image_storage_url, status_code=302)
+    except Exception as exc:
+        # Redirect resolution is best-effort — fall back to streaming.
+        print(f"[serve_file] R2 redirect lookup failed (non-fatal): {exc}")
+    return None
+
+
 @app.get("/api/file/")
-async def serve_file(path: str, request: Request):
+async def serve_file(path: str, request: Request, db: Session = Depends(get_db)):
     file_path = Path(path)
     if not _is_safe_path(file_path):
         raise HTTPException(status_code=403, detail="Path is not under an allowed root")
+
+    # Wave 2 (API scale): on R2 deployments, hand the byte-shovelling to
+    # Cloudflare via a signed-URL redirect. Local dev (STORAGE_BACKEND
+    # unset/local) keeps the streaming path below byte-identical.
+    if (os.getenv("STORAGE_BACKEND", "local") or "local").strip().lower() == "r2":
+        redirect = _r2_redirect_for_path(db, path)
+        if redirect is not None:
+            return redirect
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found — clips are ephemeral and expire on redeploy")
 
@@ -2494,6 +3754,10 @@ def _clip_dict(c):
         "section_pct":  json.loads(c.section_pct or "{}"),
         "follow_params":json.loads(c.follow_params or "{}"),
         "meta":         meta,
+        # Per-short selection label (V4): why this segment was auto-picked +
+        # its priority rank (1 = highest). Null on bulletin/legacy clips.
+        "short_priority": meta.get("short_priority"),
+        "short_why":      meta.get("short_why", ""),
         "video_url":    video_resolved,
         "seo":          seo,
         "seo_variants": (lambda raw: (json.loads(raw) if raw else {}) or {})(getattr(c, "seo_variants", "") or "{}"),
@@ -2510,24 +3774,6 @@ def _estimate_progress(log_lines: list, status: str) -> int:
     return min(90, steps_found * 9)
 
 
-# ── V2 Inngest serve mount (Step 12.2b) ──────────────────────────────────────
-# Mounts the V2 Inngest webhook at /api/inngest so the Inngest Dev Server
-# (and production Inngest Cloud) can discover process_video_v2 and drive
-# its step execution. Guarded by KAIZER_V2_ENABLED so V1-only deployments
-# get a byte-identical route table.
-#
-# Placed at the END of main.py so all V1 routes are declared first; the
-# inngest serve registers via @app.get/@app.post decorators which would
-# otherwise be shadowed if any V1 route shared the /api/inngest path
-# (none do today, but this guarantees the property forward).
-if _v2_enabled():
-    import sys as _sys
-    import os as _os
-    _pipeline_v2_dir = _os.path.join(
-        _os.path.dirname(_os.path.abspath(__file__)),
-        "pipeline_v2",
-    )
-    if _pipeline_v2_dir not in _sys.path:
-        _sys.path.insert(0, _pipeline_v2_dir)
-    from pipeline_v2.inngest_app import register_v2_inngest
-    register_v2_inngest(app)
+# ── V2 Inngest serve mount — REMOVED 2026-06-17 ──────────────────────────────
+# The Inngest-orchestrated pipeline v2 was retired; its /api/inngest webhook
+# mount and the pipeline_v2 package are gone. V4 is the single render path.

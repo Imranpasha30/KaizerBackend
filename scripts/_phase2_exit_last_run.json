@@ -1,0 +1,102 @@
+[
+  {
+    "name": "A: mixed Direct + RTMP fanout (4 channels)",
+    "passed": true,
+    "reason": "4 mixed jobs completed in 2.30s; branding 1 miss + 3 hits; credits 64\u00e2\u2020\u201928 (36 burnt); forensic_rows=4 burn_rows=10",
+    "metrics": {
+      "wall_seconds": 2.297,
+      "completed_count": 4,
+      "failed_count": 0,
+      "publish_task_status": "completed",
+      "balance_before_fanout": 64,
+      "balance_after_fanout": 28,
+      "balance_after_run": 28,
+      "credit_burn_total": 36,
+      "branding_misses_delta": 1,
+      "branding_hits_delta": 3,
+      "distinct_branded_cache_keys": 1,
+      "branded_cache_keys_exist_in_r2": true,
+      "forensic_log_delta": 4,
+      "forensic_log_by_op": {
+        "videos.insert": 2,
+        "thumbnails.set": 2
+      },
+      "quota_burn_log_delta": 10,
+      "quota_burn_log_by_op": {
+        "videos.insert": 2,
+        "liveBroadcasts.insert": 2,
+        "liveStreams.insert": 2,
+        "liveBroadcasts.bind": 2,
+        "thumbnails.set": 2
+      },
+      "snap_final_net_in_use": 0,
+      "snap_final_cpu_in_use": 0,
+      "snap_final_user_in_use": 0,
+      "snap_final_queue_depth": 0,
+      "fake_yt_insert_calls": 2,
+      "fake_yt_list_calls": 0,
+      "fake_yt_thumb_calls": 2,
+      "rtmp_counter": {
+        "obtain": 2,
+        "push": 2,
+        "finalize": 2
+      },
+      "direct_video_ids": [
+        "FAKE_VID_e35e68f86ed8",
+        "FAKE_VID_dfeb4f87cdfd"
+      ],
+      "rtmp_video_ids": [
+        "FAKE_BCAST_c58df3b41455",
+        "FAKE_BCAST_d541a5c7ae39"
+      ],
+      "legacy_upload_jobs_baseline": 49,
+      "legacy_upload_jobs_after": 49
+    }
+  },
+  {
+    "name": "B: branded artifact cache (1 miss + 1 hit)",
+    "passed": true,
+    "reason": "2 jobs / 1 miss + 1 hit / cache_key=branded/283/52fa7875abeedb20.mp4",
+    "metrics": {
+      "wall_seconds": 0.781,
+      "completed": 2,
+      "failed": 0,
+      "publish_task_status": "completed",
+      "misses_delta": 1,
+      "hits_delta": 1,
+      "distinct_cache_keys": [
+        "branded/283/52fa7875abeedb20.mp4"
+      ]
+    }
+  },
+  {
+    "name": "C: quota_v2 gate parks 3rd direct job",
+    "passed": false,
+    "reason": "expected 2 completed jobs, got 3 (failed=0 parked=0); expected 1 parked_quota job, got 0; expected >=1 refund row for parked job, got 0; no QuotaBurnLog row with was_quota_exceeded=True for the parked job \u00e2\u20ac\u201d the F-agent's burn_log is not being written on quota-park. (LIKELY REAL BUG in upload_dispatch._park_quota path.)",
+    "metrics": {
+      "test_cap": 12700,
+      "existing_used_at_start": 9500,
+      "completed_jobs": 3,
+      "failed_jobs": 0,
+      "parked_jobs": 0,
+      "parked_attempts_values": [],
+      "publish_task_status": "completed",
+      "refund_row_count": 0,
+      "refund_row_details": [],
+      "quota_exceeded_burn_rows": 0,
+      "quota_exceeded_burn_details": []
+    }
+  },
+  {
+    "name": "D: legacy + flag-gated routes intact",
+    "passed": true,
+    "reason": "legacy=401 new=401 health=200 legacy_table_unchanged (49)",
+    "metrics": {
+      "legacy_clips_publish_unauth": 401,
+      "new_publish_tasks_unauth": 401,
+      "health": 200,
+      "legacy_upload_jobs_before": 49,
+      "legacy_upload_jobs_after": 49
+    }
+  }
+]

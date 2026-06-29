@@ -418,9 +418,38 @@ def generate_seo(
     # turned that into a 422 ("AI title is 106 chars, limit 100")
     # and the user got no usable output despite a green-ish score.
     # Truncate on a word boundary instead → user always sees output.
+    # Hashtags: the generator produces them, but Live Studio used to DROP
+    # them (only title/description/tags were carried). Normalize to
+    # #CamelCase and INLINE them into the description — YouTube reads
+    # hashtags from the description body (first 3 surface above the title),
+    # and the description is what actually ships on the broadcast. This is
+    # the same treatment the main pipeline gives hashtags.
+    norm_hashtags: list[str] = []
+    try:
+        from seo.composer import _normalize_hashtag as _norm_ht
+        for h in (best.get("hashtags") or []):
+            nh = _norm_ht(str(h))
+            if nh:
+                norm_hashtags.append(nh)
+    except Exception:
+        norm_hashtags = [str(h).strip() for h in (best.get("hashtags") or []) if str(h).strip()]
+    norm_hashtags = list(dict.fromkeys(norm_hashtags))[:15]   # dedupe, cap
+
+    desc_out = (best.get("description") or "").strip()
+    if norm_hashtags:
+        try:
+            from pipeline_v4.seo_provider import inline_hashtags_into_description
+            desc_out = inline_hashtags_into_description(
+                description=desc_out, hashtags=norm_hashtags,
+            )
+        except Exception:
+            block = " ".join(norm_hashtags)
+            if block and block not in desc_out:
+                desc_out = f"{desc_out}\n\n{block}".strip()
+
     validated = live_seo.sanitize_for_user_path(live_seo.LiveSeoIn(
         title         = (best.get("title") or "").strip(),
-        description   = (best.get("description") or "").strip(),
+        description   = desc_out,
         tags          = list(best.get("tags") or best.get("keywords") or []),
         privacy       = payload.privacy or "unlisted",
         made_for_kids = False,
@@ -429,6 +458,7 @@ def generate_seo(
     return {
         "ok":       True,
         "seo":      validated.model_dump(),
+        "hashtags": norm_hashtags,
         "raw":      best,
         "model":    model_used,
         "source":   "kaizer_editor_seo_retry",

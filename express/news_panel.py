@@ -7,7 +7,7 @@ Layout (1080×1920 = 9:16 vertical):
   bottom 960 px = colored panel containing
                     - 2-line Telugu title (overlay PNG) near the top
                     - white-bordered inset photo below the title
-                    - "KAIZER NEWS NETWORK" footer near the bottom
+                    - "KAIZER X NETWORK" footer near the bottom
   channel logo  = top-right of the source band
 
 Returns ``(filter_complex_str, out_tag)`` where ``out_tag`` is the

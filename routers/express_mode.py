@@ -72,7 +72,7 @@ def start_job(
     color_grade:            str         = Form("subtle"), # off | subtle | cinematic | news-vivid | warm | cool
     cinematic_edit:         bool        = Form(False),
     panel_color:            str         = Form("#dc2626"), # shorts panel color (red default)
-    footer_text:            str         = Form("KAIZER NEWS NETWORK"),
+    footer_text:            str         = Form("KAIZER X NETWORK"),
     short_count_override:   str         = Form(""),        # blank = auto-pick from duration
     # Session 3 additions:
     openai_api_key:         str         = Form(""),        # for gpt-image-1
@@ -177,7 +177,7 @@ def start_job(
                 color_grade_preset=color_grade,
                 cinematic_edit=bool(cinematic_edit),
                 panel_color=panel_color or "#dc2626",
-                footer_text=footer_text or "KAIZER NEWS NETWORK",
+                footer_text=footer_text or "KAIZER X NETWORK",
                 short_count_override=shorts_n,
                 openai_api_key=openai_api_key,
                 inset_strategy=inset_strategy or "frame",

@@ -36,6 +36,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
     "https://www.googleapis.com/auth/youtube",
+    # Read-only YouTube Analytics — unlocks CTR / impressions / average-view-
+    # duration per video (the gold signal for the SEO feedback loop). Existing
+    # tokens keep working WITHOUT it (views/likes via the Data API); when an
+    # operator re-approves, the new token carries this scope and CTR turns on
+    # automatically (analytics/ctr.py is gated on the token actually having it).
+    # OAUTHLIB_RELAX_TOKEN_SCOPE (set above) keeps the exchange happy.
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 STATE_TTL = timedelta(minutes=15)
 
@@ -171,9 +178,83 @@ def exchange_code(db, state: str, code: str) -> Tuple[models.Channel, models.OAu
     yt_channel_id    = meta.get("google_channel_id", "") or ""
     yt_channel_title = meta.get("google_channel_title", "") or ""
 
+    # ── Dedup: don't spawn a second account for the same real channel ──
+    # If this user already has a CONNECTED account for this
+    # google_channel_id on a DIFFERENT profile, fold this connect into
+    # that existing canonical account instead of creating "Personal N+1".
+    # Only when the profile being connected is FRESH (no token yet) —
+    # re-linking the SAME profile keeps the existing behaviour untouched.
+    placeholder_to_delete = None
+    _connecting_fresh = (
+        channel.oauth_token is None or not channel.oauth_token.refresh_token_enc
+    )
+    if yt_channel_id and _connecting_fresh:
+        canonical = (
+            db.query(models.Channel)
+            .join(models.OAuthToken, models.OAuthToken.channel_id == models.Channel.id)
+            .filter(
+                models.Channel.user_id == channel.user_id,
+                models.Channel.id != channel.id,
+                models.OAuthToken.google_channel_id == yt_channel_id,
+                models.OAuthToken.refresh_token_enc.isnot(None),
+            )
+            .first()
+        )
+        if canonical is not None:
+            # Safe to discard the just-created placeholder profile only
+            # when it carries nothing of its own.
+            try:
+                fresh = (
+                    channel.oauth_token is None
+                    and db.query(models.UploadJobV2).filter(
+                        models.UploadJobV2.channel_id == channel.id).count() == 0
+                    and db.query(models.UploadJob).filter(
+                        models.UploadJob.channel_id == channel.id).count() == 0
+                    and db.query(models.ProfileDestination).filter(
+                        models.ProfileDestination.profile_id == channel.id).count() == 0
+                )
+            except Exception:
+                fresh = False
+            if fresh:
+                placeholder_to_delete = channel
+            # Redirect this connect onto the existing account.
+            channel = canonical
+
     token = channel.oauth_token or models.OAuthToken(channel_id=channel.id)
     token.google_channel_id    = yt_channel_id
     token.google_channel_title = yt_channel_title
+
+    # A channel we're attaching a live token to IS an owned account — never a
+    # style reference. Pin it so it shows in YouTube Accounts (not SEO
+    # Settings), and so disconnecting it later keeps kind='account'.
+    channel.kind = "account"
+
+    # Name the account after its REAL YouTube channel (Auto Wala,
+    # Kaizer 30…) instead of the transient "Personal N" placeholder the
+    # one-click connect created. An account is a publish target, not a
+    # style profile, so also drop the auto-stamped default style fields
+    # ("English Hook … | Personal N" / "Neutral") the placeholder carried
+    # — they're meaningless on an account and were the source of the
+    # account/style confusion. Only rename when the real title is free
+    # for this user (uniqueness is (user_id, name)); never clobber a name
+    # the user deliberately set on a different row.
+    if yt_channel_title:
+        _name_taken = (
+            db.query(models.Channel)
+            .filter(
+                models.Channel.user_id == channel.user_id,
+                models.Channel.name == yt_channel_title,
+                models.Channel.id != channel.id,
+            )
+            .first()
+            is not None
+        )
+        if not _name_taken:
+            channel.name = yt_channel_title
+        if (getattr(channel, "title_formula", "") or "").startswith("English Hook"):
+            channel.title_formula = ""
+        if (getattr(channel, "desc_style", "") or "") == "Neutral":
+            channel.desc_style = ""
     # Rich metadata — safe when keys are absent (fallback path above)
     token.channel_description   = meta.get("channel_description", "") or ""
     token.channel_thumbnail_url = meta.get("channel_thumbnail_url", "") or ""
@@ -228,9 +309,28 @@ def exchange_code(db, state: str, code: str) -> Tuple[models.Channel, models.OAu
                 enabled=True,
             ))
 
+    # Discard the fresh duplicate placeholder profile (connect was
+    # folded into the canonical account above). Best-effort — never let
+    # a cleanup failure break a successful connect.
+    if placeholder_to_delete is not None and placeholder_to_delete.id != channel.id:
+        try:
+            db.delete(placeholder_to_delete)
+        except Exception:
+            pass
+
     # Remove the consumed state so it cannot be replayed
     db.delete(st_row)
     db.commit()
+
+    # Insights / Channel Doctor: start the thumbnail-CTR clock NOW (Reporting API bulk job is
+    # forward-only with ~30-day backfill, so the sooner it's created the more CTR history the
+    # user gets). Best-effort — must NEVER break the connect flow.
+    try:
+        from insights import reporting_api as _insights_reporting
+        _insights_reporting.ensure_job_for_channel(db, channel.id)
+    except Exception:
+        pass
+
     db.refresh(channel)
     return channel, token
 

@@ -23,6 +23,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from pipeline_v4.encoder import video_encoder_args as _enc_args
+
 
 def _ffmpeg_bin() -> str:
     try:
@@ -195,6 +197,34 @@ def _video_dimensions(path: str) -> tuple[int, int]:
     return 1920, 1080
 
 
+def _read_slot_rects(source_path: str, video_w: int, video_h: int) -> dict:
+    """Read the logo/watermark slot rects a custom template recorded next to its master
+    (``<master>.slots.json``), scaled from the template canvas to the actual video size.
+    Returns {"logo": rect|None, "watermark": rect|None}. {} when there's no side-file (a
+    built-in or slot-less template) -> caller uses the default corner positions."""
+    try:
+        with open((source_path or "") + ".slots.json", encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        return {"logo": None, "watermark": None}
+    cv = d.get("canvas") or [video_w, video_h]
+    try:
+        sx = float(video_w) / float(cv[0] or video_w)
+        sy = float(video_h) / float(cv[1] or video_h)
+    except Exception:
+        sx = sy = 1.0
+
+    def _scl(r):
+        if not r:
+            return None
+        try:
+            return {"x": int(round(r["x"] * sx)), "y": int(round(r["y"] * sy)),
+                    "w": int(round(r["w"] * sx)), "h": int(round(r["h"] * sy))}
+        except Exception:
+            return None
+    return {"logo": _scl(d.get("logo")), "watermark": _scl(d.get("watermark"))}
+
+
 def stamp_for_channel(
     *,
     source_path: str,
@@ -267,27 +297,46 @@ def stamp_for_channel(
     chain_parts: list[str] = []
     last_label = "0:v"
 
-    # Logo bug at top-right (always full opacity, no slider control).
-    if logo_path:
+    # Custom-template slot rects (logo/watermark) recorded next to the master. When the
+    # template MARKS a spot, the per-channel logo/watermark goes THERE; otherwise the
+    # default corner/band below. Operator's rule: "template says where -> there; else default."
+    _slots = _read_slot_rects(source_path, canvas_w, canvas_h)
+    _logo_rect = _slots.get("logo")
+    _wm_rect = _slots.get("watermark")
+
+    # KAIZER_CLEAN_MASTER (Decision 1): when "1", SKIP the default top-right logo bug (the
+    # Phase 2 Branding Worker owns that pass — baking here would double-stamp). BUT a
+    # template's EXPLICIT logo slot is the designated spot, so we still stamp into it.
+    _clean_master = os.environ.get("KAIZER_CLEAN_MASTER", "0").strip() == "1"
+    if logo_path and (_logo_rect or not _clean_master):
         from PIL import Image as _PI
         try:
-            bug_h = max(48, int(canvas_h * 0.10))
             with _PI.open(logo_path) as _logo:
                 _logo = _logo.convert("RGBA")
-                ratio = bug_h / max(1, _logo.height)
-                bug_w = max(48, int(_logo.width * ratio))
+                if _logo_rect:
+                    # FIT the logo inside the template's marked slot (contain), centered.
+                    rw, rh = max(8, _logo_rect["w"]), max(8, _logo_rect["h"])
+                    ratio = min(rw / max(1, _logo.width), rh / max(1, _logo.height))
+                    bug_w = max(8, int(_logo.width * ratio))
+                    bug_h = max(8, int(_logo.height * ratio))
+                    ox = _logo_rect["x"] + (rw - bug_w) // 2
+                    oy = _logo_rect["y"] + (rh - bug_h) // 2
+                    xy = f"x={ox}:y={oy}"
+                else:
+                    bug_h = max(48, int(canvas_h * 0.10))
+                    ratio = bug_h / max(1, _logo.height)
+                    bug_w = max(48, int(_logo.width * ratio))
+                    margin = max(20, int(canvas_w * 0.015))
+                    xy = f"x=W-w-{margin}:y={margin}"
                 bug_png = os.path.join(work_dir, "_wm_bug.png")
                 _logo.resize((bug_w, bug_h), _PI.LANCZOS).save(bug_png, "PNG")
             inputs += ["-loop", "1", "-i", bug_png]
-            margin = max(20, int(canvas_w * 0.015))
-            chain_parts.append(
-                f"[{last_label}][1:v]overlay=x=W-w-{margin}:y={margin}:format=auto[bug]"
-            )
+            chain_parts.append(f"[{last_label}][1:v]overlay={xy}:format=auto[bug]")
             last_label = "bug"
         except Exception as exc:
             print(f"[watermark] bug overlay skipped: {exc}", flush=True)
 
-    # Text watermark in the chosen mid band.
+    # Text watermark — at the template's watermark slot if marked, else the chosen mid band.
     if text:
         plate_path = os.path.join(work_dir, "_wm_plate.png")
         _render_plate_png(
@@ -297,9 +346,16 @@ def stamp_for_channel(
         )
         plate_idx = len(inputs) // 2  # number of -i pairs so far
         inputs += ["-loop", "1", "-i", plate_path]
-        wx, wy = _watermark_overlay_xy(position)
+        if _wm_rect:
+            # Center the text plate inside the template's marked watermark slot (w/h are the
+            # plate's own dims — ffmpeg overlay refs — so it centers regardless of plate size).
+            rx, ry, rw, rh = _wm_rect["x"], _wm_rect["y"], _wm_rect["w"], _wm_rect["h"]
+            xy = f"x={rx}+({rw}-w)/2:y={ry}+({rh}-h)/2"
+        else:
+            wx, wy = _watermark_overlay_xy(position)
+            xy = f"x={wx}:y={wy}"
         chain_parts.append(
-            f"[{last_label}][{plate_idx}:v]overlay=x={wx}:y={wy}:format=auto[outv]"
+            f"[{last_label}][{plate_idx}:v]overlay={xy}:format=auto[outv]"
         )
         last_label = "outv"
 
@@ -310,7 +366,7 @@ def stamp_for_channel(
     cmd = [_ffmpeg_bin(), "-y", "-v", "error"] + inputs + [
         "-filter_complex", ";".join(chain_parts),
         "-map", f"[{last_label}]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        *_enc_args(crf=20, preset_hint="veryfast"),
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-shortest", "-movflags", "+faststart",
@@ -341,20 +397,87 @@ _SOCIAL_LABELS = {
     "email":     "Contact",
 }
 
+# Canonical URL templates per platform ({h} = cleaned handle). We emit
+# FULL https URLs because YouTube only auto-links full URLs in a
+# description — that's what makes the social links actually clickable
+# (the way YouTube renders channel links). Platforms NOT listed here
+# (website/email/whatsapp/unknown) fall back to showing the raw value.
+_SOCIAL_URL = {
+    "youtube":   "https://www.youtube.com/@{h}",
+    "instagram": "https://www.instagram.com/{h}",
+    "twitter":   "https://x.com/{h}",
+    "x":         "https://x.com/{h}",
+    "facebook":  "https://www.facebook.com/{h}",
+    "tiktok":    "https://www.tiktok.com/@{h}",
+    "threads":   "https://www.threads.net/@{h}",
+    "linkedin":  "https://www.linkedin.com/in/{h}",
+    "telegram":  "https://t.me/{h}",
+}
+
+
+def _clean_handle(val: str) -> str:
+    """Reduce any stored social value to a bare handle.
+
+    Accepts a full URL (returned as-is), '@handle', 'handle', or the
+    legacy 'platform@handle' junk we have in the DB (e.g.
+    'isntagram@autowalla'). We always take the part AFTER the last '@'
+    so a mistyped/prefixed platform name can't pollute the handle, then
+    strip slashes/spaces. The platform is decided by the dict KEY, never
+    by this value — so typos in the value can't mis-route the link.
+    """
+    v = (val or "").strip()
+    if not v:
+        return ""
+    if v.lower().startswith(("http://", "https://")):
+        return v  # already a clickable URL — pass through untouched
+    if "@" in v:
+        v = v.rsplit("@", 1)[-1]
+    return v.strip().strip("/").strip()
+
+
+def social_url(platform: str, val: str) -> str:
+    """Build a clickable URL for one {platform: value} pair.
+
+    Full URLs pass through. Known platforms become canonical https URLs
+    from the bare handle. WhatsApp only links when the handle is a phone
+    number (wa.me requires digits). Unknown/website/email show the raw
+    cleaned value so nothing the user typed silently disappears.
+    """
+    p = (platform or "").strip().lower()
+    handle = _clean_handle(val)
+    if not handle:
+        return ""
+    if handle.lower().startswith(("http://", "https://")):
+        return handle
+    if p == "whatsapp":
+        # WhatsApp has no username URL — a link needs a phone number
+        # (wa.me/<digits>) or a full chat-invite URL. A bare username
+        # (e.g. "kaizer30") can't be linked, so OMIT it rather than emit
+        # a dead plain-text line. Full URLs already returned above.
+        digits = "".join(c for c in handle if c.isdigit())
+        return f"https://wa.me/{digits}" if len(digits) >= 8 else ""
+    tmpl = _SOCIAL_URL.get(p)
+    if tmpl:
+        return tmpl.format(h=handle)
+    # Unknown platform (website/email/custom): only keep it if the user
+    # gave a real URL — otherwise omit so every emitted line is a link.
+    return handle if handle.lower().startswith(("http://", "https://")) else ""
+
 
 def build_socials_footer(socials: dict) -> str:
-    """Format a dict of {platform: handle_or_url} into a multi-line
-    description footer that YouTube renders as clickable links. Returns
-    empty string when nothing's set."""
+    """Format {platform: handle_or_url} into a multi-line description
+    footer of CLICKABLE links. Each per-channel handle is normalized to
+    its canonical https URL so YouTube renders it as a real link.
+    Returns '' when nothing usable is set."""
     if not socials or not isinstance(socials, dict):
         return ""
     lines: list[str] = []
     for key, val in socials.items():
-        v = (val or "").strip()
-        if not v:
+        url = social_url(key, val)
+        if not url:
             continue
-        label = _SOCIAL_LABELS.get(key.lower(), key.title())
-        lines.append(f"{label}: {v}")
+        label = _SOCIAL_LABELS.get((key or "").lower(), (key or "").title())
+        lines.append(f"{label}: {url}")
     if not lines:
         return ""
     return "Follow us:\n" + "\n".join(lines)

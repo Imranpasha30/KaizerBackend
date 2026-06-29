@@ -46,11 +46,19 @@ class PostizPublisher(Publisher):
                 "Postiz upload selected but POSTIZ_API_KEY is empty.",
                 remediation_url="/settings",
             )
+        # Composed metadata lives on the UploadJob row — `routers/
+        # youtube_upload.py:_compose_metadata` populates job.title /
+        # description / tags at publish-API time using the SEO
+        # composer's brand overlay. The Clip model itself doesn't
+        # carry pre-composed `seo_*_final` columns, so reading them
+        # from clip raises AttributeError on every worker pickup.
+        # Mirror the source of truth here (job.*) and keep the safe
+        # getattrs only for fields that genuinely live on Clip.
         return PrepareResult(
-            title=(clip.seo_title_final or "")[:120],
-            description=(clip.seo_description_final or "")[:5000],
-            tags=getattr(clip, "seo_keywords", []) or [],
-            hashtags=getattr(clip, "seo_hashtags", []) or [],
+            title=(job.title or "")[:120],
+            description=(job.description or "")[:5000],
+            tags=list(job.tags or []),
+            hashtags=[],  # already inlined into job.title / job.description by the composer
             privacy=(job.privacy_status or "private"),
             scheduled_at=getattr(job, "publish_at", None),
             thumbnail_path=getattr(clip, "thumb_path", "") or "",

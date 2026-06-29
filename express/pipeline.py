@@ -581,7 +581,7 @@ def run_shorts(
     color_grade_preset: str = "subtle",
     cinematic_edit: bool = False,
     panel_color: str = "#dc2626",
-    footer_text: str = "KAIZER NEWS NETWORK",
+    footer_text: str = "KAIZER X NETWORK",
     logo_path: Optional[str] = None,
     short_count_override: Optional[int] = None,
     # Session 3 additions:

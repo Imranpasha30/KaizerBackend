@@ -606,6 +606,22 @@ def logs_recent(
     return {"lines": items, "count": len(items)}
 
 
+@router.get("/email-comms")
+def email_comms(
+    limit: int = Query(200, ge=1, le=1000),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Durable log of operator email communication — updates we SENT and
+    commands we RECEIVED (from imranpasha.ahmed@gmail.com). Backed by
+    logs/email_comms.jsonl so it survives restarts. Newest-last."""
+    try:
+        from email_comms_log import read_email_log
+        rows = read_email_log(limit=int(limit))
+    except Exception as exc:
+        return {"items": [], "count": 0, "error": str(exc)[:200]}
+    return {"items": rows, "count": len(rows)}
+
+
 @router.get("/logs/stream")
 async def logs_stream(
     request: Request,
@@ -802,6 +818,11 @@ def get_user(
     base["storage_breakdown_mb"] = {
         k: round(v / (1024 ** 2), 2) for k, v in storage_breakdown.items()
     }
+
+    # Current subscription tier — drives the tier picker in the user modal.
+    _pt = getattr(u, "plan_tier", None)
+    base["plan_tier_id"] = int(u.plan_tier_id) if u.plan_tier_id is not None else None
+    base["plan_tier_name"] = _pt.name if _pt else None
     return base
 
 
@@ -822,7 +843,149 @@ def toggle_admin(
 
     target.is_admin = not bool(target.is_admin)
     db.commit()
+    # Wave 2: drop the auth-cache snapshot so the flip is visible on the
+    # target's very next request, not after the cache TTL.
+    auth.invalidate_user_cache(target.id)
     return {"id": target.id, "is_admin": bool(target.is_admin)}
+
+
+# ─── Endpoints: plan tiers (subscription parameters) ───────────────────────
+#
+# Admin-editable subscription tiers (Free / Pro / Enterprise). Every
+# enforcement site reads the PlanTier row LIVE from the DB — fanout's channel
+# cap + direct-path gate, job_queue/scheduler's active-upload slot cap, and
+# credits' monthly allotment — so an edit here takes effect on the user's very
+# next publish/claim with NO restart and NO cache bust. See models.PlanTier.
+
+
+def _plan_tier_row(t: "models.PlanTier") -> dict:
+    return {
+        "id":   t.id,
+        "name": t.name,
+        "monthly_credit_allotment": int(t.monthly_credit_allotment),
+        "slot_cap_active_uploads":  int(t.slot_cap_active_uploads),
+        "direct_path_allowed":      bool(t.direct_path_allowed),
+        "max_channels":             int(t.max_channels),
+        "max_publishes_per_day":    int(t.max_publishes_per_day),
+        "created_at": _iso(t.created_at),
+        "updated_at": _iso(t.updated_at),
+    }
+
+
+@router.get("/plan-tiers")
+def list_plan_tiers(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Every subscription tier + a live count of users on each, so the admin
+    sees the blast radius before changing a tier's caps."""
+    tiers = db.query(models.PlanTier).order_by(models.PlanTier.id).all()
+    # One grouped count instead of N per-tier queries.
+    counts = dict(
+        db.query(models.User.plan_tier_id, func.count(models.User.id))
+          .group_by(models.User.plan_tier_id)
+          .all()
+    )
+    out = []
+    for t in tiers:
+        row = _plan_tier_row(t)
+        row["user_count"] = int(counts.get(t.id, 0) or 0)
+        out.append(row)
+    return {"tiers": out}
+
+
+@router.patch("/plan-tiers/{tier_id}")
+def update_plan_tier(
+    tier_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Update a tier's editable parameters. ``name`` is immutable — it keys
+    the credit-allotment + signup-default lookups, so renaming it would
+    silently detach users. Validation mirrors the enforcement semantics so an
+    admin can't set a value that quietly breaks the pipeline:
+
+      * ``slot_cap_active_uploads`` MUST be >= 1. The queue eligibility gate
+        is ``COALESCE(pt.slot_cap_active_uploads, default)`` — COALESCE only
+        catches NULL, so 0 or a negative makes the gate admit ZERO jobs and
+        every upload for this tier stalls. (No "unlimited" sentinel here.)
+      * ``max_channels`` / ``max_publishes_per_day``: ``-1`` = unlimited,
+        otherwise must be >= 0 (matches ``>= 0`` checks in fanout).
+      * ``monthly_credit_allotment``: >= 0.
+    """
+    tier = db.query(models.PlanTier).filter(models.PlanTier.id == tier_id).first()
+    if not tier:
+        raise HTTPException(status_code=404, detail="Plan tier not found")
+
+    def _as_int(field: str) -> int:
+        try:
+            return int(payload[field])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+
+    if "direct_path_allowed" in payload:
+        tier.direct_path_allowed = bool(payload["direct_path_allowed"])
+
+    if "monthly_credit_allotment" in payload:
+        v = _as_int("monthly_credit_allotment")
+        if v < 0:
+            raise HTTPException(status_code=400, detail="monthly_credit_allotment must be >= 0")
+        tier.monthly_credit_allotment = v
+
+    if "slot_cap_active_uploads" in payload:
+        v = _as_int("slot_cap_active_uploads")
+        if v < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="slot_cap_active_uploads must be >= 1 (0 or negative stalls every upload on this tier)",
+            )
+        tier.slot_cap_active_uploads = v
+
+    for field in ("max_channels", "max_publishes_per_day"):
+        if field in payload:
+            v = _as_int(field)
+            if v < -1:
+                raise HTTPException(status_code=400, detail=f"{field} must be -1 (unlimited) or >= 0")
+            setattr(tier, field, v)
+
+    db.commit()
+    db.refresh(tier)
+    return _plan_tier_row(tier)
+
+
+@router.post("/users/{user_id}/assign-tier")
+def assign_user_tier(
+    user_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Put a user on a specific plan tier. Clears the auth-cache snapshot so
+    the new caps apply on the user's very next request (same pattern as
+    toggle-admin)."""
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    raw = payload.get("plan_tier_id")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="plan_tier_id required")
+    try:
+        tier_id = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="plan_tier_id must be an integer")
+    tier = db.query(models.PlanTier).filter(models.PlanTier.id == tier_id).first()
+    if not tier:
+        raise HTTPException(status_code=404, detail="Plan tier not found")
+    target.plan_tier_id = tier.id
+    db.commit()
+    auth.invalidate_user_cache(target.id)
+    return {
+        "id": target.id,
+        "email": target.email,
+        "plan_tier_id": int(tier.id),
+        "plan_tier_name": tier.name,
+    }
 
 
 # ─── Endpoints: jobs ──────────────────────────────────────────────────────
@@ -1285,6 +1448,19 @@ def list_settings(
                 "verification is complete; admin can flip per-need."
             ),
         },
+        "delivery_mode": {
+            "value":   _ss.get_delivery_mode(db),
+            "default": _ss.DELIVERY_MODE_DEFAULT,
+            "options": sorted(_ss.DELIVERY_MODE_VALID),
+            "description": (
+                "Postiz auto-fallback switch. 'testing' (default) = manual: "
+                "channels upload natively (our quota) unless the user "
+                "explicitly picks Postiz; no automatic fallback. "
+                "'production' = auto-fallback: native first, and when the "
+                "YouTube daily quota can't cover an upload, channels with a "
+                "bound Postiz integration are routed to Postiz automatically."
+            ),
+        },
     }
 
 
@@ -1305,6 +1481,13 @@ def update_setting(
             raise HTTPException(
                 status_code=400,
                 detail=f"upload_provider must be one of {sorted(_ss.UPLOAD_PROVIDER_VALID)}",
+            )
+        new_val = new_val.strip().lower()
+    elif key == _ss.DELIVERY_MODE:
+        if new_val.strip().lower() not in _ss.DELIVERY_MODE_VALID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"delivery_mode must be one of {sorted(_ss.DELIVERY_MODE_VALID)}",
             )
         new_val = new_val.strip().lower()
     else:
@@ -1369,6 +1552,445 @@ def admin_queue_replay(
         return replay_from_dlq(message_id)
     except QueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ─── Pipeline Flow (staged "factory" live view) ─────────────────────────
+
+def _map_render_stage(current_stage: Optional[str]) -> str:
+    """Map a render Job.current_stage string onto a canonical station key."""
+    s = (current_stage or "").lower()
+    if "ingest" in s or "download" in s or "probe" in s:
+        return "ingest"
+    if "transcri" in s or "asr" in s or "deepgram" in s or "whisper" in s:
+        return "transcribe"
+    if "plan" in s or "cut" in s or "keep" in s or "analy" in s:
+        return "cut_plan"
+    if "trim" in s or "concat" in s or "encode" in s:
+        return "trim"
+    # compose / render / stitch / overlay / carousel / finalize → the heavy
+    # GPU compose station (the belt's pacing bottleneck) by default.
+    return "compose"
+
+
+# UploadJobV2 status → canonical publish station.
+_UPLOAD_STATUS_STATION = {
+    "claimed": "brand",
+    "branding": "brand",
+    "ready_to_upload": "brand",
+    "uploading": "upload",
+}
+
+
+@router.get("/pipeline/flow")
+def admin_pipeline_flow(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Live snapshot of the staged 'factory' pipeline for the admin
+    conveyor view. Composes three sources, all tenant-attributed:
+
+      1. Real DB occupancy — running render Jobs bucketed by current_stage,
+         active UploadJobV2 rows bucketed by status, mapped onto the 7
+         canonical stations (ingest→upload).
+      2. The in-memory stage-event ring buffer — recent transitions for the
+         flying-card animation, plus the factory's own live occupancy.
+      3. Factory queue depths + enabled flags.
+
+    Designed to be polled ~every 1-2s. All queries are bounded.
+    """
+    from services import stage_events as _se
+    try:
+        from services import pipeline_factory as _pf
+        factory_depths = _pf.depths()
+        factory_on = _pf.enabled()
+        workers_on = _pf.workers_enabled()
+    except Exception:
+        factory_depths, factory_on, workers_on = {}, False, False
+
+    stations = {
+        k: {"key": k, "label": _se.STATION_LABELS.get(k, k),
+            "count": 0, "queue_depth": int(factory_depths.get(k, 0) or 0),
+            "cards": []}
+        for k in _se.STATIONS
+    }
+
+    # 0) Live in-memory occupancy first — it is the FINEST-grained, most
+    #    up-to-date source (a V4 job emits its real sub-stage here). The DB
+    #    sections below dedupe against these ids so a job is never shown twice.
+    occ_cards = {}
+    occ_ids = set()
+    try:
+        occ_cards = _se.occupancy_cards(limit_per=8)
+        for k, cards in occ_cards.items():
+            if k not in stations or not cards:
+                continue
+            st = stations[k]
+            st["count"] += len(cards)
+            st["cards"].extend(cards[:8])
+            for c in cards:
+                if c.get("id"):
+                    occ_ids.add(c["id"])
+    except Exception:
+        pass
+
+    # 1) Render jobs in flight (status='running'), bucketed by current_stage.
+    #    Skipped if the same job is already shown live (occ_ids) — e.g. a V4
+    #    job mid-render emits its fine stage above; here we only add jobs that
+    #    are running but not (yet) emitting, so the belt still shows them.
+    try:
+        rows = (
+            db.query(models.Job.id, models.Job.user_id,
+                     models.Job.video_name, models.Job.current_stage,
+                     models.Job.started_at)
+            .filter(models.Job.status == "running")
+            .order_by(desc(models.Job.started_at))
+            .limit(120)
+            .all()
+        )
+        for jid, uid, vname, stage, started in rows:
+            if f"j{jid}" in occ_ids:
+                continue  # already shown live at its fine sub-stage
+            key = _map_render_stage(stage)
+            st = stations[key]
+            st["count"] += 1
+            if len(st["cards"]) < 8:
+                st["cards"].append({
+                    "id": f"j{jid}", "kind": "render", "user_id": uid,
+                    "label": (vname or f"job {jid}")[:40],
+                    "since": started.isoformat() if started else None,
+                })
+    except Exception as exc:  # noqa: BLE001
+        stations["compose"].setdefault("warn", str(exc)[:120])
+
+    # 2) Active upload jobs, bucketed by status → brand/upload stations.
+    queued_backlog = 0
+    try:
+        urows = (
+            db.query(models.UploadJobV2.id, models.UploadJobV2.user_id,
+                     models.UploadJobV2.channel_id, models.UploadJobV2.status,
+                     models.UploadJobV2.updated_at)
+            .filter(models.UploadJobV2.status.in_(
+                ["queued", "claimed", "branding", "ready_to_upload", "uploading"]))
+            .order_by(desc(models.UploadJobV2.updated_at))
+            .limit(200)
+            .all()
+        )
+        chan_ids = {c for (_i, _u, c, _s, _t) in urows if c}
+        chan_names: dict = {}
+        if chan_ids:
+            for cid, cname in (
+                db.query(models.Channel.id, models.Channel.name)
+                .filter(models.Channel.id.in_(list(chan_ids)))
+                .all()
+            ):
+                chan_names[cid] = cname
+        for uid_, user_id, cid, status, upd in urows:
+            if status == "queued":
+                queued_backlog += 1
+                continue
+            if f"u{uid_}" in occ_ids:
+                continue  # already shown live by the publish-path emitter
+            key = _UPLOAD_STATUS_STATION.get(status, "upload")
+            st = stations[key]
+            st["count"] += 1
+            if len(st["cards"]) < 8:
+                st["cards"].append({
+                    "id": f"u{uid_}", "kind": "publish", "user_id": user_id,
+                    "label": (chan_names.get(cid) or f"ch {cid}")[:40],
+                    "since": upd.isoformat() if upd else None,
+                })
+    except Exception as exc:  # noqa: BLE001
+        stations["upload"].setdefault("warn", str(exc)[:120])
+
+    # Today's throughput (UTC) from the durable upload table.
+    completed_today = failed_today = 0
+    try:
+        start_utc = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        completed_today = int(
+            db.query(func.count(models.UploadJobV2.id))
+            .filter(models.UploadJobV2.status == "completed",
+                    models.UploadJobV2.finished_at >= start_utc)
+            .scalar() or 0)
+        failed_today = int(
+            db.query(func.count(models.UploadJobV2.id))
+            .filter(models.UploadJobV2.status == "failed",
+                    models.UploadJobV2.finished_at >= start_utc)
+            .scalar() or 0)
+    except Exception:
+        pass
+
+    try:
+        from services import stage_gate as _sg
+        gate_status = _sg.status()
+    except Exception:
+        gate_status = {"enabled": False, "gates": {}}
+
+    station_list = [stations[k] for k in _se.STATIONS]
+    in_flight = sum(s["count"] for s in station_list)
+    # Multi-belt view: the render+delivery belt (above) plus the extra lanes
+    # (editor re-renders, SEO pipeline). ``stations`` stays for back-compat.
+    belts = [
+        {"key": "render", "label": "Render → delivery", "stations": station_list},
+    ] + _se.lane_belts(limit_per=8)
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "factory_enabled": factory_on,
+        "factory_workers_enabled": workers_on,
+        "stations": station_list,
+        "belts": belts,
+        "recent_events": _se.recent(limit=120),
+        "counters": _se.counters_snapshot(),
+        "encode_gate": gate_status,
+        "totals": {
+            "in_flight": in_flight,
+            "queued_backlog": queued_backlog,
+            "completed_today": completed_today,
+            "failed_today": failed_today,
+        },
+    }
+
+
+def _aware(dt):
+    """Coerce a possibly-naive datetime to tz-aware UTC for safe compares."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _diagnose_publish(job, now) -> dict:
+    """Human 'why is it here / why is it stuck' for an UploadJobV2 row."""
+    status = job.status
+    attempts = int(job.attempts or 0)
+    err = (job.last_error or "").strip()
+    lease = _aware(job.lease_expires_at)
+    nxt = _aware(job.next_attempt_at)
+    started = _aware(job.started_at)
+
+    if status == "completed":
+        return {"severity": "ok", "stuck": False,
+                "reason": "Delivered successfully.",
+                "detail": f"video {job.youtube_video_id or '—'}"}
+    if status == "failed":
+        return {"severity": "error", "stuck": True,
+                "reason": f"Failed after {attempts} attempt(s).",
+                "detail": err or "no error recorded"}
+    if status == "cancelled":
+        return {"severity": "info", "stuck": False,
+                "reason": "Cancelled.", "detail": err}
+    if status == "parked_quota":
+        return {"severity": "warn", "stuck": True,
+                "reason": "Parked — YouTube upload quota exhausted.",
+                "detail": "Resumes automatically when the daily quota window "
+                          "resets (the un-parker cron requeues it)."}
+    # Active statuses — distinguish a crashed lease from healthy progress.
+    if status in ("claimed", "branding", "ready_to_upload", "uploading"):
+        if lease is not None and lease < now:
+            return {"severity": "warn", "stuck": True,
+                    "reason": "Lease expired — the worker stopped or crashed.",
+                    "detail": f"claimed_by={job.claimed_by or '—'}; the reaper "
+                              f"will requeue this automatically."}
+        if status == "uploading":
+            mins = int((now - started).total_seconds() // 60) if started else 0
+            return {"severity": "info" if mins < 20 else "warn",
+                    "stuck": mins >= 20,
+                    "reason": f"Uploading… {job.bytes_uploaded or 0} bytes pushed.",
+                    "detail": f"in 'uploading' for ~{mins} min"
+                              + (" — may be a large file or a slow network."
+                                 if mins >= 20 else "")}
+        return {"severity": "info", "stuck": False,
+                "reason": f"Working ({status}).",
+                "detail": "branded artifact in progress"}
+    if status == "queued":
+        if nxt is not None and nxt > now and attempts > 0:
+            secs = int((nxt - now).total_seconds())
+            return {"severity": "warn", "stuck": True,
+                    "reason": f"Backing off after {attempts} attempt(s).",
+                    "detail": f"next retry in ~{secs}s"
+                              + (f" — last error: {err}" if err else "")}
+        return {"severity": "info", "stuck": False,
+                "reason": "Queued — waiting for a free worker.",
+                "detail": ""}
+    return {"severity": "info", "stuck": False,
+            "reason": f"Status: {status}", "detail": err}
+
+
+@router.get("/pipeline/unit")
+def admin_pipeline_unit(
+    kind: str = Query(..., pattern="^(publish|render)$"),
+    id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Inspect one unit on the conveyor — tap a (possibly stuck) card to see
+    its full state, a plain-language diagnosis of WHY it is where it is, and
+    its recent stage transitions. ``kind=publish`` → UploadJobV2;
+    ``kind=render`` → render Job.
+    """
+    from services import stage_events as _se
+    now = datetime.now(timezone.utc)
+
+    if kind == "publish":
+        job = (db.query(models.UploadJobV2)
+               .filter(models.UploadJobV2.id == id).first())
+        if job is None:
+            raise HTTPException(status_code=404, detail="upload job not found")
+        ch = (db.query(models.Channel)
+              .filter(models.Channel.id == job.channel_id).first())
+        diag = _diagnose_publish(job, now)
+        return {
+            "kind": "publish",
+            "id": job.id,
+            "label": (getattr(ch, "name", None) or f"ch {job.channel_id}"),
+            "user_id": job.user_id,
+            "channel_id": job.channel_id,
+            "status": job.status,
+            "upload_path": job.upload_path,
+            "publish_kind": job.publish_kind,
+            "privacy_status": job.privacy_status,
+            "attempts": int(job.attempts or 0),
+            "last_error": job.last_error,
+            "bytes_uploaded": int(job.bytes_uploaded or 0),
+            "youtube_video_id": job.youtube_video_id,
+            "claimed_by": job.claimed_by,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+            "next_attempt_at": job.next_attempt_at.isoformat() if job.next_attempt_at else None,
+            "lease_expires_at": job.lease_expires_at.isoformat() if job.lease_expires_at else None,
+            "diagnosis": diag,
+            "events": [e for e in _se.recent(limit=400)
+                       if e.get("upload_job_id") == id][-40:],
+        }
+
+    # kind == "render"
+    job = db.query(models.Job).filter(models.Job.id == id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="render job not found")
+    log_tail = (getattr(job, "log", "") or "")[-1500:]
+    started = _aware(getattr(job, "started_at", None))
+    if job.status == "failed":
+        diag = {"severity": "error", "stuck": True,
+                "reason": "Render failed.",
+                "detail": (log_tail.strip().splitlines() or ["no log"])[-1]}
+    elif job.status == "running":
+        mins = int((now - started).total_seconds() // 60) if started else 0
+        diag = {"severity": "info" if mins < 25 else "warn", "stuck": mins >= 25,
+                "reason": f"Rendering at '{job.current_stage or '—'}'.",
+                "detail": f"running ~{mins} min"
+                          + (" — longer than expected for this stage." if mins >= 25 else "")}
+    elif job.status == "done":
+        diag = {"severity": "ok", "stuck": False, "reason": "Render complete.", "detail": ""}
+    else:
+        diag = {"severity": "info", "stuck": False,
+                "reason": f"Status: {job.status}", "detail": ""}
+    return {
+        "kind": "render",
+        "id": job.id,
+        "label": (getattr(job, "video_name", None) or f"job {job.id}"),
+        "user_id": job.user_id,
+        "status": job.status,
+        "current_stage": getattr(job, "current_stage", None),
+        "created_at": job.created_at.isoformat() if getattr(job, "created_at", None) else None,
+        "started_at": job.started_at.isoformat() if started else None,
+        "diagnosis": diag,
+        "log_tail": log_tail,
+        "events": [e for e in _se.recent(limit=400) if e.get("job_id") == id][-40:],
+    }
+
+
+@router.post("/pipeline/simulate")
+def admin_pipeline_simulate(
+    units: int = Query(5, ge=1, le=40),
+    delay_ms: int = Query(1500, ge=0, le=8000),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Run SYNTHETIC units through the real factory engine so the conveyor
+    visibly fills, flows, and drains — a safe, YouTube-free, render-free live
+    smoke test. Synthetic units use negative ids (label 'sim N') and write no
+    DB rows and make no external calls."""
+    from services import pipeline_factory as _pf
+    # Also animate the extra belts (re-render + SEO) so all three conveyors
+    # visibly move during a simulation. Synthetic, negative ids, no DB/network.
+    try:
+        _simulate_extra_lanes(units=min(units, 4), delay_ms=delay_ms)
+    except Exception:
+        pass
+    return _pf.run_demo(units=units, delay_ms=delay_ms)
+
+
+def _simulate_extra_lanes(units: int = 3, delay_ms: int = 1500) -> None:
+    """Push synthetic units through the re-render + SEO lanes (background
+    thread) so the admin sees those belts flow during a simulate run."""
+    import threading
+    import time as _t
+    from services import stage_events as _se
+
+    def _worker():
+        step = max(0.0, (delay_ms / 1000.0) / 2.0)
+        for lane in ("rerender", "seo"):
+            stations = _se.LANE_DEFS.get(lane, {}).get("stations", [])
+            for n in range(1, units + 1):
+                env = _se.Envelope(
+                    tenant_id=-n, user_id=-n, job_id=-(1000 + n),
+                    clip_id=None, channel_id=None, label=f"sim {lane} {n}",
+                )
+                for st in stations:
+                    _se.emit_lane(env, lane, st, _se.ENTERED)
+                    if step:
+                        _t.sleep(step)
+                    _se.emit_lane(env, lane, st, _se.EXITED)
+
+    threading.Thread(target=_worker, daemon=True, name="sim-extra-lanes").start()
+
+
+# ─── Learning / training data ───────────────────────────────────────────
+
+@router.get("/learning/overview")
+def admin_learning_overview(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Aggregate of the collected training dataset: size, view/CTR coverage,
+    per-language / per-platform / per-channel breakdown, and the winning
+    keywords (ranked by views-per-hour). Powers the admin Learning view."""
+    from learning import dataset as _ds
+    return _ds.overview(db)
+
+
+@router.post("/learning/backfill")
+def admin_learning_backfill(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """(Re)build training samples from existing performance data — a one-time
+    bootstrap so the dataset has rows before the next poll. Idempotent."""
+    from learning import dataset as _ds
+    return _ds.backfill(db)
+
+
+@router.get("/learning/dataset.jsonl")
+def admin_learning_dataset_jsonl(
+    limit: Optional[int] = Query(None, ge=1, le=200000),
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+):
+    """Download the training dataset as JSONL — ONE clean row per published
+    video: {input, output, label, features, meta}. Training-ready: feed it
+    straight to a model, no preprocessing."""
+    import json as _json
+    from learning import dataset as _ds
+
+    def _gen():
+        for r in _ds.iter_rows(db, limit=limit):
+            yield _json.dumps(_ds.to_export_dict(r), ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        _gen(), media_type="application/x-ndjson",
+        headers={"Content-Disposition": "attachment; filename=kaizer_seo_training.jsonl"},
+    )
 
 
 # ─── Gemini cache (Stage 4 of Redis migration) ──────────────────────────
@@ -1561,6 +2183,18 @@ def usage_dashboard(
               .filter(models.OpenAiCall.created_at >= start)
         )
 
+    def _anthropic_total(start):
+        return _scalar(
+            db.query(func.coalesce(func.sum(models.AnthropicCall.cost_usd), 0.0))
+              .filter(models.AnthropicCall.created_at >= start)
+        )
+
+    def _anthropic_calls(start):
+        return _scalar_int(
+            db.query(func.count(models.AnthropicCall.id))
+              .filter(models.AnthropicCall.created_at >= start)
+        )
+
     def _yt_calls(start):
         return _scalar_int(
             db.query(func.count(models.YouTubeApiCall.id))
@@ -1580,6 +2214,12 @@ def usage_dashboard(
             "today_calls":     _openai_calls(today_start),
             "window_calls":    _openai_calls(window_start),
         },
+        "anthropic": {
+            "today_cost_usd":  round(_anthropic_total(today_start),  4),
+            "window_cost_usd": round(_anthropic_total(window_start), 4),
+            "today_calls":     _anthropic_calls(today_start),
+            "window_calls":    _anthropic_calls(window_start),
+        },
         "youtube": {
             "today_quota":   _yt_quota_total(today_start),
             "window_quota":  _yt_quota_total(window_start),
@@ -1589,10 +2229,12 @@ def usage_dashboard(
             "today_pct":     round(100.0 * _yt_quota_total(today_start) / max(_YT_DAILY_CAP, 1), 1),
         },
         "total_cost_today_usd":  round(
-            _gemini_total(today_start) + _openai_total(today_start), 4
+            _gemini_total(today_start) + _openai_total(today_start)
+            + _anthropic_total(today_start), 4
         ),
         "total_cost_window_usd": round(
-            _gemini_total(window_start) + _openai_total(window_start), 4
+            _gemini_total(window_start) + _openai_total(window_start)
+            + _anthropic_total(window_start), 4
         ),
     }
 
@@ -1601,6 +2243,7 @@ def usage_dashboard(
     # the func layer (we use date() to be dialect-agnostic).
     day_col_g = func.date(models.GeminiCall.created_at).label("d")
     day_col_o = func.date(models.OpenAiCall.created_at).label("d")
+    day_col_a = func.date(models.AnthropicCall.created_at).label("d")
     day_col_y = func.date(models.YouTubeApiCall.created_at).label("d")
 
     g_rows = (
@@ -1623,6 +2266,16 @@ def usage_dashboard(
         .filter(models.OpenAiCall.created_at >= window_start)
         .group_by(day_col_o).order_by(day_col_o).all()
     )
+    a_rows = (
+        db.query(
+            day_col_a,
+            func.coalesce(func.sum(models.AnthropicCall.cost_usd),     0.0),
+            func.coalesce(func.sum(models.AnthropicCall.total_tokens), 0),
+            func.count(models.AnthropicCall.id),
+        )
+        .filter(models.AnthropicCall.created_at >= window_start)
+        .group_by(day_col_a).order_by(day_col_a).all()
+    )
     y_rows = (
         db.query(
             day_col_y,
@@ -1642,6 +2295,10 @@ def usage_dashboard(
         "openai": _row_to_dict(("day","cost_usd","images","calls"), [
             (str(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
             for r in o_rows
+        ]),
+        "anthropic": _row_to_dict(("day","cost_usd","tokens","calls"), [
+            (str(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
+            for r in a_rows
         ]),
         "youtube": _row_to_dict(("day","quota","calls"), [
             (str(r[0]), int(r[1] or 0), int(r[2] or 0))
@@ -1825,6 +2482,79 @@ def usage_dashboard(
         ]),
     }
 
+    # ─── Anthropic (Claude) breakdowns ─────────────────────────
+    a_by_purpose = (
+        db.query(
+            models.AnthropicCall.purpose,
+            func.coalesce(func.sum(models.AnthropicCall.total_tokens), 0),
+            func.coalesce(func.sum(models.AnthropicCall.cost_usd),     0.0),
+            func.count(models.AnthropicCall.id),
+        )
+        .filter(models.AnthropicCall.created_at >= window_start)
+        .group_by(models.AnthropicCall.purpose)
+        .order_by(desc(func.sum(models.AnthropicCall.cost_usd)))
+        .all()
+    )
+    a_by_model = (
+        db.query(
+            models.AnthropicCall.model,
+            func.coalesce(func.sum(models.AnthropicCall.total_tokens), 0),
+            func.coalesce(func.sum(models.AnthropicCall.cost_usd),     0.0),
+            func.count(models.AnthropicCall.id),
+        )
+        .filter(models.AnthropicCall.created_at >= window_start)
+        .group_by(models.AnthropicCall.model)
+        .order_by(desc(func.sum(models.AnthropicCall.cost_usd)))
+        .all()
+    )
+    a_top_users = (
+        db.query(
+            models.AnthropicCall.user_id,
+            models.User.email,
+            func.coalesce(func.sum(models.AnthropicCall.cost_usd),     0.0),
+            func.coalesce(func.sum(models.AnthropicCall.total_tokens), 0),
+            func.count(models.AnthropicCall.id),
+        )
+        .outerjoin(models.User, models.User.id == models.AnthropicCall.user_id)
+        .filter(models.AnthropicCall.created_at >= window_start)
+        .group_by(models.AnthropicCall.user_id, models.User.email)
+        .order_by(desc(func.sum(models.AnthropicCall.cost_usd)))
+        .limit(10).all()
+    )
+    a_top_jobs = (
+        db.query(
+            models.AnthropicCall.job_id,
+            func.coalesce(func.sum(models.AnthropicCall.cost_usd),     0.0),
+            func.coalesce(func.sum(models.AnthropicCall.total_tokens), 0),
+            func.count(models.AnthropicCall.id),
+        )
+        .filter(models.AnthropicCall.created_at >= window_start)
+        .filter(models.AnthropicCall.job_id.isnot(None))
+        .group_by(models.AnthropicCall.job_id)
+        .order_by(desc(func.sum(models.AnthropicCall.cost_usd)))
+        .limit(15).all()
+    )
+
+    anthropic = {
+        "by_purpose": _row_to_dict(("purpose","tokens","cost_usd","calls"), [
+            (r[0] or "(unset)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in a_by_purpose
+        ]),
+        "by_model": _row_to_dict(("model","tokens","cost_usd","calls"), [
+            (r[0] or "(unknown)", int(r[1] or 0), round(float(r[2] or 0), 4), int(r[3] or 0))
+            for r in a_by_model
+        ]),
+        "top_users": _row_to_dict(("user_id","email","cost_usd","tokens","calls"), [
+            (int(r[0]) if r[0] else None, r[1] or "(system)",
+             round(float(r[2] or 0), 4), int(r[3] or 0), int(r[4] or 0))
+            for r in a_top_users
+        ]),
+        "top_jobs": _row_to_dict(("job_id","cost_usd","tokens","calls"), [
+            (int(r[0]), round(float(r[1] or 0), 4), int(r[2] or 0), int(r[3] or 0))
+            for r in a_top_jobs
+        ]),
+    }
+
     # ─── YouTube breakdowns ────────────────────────────────────
     y_by_op = (
         db.query(
@@ -1953,6 +2683,28 @@ def usage_dashboard(
             "status":        r.status,
         } for r in rows]
 
+    def _anthropic_recent():
+        rows = (
+            db.query(models.AnthropicCall)
+              .order_by(desc(models.AnthropicCall.created_at))
+              .limit(25).all()
+        )
+        return [{
+            "id":            r.id,
+            "created_at":    r.created_at.isoformat() if r.created_at else None,
+            "user_id":       r.user_id,
+            "job_id":        r.job_id,
+            "clip_id":       r.clip_id,
+            "model":         r.model,
+            "purpose":       r.purpose,
+            "prompt_tokens": int(r.prompt_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
+            "total_tokens":  int(r.total_tokens or 0),
+            "cost_usd":      round(float(r.cost_usd or 0), 5),
+            "latency_ms":    int(r.latency_ms or 0),
+            "status":        r.status,
+        } for r in rows]
+
     def _youtube_recent():
         rows = (
             db.query(models.YouTubeApiCall)
@@ -1986,11 +2738,13 @@ def usage_dashboard(
         "timeseries":   timeseries,
         "gemini":       gemini,
         "openai":       openai,
+        "anthropic":    anthropic,
         "youtube":      youtube,
         "recent_calls": {
-            "gemini":  _gemini_recent(),
-            "openai":  _openai_recent(),
-            "youtube": _youtube_recent(),
+            "gemini":    _gemini_recent(),
+            "openai":    _openai_recent(),
+            "anthropic": _anthropic_recent(),
+            "youtube":   _youtube_recent(),
         },
     }
 

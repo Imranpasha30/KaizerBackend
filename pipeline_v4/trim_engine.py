@@ -36,6 +36,69 @@ if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
 from pipeline_v4 import prompts as v4_prompts
+from pipeline_v4.encoder import video_encoder_args as _enc_args
+from pipeline_v4.encoder import video_decoder_args as _dec_args
+
+# Factory live-belt telemetry — best-effort, never breaks a render. Uses the
+# thread-bound envelope set by the orchestrator (services.stage_events.bind),
+# so we emit station transitions without threading job_id through signatures.
+try:
+    from services import stage_events as _se
+except Exception:  # CLI-only runs without the app loaded
+    _se = None
+
+try:
+    from services import stage_gate as _gate
+except Exception:
+    _gate = None
+
+try:
+    from learning.claude_log import log_anthropic_call as _log_anthropic
+except Exception:
+    _log_anthropic = None
+
+
+from contextlib import contextmanager as _contextmanager
+
+
+class _NoopCall:
+    def record(self, *a, **k): pass
+    def record_tokens(self, *a, **k): pass
+
+
+@_contextmanager
+def _anthropic_log(model: str, purpose: str):
+    """Claude usage-logging context manager (no-op if the logger is
+    unavailable). Yields an object with .record(resp). A failure of the
+    Claude call itself propagates normally — the logger records the error and
+    re-raises; we never swallow the caller's exception."""
+    if _log_anthropic is None:
+        yield _NoopCall()
+        return
+    with _log_anthropic(db=None, model=model, purpose=purpose) as c:
+        yield c
+
+
+def _belt(stage: str, status: str) -> None:
+    if _se is not None:
+        try:
+            _se.emit_here(stage, status)
+        except Exception:
+            pass
+
+
+def _encode_gate():
+    """Cross-process/machine NVENC gate context manager (no-op if disabled)."""
+    if _gate is not None:
+        try:
+            return _gate.gate("encode")
+        except Exception:
+            pass
+    from contextlib import nullcontext
+    return nullcontext()
+
+
+from pipeline_v4.ffmpeg_exec import run_ffmpeg as _run_ffmpeg
 
 
 @dataclass
@@ -59,6 +122,14 @@ class TrimmedStory:
     video_t_start: float    # where in trimmed.mp4 this story begins
     video_t_end: float      # where in trimmed.mp4 this story ends
     source_spans: list[KeptSpan] = field(default_factory=list)
+    # Verbatim spoken text in the story's KEEP spans. Built by
+    # walking the Deepgram word array and joining words that fall
+    # inside the story's source_spans. Carried forward so image
+    # generation prompts can reference the actual incident words
+    # ("today PM Modi launched ... in Hyderabad") instead of just
+    # Claude's headline / summary — much higher chance of getting
+    # an event-specific photo or render.
+    transcript_text: str = ""
 
     @property
     def duration(self) -> float:
@@ -167,6 +238,52 @@ def _strip_code_fences(text: str) -> str:
     return s.strip()
 
 
+def _loads_lenient(raw: str):
+    """Parse model JSON tolerantly: strict → outer ``{ ... }`` → trailing-comma
+    repair. Repairs are CONSERVATIVE (only ever-invalid constructs, so valid
+    content is never corrupted). Raises ``json.JSONDecodeError`` if none parse —
+    genuine syntax errors (e.g. a missing comma) are left for the caller's
+    model-retry, which is the only safe fix for those.
+    """
+    s = _strip_code_fences(raw or "")
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    cand = m.group(0) if m else s
+    try:
+        return json.loads(cand)
+    except json.JSONDecodeError:
+        pass
+    # Trailing commas before } or ] are ALWAYS invalid JSON → safe to strip.
+    repaired = re.sub(r",(\s*[}\]])", r"\1", cand)
+    return json.loads(repaired)   # raises if still malformed
+
+
+def _gemini_repair_json(client, genai_types, model: str, broken: str) -> str:
+    """Ask Gemini to return a strictly-valid version of a JSON blob it produced
+    with a syntax error. Best-effort; the caller still parses the result
+    tolerantly. This rescues the job#500-class failure where the cut-plan JSON
+    had a stray ``Expecting ',' delimiter`` that no regex can safely repair."""
+    fix_prompt = (
+        "The text below was meant to be ONE valid JSON object but has a syntax "
+        "error (often a missing comma). Return ONLY the corrected JSON — the "
+        "SAME data and keys, no commentary, no code fences, strictly parseable:\n\n"
+        + (broken or "")[:120000]
+    )
+    resp = client.models.generate_content(
+        model=model,
+        contents=fix_prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0,
+            max_output_tokens=16384,
+        ),
+    )
+    return (resp.text or "").strip()
+
+
 def _claude_keep_cut_plan(
     *,
     words: list[dict],
@@ -190,26 +307,140 @@ def _claude_keep_cut_plan(
         duration_sec=duration_sec,
     )
 
-    msg = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=8192,
-        system=v4_prompts.KEEP_CUT_SYSTEM,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    _model = "claude-opus-4-7"
+    with _anthropic_log(model=_model, purpose="cut-plan") as _acall:
+        msg = client.messages.create(
+            model=_model,
+            max_tokens=8192,
+            system=v4_prompts.KEEP_CUT_SYSTEM,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        _acall.record(msg)
     raw = msg.content[0].text if msg.content else ""
-    raw = _strip_code_fences(raw)
     try:
-        data = json.loads(raw)
+        data = _loads_lenient(raw)
     except json.JSONDecodeError as exc:
-        # Try to recover: find the outer { ... } block
-        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not m:
-            raise RuntimeError(f"Claude returned non-JSON: {raw[:400]}") from exc
-        data = json.loads(m.group(0))
+        raise RuntimeError(f"Claude returned non-JSON: {raw[:400]}") from exc
 
     stories = data.get("stories") or []
     removed = float(data.get("removed_sec_total") or 0.0)
     return stories, removed
+
+
+def _gemini_keep_cut_plan(
+    *,
+    words: list[dict],
+    language: str,
+    duration_sec: float,
+) -> tuple[list[dict], float]:
+    """Call Gemini 2.5 Flash on Vertex AI with the SAME KEEP/CUT prompt
+    Claude uses, so an A/B comparison is apples-to-apples.
+
+    Why Vertex Gemini for an alternate planner:
+      - The Vertex client is already wired (seo_provider uses it for
+        SEO generation), so no extra auth or new env vars.
+      - gemini-2.5-flash is ~10× cheaper than Claude Opus 4.7 for the
+        same prompt — meaningful at SaaS scale if quality holds.
+      - 1M context window handles every realistic news source (the
+        current 2530-word transcripts land around 30-40K tokens).
+      - response_mime_type=application/json enforces the schema so we
+        don't need a recovery regex like the Claude path does.
+
+    Returns the SAME (stories, removed_sec) tuple shape Claude returns,
+    so downstream code in ``run_step1`` doesn't care which planner ran.
+    """
+    try:
+        from seo.generator import _gemini_client
+        from google.genai import types as genai_types
+    except Exception as exc:
+        raise RuntimeError(
+            f"Vertex Gemini SDK unavailable: {exc}. "
+            f"Switch planner to claude or fix the google-genai install."
+        )
+
+    try:
+        client = _gemini_client()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gemini client init failed: {exc}. "
+            f"Check KAIZER_GCP_PROJECT / KAIZER_VERTEX_CREDENTIALS or "
+            f"switch planner to claude."
+        )
+
+    target_min, target_max = _target_duration_window(duration_sec)
+    user_prompt = v4_prompts.build_keep_cut_user_prompt(
+        words=words,
+        target_min_sec=target_min,
+        target_max_sec=target_max,
+        language=language,
+        duration_sec=duration_sec,
+    )
+
+    model = os.environ.get("KAIZER_V4_TRIM_GEMINI_MODEL", "gemini-2.5-flash")
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=v4_prompts.KEEP_CUT_SYSTEM,
+                response_mime_type="application/json",
+                # Editorial decisions should be reproducible; low temp
+                # mirrors Claude's typical default behaviour.
+                temperature=0.2,
+                # Big enough headroom for 20+ stories × N kept_spans each
+                # without truncation; matches what we saw in real jobs.
+                max_output_tokens=16384,
+            ),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Gemini KEEP/CUT call failed: {exc}")
+
+    raw = ""
+    try:
+        raw = (resp.text or "").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        raise RuntimeError("Gemini KEEP/CUT returned empty body")
+
+    try:
+        data = _loads_lenient(raw)
+    except json.JSONDecodeError as exc:
+        # Malformed JSON (e.g. a missing comma — the job#500 failure). No regex
+        # can safely fix that, so ask Gemini ONCE to repair its own output,
+        # then parse tolerantly again. Loud-fail only if the repair also fails.
+        pos = str(exc)
+        try:
+            fixed = _gemini_repair_json(client, genai_types, model, raw)
+            data = _loads_lenient(fixed)
+            print(f"[v4/step1] gemini cut-plan JSON repaired on retry ({pos})", flush=True)
+        except Exception as exc2:
+            raise RuntimeError(
+                f"Gemini KEEP/CUT JSON unparseable even after repair ({pos}): {raw[:400]}"
+            ) from exc2
+
+    stories = data.get("stories") or []
+    removed = float(data.get("removed_sec_total") or 0.0)
+    return stories, removed
+
+
+def _select_planner() -> tuple[str, callable]:
+    """Resolve which KEEP/CUT planner to use this run.
+
+    Reads ``KAIZER_V4_TRIM_PLANNER`` (set per-job by the runner from
+    the Job.meta.trim_planner choice). Unknown values fall back to
+    ``claude`` so an env typo doesn't crash a paid job.
+
+    Returns ``(planner_label, planner_function)`` so the orchestrator
+    can log which planner ran without re-reading the env var.
+    """
+    choice = (os.environ.get("KAIZER_V4_TRIM_PLANNER") or "claude").strip().lower()
+    if choice == "gemini":
+        return ("gemini", _gemini_keep_cut_plan)
+    if choice != "claude":
+        print(f"[v4/step1] unknown KAIZER_V4_TRIM_PLANNER={choice!r}, "
+              f"falling back to claude", flush=True)
+    return ("claude", _claude_keep_cut_plan)
 
 
 # ─── Step 1.D — atomic ffmpeg trim+concat ───────────────────────────
@@ -260,19 +491,22 @@ def atomic_trim_concat(
 
     cmd = [
         ffmpeg_bin, "-y", "-v", "error",
+        # GPU decode when NVENC is active (input option — must precede -i).
+        *_dec_args(),
         "-i", source_video,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "21",
+        *_enc_args(crf=21, preset_hint="medium"),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
         "-movflags", "+faststart",
         output_path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 30)
-    if proc.returncode != 0:
-        raise RuntimeError(f"atomic trim+concat failed: {proc.stderr[-800:]}")
+    # Centralised runner: one retry, NVENC→libx264 fallback on GPU
+    # session/CUDA failures, stderr-tail logging. Raises RuntimeError
+    # on final failure (same contract as the old inline check).
+    _run_ffmpeg(cmd, timeout=60 * 30, log_label="atomic_trim_concat")
 
 
 # Back-compat alias for any internal call sites that still use the
@@ -302,68 +536,147 @@ def run_step1(
     _extract_audio_mp3(source_video, audio_mp3)
 
     # 2) Deepgram words
+    _belt("transcribe", "entered")
     print(f"[v4/step1] Deepgram nova-3 transcribing ({language}) ...", flush=True)
     words, src_duration = _deepgram_words(audio_mp3, language=language)
+    _belt("transcribe", "exited")
     print(f"[v4/step1]   got {len(words)} words across {src_duration:.1f}s source", flush=True)
     try:
         os.unlink(audio_mp3)
     except OSError:
         pass
 
-    # 3) Claude KEEP/CUT plan
-    print(f"[v4/step1] Claude opus-4-7 planning KEEP/CUT ...", flush=True)
-    claude_stories, removed_sec = _claude_keep_cut_plan(
+    # 3) KEEP/CUT plan — Claude OR Gemini, picked via env var so each
+    #    job records which engine it used (operator A/B comparison).
+    planner_label, planner_fn = _select_planner()
+    pretty_model = (
+        "Claude opus-4-7" if planner_label == "claude"
+        else f"Gemini {os.environ.get('KAIZER_V4_TRIM_GEMINI_MODEL', 'gemini-2.5-flash')}"
+    )
+    _belt("cut_plan", "entered")
+    print(f"[v4/step1] {pretty_model} planning KEEP/CUT "
+          f"(KAIZER_V4_TRIM_PLANNER={planner_label}) ...", flush=True)
+    claude_stories, removed_sec = planner_fn(
         words=words,
         language=language,
         duration_sec=src_duration,
     )
-    print(f"[v4/step1]   {len(claude_stories)} stories, ~{removed_sec:.1f}s removed", flush=True)
+    _belt("cut_plan", "exited")
+    print(f"[v4/step1]   {len(claude_stories)} stories, ~{removed_sec:.1f}s removed "
+          f"(planner={planner_label})", flush=True)
 
-    # Flatten kept_spans into one ordered list (preserving story
-    # grouping for the output timeline).
-    all_spans: list[KeptSpan] = []
-    stories_out: list[TrimmedStory] = []
-    cursor = 0.0          # current position in the OUTPUT timeline
-    for s_idx, s in enumerate(claude_stories):
-        s_start_in_output = cursor
-        story_spans: list[KeptSpan] = []
-        for sp in (s.get("kept_spans") or []):
-            try:
-                ss = float(sp.get("start_sec") or 0.0)
-                ee = float(sp.get("end_sec") or 0.0)
-            except (TypeError, ValueError):
+    # Flatten kept_spans into one ordered list (preserving story grouping for
+    # the output timeline). Wrapped in a helper so we can re-run it verbatim
+    # after a planner retry without duplicating the logic.
+    def _flatten(stories_in):
+        spans: list[KeptSpan] = []
+        out: list[TrimmedStory] = []
+        cur = 0.0          # current position in the OUTPUT timeline
+        for s_idx, s in enumerate(stories_in):
+            s_start_in_output = cur
+            story_spans: list[KeptSpan] = []
+            for sp in (s.get("kept_spans") or []):
+                try:
+                    ss = float(sp.get("start_sec") or 0.0)
+                    ee = float(sp.get("end_sec") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if ee <= ss + 0.05:
+                    continue
+                sp_obj = KeptSpan(start_sec=ss, end_sec=ee, reason=str(sp.get("reason") or "")[:40])
+                story_spans.append(sp_obj)
+                spans.append(sp_obj)
+                cur += sp_obj.duration
+            if not story_spans:
                 continue
-            if ee <= ss + 0.05:
-                continue
-            sp_obj = KeptSpan(start_sec=ss, end_sec=ee, reason=str(sp.get("reason") or "")[:40])
-            story_spans.append(sp_obj)
-            all_spans.append(sp_obj)
-            cursor += sp_obj.duration
-        if not story_spans:
-            continue
-        stories_out.append(TrimmedStory(
-            story_index=s_idx,
-            title_native=str(s.get("title_native") or "")[:200],
-            title_english=str(s.get("title_english") or "")[:200],
-            summary=str(s.get("summary") or "")[:500],
-            video_t_start=s_start_in_output,
-            video_t_end=cursor,
-            source_spans=story_spans,
-        ))
+            # Collect the spoken transcript for this story by walking the
+            # Deepgram word array and joining every word that falls inside
+            # any of its KEEP spans. This is the actual speech content the
+            # anchor delivered, NOT Claude's headline / summary — the
+            # extra grounding lets image generation match the specific
+            # incident (place names, people, dates).
+            story_words: list[str] = []
+            for sp_obj in story_spans:
+                for w in words:
+                    ws = float(w.get("s") or w.get("start") or 0.0)
+                    we = float(w.get("e") or w.get("end") or 0.0)
+                    if we < sp_obj.start_sec or ws > sp_obj.end_sec:
+                        continue
+                    tok = (w.get("w") or w.get("word") or "").strip()
+                    if tok:
+                        story_words.append(tok)
+            # Trim to a reasonable size — image prompts don't need 30s of
+            # filler. 1200 chars ≈ 200 words ≈ the most salient sentences.
+            transcript_text = " ".join(story_words)[:1200]
+            out.append(TrimmedStory(
+                story_index=s_idx,
+                title_native=str(s.get("title_native") or "")[:200],
+                title_english=str(s.get("title_english") or "")[:200],
+                summary=str(s.get("summary") or "")[:500],
+                video_t_start=s_start_in_output,
+                video_t_end=cur,
+                source_spans=story_spans,
+                transcript_text=transcript_text,
+            ))
+        return spans, out, cur
+
+    all_spans, stories_out, cursor = _flatten(claude_stories)
+
+    # The planner occasionally returns ZERO usable spans (a transient model
+    # blip, or a source with little clean speech). Don't hard-fail the whole
+    # job: retry the planner once, then fall back to keeping the FULL source
+    # so SOMETHING renders and the operator can refine the cut in the canvas.
+    if not all_spans:
+        print(f"[v4/step1] planner={planner_label} returned no kept spans — retrying once", flush=True)
+        try:
+            claude_stories, removed_sec = planner_fn(
+                words=words, language=language, duration_sec=src_duration,
+            )
+            all_spans, stories_out, cursor = _flatten(claude_stories)
+        except Exception as _retry_exc:
+            print(f"[v4/step1] planner retry failed: {_retry_exc}", flush=True)
 
     if not all_spans:
-        raise RuntimeError("Claude returned no kept spans -- nothing to render")
+        if (src_duration or 0.0) <= 0.1:
+            raise RuntimeError(
+                "trim planner kept nothing and the source has no usable "
+                "audio/duration — cannot render"
+            )
+        print("[v4/step1] still no kept spans — keeping FULL source as fallback "
+              "(refine the cut in the canvas editor)", flush=True)
+        _full = KeptSpan(start_sec=0.0, end_sec=float(src_duration), reason="full-source fallback")
+        _full_words = " ".join(
+            (w.get("w") or w.get("word") or "").strip() for w in words
+        ).strip()[:1200]
+        all_spans = [_full]
+        cursor = float(src_duration)
+        stories_out = [TrimmedStory(
+            story_index=0,
+            title_native="",
+            title_english="",
+            summary="",
+            video_t_start=0.0,
+            video_t_end=cursor,
+            source_spans=[_full],
+            transcript_text=_full_words,
+        )]
+        removed_sec = 0.0
 
-    # 4) Atomic ffmpeg pass
+    # 4) Atomic ffmpeg pass — gated: bounds simultaneous NVENC encodes across
+    #    ALL render jobs (this box + any other) so admission can be raised
+    #    without thrashing the single encoder.
+    _belt("trim", "entered")
     output_path = str(output_dir_p / output_filename)
     print(f"[v4/step1] atomic ffmpeg trim+concat ({len(all_spans)} spans) -> {output_filename}", flush=True)
-    _atomic_trim_concat(
-        source_video=source_video,
-        spans=all_spans,
-        output_path=output_path,
-    )
+    with _encode_gate():
+        _atomic_trim_concat(
+            source_video=source_video,
+            spans=all_spans,
+            output_path=output_path,
+        )
 
     trimmed_dur = cursor
+    _belt("trim", "exited")
     print(f"[v4/step1]   done -- {trimmed_dur:.1f}s trimmed output", flush=True)
 
     return TrimResult(

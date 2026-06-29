@@ -157,11 +157,18 @@ def attach_to_job(
     payload: AttachRequest,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
 ):
-    c = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+    c = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        models.Campaign.user_id == user.id,
+    ).first()
     if not c:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    j = db.query(models.Job).filter(models.Job.id == payload.job_id).first()
+    j = db.query(models.Job).filter(
+        models.Job.id == payload.job_id,
+        models.Job.user_id == user.id,
+    ).first()
     if not j:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -181,12 +188,24 @@ def attach_to_job(
 
 
 @router.post("/{campaign_id}/run/{job_id}")
-def manual_run(campaign_id: int, job_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
+def manual_run(
+    campaign_id: int,
+    job_id: int,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
     """Force a one-shot fan-out even if the campaign wasn't pre-attached."""
-    c = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+    c = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        models.Campaign.user_id == user.id,
+    ).first()
     if not c:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    j = db.query(models.Job).filter(models.Job.id == job_id).first()
+    j = db.query(models.Job).filter(
+        models.Job.id == job_id,
+        models.Job.user_id == user.id,
+    ).first()
     if not j:
         raise HTTPException(status_code=404, detail="Job not found")
     if j.status != "done":
@@ -210,7 +229,17 @@ def manual_run(campaign_id: int, job_id: int, background: BackgroundTasks, db: S
 
 
 @router.get("/job/{job_id}")
-def list_job_campaigns(job_id: int, db: Session = Depends(get_db)):
+def list_job_campaigns(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    # Only expose links for a job the caller owns.
+    j = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
     rows = (
         db.query(models.JobCampaign)
           .filter(models.JobCampaign.job_id == job_id)

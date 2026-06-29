@@ -1,7 +1,7 @@
 """
 kaizer.pipeline.qa
 ==================
-FFprobe + FFmpeg-based OUTPUT gate for the Kaizer News video pipeline.
+FFprobe + FFmpeg-based OUTPUT gate for the Kaizer X video pipeline.
 
 Run AFTER each compose_* function writes its output file to verify the
 rendered clip meets platform specifications before it is imported into the DB

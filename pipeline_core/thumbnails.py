@@ -1,7 +1,7 @@
 """
 kaizer.pipeline.thumbnails
 ===========================
-Smart thumbnail candidate generator for the Kaizer News video pipeline.
+Smart thumbnail candidate generator for the Kaizer X video pipeline.
 
 Generates up to 3 candidate thumbnails per video clip, each representing a
 different visual strategy, so the user (or a downstream ranker) can pick the
@@ -176,6 +176,8 @@ def _extract_frames(video_path: str, out_dir: str) -> list[tuple[float, str]]:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",      # ffmpeg output can carry non-ASCII (Telugu)
+            errors="replace",      # — Windows' default cp1252 decode crashes on it
             timeout=300,
         )
     except subprocess.TimeoutExpired as exc:

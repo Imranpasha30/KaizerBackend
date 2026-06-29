@@ -1,0 +1,44 @@
+# Keep secrets, renders, and dev junk out of the build context.
+
+# Secrets — NEVER bake credentials into a layer.
+.env
+.env.*
+!.env.example
+
+# VCS / editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Python build artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Render output + logs (mounted as volumes at runtime instead)
+output/
+logs/
+media/
+
+# Video artifacts anywhere in the tree
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# Local databases / backups — prod uses Postgres via DATABASE_URL
+*.db
+*.db.bak*
+*.sqlite3
+
+# Repro bundles, archives, one-off debug scratch
+*.zip
+job53_repro/
+job53_repro_source/
+node_modules/

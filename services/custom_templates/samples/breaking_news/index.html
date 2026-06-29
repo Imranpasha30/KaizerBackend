@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="kaizer:canvas" content="1080x1920">
+<style>
+  :root{
+    --kaizer-brand:#e11d2a; --kaizer-accent:#ffd23f;
+    --kaizer-text:#ffffff; --kaizer-bg:#0b0f1a;
+    --kaizer-font:'Segoe UI',system-ui,sans-serif;
+  }
+  *{margin:0;box-sizing:border-box}
+  html,body{width:1080px;height:1920px;overflow:hidden;background:var(--kaizer-bg);
+    font-family:var(--kaizer-font);color:var(--kaizer-text)}
+  .frame{position:absolute;inset:0;display:flex;flex-direction:column}
+  /* top kicker bar */
+  .kicker{margin:54px 54px 0;display:flex;align-items:center;gap:18px}
+  .kicker .live{background:var(--kaizer-brand);color:#fff;font-weight:800;
+    padding:12px 22px;border-radius:10px;font-size:34px;letter-spacing:.04em}
+  .kicker .hook{font-size:34px;font-weight:600;opacity:.92}
+  /* video stage */
+  .stage{position:relative;margin:40px 54px 0;flex:1;border-radius:34px;overflow:hidden;
+    box-shadow:0 30px 80px rgba(0,0,0,.55);border:3px solid rgba(255,255,255,.08)}
+  .clip{position:absolute;inset:0;width:100%;height:100%}
+  .vignette{position:absolute;inset:0;background:
+    radial-gradient(120% 80% at 50% 0%,transparent 55%,rgba(0,0,0,.45) 100%)}
+  /* headline band */
+  .band{margin:0 54px 70px;padding:40px 44px;border-radius:28px;
+    background:linear-gradient(135deg,var(--kaizer-brand),#7a0d14)}
+  .headline{font-size:74px;line-height:1.08;font-weight:800;text-shadow:0 4px 18px rgba(0,0,0,.4)}
+  .badge{position:absolute;right:78px;top:560px;width:150px;height:150px;filter:drop-shadow(0 8px 20px rgba(0,0,0,.5))}
+  .accent{height:10px;background:var(--kaizer-accent);margin:18px 54px 0;border-radius:6px}
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="kicker">
+      <span class="live">● LIVE</span>
+      <span class="hook" data-kaizer="hook">Top story today</span>
+    </div>
+    <div class="accent"></div>
+    <div class="stage">
+      <video class="clip" data-kaizer="video"></video>
+      <div class="vignette"></div>
+    </div>
+    <img class="badge" src="assets/badge.svg" alt="">
+    <div class="band">
+      <div class="headline" data-kaizer="headline">Your headline goes here</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -9,8 +9,41 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./kaizer.db")
 # Railway uses postgres:// but SQLAlchemy needs postgresql://
 DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL, connect_args={"check_same_thread": False}
+    )
+else:
+    # Wave 1.7 of the enterprise push — the default pool (5 + 10
+    # overflow) starved under load: dispatch holds a session for the
+    # full branding+upload duration, so N workers × concurrency must
+    # fit in the pool. Sizing rule per process:
+    #   pool_size ≥ KAIZER_WORKER_CONCURRENCY + web traffic + crons.
+    # pool_pre_ping heals dropped connections (Railway/Cloud LBs kill
+    # idle TCP); pool_recycle stays under common 30-min idle reapers;
+    # statement_timeout stops one runaway query from wedging the app.
+    _connect_args: dict = {}
+    _stmt_ms = _int_env("KAIZER_DB_STATEMENT_TIMEOUT_MS", 60_000)
+    if DATABASE_URL.startswith("postgresql") and _stmt_ms > 0:
+        _connect_args["options"] = f"-c statement_timeout={_stmt_ms}"
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=_int_env("KAIZER_DB_POOL_SIZE", 10),
+        max_overflow=_int_env("KAIZER_DB_MAX_OVERFLOW", 10),
+        pool_pre_ping=True,
+        pool_recycle=_int_env("KAIZER_DB_POOL_RECYCLE_SECONDS", 1800),
+        pool_timeout=_int_env("KAIZER_DB_POOL_TIMEOUT_SECONDS", 30),
+        connect_args=_connect_args,
+    )
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

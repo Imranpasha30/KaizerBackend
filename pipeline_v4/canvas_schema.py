@@ -71,6 +71,11 @@ class CanvasTextBlock(BaseModel):
     font_size_pct: Optional[float] = Field(None, gt=0.0, description="Font size as % of canvas height.")
     fg_color: Optional[str] = Field(None, description="Hex e.g. '#FFFFFF'")
     bg_color: Optional[str] = Field(None, description="Hex e.g. '#C10000' — None means transparent.")
+    # Ticker-only knobs (kind == "ticker"). None → renderer defaults
+    # (gold-bordered navy strip scrolling at ~200 px/s). The editor's live
+    # ticker controls write these so the rendered MP4 matches the preview.
+    ticker_speed: Optional[float] = Field(None, gt=0.0, le=120.0, description="Ticker only: seconds for one full scroll loop (lower = faster).")
+    ticker_color: Optional[str] = Field(None, description="Ticker only: hex background color e.g. '#FFD400'. None = default navy/gold.")
 
 
 # ─── Per-story clip on the timeline ─────────────────────────────────
@@ -159,7 +164,7 @@ class ShortCardStyle(BaseModel):
 
 class ShortFollowParams(BaseModel):
     """Follow-bar layout text + colours (V1 parity)."""
-    follow_text: str = "FOLLOW KAIZER NEWS TELUGU"
+    follow_text: str = "FOLLOW KAIZER X TELUGU"
     follow_text_color: str = "#FFFFFF"
     bg_color: str = "#1A0A2E"
     text_color: str = "#FFFF00"
@@ -174,7 +179,9 @@ class ShortSectionPct(BaseModel):
 
 class ShortConfig(BaseModel):
     """Per-short editor settings. Drives :func:`v1_bridge.render_short`."""
-    layout: Literal["torn_card", "clean_card", "split_frame", "follow_bar"] = "torn_card"
+    # Built-in: torn_card | clean_card | split_frame | follow_bar. Also accepts a
+    # developer-uploaded template as the string "custom:<id>" (services/custom_templates).
+    layout: str = "torn_card"
     # Headline text. None = use the parent story's title_native.
     text: Optional[str] = None
     # Font / colour / size (V1 controls).
@@ -188,6 +195,12 @@ class ShortConfig(BaseModel):
     section_pct: ShortSectionPct = Field(default_factory=ShortSectionPct)
     card_style:  ShortCardStyle  = Field(default_factory=ShortCardStyle)
     follow_params: ShortFollowParams = Field(default_factory=ShortFollowParams)
+    # Display-only selection label: why this segment was auto-picked as a
+    # short + its priority rank (1 = highest; candidates are kept lead-first).
+    # Surfaced in JobDetail so the operator understands the shorts plan.
+    # Persisted in canvas.json so it survives re-renders.
+    priority: Optional[int] = None
+    why_selected: Optional[str] = None
 
 
 class CanvasSEO(BaseModel):
@@ -204,6 +217,10 @@ class CanvasSEO(BaseModel):
     language: str = ""
     model: str = ""
     edited_by_user: bool = False
+    # Competitor style reference (a kind:styles Channel) this copy was
+    # written in the voice of, or None for the default voice. Lets the
+    # editor show "in X's style" and re-pick it on the next regenerate.
+    style_source_id: Optional[int] = None
 
 
 class Canvas(BaseModel):
@@ -226,6 +243,11 @@ class V4JobCanvas(BaseModel):
     language: str = "te"
     bulletin: Canvas
     shorts: list[Canvas] = Field(default_factory=list)
+    # Operator's render-output choice at job time:
+    #   "both" (full video + shorts), "full-only" (bulletin, no shorts),
+    #   "shorts-only" (shorts/reels, no bulletin). Carried here for
+    #   display + audit; the actual gating happens in the orchestrator.
+    output_format: str = "both"
     # Bookkeeping
     schema_version: int = 1
     # Step 1 output paths (kept for editor's "rebuild bulletin only"

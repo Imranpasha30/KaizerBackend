@@ -34,10 +34,10 @@ class YoutubeDirectPublisher(Publisher):
     provider_key = "kaizer"   # legacy name in the existing routing knob
     display_name = "YouTube (direct upload)"
 
-    # YouTube quota: videos.insert = 1600 units, default project cap
-    # 10,000/day. Keep a soft cap so we don't surprise the operator
-    # with a "you're out" right before a scheduled bulletin.
-    QUOTA_COST_INSERT = 1600
+    # YouTube quota: videos.insert = 100 units in its OWN 100/day bucket
+    # (repriced 1,600 → 100 on 2025-12-04; granular bucket since
+    # 2026-06-01) — separate from the 10,000-unit Queries pool.
+    QUOTA_COST_INSERT = 100
 
     def prepare(self, *, job, clip, source_video_path: str) -> PrepareResult:
         from youtube.uploader import sanitize_tags  # late import — heavy SDK

@@ -408,6 +408,20 @@ def preview_composed_seo(
     except (ValueError, TypeError):
         raise HTTPException(status_code=500, detail="Existing SEO is corrupt — regenerate")
 
+    # PER-CHANNEL SEO: if a distinct variant was saved for THIS channel, preview
+    # THAT (not the shared base) — identical rule to the publish path
+    # (upload_dispatch._compose_metadata), so the preview matches what actually
+    # uploads. Without this the modal showed the base title for every channel
+    # even after the operator saved per-channel SEO ("not applying").
+    try:
+        _variants = json.loads(clip.seo_variants) if clip.seo_variants else {}
+        if isinstance(_variants, dict):
+            _v = _variants.get(str(channel_id)) or _variants.get(channel_id)
+            if isinstance(_v, dict) and _v.get("_per_channel") and _v.get("title"):
+                generic = {k: val for k, val in _v.items() if k != "_per_channel"}
+    except (ValueError, TypeError):
+        pass
+
     from seo.composer import compose, assert_no_foreign_brand
     composed = compose(generic, dest, publish_kind=publish_kind)
 

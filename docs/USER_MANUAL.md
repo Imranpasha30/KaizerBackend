@@ -1,6 +1,6 @@
-# Kaizer News — User Manual
+# Kaizer X — User Manual
 
-A complete guide for operating, running, and extending the Kaizer News
+A complete guide for operating, running, and extending the Kaizer X
 video pipeline. Written for a new team member who has never touched the
 codebase before.
 
@@ -12,7 +12,7 @@ codebase before.
 
 ## Table of Contents
 
-1. [What Kaizer News Is](#1-what-kaizer-news-is)
+1. [What Kaizer X Is](#1-what-kaizer-news-is)
 2. [Quick Start (run it locally in 5 minutes)](#2-quick-start)
 3. [Core Concepts](#3-core-concepts)
 4. [Step-by-Step Usage](#4-step-by-step-usage)
@@ -27,7 +27,7 @@ codebase before.
 
 ---
 
-## 1. What Kaizer News Is
+## 1. What Kaizer X Is
 
 A professional video-pipeline SaaS that turns long-form Telugu / Hindi /
 Tamil news broadcasts (or any long-form content) into publishable YouTube

@@ -21,9 +21,11 @@ Why this module instead of always falling back to web search:
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 DEFAULT_IMAGE_MODEL  = os.environ.get("KAIZER_NANO_BANANA_MODEL",       "gemini-2.5-flash-image")
@@ -77,6 +79,39 @@ Rules:
 5. No watermarks, no channel branding.
 
 Output: ONE prompt string under 300 words.
+"""
+
+
+# Multi-image planner: break ONE story into several DISTINCT visual beats, one
+# image per beat — for a carousel/slideshow whose length is driven by the story,
+# not a fixed template count. Each beat is a different moment/angle so the
+# slideshow tells the story instead of showing the same picture N times.
+_MULTI_PROMPT_WRITER_SYSTEM = """\
+You are a news-broadcast art director planning a SEQUENCE of B-roll / sidebar
+images for ONE news story. The images play one after another (a slideshow)
+beside the anchor while the story is read, so each image must show a DIFFERENT
+beat of the story — establishing scene, the key subject/symbol, the
+consequence/aftermath, the reaction, the wider context — never the same shot
+twice.
+
+Decide how many images the story naturally needs (more beats = more images),
+between {min_n} and {max_n}. If the user gives an explicit count, output EXACTLY
+that many.
+
+Each prompt follows these rules:
+1. 16:9 cinematic news B-roll aesthetic, documentary photography vibe.
+2. NO large overlay text, NO shout headlines, NO watermarks, NO channel logos.
+3. Replace real public figures with generic silhouettes / back-of-head /
+   environmental scene-setters. Never name a real person.
+4. Crime/scam: evocative symbols (handcuffs, evidence, courthouse, vault).
+   Politics: parliament, podium silhouettes, signed papers. Economy: charts,
+   currency, factory floors, ports. Disaster/weather: flooded streets, rescue
+   crews, storm skies — match the actual story.
+5. Sharp focus, natural lighting, slightly desaturated like a real news photo.
+
+Output ONLY a JSON array of prompt strings, e.g.
+["prompt for beat 1", "prompt for beat 2", ...]
+No preamble, no markdown fences, nothing but the JSON array.
 """
 
 
@@ -161,6 +196,94 @@ def tweak_image_prompt(*, previous_prompt: str, tweak: str) -> str:
     except Exception as exc:
         print(f"[v4/image-ai] tweak failed: {exc}", flush=True)
     return f"{previous_prompt}\n\nAdditional direction: {tweak}"
+
+
+def _parse_prompt_list(text: str) -> List[str]:
+    """Pull a JSON array of prompt strings out of a model response, tolerating
+    code fences / stray prose / a `[{"prompt": …}]` shape. [] when nothing usable."""
+    if not text:
+        return []
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t).strip()
+    m = re.search(r"\[.*\]", t, re.DOTALL)
+    blob = m.group(0) if m else t
+    try:
+        data = json.loads(blob)
+    except Exception:
+        return []
+    out: List[str] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif isinstance(item, dict):
+                v = item.get("prompt") or item.get("text") or ""
+                if isinstance(v, str) and v.strip():
+                    out.append(v.strip())
+    return out
+
+
+def plan_story_images(
+    *,
+    title_native: str = "",
+    title_english: str = "",
+    summary: str = "",
+    language: str = "te",
+    count: Optional[int] = None,
+    max_images: int = 8,
+) -> List[str]:
+    """Break ONE story into a SEQUENCE of distinct B-roll image prompts (one per
+    visual beat), so a carousel's length is driven by the story — not a fixed
+    template count. ``count=None`` → the model decides how many beats the story
+    needs (clamped 1..max_images); an explicit ``count`` → exactly that many.
+    Always returns ≥1 prompt (falls back to a single prompt + angle variations)."""
+    max_images = max(1, min(int(max_images or 8), 12))
+    want = max(1, min(int(count), max_images)) if count is not None else None
+    min_n = want or 2
+    max_n = want or max_images
+
+    facts = []
+    if title_native:  facts.append(f"native-script headline: {title_native}")
+    if title_english: facts.append(f"English headline: {title_english}")
+    if summary:       facts.append(f"summary: {summary[:800]}")
+    facts.append(f"language: {language}")
+    if want:
+        facts.append(f"REQUIRED image count: exactly {want}")
+    user_msg = "Plan the sidebar-image sequence for this news story.\n\n" + "\n".join(facts)
+    system = _MULTI_PROMPT_WRITER_SYSTEM.format(min_n=min_n, max_n=max_n)
+    try:
+        from google.genai import types as genai_types
+        client = _gemini_client()
+        resp = client.models.generate_content(
+            model=DEFAULT_PROMPT_MODEL,
+            contents=user_msg,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.85,
+                max_output_tokens=4096,   # flash spends thinking tokens — keep headroom for the JSON
+            ),
+        )
+        prompts = _parse_prompt_list(resp.text or "")
+        if prompts:
+            return prompts[:(want or max_images)]
+    except Exception as exc:
+        print(f"[v4/image-ai] multi-prompt planner failed: {exc}", flush=True)
+
+    # Fallback: one solid prompt, padded with distinct angles to the wanted count.
+    base = write_image_prompt(title_native=title_native, title_english=title_english,
+                              summary=summary, language=language)
+    n = want or 1
+    if n <= 1:
+        return [base]
+    angles = ["establishing wide shot", "close detail of the key subject",
+              "the aftermath / consequence", "the wider location / context",
+              "a symbolic object from the story", "reaction of bystanders",
+              "an overhead / aerial perspective", "a quiet human moment"]
+    out = [base]
+    for i in range(1, n):
+        out.append(f"{base} Variation: {angles[(i - 1) % len(angles)]}.")
+    return out
 
 
 def generate_image(
@@ -282,3 +405,36 @@ def make_image_for_story(
     print(f"[v4/image-ai] prompt: {prompt[:160]}…", flush=True)
     saved = generate_image(prompt=prompt, out_path=out_path, width=width, height=height)
     return saved, prompt
+
+
+def make_images_for_story(
+    *,
+    title_native: str = "",
+    title_english: str = "",
+    summary: str = "",
+    language: str = "te",
+    count: Optional[int] = None,
+    out_dir: str,
+    base: str = "ai",
+    width: int = 1280,
+    height: int = 720,
+    max_images: int = 8,
+) -> List[Tuple[str, str]]:
+    """Plan a story-driven image SEQUENCE and render each beat to
+    ``out_dir/<base>_<i>.jpg``. Returns ``[(saved_path, prompt), …]`` for every
+    image that rendered (failed beats are skipped so the caller still gets the
+    successes). ``count`` forces an exact number; else the planner picks
+    1..max_images from the story. Use this for carousels / multi-image slots; for
+    a single sidebar image use ``make_image_for_story``."""
+    prompts = plan_story_images(
+        title_native=title_native, title_english=title_english,
+        summary=summary, language=language, count=count, max_images=max_images,
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    out: List[Tuple[str, str]] = []
+    for i, prompt in enumerate(prompts):
+        path = os.path.join(out_dir, f"{base}_{i + 1}.jpg")
+        saved = generate_image(prompt=prompt, out_path=path, width=width, height=height)
+        if saved and os.path.isfile(path):
+            out.append((path, prompt))
+    return out

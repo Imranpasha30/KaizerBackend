@@ -74,8 +74,25 @@ def _maybe_log_yt(**kwargs):
 # ─── YouTube client builder ──────────────────────────────────────────
 
 def _yt(creds: Credentials):
-    """Return a YouTube Data API v3 client bound to ``creds``."""
-    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+    """Return a YouTube Data API v3 client bound to ``creds``.
+
+    Wave 1.6: explicit socket timeout on the httplib2 transport — the
+    library default has NONE, so a single hung liveBroadcasts call used
+    to block its dispatch thread (and scheduler slot) forever.
+    """
+    try:
+        import os as _os
+
+        import google_auth_httplib2
+        import httplib2
+        _timeout = max(10, int(_os.environ.get(
+            "KAIZER_YT_HTTP_TIMEOUT_SECONDS", "120")))
+        authed = google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(timeout=_timeout),
+        )
+        return build("youtube", "v3", http=authed, cache_discovery=False)
+    except Exception:
+        return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
 def _gcid_from_channel(channel: Optional["models.Channel"]) -> str:

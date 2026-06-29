@@ -6,9 +6,10 @@ mandatory hashtags) and upload targeting (linked OAuth token).
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from database import SessionLocal, get_db
 import models
@@ -85,8 +86,22 @@ class ChannelPatch(BaseModel):
     # Pass `null` explicitly to clear the logo.  Pass an int to set it to a
     # UserAsset (ownership validated server-side).
     logo_asset_id: Optional[int] = None
+    # Per-channel INTRO video (UserAsset id) — prepended to the branded clip
+    # at publish (anti-duplicate). Same semantics as logo: null clears, int
+    # sets (ownership validated), mirrored to sibling account profiles.
+    intro_asset_id: Optional[int] = None
+    # Per-channel YouTube publish defaults (applied to every upload to this
+    # channel so the operator needn't open YouTube Studio).
+    yt_category_id: Optional[str] = None
+    yt_playlist_id: Optional[str] = None
+    yt_default_language: Optional[str] = None
+    yt_made_for_kids: Optional[bool] = None
+    yt_license: Optional[str] = None
     # "postiz" | "kaizer" | "" (= clear → fall back to system default)
     upload_provider: Optional[str] = None
+    # Postiz integration id this channel delivers to (when
+    # upload_provider='postiz'). Bind it from the Postiz integrations list.
+    postiz_integration_id: Optional[str] = None
     # Per-channel watermark + socials. None = leave existing values.
     watermark_text: Optional[str] = None
     watermark_opacity: Optional[float] = None
@@ -175,6 +190,15 @@ def _to_dict(c: models.Channel) -> dict:
         "mandatory_hashtags": c.mandatory_hashtags or [],
         "is_priority": bool(c.is_priority),
         "logo_asset_id": c.logo_asset_id,
+        # Per-channel intro video (UserAsset id), or null. Prepended to the
+        # branded clip at publish; registered in the same brand modal as logo.
+        "intro_asset_id": getattr(c, "intro_asset_id", None),
+        # Per-channel YouTube publish defaults.
+        "yt_category_id": getattr(c, "yt_category_id", None),
+        "yt_playlist_id": getattr(c, "yt_playlist_id", None),
+        "yt_default_language": getattr(c, "yt_default_language", None),
+        "yt_made_for_kids": getattr(c, "yt_made_for_kids", None),
+        "yt_license": getattr(c, "yt_license", None),
         # `effective_logo_asset_id` reflects whatever logo the upload
         # worker would actually apply — OAuthToken first, Channel
         # second — so UIs can label "logo configured" correctly. Stays
@@ -184,6 +208,7 @@ def _to_dict(c: models.Channel) -> dict:
         # null = "use system default" — the UI shows the resolved
         # value via the system-settings endpoint when null.
         "upload_provider": c.upload_provider,
+        "postiz_integration_id": getattr(c, "postiz_integration_id", None),
         "watermark_text":     getattr(c, "watermark_text", "") or "",
         "watermark_opacity":  float(getattr(c, "watermark_opacity", 0.35) or 0.35),
         "watermark_position": getattr(c, "watermark_position", "top-right") or "top-right",
@@ -191,8 +216,18 @@ def _to_dict(c: models.Channel) -> dict:
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         "connected": tok is not None and bool(tok.refresh_token_enc),
+        # 'account' = a connected YouTube channel you PUBLISH to (owns
+        # branding). 'style' = a competitor/style reference used only to
+        # generate SEO. Lets the UI cleanly split into two tabs.
+        "kind": (getattr(c, "kind", None)
+                 or ("account" if (tok is not None and bool(tok.refresh_token_enc)) else "style")),
         "youtube_channel_id": tok.google_channel_id if tok else "",
         "youtube_channel_title": tok.google_channel_title if tok else "",
+        # Cached at OAuth time; lets the publish UI show the real YT
+        # avatar + handle next to the style-profile name instead of
+        # just "Personal 3".
+        "youtube_channel_thumbnail_url": (tok.channel_thumbnail_url if tok else "") or "",
+        "youtube_channel_custom_url":    (tok.channel_custom_url if tok else "") or "",
         "connected_at": tok.connected_at.isoformat() if tok and tok.connected_at else None,
         # Many-to-many: all destinations this profile is permitted to publish to.
         # Auto-includes the profile's own oauth-token destination.
@@ -244,13 +279,34 @@ def _load_allowed_destinations(db, profiles: list) -> None:
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/")
-def list_channels(db: Session = Depends(get_db), user: models.User = Depends(auth.current_user)):
+def list_channels(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+    kind: Optional[str] = Query(None, pattern="^(accounts|styles)$"),
+):
+    """List the user's channels.
+
+    ``kind=accounts`` → only CONNECTED YouTube accounts (publish targets
+    that own branding). ``kind=styles`` → only style references
+    (competitor channels used to generate SEO). No ``kind`` → the full
+    list (back-compat). The two tabs in the UI call this with each kind
+    so connected accounts no longer leak into the style list.
+    """
     rows = (
         db.query(models.Channel)
           .filter(models.Channel.user_id == user.id)
           .order_by(models.Channel.is_priority.desc(), models.Channel.name)
           .all()
     )
+    if kind == "accounts":
+        # Connected YouTube accounts you publish to — a live token is required.
+        rows = [c for c in rows
+                if c.oauth_token is not None and bool(c.oauth_token.refresh_token_enc)]
+    elif kind == "styles":
+        # Style references only — driven by the persistent `kind` column, NOT
+        # by token presence. A disconnected account is kind='account', so it
+        # never shows here even though its token is gone.
+        rows = [c for c in rows if (getattr(c, "kind", None) or "account") == "style"]
     _load_allowed_destinations(db, rows)
     return [_to_dict(c) for c in rows]
 
@@ -448,11 +504,85 @@ def create_channel(payload: ChannelIn, db: Session = Depends(get_db), user: mode
                 data["socials"] = user_socials
         except Exception:
             pass
-    ch = models.Channel(user_id=user.id, **data)
+    # This endpoint creates STYLE references (competitor channels added on the
+    # SEO Settings tab). Owned YouTube accounts are created by the OAuth connect
+    # flow, not here. Mark it so it never gets confused with an account.
+    data.pop("kind", None)
+    ch = models.Channel(user_id=user.id, kind="style", **data)
     db.add(ch)
     db.commit()
     db.refresh(ch)
     return _to_dict(ch)
+
+
+class BulkBrandIn(BaseModel):
+    """Copy branding from ONE configured channel onto many others at once.
+    Each toggled field is read from the source channel and written to every
+    target. Lets the operator set a logo / watermark / socials on one channel
+    then apply it to 30 others in a click instead of editing each by hand."""
+    source_channel_id: int
+    target_channel_ids: list[int] = Field(default_factory=list)
+    copy_logo: bool = False
+    copy_watermark: bool = False
+    copy_socials: bool = False
+
+
+@router.post("/bulk-brand")
+def bulk_apply_branding(
+    payload: BulkBrandIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    if not (payload.copy_logo or payload.copy_watermark or payload.copy_socials):
+        raise HTTPException(400, "Select at least one of logo / watermark / socials to copy")
+    if not payload.target_channel_ids:
+        raise HTTPException(400, "Select at least one target channel")
+
+    src = db.query(models.Channel).filter(
+        models.Channel.id == payload.source_channel_id,
+        models.Channel.user_id == user.id,
+    ).first()
+    if not src:
+        raise HTTPException(404, "Source channel not found")
+
+    # Resolve the source logo: the overlay logo lives on the OAuthToken (set
+    # via the account-logo endpoint); fall back to the channel's own field.
+    src_logo = None
+    if payload.copy_logo:
+        if src.oauth_token is not None:
+            src_logo = getattr(src.oauth_token, "logo_asset_id", None)
+        if src_logo is None:
+            src_logo = getattr(src, "logo_asset_id", None)
+
+    targets = db.query(models.Channel).filter(
+        models.Channel.id.in_(payload.target_channel_ids),
+        models.Channel.user_id == user.id,
+    ).all()
+
+    applied = 0
+    for ch in targets:
+        if ch.id == src.id:
+            continue
+        if payload.copy_logo:
+            ch.logo_asset_id = src_logo
+            # Mirror onto the linked YouTube account token (where the overlay
+            # logo is actually read from at publish time), like set_account_logo.
+            if ch.oauth_token is not None:
+                ch.oauth_token.logo_asset_id = src_logo
+        if payload.copy_watermark:
+            ch.watermark_text     = src.watermark_text
+            ch.watermark_opacity  = src.watermark_opacity
+            ch.watermark_position = src.watermark_position
+        if payload.copy_socials:
+            ch.socials = dict(src.socials or {})
+        applied += 1
+
+    db.commit()
+    fields = [f for f, on in (("logo", payload.copy_logo),
+                              ("watermark", payload.copy_watermark),
+                              ("socials", payload.copy_socials)) if on]
+    return {"ok": True, "applied": applied, "fields": fields,
+            "source_channel_id": src.id}
 
 
 @router.get("/{channel_id}/")
@@ -486,9 +616,65 @@ def update_channel(channel_id: int, payload: ChannelPatch, db: Session = Depends
 
     if "logo_asset_id" in updates:
         _validate_logo_ownership(db, user.id, updates["logo_asset_id"])
+    if "intro_asset_id" in updates:
+        _validate_logo_ownership(db, user.id, updates["intro_asset_id"])
+
+    # Postiz binding must reference an integration THIS user connected
+    # (per-user isolation in the shared Postiz org). Empty / None = unbind,
+    # always allowed.
+    if updates.get("postiz_integration_id"):
+        from services.postiz_scope import team_user_ids as _pz_team
+        _iid = str(updates["postiz_integration_id"]).strip()
+        _team = _pz_team(db, user.id)
+        _owned = db.query(models.PostizIntegration.id).filter(
+            models.PostizIntegration.user_id.in_(_team),
+            models.PostizIntegration.integration_id == _iid,
+        ).first()
+        if not _owned:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only bind a Postiz channel your team connected",
+            )
 
     for key, val in updates.items():
         setattr(ch, key, val)
+
+    # Account-level branding consistency: when this row is a CONNECTED
+    # account and the edit touches brand fields, mirror them onto every
+    # sibling profile of the SAME real YouTube account (same
+    # google_channel_id). The user thinks of branding as belonging to
+    # the account, so all its duplicate profiles must stay in sync.
+    _BRAND_FIELDS = {
+        "logo_asset_id", "intro_asset_id", "watermark_text", "watermark_opacity",
+        "watermark_position", "socials",
+    }
+    brand_updates = {k: v for k, v in updates.items() if k in _BRAND_FIELDS}
+    tok = ch.oauth_token
+    gcid = (getattr(tok, "google_channel_id", "") or "").strip() if tok else ""
+    if brand_updates and gcid and tok and tok.refresh_token_enc:
+        siblings = (
+            db.query(models.Channel)
+            .join(models.OAuthToken, models.OAuthToken.channel_id == models.Channel.id)
+            .filter(
+                models.Channel.user_id == user.id,
+                models.Channel.id != ch.id,
+                models.OAuthToken.google_channel_id == gcid,
+                # Only mirror onto REAL connected accounts — never a style
+                # reference that happens to carry a stale/empty token row.
+                models.OAuthToken.refresh_token_enc.isnot(None),
+                models.OAuthToken.refresh_token_enc != "",
+            )
+            .all()
+        )
+        for s in siblings:
+            for key, val in brand_updates.items():
+                setattr(s, key, val)
+            # The logo specifically also lives on the OAuth token (the
+            # 'VIDEO OVERLAY LOGO' the upload worker reads first).
+            if "logo_asset_id" in brand_updates and s.oauth_token is not None:
+                s.oauth_token.logo_asset_id = brand_updates["logo_asset_id"]
+        if "logo_asset_id" in brand_updates and tok is not None:
+            tok.logo_asset_id = brand_updates["logo_asset_id"]
 
     db.commit()
     db.refresh(ch)
@@ -517,8 +703,31 @@ def delete_channel(channel_id: int, db: Session = Depends(get_db), user: models.
             detail=f"Cannot delete — {queued} upload job(s) still active. Cancel them first.",
         )
 
+    # Clean up dependents that have NO ORM cascade and would otherwise
+    # block the FK delete. The connect flow's oauth_states CSRF row is the
+    # cause of the "abandoned connect → Personal N → 500 on delete" bug:
+    # an incomplete OAuth leaves an oauth_states row referencing this
+    # channel. profile_destinations also lack a cascade. The oauth_token /
+    # upload_jobs / corpus rows cascade via their relationships.
+    db.query(models.OAuthState).filter(
+        models.OAuthState.channel_id == channel_id
+    ).delete(synchronize_session=False)
+    db.query(models.ProfileDestination).filter(
+        models.ProfileDestination.profile_id == channel_id
+    ).delete(synchronize_session=False)
+
     db.delete(ch)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Some other table still references this channel (e.g. publish
+        # history). Fail cleanly with a 409 instead of a raw 500.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete — this profile is still referenced by other "
+                   "records (e.g. publish history). Remove those first.",
+        )
     return {"deleted": channel_id}
 
 

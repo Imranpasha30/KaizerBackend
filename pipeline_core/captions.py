@@ -1,7 +1,7 @@
 """
 kaizer.pipeline.captions
 ========================
-Indic-script caption renderer for the Kaizer News video pipeline.
+Indic-script caption renderer for the Kaizer X video pipeline.
 
 Renders text to a PIL RGBA ``Image`` at arbitrary size, with no clipping.
 Handles all major Indic scripts via ``uharfbuzz`` shaping + Pillow rasterisation.

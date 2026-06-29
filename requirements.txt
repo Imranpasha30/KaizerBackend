@@ -186,3 +186,7 @@ opentelemetry-sdk>=1.27
 opentelemetry-exporter-otlp>=1.27
 opentelemetry-instrumentation-fastapi>=0.48b0
 opentelemetry-instrumentation-redis>=0.48b0
+# Phase 3.G — Prometheus client for /metrics endpoint and the 11 publish/upload
+# pipeline metrics (services/metrics_collector.py). Pinned >=0.19 for the
+# CollectorRegistry API used by the admin upload-v2 observability layer.
+prometheus_client>=0.19

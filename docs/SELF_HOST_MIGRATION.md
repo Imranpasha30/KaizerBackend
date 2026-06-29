@@ -1,4 +1,4 @@
-# Migrate Kaizer News from Railway → local GPU server
+# Migrate Kaizer X from Railway → local GPU server
 
 End-state after this guide:
 
@@ -516,7 +516,7 @@ Ubuntu.
 ```bash
 sudo tee /etc/systemd/system/kaizer-backend.service <<EOF
 [Unit]
-Description=Kaizer News FastAPI backend
+Description=Kaizer X FastAPI backend
 After=network.target postgresql.service
 
 [Service]

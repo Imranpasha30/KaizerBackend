@@ -101,12 +101,50 @@ class QuotaSEOError(SEOGenerationError):
 
 
 def _gemini_client() -> "genai.Client":
-    """Return a fresh google.genai client. Replaces the legacy
-    `_configure_gemini()` (which used module-level `genai.configure(...)`
-    in the deprecated SDK)."""
-    key = os.environ.get("GEMINI_API_KEY", "")
+    """Return a fresh google.genai client.
+
+    Auth precedence (matches the rest of the V4 pipeline so SEO bills
+    to the same account as thumbnail / image generation):
+
+      1. KAIZER_GCP_PROJECT set  → Vertex AI mode. Spends GCP credits
+         (e.g. GenAI App Builder / Free Trial). The Vertex SA is loaded
+         from KAIZER_VERTEX_CREDENTIALS explicitly so the SDK doesn't
+         pick up the wrong default project from
+         GOOGLE_APPLICATION_CREDENTIALS (the STT pipeline's SA).
+      2. KAIZER_GEMINI_API_KEY / GEMINI_API_KEY set → AI Studio mode.
+         This is the depleted-prepay path that triggered the
+         "All SEO models exhausted: 429 RESOURCE_EXHAUSTED" loop;
+         only used when the operator hasn't configured Vertex.
+
+    Without either, SEO generation is impossible — raise a clear error
+    that names BOTH paths so the operator knows which env var to set.
+    """
+    project = (os.environ.get("KAIZER_GCP_PROJECT") or "").strip()
+    if project:
+        location = (os.environ.get("KAIZER_GCP_LOCATION") or "us-central1").strip()
+        vertex_creds_path = (os.environ.get("KAIZER_VERTEX_CREDENTIALS") or "").strip()
+        explicit_creds = None
+        if vertex_creds_path and os.path.isfile(vertex_creds_path):
+            try:
+                from google.oauth2 import service_account
+                explicit_creds = service_account.Credentials.from_service_account_file(
+                    vertex_creds_path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+            except Exception as exc:
+                print(f"[seo] failed to load Vertex SA from {vertex_creds_path}: {exc}", flush=True)
+        return genai.Client(
+            vertexai=True, project=project, location=location,
+            credentials=explicit_creds,
+        )
+
+    key = (os.environ.get("KAIZER_GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
-        raise SEOGenerationError("GEMINI_API_KEY is not set")
+        raise SEOGenerationError(
+            "No Gemini auth for SEO. Either:\n"
+            "  - set KAIZER_GCP_PROJECT (recommended — uses GCP credits via Vertex AI), OR\n"
+            "  - set GEMINI_API_KEY (AI Studio mode)."
+        )
     return genai.Client(api_key=key)
 
 
@@ -436,6 +474,26 @@ def generate_seo_for_clip(
         {"title": v["title"], "views": v["views"], "channel": v.get("channel", "")}
         for v in yt_top
     ]
+
+    # ── 6b. Tool-based SEO score (content relevance + keyword coverage +
+    # title/tag quality). Stored alongside the verifier score so the editor
+    # shows an objective "does this match the video / use real keywords" read.
+    # Trends OFF here (we already gathered trending_keywords above); advisory.
+    try:
+        from seo.score_checker import score_seo as _score_seo
+        _content = " ".join(x for x in [getattr(clip, "text", "") or "", topic or ""] if x)
+        _sc = _score_seo(
+            title=best.get("title", ""), description=best.get("description", ""),
+            tags=best.get("tags") or best.get("keywords") or [],
+            content_text=_content, language=language, use_trends=False,
+        )
+        best["tool_score"]       = _sc.get("score")
+        best["tool_verdict"]     = _sc.get("verdict")
+        best["tool_suggestions"] = _sc.get("suggestions", [])
+        best["tool_dimensions"]  = _sc.get("dimensions", {})
+        tick("scored", f"tool score {_sc.get('score')}/100 ({_sc.get('verdict')})")
+    except Exception as _exc:
+        tick("score", f"score-checker skipped: {_exc}")
 
     # Persist as the single canonical generic SEO on the clip.  The legacy
     # per-channel `seo_variants` field is left untouched (read-only legacy).

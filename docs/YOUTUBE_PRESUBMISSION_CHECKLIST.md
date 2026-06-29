@@ -16,7 +16,7 @@ of recording, then submit.
 Go to https://console.cloud.google.com → select your project →
 **APIs & Services → OAuth consent screen**.
 
-- [ ] **App name** is exactly `Kaizer News`. (No version numbers, no
+- [ ] **App name** is exactly `Kaizer X`. (No version numbers, no
       "test", no emoji.)
 - [ ] **User support email** is a real address you check.
 - [ ] **Application logo** is uploaded — at least 120×120 PNG, square.
@@ -91,10 +91,10 @@ review it, edit in the YouTube-specific clauses above, and publish.
 The reviewer cross-references your consent screen against the docs +
 videos. Inconsistencies trigger flags.
 
-- [ ] App name on consent screen = "Kaizer News".
+- [ ] App name on consent screen = "Kaizer X".
 - [ ] App name on your website's `<title>` and homepage hero =
-      "Kaizer News" (not a placeholder).
-- [ ] Privacy policy header / page title says "Kaizer News".
+      "Kaizer X" (not a placeholder).
+- [ ] Privacy policy header / page title says "Kaizer X".
 - [ ] Logo on the consent screen matches the logo on your site nav.
 
 If you have a different working name (e.g. "Ozone Wash") plan to
@@ -107,7 +107,7 @@ rename the OAuth client or rename the public site to match.
 ## Step 5 — Test the OAuth flow yourself end-to-end  *(20 min)*
 
 - [ ] Open an incognito window.
-- [ ] Use a Google account that has **never** authorised Kaizer News.
+- [ ] Use a Google account that has **never** authorised Kaizer X.
       (If unsure, revoke first at
       https://myaccount.google.com/permissions.)
 - [ ] Go through the entire flow: register → create profile →

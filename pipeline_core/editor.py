@@ -1,5 +1,5 @@
 """
-KAIZER NEWS — Simplified Web Editor (API Pipeline)
+KAIZER X — Simplified Web Editor (API Pipeline)
 ====================================================
 Usage:
     python scripts/12_web_editor.py output/api_pipeline/.../editor_meta.json
@@ -86,7 +86,7 @@ def rerender_clip(clip, edits):
             clip["image_path"] = edits["image_path"]
 
     elif frame_type == "clean_card" and _compose_clip_clean is not None:
-        text = edits.get("text", clip.get("text", "KAIZER NEWS"))
+        text = edits.get("text", clip.get("text", "KAIZER X"))
         cp_in = clip.get("card_params", {}) or {}
         word_colors = edits.get("word_colors") or cp_in.get("word_colors")
         _compose_clip_clean(
@@ -123,7 +123,7 @@ def rerender_clip(clip, edits):
             text_color=fp.get("text_color", "#ffff00"),
             text_size=int(edits.get("font_size", 60)),
             bg_color=fp.get("bg_color", "#1a0a2e"),
-            follow_text=fp.get("follow_text", "FOLLOW KAIZER NEWS TELUGU"),
+            follow_text=fp.get("follow_text", "FOLLOW KAIZER X TELUGU"),
             follow_text_color=fp.get("follow_text_color", "#ffffff"),
             social_logos=fp.get("social_logos", []),
             video_logo=video_logo or None,
@@ -136,7 +136,7 @@ def rerender_clip(clip, edits):
                    "font_file": edits.get("font_file", "Ponnala-Regular.ttf")})
 
     else:
-        text      = edits.get("text", clip.get("text", "KAIZER NEWS"))
+        text      = edits.get("text", clip.get("text", "KAIZER X"))
         sp        = edits.get("section_pct") or clip.get("section_pct")
         word_colors = edits.get("word_colors") or clip.get("card_params", {}).get("word_colors")
         card_style  = edits.get("card_style")  or clip.get("card_params", {}).get("card_style")
@@ -176,7 +176,7 @@ def rerender_clip(clip, edits):
 
 EDITOR_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
-<title>KAIZER NEWS &mdash; Live Editor</title>
+<title>KAIZER X &mdash; Live Editor</title>
 <style>
 @font-face{font-family:'KNTelugu';src:url('/fonts/NotoSansTelugu-Bold.ttf') format('truetype')}
 @font-face{font-family:'KNTeluguSerif';src:url('/fonts/NotoSerifTelugu-Bold.ttf') format('truetype')}
@@ -292,7 +292,7 @@ textarea#ctrl-text:focus{outline:1px solid var(--acc);border-color:var(--acc)}
 .social-slot-preview:hover{border-color:var(--acc)}
 </style></head><body>
 <div id="topbar">
-  <h1>&#9632; KAIZER NEWS&nbsp;<small style="color:#333;font-weight:400;font-size:11px">Live Editor</small></h1>
+  <h1>&#9632; KAIZER X&nbsp;<small style="color:#333;font-weight:400;font-size:11px">Live Editor</small></h1>
   <button class="tb-btn" id="btn-export" onclick="doExport()">&#8659; Export All</button>
   <button class="tb-btn" id="btn-folder" onclick="doOpenFolder()">&#128193; Folder</button>
   <span id="status">Loading&hellip;</span><span id="autosave"></span>
@@ -346,7 +346,7 @@ textarea#ctrl-text:focus{outline:1px solid var(--acc);border-color:var(--acc)}
       <div id="sec-fb-text"></div>
       <div id="sec-fb-video"><img id="fb-vid-img" src="" alt=""></div>
       <div id="sec-fb-bar">
-        <div class="fb-follow-txt" id="fb-follow-lbl">FOLLOW KAIZER NEWS TELUGU</div>
+        <div class="fb-follow-txt" id="fb-follow-lbl">FOLLOW KAIZER X TELUGU</div>
         <div class="fb-social-row" id="fb-social-row"></div>
       </div>
       <img id="sec-fb-logo" src="" alt="">
@@ -414,7 +414,7 @@ textarea#ctrl-text:focus{outline:1px solid var(--acc);border-color:var(--acc)}
     <div class="sec-hd">Title Text</div>
     <div class="row"><label>Text color</label><input type="color" id="ctrl-fb-tc" value="#ffff00" oninput="onFollowCtrl()"></div>
     <div class="sec-hd">Follow Bar</div>
-    <div class="row"><label>Follow text</label><input type="text" id="ctrl-fb-ftxt" value="FOLLOW KAIZER NEWS TELUGU" style="flex:1;background:#141414;border:1px solid #252525;color:#ddd;padding:3px 6px;border-radius:3px;font-size:11px" oninput="onFollowCtrl()"></div>
+    <div class="row"><label>Follow text</label><input type="text" id="ctrl-fb-ftxt" value="FOLLOW KAIZER X TELUGU" style="flex:1;background:#141414;border:1px solid #252525;color:#ddd;padding:3px 6px;border-radius:3px;font-size:11px" oninput="onFollowCtrl()"></div>
     <div class="row"><label>Text color</label><input type="color" id="ctrl-fb-ftc" value="#ffffff" oninput="onFollowCtrl()"></div>
     <div class="sec-hd">Social Logos <small style="color:#333">(up to 3)</small></div>
     <div class="social-slots">
@@ -853,7 +853,7 @@ function applyFollowBar(){
   var fbar_h  = FH - fbar_y;
   var bg      = ss('ctrl-fb-bg').value||'#1a0a2e';
   var tc      = ss('ctrl-fb-tc').value||'#ffff00';
-  var ftxt    = ss('ctrl-fb-ftxt').value||'FOLLOW KAIZER NEWS TELUGU';
+  var ftxt    = ss('ctrl-fb-ftxt').value||'FOLLOW KAIZER X TELUGU';
   var ftc     = ss('ctrl-fb-ftc').value||'#ffffff';
 
   /* BG — velvet canvas */
@@ -1058,7 +1058,7 @@ function showClip(i){
   var fbp=c.follow_params||{};
   ss('ctrl-fb-bg').value=fbp.bg_color||'#1a0a2e';
   ss('ctrl-fb-tc').value=fbp.text_color||'#ffff00';
-  ss('ctrl-fb-ftxt').value=fbp.follow_text||'FOLLOW KAIZER NEWS TELUGU';
+  ss('ctrl-fb-ftxt').value=fbp.follow_text||'FOLLOW KAIZER X TELUGU';
   ss('ctrl-fb-ftc').value=fbp.follow_text_color||'#ffffff';
   ss('fb-vid-img').src='/clip/'+i+'/raw_thumb?t='+Date.now();
   /* social logos */
@@ -1566,7 +1566,7 @@ def main():
         print("Usage: python scripts/12_web_editor.py <editor_meta.json>")
         sys.exit(1)
 
-    print(f"  KAIZER NEWS Editor")
+    print(f"  KAIZER X Editor")
     print(f"  Clips: {len(META.get('clips', []))}")
     print(f"  Meta:  {META_PATH}")
 

@@ -29,6 +29,10 @@ _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
+from pipeline_v4.encoder import video_encoder_args as _enc_args
+from pipeline_v4.encoder import video_decoder_args as _dec_args
+from pipeline_v4.ffmpeg_exec import run_ffmpeg as _run_ffmpeg
+
 from pipeline_v4.canvas_schema import Canvas, CanvasImage, CanvasStory, CanvasTextBlock
 from pipeline_v4.text_renderer import render_text_panel_png
 
@@ -324,6 +328,14 @@ def render_canvas(
     write the result to ``output_dir/<canvas.output_filename>``.
 
     Returns the absolute path to the rendered video.
+
+    KAIZER_CLEAN_MASTER (Decision 1, see docs/upload-rewrite/DECISIONS.md):
+    when the env var is ``"1"``, the brand-logo overlay block below
+    is SKIPPED entirely. This produces a clean MasterVideo with no
+    logo baked in — the Phase 2 Branding Worker (services/branding)
+    then does the only logo overlay pass downstream. Default is
+    ``"0"`` (Decision 12) so existing renders keep their current
+    behaviour until ops flip the flag at Phase 3 cutover.
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +356,11 @@ def render_canvas(
 
     # ─── Build the ffmpeg command ───────────────────────────────────
     layout = canvas.layout
-    inputs: list[str] = ["-i", canvas.trimmed_video_path]
+    # GPU decode of the trimmed video when NVENC is active. Input
+    # option — precedes the FIRST -i only (PNG/text inputs keep their
+    # own decoders). Input INDICES are unaffected by input options, so
+    # the bg_in_idx math below stays valid.
+    inputs: list[str] = [*_dec_args(), "-i", canvas.trimmed_video_path]
     # Each text overlay adds one input
     for o in text_overlays:
         inputs += ["-i", o["png_path"]]
@@ -478,7 +494,23 @@ def render_canvas(
         in_idx += 1
 
     # 4) Brand logo (optional)
-    if layout.brand_logo_path and os.path.isfile(layout.brand_logo_path):
+    #
+    # KAIZER_CLEAN_MASTER (Decision 1 in DECISIONS.md, gated by Decision 12):
+    # When the env var is "1", skip the entire logo overlay block — no
+    # ``-i logo`` input, no scale+overlay chain entries. The new Phase 2
+    # Branding Worker (services/branding) owns the only logo overlay
+    # pass; baking the logo here too would double-stamp the artifact.
+    # Default is "0" so existing pipelines keep producing bit-identical
+    # output until ops flip the flag at Phase 3 cutover. See
+    # docs/upload-rewrite/DECISIONS.md Decision 1.
+    _clean_master = os.environ.get("KAIZER_CLEAN_MASTER", "0").strip() == "1"
+    if _clean_master:
+        import logging as _lg
+        _lg.getLogger("kaizer.pipeline_v4").info(
+            "canvas_engine.render_canvas: KAIZER_CLEAN_MASTER=1 — skipping "
+            "brand_logo overlay (Decision 1; branding worker handles it)"
+        )
+    elif layout.brand_logo_path and os.path.isfile(layout.brand_logo_path):
         inputs += ["-i", layout.brand_logo_path]
         logo_w_px = _pct(layout.brand_logo_w_pct, layout.width)
         logo_x_px = _pct(layout.brand_logo_x_pct, layout.width)
@@ -532,7 +564,7 @@ def render_canvas(
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-map", audio_map,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        *_enc_args(crf=20, preset_hint="medium"),
         "-pix_fmt", "yuv420p",
     ] + audio_codec + [
         "-shortest",
@@ -541,16 +573,17 @@ def render_canvas(
     ]
 
     print(f"[v4/step2] compositing {len(text_overlays)} text + {len(image_overlays)} image overlays -> {canvas.output_filename}", flush=True)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 20)
-    if proc.returncode != 0:
+    try:
+        # Centralised runner: retry + NVENC→libx264 fallback + stderr
+        # tail logging. Raises RuntimeError on final failure.
+        _run_ffmpeg(cmd, timeout=60 * 20, log_label="canvas_render")
+    except RuntimeError as exc:
         # Persist the filter graph alongside the failure for debugging
         try:
             (out_dir / "_failed_filter.txt").write_text(filter_complex, encoding="utf-8")
         except OSError:
             pass
-        raise RuntimeError(
-            f"canvas render failed: {proc.stderr[-1000:]}"
-        )
+        raise RuntimeError(f"canvas render failed: {exc}") from exc
 
     if use_intro:
         intro_path = str(out_dir / "_intro.mp4")
@@ -605,7 +638,7 @@ def _render_intro_clip(*, bg_video_path: str, duration_s: float,
         ffmpeg_bin, "-y", "-v", "error",
         "-stream_loop", "-1", "-t", f"{duration_s:.3f}", "-i", bg_video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        *_enc_args(crf=20, preset_hint="medium"),
         "-pix_fmt", "yuv420p",
     ]
     if has_audio:
@@ -652,7 +685,7 @@ def _concat_intro_with_main(*, intro_path: str, main_path: str,
         "-i", intro_path, "-i", main_path,
         "-filter_complex", filter_complex,
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        *_enc_args(crf=20, preset_hint="medium"),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",

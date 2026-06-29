@@ -1,4 +1,4 @@
-# Kaizer News — Phase 4 Roadmap
+# Kaizer X — Phase 4 Roadmap
 
 > **Status**: Design doc + interface stubs only. No Phase 4 subsystem is
 > implemented in the v1 codebase committed to date. Every import path in

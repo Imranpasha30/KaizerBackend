@@ -16,6 +16,14 @@ import models
 
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
+# V2 upload statuses that occupy a slot on a channel (anything not terminally
+# dead). Mirrors the legacy queued/uploading/done set onto the UploadJobV2
+# lifecycle so spacing + daily-cap see the LIVE publish queue.
+_V2_OCCUPYING = (
+    "queued", "claimed", "branding", "ready_to_upload",
+    "uploading", "completed", "parked_quota",
+)
+
 
 def _to_ist(dt: datetime) -> datetime:
     if dt.tzinfo is None:
@@ -51,14 +59,14 @@ def count_scheduled_today(db: Session, channel_id: int) -> int:
     day_end_utc   = day_start_utc + timedelta(days=1)
 
     return (
-        db.query(models.UploadJob)
-          .filter(models.UploadJob.channel_id == channel_id)
-          .filter(models.UploadJob.status.in_(["queued", "uploading", "processing", "done"]))
+        db.query(models.UploadJobV2)
+          .filter(models.UploadJobV2.channel_id == channel_id)
+          .filter(models.UploadJobV2.status.in_(_V2_OCCUPYING))
           .filter(
-              (models.UploadJob.publish_at.between(day_start_utc, day_end_utc))
+              (models.UploadJobV2.publish_at.between(day_start_utc, day_end_utc))
               | (
-                  (models.UploadJob.publish_at.is_(None))
-                  & (models.UploadJob.created_at.between(day_start_utc, day_end_utc))
+                  (models.UploadJobV2.publish_at.is_(None))
+                  & (models.UploadJobV2.created_at.between(day_start_utc, day_end_utc))
               )
           )
           .count()
@@ -82,11 +90,11 @@ def next_slot(
     min_start = (after or now) + timedelta(minutes=10)
 
     latest = (
-        db.query(models.UploadJob.publish_at)
-          .filter(models.UploadJob.channel_id == channel_id)
-          .filter(models.UploadJob.publish_at.isnot(None))
-          .filter(models.UploadJob.status.in_(["queued", "uploading", "processing", "done"]))
-          .order_by(models.UploadJob.publish_at.desc())
+        db.query(models.UploadJobV2.publish_at)
+          .filter(models.UploadJobV2.channel_id == channel_id)
+          .filter(models.UploadJobV2.publish_at.isnot(None))
+          .filter(models.UploadJobV2.status.in_(_V2_OCCUPYING))
+          .order_by(models.UploadJobV2.publish_at.desc())
           .first()
     )
     latest_dt = latest[0] if latest and latest[0] else None

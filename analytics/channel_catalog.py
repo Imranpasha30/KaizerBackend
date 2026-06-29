@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -40,6 +41,22 @@ logger = logging.getLogger("kaizer.analytics.channel_catalog")
 
 PAGE_SIZE      = 50
 DEFAULT_LIMIT  = 200      # cap a single sync to keep quota predictable
+
+
+def _redact(text) -> str:
+    """Strip secrets (the YouTube Data API key) out of an error string.
+    The googleapiclient embeds the full request URL — including
+    ``key=AIza...`` — in HttpError messages, which would otherwise leak
+    into 502 responses and logs."""
+    return re.sub(r"key=[A-Za-z0-9_\-]+", "key=***", str(text))
+
+
+def _http_status(exc: HttpError):
+    """Best-effort HTTP status code from a googleapiclient HttpError."""
+    try:
+        return int(getattr(exc, "resp", None).status)  # type: ignore[union-attr]
+    except Exception:
+        return None
 
 
 # ─── YouTube Data API helpers ─────────────────────────────────────────
@@ -140,7 +157,15 @@ def sync_channel_videos(
     try:
         uploads_pid = _resolve_uploads_playlist(yt, google_channel_id)
     except HttpError as exc:
-        raise RuntimeError(f"YouTube channels.list failed: {exc}") from exc
+        # A channel with zero uploads has no uploads playlist → 404.
+        # Treat it as "no uploads" so Sync All doesn't 502 on empty channels.
+        if _http_status(exc) == 404:
+            return {
+                "google_channel_id": google_channel_id,
+                "synced": 0, "new": 0, "updated": 0,
+                "note": "channel has no uploads",
+            }
+        raise RuntimeError(f"YouTube channels.list failed: {_redact(exc)}") from exc
 
     seen_video_ids: List[str] = []
     page_token: Optional[str] = None
@@ -151,7 +176,11 @@ def sync_channel_videos(
                 maxResults=PAGE_SIZE, pageToken=page_token or None,
             ).execute()
         except HttpError as exc:
-            raise RuntimeError(f"YouTube playlistItems.list failed: {exc}") from exc
+            # Brand-new channel: the UU… uploads playlist doesn't exist yet
+            # → 404 "playlist not found". Not an error — just no videos.
+            if _http_status(exc) == 404:
+                break
+            raise RuntimeError(f"YouTube playlistItems.list failed: {_redact(exc)}") from exc
 
         batch = [
             it["contentDetails"]["videoId"]
@@ -184,7 +213,7 @@ def sync_channel_videos(
                 maxResults=PAGE_SIZE,
             ).execute()
         except HttpError as exc:
-            raise RuntimeError(f"YouTube videos.list failed: {exc}") from exc
+            raise RuntimeError(f"YouTube videos.list failed: {_redact(exc)}") from exc
         for item in (v.get("items") or []):
             vid = item.get("id") or ""
             if not vid:
@@ -248,6 +277,47 @@ def sync_channel_videos(
         "new":               new_count,
         "updated":           updated,
     }
+
+
+def ensure_synced(
+    db: Session,
+    user_id: int,
+    google_channel_id: str,
+    *,
+    max_age_days: int = 7,
+    max_videos: int = DEFAULT_LIMIT,
+) -> int:
+    """Sync the channel's catalogue if it's EMPTY or STALE (last sync older
+    than ``max_age_days``). Best-effort — NEVER raises. Returns the cached row
+    count afterwards. Lets the per-channel SEO path pull a monetized channel's
+    real YouTube history on demand instead of reporting 'no history'."""
+    try:
+        latest = (
+            db.query(models.ChannelVideo)
+              .filter(models.ChannelVideo.user_id == user_id,
+                      models.ChannelVideo.google_channel_id == google_channel_id)
+              .order_by(models.ChannelVideo.last_synced_at.desc())
+              .first()
+        )
+        fresh = False
+        if latest is not None and latest.last_synced_at:
+            ts = latest.last_synced_at
+            ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            fresh = (datetime.now(timezone.utc) - ts) < timedelta(days=max_age_days)
+        if not fresh:
+            sync_channel_videos(db, user_id, google_channel_id, max_videos=max_videos)
+    except Exception as exc:
+        logger.info("ensure_synced best-effort failed for %s: %s",
+                    google_channel_id, _redact(exc))
+    try:
+        return (
+            db.query(models.ChannelVideo)
+              .filter(models.ChannelVideo.user_id == user_id,
+                      models.ChannelVideo.google_channel_id == google_channel_id)
+              .count()
+        )
+    except Exception:
+        return 0
 
 
 # ─── Analytics over the catalogue ──────────────────────────────────────

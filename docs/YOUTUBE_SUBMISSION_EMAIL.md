@@ -20,7 +20,7 @@ News. Please find below the requested information, screen-cast
 recordings, and a link to our full compliance write-up.
 
 — Application identity
-   Project / API client name:  Kaizer News
+   Project / API client name:  Kaizer X
    OAuth client ID:            542271243369-6ikvqv149ht0s569u4prf11kkm8vqalh.apps.googleusercontent.com
    Production frontend:        https://kaizerx.com
    Production backend:         https://api.kaizerx.com
@@ -28,7 +28,7 @@ recordings, and a link to our full compliance write-up.
    Terms of service:           https://kaizerx.com/terms
 
 — Organization-owned YouTube channels (videos are uploaded to these)
-   1. Kaizer News Andhra — https://www.youtube.com/@KaizerNewsAndhra
+   1. Kaizer X Andhra — https://www.youtube.com/@KaizerXAndhra
       (327k subscribers, 2.1k videos, joined 3 Jan 2025)
    2. Auto Wala          — https://www.youtube.com/@kaizerautowala45
       (1 subscriber, 10 videos, joined 7 Mar 2024)
@@ -61,7 +61,7 @@ recordings, and a link to our full compliance write-up.
    This recording shows the OAuth 2.0 consent flow that any public
    creator (the SaaS user base) goes through to connect their own
    YouTube channel. It uses a Google account that has never
-   authorised Kaizer News before, so the full consent screen with
+   authorised Kaizer X before, so the full consent screen with
    the scope list is visible.
 
    The "Google hasn't verified this app" warning shown at the start
@@ -70,7 +70,7 @@ recordings, and a link to our full compliance write-up.
    the branding verification associated with this exact compliance
    review. The advisory will clear automatically once verification
    completes. We have not bypassed it in the recording; the user
-   clicks Advanced → Go to Kaizer News (unsafe), exactly as Google's
+   clicks Advanced → Go to Kaizer X (unsafe), exactly as Google's
    policy mandates during the verification window.
 
    The actual scope-listing consent screen is then visible. The user
@@ -131,7 +131,7 @@ Please let us know if you need anything further.
 
 Thanks,
 <Senior submitter — fill in name and role here>
-Kaizer News
+Kaizer X
 contact: devsharkify@gmail.com
 ```
 

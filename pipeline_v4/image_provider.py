@@ -10,6 +10,16 @@ Hard rules (from the user):
     news card fallback.
   * For real public figures / named incidents the caller can pass
     `prefer_real_photo=True` to skip OpenAI and grab the actual photo.
+
+Image provider catalog (selected via ``KAIZER_V4_IMAGE_PROVIDER`` env):
+  * ``auto`` (default) — V1's multi-source chain (CSE/DDG/Pexels/OpenAI).
+                          Best when you want real photos of named events.
+  * ``gemini``           — Pure Gemini Nano Banana (gemini-2.5-flash-image).
+                          One AI-generated image per story; no photo
+                          search. Best for symbolic / illustrative output.
+  * ``openai``           — Pure OpenAI gpt-image-1. Same per-story
+                          shape; uses the express/ai_image.py wrapper.
+                          Most expensive but highest visual polish.
 """
 from __future__ import annotations
 
@@ -19,6 +29,112 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# ─── Image-provider dispatcher ────────────────────────────────────────
+
+def _selected_image_provider() -> str:
+    """Return the operator's image-provider choice for this job.
+
+    Reads ``KAIZER_V4_IMAGE_PROVIDER`` (set per-job by the runner from
+    the wizard pick). Unknown values fall back to ``auto`` so an env
+    typo never silently downgrades to a stub. Cached on the function
+    so repeated lookups inside one job don't re-parse the env.
+    """
+    raw = (os.environ.get("KAIZER_V4_IMAGE_PROVIDER") or "auto").strip().lower()
+    if raw in {"gemini", "openai", "auto"}:
+        return raw
+    return "auto"
+
+
+def _generate_via_gemini(*, story_index: int, title_native: str,
+                         title_english: str, summary: str, language: str,
+                         pool_dir: Path,
+                         transcript_text: str = "") -> Optional[str]:
+    """Pure Gemini Nano Banana story-image generation. Returns the
+    pool filename on success or None on any failure (caller can fall
+    back to the multi-source chain when this returns None).
+
+    ``transcript_text`` is the verbatim spoken text for this story
+    (collected by trim_engine from the Deepgram word array). When
+    supplied, we fold it into the summary so the prompt writer sees
+    the actual incident words — much better grounding than the bare
+    headline + Claude's one-sentence summary.
+    """
+    try:
+        from pipeline_v4 import image_ai
+    except Exception as exc:
+        print(f"[v4/image] gemini SDK unavailable: {exc}", flush=True)
+        return None
+    fname = f"story{story_index:02d}_gemini_{uuid.uuid4().hex[:8]}.jpg"
+    out_path = pool_dir / fname
+    # Merge transcript into summary so write_image_prompt sees the
+    # full story context. Keeping both because they overlap but the
+    # transcript has place names + dates the summary often drops.
+    rich_summary = summary or ""
+    if transcript_text:
+        rich_summary = (
+            f"{rich_summary}\n\nSpoken transcript: {transcript_text}"
+            if rich_summary else f"Spoken transcript: {transcript_text}"
+        )
+    try:
+        saved, _ = image_ai.make_image_for_story(
+            title_native=title_native,
+            title_english=title_english,
+            summary=rich_summary,
+            language=language,
+            out_path=str(out_path),
+        )
+    except Exception as exc:
+        print(f"[v4/image] gemini gen failed (story {story_index + 1}): {exc}", flush=True)
+        return None
+    return Path(saved).name if saved else None
+
+
+def _generate_via_openai(*, story_index: int, title_native: str,
+                         title_english: str, summary: str,
+                         pool_dir: Path,
+                         transcript_text: str = "") -> Optional[str]:
+    """Pure OpenAI gpt-image-1 story-image generation. Wraps the
+    existing ``express/ai_image.py`` helper. Returns pool filename
+    on success or None on failure.
+
+    ``transcript_text`` is the verbatim spoken text for this story.
+    Folded into the raw prompt so gpt-image-1 sees the specific
+    incident words ("PM Modi launched X in Hyderabad") rather than
+    just an abstract headline — sharply improves event-specificity.
+    """
+    try:
+        from express.ai_image import generate_short_inset
+    except Exception as exc:
+        print(f"[v4/image] openai wrapper unavailable: {exc}", flush=True)
+        return None
+    headline = (title_native or title_english or "").strip()
+    if not headline:
+        print(f"[v4/image] openai: story {story_index + 1} has no headline, skipping",
+              flush=True)
+        return None
+    brief = (summary or "").strip()[:300]
+    # The styled wrapper in express/ai_image only gets ~600-1000 chars
+    # of prompt before quality degrades, so we cap transcript at 500.
+    transcript_chunk = (transcript_text or "").strip()[:500]
+    pieces = [headline]
+    if brief:
+        pieces.append(f"Summary: {brief}")
+    if transcript_chunk:
+        pieces.append(f"What was said on-air: {transcript_chunk}")
+    raw_prompt = "\n\n".join(pieces)
+    fname = f"story{story_index:02d}_openai_{uuid.uuid4().hex[:8]}.png"
+    out_path = pool_dir / fname
+    saved = generate_short_inset(
+        api_key="",  # falls back to OPENAI_API_KEY env
+        raw_prompt=raw_prompt,
+        output_path=str(out_path),
+        size="1536x1024",
+        quality="medium",
+        timeout_s=90,
+    )
+    return Path(saved).name if saved else None
 
 
 @dataclass
@@ -167,33 +283,67 @@ def auto_populate_pool(
               f"skipping auto-fetch", flush=True)
         return []
 
+    provider = _selected_image_provider()
+    print(f"[v4/image] auto_populate_pool: provider={provider!r}", flush=True)
+
     added: list[dict] = []
     for s in stories:
         title    = getattr(s, "title_native",  "") or ""
         title_en = getattr(s, "title_english", "") or ""
         summary  = getattr(s, "summary",       "") or ""
+        transcript_text = getattr(s, "transcript_text", "") or ""
         story_index = getattr(s, "story_index", len(added))
-        # PERSON / NAMED-INCIDENT heuristic — V1's policy is: if the
-        # headline carries a real name, prefer the actual photo over
-        # an AI render. We can't reliably detect named entities without
-        # an LLM call, so default to real-photo-preferred and let the
-        # editor flip it per story later.
-        q = StoryImageQuery(
-            story_index=story_index,
-            title=title, title_en=title_en, summary=summary,
-            prefer_real_photo=True,
-        )
-        fn = fetch_story_image(
-            query=q,
-            language=language,
-            pool_dir=pool_dir,
-            user_assets_dir=user_assets_dir,
-        )
+
+        fn: Optional[str] = None
+        if provider == "gemini":
+            fn = _generate_via_gemini(
+                story_index=story_index,
+                title_native=title, title_english=title_en,
+                summary=summary, language=language,
+                pool_dir=pool_dir,
+                transcript_text=transcript_text,
+            )
+        elif provider == "openai":
+            fn = _generate_via_openai(
+                story_index=story_index,
+                title_native=title, title_english=title_en,
+                summary=summary,
+                pool_dir=pool_dir,
+                transcript_text=transcript_text,
+            )
+
+        # Fallback to V1's multi-source chain for the ``auto`` provider
+        # AND when the explicit provider returned None (so a Gemini /
+        # OpenAI hiccup never leaves a story imageless when a real
+        # photo would have worked).
+        if fn is None:
+            # PERSON / NAMED-INCIDENT heuristic — V1's policy is: if the
+            # headline carries a real name, prefer the actual photo over
+            # an AI render. We can't reliably detect named entities without
+            # an LLM call, so default to real-photo-preferred and let the
+            # editor flip it per story later.
+            q = StoryImageQuery(
+                story_index=story_index,
+                title=title, title_en=title_en, summary=summary,
+                prefer_real_photo=True,
+            )
+            fn = fetch_story_image(
+                query=q,
+                language=language,
+                pool_dir=pool_dir,
+                user_assets_dir=user_assets_dir,
+            )
         if fn:
             added.append({
                 "filename": fn,
                 "label": (title or title_en or f"Story {story_index + 1}")[:60],
                 "kind":  "ai",
+                # Bind the image to its parent story so the canvas builder
+                # can scope visibility — without this every story ended
+                # up cycling through every image (story 1 showed image
+                # for story 7, etc.). Per-story scoping is what the
+                # operator wants ("topic 1's image shows only in topic 1").
+                "story_index": int(story_index),
             })
             print(f"[v4/image] story {story_index + 1}: {fn}", flush=True)
         else:
