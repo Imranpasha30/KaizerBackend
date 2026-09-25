@@ -179,6 +179,20 @@ def _migrate_schema():
             # Template remix: creator opt-in for others to fork+edit a template.
             ("custom_templates", "allow_remix",
              "ALTER TABLE custom_templates ADD COLUMN allow_remix BOOLEAN NOT NULL DEFAULT TRUE"),
+            ("channels", "content_type_default",
+             "ALTER TABLE channels ADD COLUMN content_type_default VARCHAR(20)"),
+            # Live Studio branding conveyor: per-stream opt-in to stamp the
+            # channel's logo before going live, plus the stamped temp file.
+            #
+            # Without these two, EVERY attempt to go live fails: creating a
+            # batch inserts a LiveStream row, SQLAlchemy names all the model's
+            # columns, and Postgres rejects the statement -- a 500 with
+            # nothing useful on the client. create_all does not help, because
+            # it only creates missing TABLES and never alters existing ones.
+            ("live_streams", "apply_branding",
+             "ALTER TABLE live_streams ADD COLUMN apply_branding BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("live_streams", "branded_path",
+             "ALTER TABLE live_streams ADD COLUMN branded_path VARCHAR(512)"),
         ]
         for _tbl, _col, _sql in _adds:
             if _tbl in _inspCI.get_table_names():
@@ -351,6 +365,10 @@ def _migrate_schema():
             # not yet resolved (running jobs, pre-Wave-2 rows).
             "thumb_url":    "VARCHAR(500)",
             "thumb_aspect": "VARCHAR(8)",
+            # V4 only: which BRAIN writes the Director's plan ("gemini"
+            # default | "claude" | "openai"). Missing here meant creating a
+            # job failed the same way going live did.
+            "v4_director_provider": "VARCHAR(20) DEFAULT 'gemini'",
         }
         for col, dtype in job_additions.items():
             if col not in existing_jobs:
