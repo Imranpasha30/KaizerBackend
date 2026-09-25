@@ -31,7 +31,7 @@ from queue import Empty
 import psutil
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import case, desc, func
+from sqlalchemy import case, desc, func, or_
 from sqlalchemy.orm import Session
 
 import auth
@@ -2911,4 +2911,88 @@ def v2_admin_stats(
         "rating_count":              rating_count,
         "rating_distribution":       buckets,
         "cancellation_rate_pct":     cancel_rate,
+    }
+
+# ─── Onboarding: what people told us on their first sign-in ──────────
+#
+# The form is mandatory for new accounts and cannot be skipped, so this is
+# the operator's record of every customer: name, mobile, company or channel,
+# the languages they publish in, and the channel itself.
+
+
+@router.get("/onboarding")
+def onboarding_submissions(
+    q: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(auth.admin_required),
+) -> dict:
+    """Counts and rows for the first-sign-in details form.
+
+    THE THREE STATES ARE KEPT APART on purpose:
+
+      submitted  a person filled it in            (source="form")
+      exempt     existed before the form shipped  (source="legacy")
+      pending    a new account that has not filled it yet -- no row at all
+
+    Counting `exempt` as filled would report details we do not hold: those
+    rows carry a name and an email copied off the account and nothing else.
+    """
+    Prof = models.OnboardingProfile
+
+    total_users = db.query(models.User).count()
+    submitted = db.query(Prof).filter(Prof.source == "form").count()
+    exempt = db.query(Prof).filter(Prof.source != "form").count()
+    pending = max(0, total_users - submitted - exempt)
+
+    # Language spread, across real submissions only -- a legacy row has none.
+    langs: dict = {}
+    for (raw,) in db.query(Prof.languages).filter(Prof.source == "form").all():
+        for code in [c for c in (raw or "").split(",") if c]:
+            langs[code] = langs.get(code, 0) + 1
+
+    rows_q = (db.query(Prof, models.User)
+                .join(models.User, models.User.id == Prof.user_id)
+                .filter(Prof.source == "form"))
+    term = (q or "").strip()
+    if term:
+        like = f"%{term}%"
+        rows_q = rows_q.filter(
+            or_(Prof.full_name.ilike(like), Prof.company_name.ilike(like),
+                Prof.email.ilike(like), Prof.mobile.ilike(like),
+                Prof.channel_link.ilike(like), models.User.email.ilike(like)))
+
+    matched = rows_q.count()
+    rows = (rows_q.order_by(Prof.updated_at.desc(), Prof.id.desc())
+                  .offset(max(0, offset)).limit(min(500, max(1, limit))).all())
+
+    out = []
+    for prof, user in rows:
+        out.append({
+            "user_id":      user.id,
+            "account_email": user.email,
+            "full_name":    prof.full_name or "",
+            "mobile":       prof.mobile or "",
+            "company_name": prof.company_name or "",
+            "email":        prof.email or "",
+            "website":      prof.website or "",
+            "languages":    [c for c in (prof.languages or "").split(",") if c],
+            "channel_link": prof.channel_link or "",
+            "submitted_at": (prof.updated_at or prof.created_at).isoformat()
+                            if (prof.updated_at or prof.created_at) else None,
+        })
+
+    return {
+        "stats": {
+            "users":     total_users,
+            "submitted": submitted,
+            "exempt":    exempt,
+            "pending":   pending,
+            "languages": dict(sorted(langs.items(), key=lambda kv: -kv[1])),
+        },
+        "rows":    out,
+        "matched": matched,
+        "limit":   limit,
+        "offset":  offset,
     }
