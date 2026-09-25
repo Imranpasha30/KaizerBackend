@@ -55,6 +55,83 @@ class OnboardingIn(BaseModel):
     website:      Optional[str] = Field(None, max_length=500)
 
 
+
+# ─── The channel link must be a YouTube CHANNEL ──────────────────────
+#
+# This field feeds per-channel SEO, which reads the channel's own catalogue.
+# Anything else is not merely untidy, it is unusable -- and the live database
+# already held this product's own login page in it, because the field used to
+# take any URL at all.
+
+_YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com",
+             "music.youtube.com"}
+
+#: The four shapes a channel address comes in. Checked against the PATH only,
+#: after the host has been confirmed as YouTube.
+_YT_PATHS = (
+    re.compile(r"^/(@[A-Za-z0-9._-]{3,30})/?$"),
+    re.compile(r"^/(channel/UC[A-Za-z0-9_-]{22})/?$"),
+    re.compile(r"^/(c/[A-Za-z0-9._-]{1,100})/?$"),
+    re.compile(r"^/(user/[A-Za-z0-9._-]{1,100})/?$"),
+)
+
+
+def normalise_channel_link(raw: str) -> str:
+    """Return a canonical channel URL, or raise 422 saying what is wrong.
+
+    Messages name the actual problem. "Invalid URL" on a mandatory form with
+    no skip button is a dead end, and a video link is by far the most likely
+    thing someone pastes -- so it is told apart from a typo.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    def bad(msg: str):
+        raise HTTPException(status_code=422, detail=msg)
+
+    text = (raw or "").strip()
+    if not text:
+        bad("Please enter your YouTube channel link.")
+
+    # People type the handle far more readily than the URL.
+    if text.startswith("@"):
+        text = "https://www.youtube.com/" + text
+    elif not text.lower().startswith(("http://", "https://")):
+        text = "https://" + text
+
+    try:
+        parts = urlsplit(text)
+    except Exception:                                    # noqa: BLE001
+        bad("That does not look like a link. Paste your YouTube channel URL.")
+
+    host = (parts.netloc or "").lower().split(":")[0]
+
+    if host in ("youtu.be", "www.youtu.be"):
+        bad("That is a link to a video. Please paste your CHANNEL link — open "
+            "your channel on YouTube and copy the address, e.g. "
+            "https://youtube.com/@yourchannel")
+
+    if host not in _YT_HOSTS:
+        bad("Please paste a YouTube channel link, e.g. "
+            "https://youtube.com/@yourchannel")
+
+    path = parts.path or "/"
+    if path.startswith("/watch") or path.startswith("/playlist"):
+        bad("That is a link to a video or playlist. Please paste your CHANNEL "
+            "link, e.g. https://youtube.com/@yourchannel")
+
+    for pat in _YT_PATHS:
+        m = pat.match(path)
+        if m:
+            # Canonical, and WITHOUT the query string: an address copied from
+            # the bar carries ?si=... , a share token that identifies whoever
+            # copied it. It has no business in our database.
+            return urlunsplit(("https", "www.youtube.com", "/" + m.group(1), "", ""))
+
+    bad("That is a YouTube link, but not a channel. Open your channel and copy "
+        "the address — it looks like https://youtube.com/@yourchannel or "
+        "https://youtube.com/channel/UC...")
+
+
 def _clean(payload: OnboardingIn) -> dict:
     """Validate every field, and say precisely which one is wrong.
 
@@ -88,11 +165,9 @@ def _clean(payload: OnboardingIn) -> dict:
     if not langs:
         bad("Please choose at least one language.")
 
-    link = (payload.channel_link or "").strip()
-    if link and not link.lower().startswith(("http://", "https://")):
-        link = "https://" + link          # people paste youtube.com/@name
-    if not _URL.match(link):
-        bad("Please enter a valid channel link, e.g. https://youtube.com/@yourchannel")
+    # YouTube channels only -- see normalise_channel_link for why, and for
+    # the messages that name the actual mistake.
+    link = normalise_channel_link(payload.channel_link)
 
     site = (payload.website or "").strip()
     if site:                               # optional -- only checked if given
