@@ -84,6 +84,7 @@ from routers.admin import router as admin_router
 from routers.work_monitor import router as work_monitor_router
 from routers.postiz import router as postiz_router
 from routers.yt_lookup import router as yt_lookup_router
+from routers.onboarding import router as onboarding_router
 from routers.analytics_ai import router as analytics_ai_router
 from routers.bulletin_images import router as bulletin_images_router
 from routers.express_mode import router as express_mode_router
@@ -1008,6 +1009,7 @@ def _seed_defaults():
     Idempotent — safe to run on every startup.
     """
     from sqlalchemy import text as _text
+    from sqlalchemy import inspect as _sa_inspect
     from auth import ensure_legacy_user
 
     db = SessionLocal()
@@ -1060,6 +1062,60 @@ def _seed_defaults():
                 ))
             db.commit()
             print(f"[startup] Seeded {len(seeds)} default library categories")
+        # ── Onboarding: exempt the accounts that predate this feature ─────
+        # The first-sign-in details form is gated on "does this user have an
+        # onboarding row", so giving a row to everyone who already existed is
+        # what makes the form show to NEW sign-ups only.
+        #
+        # ONE SHOT, EVER -- and that is the whole point. Re-running it would
+        # make "pre-existing" mean "exists right now", so a new account that
+        # opened the form and closed the tab without submitting would be handed
+        # a legacy row by the next restart and never asked again, leaving a
+        # profile with no mobile, company, languages or channel link that looks
+        # filled in. The gate would be defeated by waiting for a restart, and
+        # this machine restarts routinely.
+        #
+        # The marker and the rows commit together: a crash cannot leave the
+        # marker set with the rows missing.
+        try:
+            # Imported here, not at module scope: this file's top-level
+            # imports run AFTER _seed_defaults() is called, so a module-level
+            # name would not exist yet. The local sqlalchemy imports above do
+            # the same thing for the same reason.
+            import datetime as _dtm
+            _MARK = "onboarding_backfill_done"
+            _insp = _sa_inspect(engine)
+            if (_insp.has_table("onboarding_profiles")
+                    and _insp.has_table("system_settings")
+                    and db.query(models.SystemSetting)
+                         .filter(models.SystemSetting.key == _MARK).first() is None):
+                # Skip anyone who already has a row. The marker makes this
+                # one-shot, but a deployment can still carry rows from a
+                # partially-completed earlier run -- inserting blindly would
+                # raise UniqueViolation, roll back, never set the marker, and
+                # retry forever on every boot.
+                _have = {r[0] for r in db.query(models.OnboardingProfile.user_id).all()}
+                _added = 0
+                for _u in db.query(models.User).all():
+                    if _u.id in _have:
+                        continue
+                    db.add(models.OnboardingProfile(
+                        user_id=_u.id, source="legacy",
+                        full_name=(_u.name or ""), email=(_u.email or ""),
+                    ))
+                    _added += 1
+                db.add(models.SystemSetting(
+                    key=_MARK,
+                    value=_dtm.datetime.now(_dtm.timezone.utc).isoformat()))
+                db.commit()
+                print(f"[startup] onboarding: {_added} pre-existing account(s) marked "
+                      f"legacy. Accounts created from now on must fill the form.")
+        except Exception as _e:
+            # Never let this stop the app booting. Worst case an existing
+            # user sees the form once, which they can fill; a failed start
+            # is not recoverable.
+            db.rollback()
+            print(f"[startup] onboarding backfill skipped: {_e}")
     finally:
         db.close()
 
@@ -1204,7 +1260,8 @@ if not _DESKTOP:
     app.include_router(admin_router)           # Phase 12 — admin panel REST surface
     app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
     app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
-    app.include_router(yt_lookup_router)        # YouTube channel lookup for Style References (auth'd)
+    app.include_router(yt_lookup_router)
+    app.include_router(onboarding_router)        # one-time details form on a new account's first sign-in        # YouTube channel lookup for Style References (auth'd)
     app.include_router(analytics_ai_router)     # AI-powered Insights — coach reports + any-channel compare (auth'd + rate-limited)
     app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
     app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)

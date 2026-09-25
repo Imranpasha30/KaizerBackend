@@ -1617,6 +1617,40 @@ class LoginCode(Base):
     requested_ip = Column(String(64), nullable=True)
 
 
+class OnboardingProfile(Base):
+    """What we ask for once, on a new account's first sign-in.
+
+    Its own table rather than columns on ``users``: create_all brings a
+    missing TABLE into being on any deployment, whereas a missing COLUMN
+    needs a migration somebody has to remember to write.
+
+    Every field except ``user_id`` is nullable at the database level and
+    required by the API instead. That is deliberate -- it lets the startup
+    backfill write a sparse ``legacy`` row for each pre-existing account
+    without inventing values for them, while new submissions are still
+    validated in full. Whether the form was filled is "does a row exist",
+    which is a question with no edge cases.
+    """
+    __tablename__ = "onboarding_profiles"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    user_id      = Column(Integer, ForeignKey("users.id"), nullable=False,
+                          unique=True, index=True)
+    full_name    = Column(String(160), nullable=True)
+    mobile       = Column(String(32),  nullable=True)
+    company_name = Column(String(200), nullable=True)   # company OR channel name
+    email        = Column(String(320), nullable=True)
+    website      = Column(String(500), nullable=True)   # the one optional field
+    languages    = Column(String(200), nullable=True)   # comma-separated codes
+    channel_link = Column(String(500), nullable=True)
+    # "form"   filled in by the person
+    # "legacy" written by the backfill for an account that predates this
+    source       = Column(String(12), nullable=False, default="form")
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), server_default=func.now(),
+                          onupdate=func.now())
+
+
 class PasswordResetToken(Base):
     """One-shot, time-limited reset token issued by /auth/forgot.
 

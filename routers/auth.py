@@ -41,6 +41,24 @@ class GoogleIn(BaseModel):
     credential: str  # the ID token from Google Identity Services
 
 
+def _onboarding_done(u: models.User) -> bool:
+    """Does this account have an onboarding row?
+
+    Errs towards True. A False here forces the person into a form, so the
+    cost of being wrong in that direction is someone locked out of the
+    product; the cost of the other direction is a form not shown.
+    """
+    try:
+        from sqlalchemy.orm import object_session
+        db = object_session(u)
+        if db is None:
+            return True
+        return db.query(models.OnboardingProfile).filter(
+            models.OnboardingProfile.user_id == u.id).first() is not None
+    except Exception:
+        return True
+
+
 def _public_user(u: models.User) -> dict:
     raw_socials = getattr(u, "socials", None) or {}
     avatar_url = ""
@@ -64,6 +82,14 @@ def _public_user(u: models.User) -> dict:
         "creator_rating_avg":   rating_avg,
         "creator_rating_count": rating_count,
         "socials": raw_socials if isinstance(raw_socials, dict) else {},
+        # Has this account filled the one-time details form? Every sign-in
+        # path returns _public_user, so adding it here covers password,
+        # Google and emailed-code at once.
+        #
+        # TRUE ON ANY DOUBT. If the table is not there yet, or the session
+        # has gone, we say completed rather than risk gating a user we
+        # cannot then let through.
+        "onboarding_completed": _onboarding_done(u),
         "created_at":    u.created_at.isoformat() if u.created_at else None,
         "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
     }
