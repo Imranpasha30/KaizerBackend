@@ -152,8 +152,12 @@ def save_mine(payload: OnboardingIn,
             setattr(row, k, v)
         row.source = "form"          # a legacy stub becomes a real answer
 
-    # The name they give here is the name we should call them everywhere.
-    if data["full_name"] and not (user.name or "").strip():
+    # The name they give here is the name we call them everywhere. It
+    # OVERWRITES whatever the account had: an emailed-code signup starts with
+    # the local part of the address as a placeholder ("imran" from
+    # imran@...), and this form is the one place a person types their actual
+    # name. Only set when non-empty, which validation already guarantees.
+    if data["full_name"]:
         user.name = data["full_name"]
 
     db.commit()
