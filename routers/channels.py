@@ -769,18 +769,38 @@ def learn_channel(
 ):
     """Kick off a one-off corpus refresh for this channel. Non-blocking.
 
-    422 if the channel isn't connected to YouTube yet, since we need its
-    google_channel_id to list uploads.
+    Own accounts study via their Connected identity; a study/writing-voice
+    channel (a competitor, kind='style') studies its PUBLIC top videos via
+    its @handle — no OAuth needed (you can't connect someone else's channel).
+    422 only if there's neither a connection nor a resolvable handle.
     """
     ch = db.query(models.Channel).filter(models.Channel.id == channel_id).first()
     if not ch:
         raise HTTPException(status_code=404, detail="Channel not found")
     tok = ch.oauth_token
-    if not tok or not tok.google_channel_id:
+    connected = bool(tok and tok.google_channel_id)
+    has_handle = bool((getattr(ch, "handle", "") or "").strip())
+    if not connected and not has_handle:
         raise HTTPException(
             status_code=422,
-            detail=f"Channel '{ch.name}' is not connected to YouTube. Connect it first to mine its top videos.",
+            detail=(f"'{ch.name}' has no YouTube identity — add its @handle or "
+                    f"channel URL (Edit) so we can study its public videos."),
         )
+    if not connected:
+        # Resolving an @handle → channel id needs the public Data API key; a
+        # pasted UC-id / channel URL resolves with no API call, so don't gate it.
+        import re as _re
+        _h = (getattr(ch, "handle", "") or "").strip()
+        _needs_resolve = not _re.fullmatch(r"UC[A-Za-z0-9_-]{20,30}", _h) \
+            and "channel/UC" not in _h
+        if _needs_resolve:
+            from config import settings as _settings
+            if not _settings.yt_data_api_key:
+                raise HTTPException(
+                    status_code=422,
+                    detail=("Studying a channel by its public @handle needs "
+                            "YOUTUBE_DATA_API_KEY set on the server."),
+                )
 
     background.add_task(_run_corpus_refresh, channel_id)
     return {

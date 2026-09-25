@@ -155,7 +155,7 @@ def neutralize_external_html(html_str: str) -> tuple[str, int]:
     NOTE: this is the upload-time layer; the renderer's network guard is the runtime layer."""
     if not html_str.strip():
         return html_str, 0
-    doc = lxml_html.fromstring(html_str)
+    doc = lxml_html.fromstring(html_str)   # NOTE: lxml drops the doctype here
     removed = 0
 
     # Drop elements that execute code or navigate, regardless of attributes.
@@ -190,7 +190,10 @@ def neutralize_external_html(html_str: str) -> tuple[str, int]:
                 removed += 1
 
     clean = lxml_html.tostring(doc, encoding="unicode")
-    return clean, removed
+    # Re-attach the author's doctype: without it stored bundles render in QUIRKS mode
+    # (lxml drops it at fromstring above) — a standards-correctness hazard at render time.
+    from .contract import preserve_doctype
+    return preserve_doctype(html_str, clean), removed
 
 
 def neutralize_external_css(css_str: str) -> tuple[str, int]:

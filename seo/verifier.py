@@ -48,6 +48,7 @@ _POWER_WORDS = {
 }
 
 _HASHTAG_PATTERN     = re.compile(r"^#[A-Z][A-Za-z0-9]*$")
+_NUM_HOOK_RE         = re.compile(r"\d")   # number-led hook detector (first 24 chars)
 # Channel-suffix = " | Something" at the END of the title (where YouTube
 # clients render the channel tag).  Mid-title "|" used as a bilingual
 # separator is NOT a channel leak — that's a high-CTR pattern we want to keep.
@@ -61,7 +62,8 @@ _FORBIDDEN_BRANDS    = [
 
 # ── Dimension scorers ────────────────────────────────────────────────────────
 
-def _score_title(title: str) -> Tuple[int, List[str]]:
+def _score_title(title: str,
+                 script_policy: str = "bilingual") -> Tuple[int, List[str]]:
     pts = 0
     fails: List[str] = []
     t = (title or "").strip()
@@ -77,17 +79,24 @@ def _score_title(title: str) -> Tuple[int, List[str]]:
             f"Current: {t!r}. Rewrite to end around 85 chars."
         )
 
-    # 4 pts: at least one power word
+    # 4 pts: a STRONG HOOK in any recognized form — power word, question,
+    # number-led, or quote-led. (Was power-word-ONLY, which (a) forced the
+    # "Shocking:" sameness formula and (b) rigged exploration: a QUESTION
+    # A/B probe lost these 4 pts every time, so the retry loop fought the
+    # explore directive and best-candidate selection was biased against
+    # the very experiments the learning depends on.)
     low = t.lower()
-    if any(w in low for w in _POWER_WORDS):
+    _has_power = any(w in low for w in _POWER_WORDS)
+    _has_question = "?" in t
+    _has_number = bool(_NUM_HOOK_RE.search(t[:24]))
+    _has_quote = t.startswith(("“", '"', "'")) or t.count('"') >= 2
+    if _has_power or _has_question or _has_number or _has_quote:
         pts += 4
     else:
         fails.append(
-            "title missing a POWER WORD. MUST include one of: "
-            "Shocking, Breaking, Viral, Exclusive, Revealed, Huge, Massive, "
-            "Stunning, Urgent, Biggest, Caught (or the native-script equivalent: "
-            "బిగ్, షాకింగ్, బ్రేకింగ్, వైరల్, సంచలనం, ఎక్స్క్లూజివ్, "
-            "बड़ी, शॉकिंग, ब्रेकिंग, वायरल, सनसनी)."
+            "title has NO hook — use a power word (Shocking/Breaking/"
+            "సంచలనం/షాకింగ్...), a QUESTION, a NUMBER-led opening, or a "
+            "QUOTE-led opening."
         )
 
     # 4 pts: no channel-suffix leak — generic SEO must NOT include "| Name"
@@ -103,15 +112,47 @@ def _score_title(title: str) -> Tuple[int, List[str]]:
     else:
         pts += 4
 
-    # 3 pts: bilingual (if 3+ latin AND 3+ non-ASCII, good for Indian-lang SEO)
+    # 3 pts: TITLE SCRIPT vs the channel's policy. Default 'bilingual'
+    # (operator mandate 2026-08); channels whose MEASURED history favors
+    # one script get 'english' or 'native' here (per-channel learnable \u2014
+    # operator decision after Kaizer News Telugu's 2003-video history
+    # showed English-leaning titles out-earning mixed ~3.5x).
     has_latin = len(re.findall(r"[A-Za-z]", t)) >= 3
     has_native = len(re.findall(r"[\u0900-\u0DFF]", t)) >= 3  # Devanagari..Sinhala range
-    if has_latin and has_native:
-        pts += 3
-    elif has_native or has_latin:
-        pts += 1  # partial credit for single-script
-    else:
-        fails.append("title has no alphabetic content in English or native-script")
+    sp = (script_policy or "bilingual").lower()
+    if sp == "english":
+        if has_latin and not has_native:
+            pts += 3
+        elif has_latin:
+            pts += 2   # mixed is fine-ish for an english-leaning channel
+        else:
+            fails.append("this channel's measured policy is ENGLISH-leaning "
+                         "titles \u2014 rewrite mostly in English (Latin script)")
+    elif sp == "native":
+        if has_native and not has_latin:
+            pts += 3
+        elif has_native:
+            pts += 2
+        else:
+            fails.append("this channel's measured policy is NATIVE-script "
+                         "titles \u2014 rewrite in the native script")
+    else:  # bilingual (default)
+        if has_latin and has_native:
+            pts += 3
+        elif has_native:
+            pts += 1
+            fails.append(
+                "title is native-script only \u2014 make it BILINGUAL: add the key "
+                "person/place/topic in ENGLISH (Latin script) so it is "
+                "searchable in both languages")
+        elif has_latin:
+            pts += 1
+            fails.append(
+                "title is English only \u2014 make it BILINGUAL: include the "
+                "native-script core of the headline alongside the English terms")
+        else:
+            fails.append("title has no alphabetic content \u2014 write a BILINGUAL "
+                         "(English + native-script) title")
 
     # 2 pts: has a hook-style separator (— or : or ? or !) that structures the title
     if re.search(r"[—:?!]", t):
@@ -120,7 +161,8 @@ def _score_title(title: str) -> Tuple[int, List[str]]:
     return min(pts, 20), fails
 
 
-def _score_description(desc: str, hook: str) -> Tuple[int, List[str]]:
+def _score_description(desc: str, hook: str,
+                       title: str = "") -> Tuple[int, List[str]]:
     pts = 0
     fails: List[str] = []
     d = (desc or "").strip()
@@ -154,9 +196,21 @@ def _score_description(desc: str, hook: str) -> Tuple[int, List[str]]:
     else:
         fails.append("description is one run-on paragraph — split into 3 paragraphs")
 
-    # 2 pts: has line 1 (hook) distinct from body
+    # 2 pts: FIRST-125-CHARS quality — the only part YouTube shows in
+    # search/suggested before "…more", so it must SELL, not restate the
+    # title. 1pt: line-1 structure exists; 1pt: the opening 125 chars are
+    # not just the title again (normalized containment either way).
     if "\n" in d[:400]:
-        pts += 2
+        pts += 1
+    first125 = re.sub(r"\s+", " ", d[:125].strip().lower())
+    tnorm = re.sub(r"\s+", " ", (title or "").strip().lower())
+    if first125 and tnorm and (tnorm in first125 or first125 in tnorm):
+        fails.append(
+            "description's first 125 chars just repeat the title — that's "
+            "the ONLY text YouTube shows in search before '…more'; open "
+            "with a NEW selling detail instead")
+    else:
+        pts += 1
 
     # 2 pts: no channel-brand leaks (from style source)
     low = d.lower()
@@ -257,6 +311,7 @@ def _score_relevance(
     clip_topic: str,
     trend_keywords: List[str],
     news_items: List[Dict[str, Any]],
+    competitor_terms: List[str] | None = None,
 ) -> Tuple[int, List[str]]:
     """Topic relevance + freshness bundle (20)."""
     pts = 0
@@ -265,6 +320,23 @@ def _score_relevance(
     desc = (seo.get("description") or "").lower()
     topic = (clip_topic or "").strip().lower()
     combined = f"{title} {desc}"
+    # COMPETITOR COVERAGE (only when intel was provided — scoring without
+    # intel is byte-identical to before): the rivals' winning query terms
+    # must be represented in the output. 2 bonus-capped pts folded into
+    # this dimension's 20 via the shared min() cap at the caller.
+    if competitor_terms:
+        kw_blob = " ".join(str(k).lower()
+                           for k in (seo.get("keywords") or []))
+        hay = f"{combined} {kw_blob}"
+        covered = sum(1 for t in competitor_terms[:12]
+                      if str(t).lower() in hay)
+        if covered >= 2:
+            pts += 2
+        else:
+            fails.append(
+                "competitor intel provided but the output covers "
+                f"only {covered} of their winning query terms/tags — weave "
+                "in at least 2 that fit this video")
 
     # 6 pts: at least one token from the clip's topic appears in title or description
     if topic:
@@ -348,8 +420,15 @@ def verify(
     clip_topic: str = "",
     trend_keywords: List[str] | None = None,
     news_items: List[Dict[str, Any]] | None = None,
+    script_policy: str = "bilingual",
+    competitor_terms: List[str] | None = None,
 ) -> Dict[str, Any]:
     """Score a generic SEO JSON deterministically.
+
+    ``script_policy``: 'bilingual' | 'english' | 'native' — per-channel
+    LEARNABLE (operator decision 2026-08): channels whose measured history
+    favors one script get scored against THAT policy instead of the
+    global bilingual default.
 
     Returns:
         {
@@ -361,16 +440,35 @@ def verify(
     trend_keywords = trend_keywords or []
     news_items = news_items or []
 
-    t_pts, t_fails = _score_title(seo.get("title", ""))
-    d_pts, d_fails = _score_description(seo.get("description", ""), seo.get("hook", ""))
+    t_pts, t_fails = _score_title(seo.get("title", ""),
+                                  script_policy=script_policy)
+    d_pts, d_fails = _score_description(seo.get("description", ""),
+                                        seo.get("hook", ""),
+                                        title=seo.get("title", ""))
     k_pts, k_fails = _score_keywords(seo.get("keywords", []), trend_keywords)
     h_pts, h_fails = _score_hashtags(seo.get("hashtags", []))
-    r_pts, r_fails = _score_relevance(seo, clip_topic, trend_keywords, news_items)
+    r_pts, r_fails = _score_relevance(seo, clip_topic, trend_keywords,
+                                      news_items,
+                                      competitor_terms=competitor_terms)
+    r_pts = min(r_pts, 20)   # competitor coverage folds into the 20 cap
 
     total = t_pts + d_pts + k_pts + h_pts + r_pts
 
     reasons: List[str] = []
     reasons += t_fails + d_fails + k_fails + h_fails + r_fails
+
+    # THUMBNAIL–TITLE COHERENCE (advisory, no points): CTR is thumbnail ×
+    # title together — a thumbnail_text sharing zero words with the title
+    # confuses the click. Retry loop fixes it without shifting the budget.
+    _tt = str(seo.get("thumbnail_text") or "").lower()
+    _ttl = str(seo.get("title") or "").lower()
+    if _tt and _ttl:
+        _tt_words = {w for w in re.findall(r"[\wऀ-෿]{3,}", _tt)}
+        if _tt_words and not any(w in _ttl for w in _tt_words):
+            reasons.append(
+                "thumbnail_text shares NO word with the title — align them "
+                "(same person/number/verdict) so the thumbnail and title "
+                "sell the same click")
 
     return {
         "score": max(0, min(100, total)),

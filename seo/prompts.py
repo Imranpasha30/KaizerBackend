@@ -80,13 +80,20 @@ branding in the output.  Use only its RHYTHM and WORDING STYLE.
     # Gemini can pattern-match against when writing back.
     language_directive = (
         f"# ⚠ LANGUAGE CONTRACT (MOST IMPORTANT RULE)\n"
-        f"All SEO output (title, description, keywords, hashtags, hook,\n"
-        f"thumbnail_text) MUST be written in {lang_full} ({lang_native})\n"
-        f"using the {script_name} script natively. ISO code: {lang_code}.\n"
+        f"The TITLE must be BILINGUAL: ENGLISH + {lang_full}\n"
+        f"({script_name} script) mixed in ONE title. All OTHER SEO output\n"
+        f"(description, keywords, hashtags, hook, thumbnail_text) MUST be\n"
+        f"written in {lang_full} ({lang_native}) using the {script_name}\n"
+        f"script natively. ISO code: {lang_code}.\n"
         f"\n"
-        f"- The TITLE may mix native script with one or two English\n"
-        f"  power words (e.g. \"Shocking\", \"Breaking\", \"Exclusive\")\n"
-        f"  AS LONG AS the bulk of the headline is in {script_name} script.\n"
+        f"- The TITLE mixes BOTH scripts (operator mandate 2026-08): a\n"
+        f"  searchable ENGLISH part (key person/place/topic in standard\n"
+        f"  English spelling, e.g. \"Revanth Reddy\", \"Hyderabad\") PLUS\n"
+        f"  the {script_name}-script core of the headline — this is the\n"
+        f"  proven high-CTR pattern in {lang_full} news feeds, and the\n"
+        f"  English terms make the video searchable in both languages.\n"
+        f"  Never a romanised transliteration of whole {lang_full}\n"
+        f"  sentences.\n"
         f"- The DESCRIPTION must be in {lang_full} ({script_name} script)\n"
         f"  with at most one English line for the opening hook. No\n"
         f"  romanised transliteration of {lang_full} words — write them\n"
@@ -122,11 +129,14 @@ Any channel name, handle, or URL that leaks in will cost score points AND
 will be mechanically stripped before publish.
 {voice_block}
 # Output contract (strict — response_schema is enforced)
-- `title`: 50-95 characters.  Bilingual (English hook + native-script) OR
-  fully native-script.  NO "| Channel" suffix anywhere.  Include a power
-  word (Shocking, Breaking, Exclusive, Revealed, Viral, or the native-script
-  equivalent: బిగ్, షాకింగ్, బ్రేకింగ్, వైరల్, ...).  Put the key person
-  / place in the first 6 words.
+- `title`: 50-95 characters, BILINGUAL (English + {lang_full} script
+  mixed in one headline — searchable English person/place/topic terms
+  plus the native-script core; never a romanised transliteration).
+  NO "| Channel" suffix anywhere.  Include a power word in EITHER
+  language (Shocking, Breaking, Exclusive, సంచలనం, షాకింగ్, ...) and
+  VARY the hook form across videos — question, number, consequence,
+  quote — never the same opener twice in a row.  Put the key person /
+  place in the first 6 words.
 - `description`: 700-1800 characters.  Plain text, no markdown.  Structure:
     1. Line 1: the HOOK sentence, verbatim.
     2. Three context paragraphs separated by blank lines.  Cite facts from
@@ -183,6 +193,12 @@ def build_user_prompt(
     corpus: Optional[Dict[str, Any]] = None,
     style_source: Optional[models.Channel] = None,
     retry_feedback: Optional[List[str]] = None,
+    learned: Optional[Dict[str, Any]] = None,
+    explore_hook: Optional[str] = None,
+    script_policy: str = "bilingual",
+    competitor: Optional[Dict[str, Any]] = None,
+    avoid_titles: Optional[List[str]] = None,
+    angle_hint: Optional[str] = None,
 ) -> str:
     """Per-clip user prompt with all grounded research layers + retry context."""
     try:
@@ -238,6 +254,103 @@ def build_user_prompt(
         if corpus.get("hook_patterns"):
             corpus_block += "Common hooks: " + " | ".join(corpus["hook_patterns"][:6]) + "\n"
 
+    # ── Learned-policy block (learning/seo_learning.py — REAL measured
+    #    performance of this channel's published videos; the wire that
+    #    makes generation improve over time instead of staying static) ──
+    learned_block = ""
+    if learned:
+        learned_block = (
+            "\n# 📈 CHANNEL LEARNING — measured from this channel's REAL "
+            "YouTube performance. FOLLOW IT.\n"
+        )
+        hooks = learned.get("best_hooks") or []
+        if hooks:
+            _hnames = {"question": "a QUESTION headline",
+                       "number": "a NUMBER-led headline",
+                       "quote": "a QUOTE-led headline",
+                       "power": "a power-word hook",
+                       "plain": "a plain factual headline"}
+            learned_block += ("- Hook forms that WIN here: "
+                              + ", ".join(_hnames.get(h, h) for h in hooks)
+                              + " — use one of these forms.\n")
+        if learned.get("best_script"):
+            _snames = {"mixed": "English + native script MIXED",
+                       "english": "mostly English",
+                       "native": "mostly native script"}
+            learned_block += (f"- Title script that earns the most here: "
+                              f"{_snames.get(learned['best_script'], learned['best_script'])}.\n")
+        if learned.get("best_len_band"):
+            _bands = {"short": "under 50 chars", "sweet": "50-80 chars",
+                      "long": "80-95 chars"}
+            learned_block += (f"- Title length sweet spot here: "
+                              f"{_bands.get(learned['best_len_band'], learned['best_len_band'])}.\n")
+        kws = learned.get("top_keywords") or []
+        if kws:
+            learned_block += ("- Keywords that historically ride this "
+                              "channel's winners (weave 2-4 IF relevant to "
+                              "THIS video, never force them): "
+                              + ", ".join(kws[:8]) + "\n")
+        tops = learned.get("top_topics") or []
+        if tops:
+            learned_block += ("- Topic angles that WIN on this channel "
+                              "(when THIS video touches one, lead with it): "
+                              + ", ".join(tops[:5]) + "\n")
+        if learned.get("based_on"):
+            learned_block += (f"(learned from {learned['based_on']} published "
+                              f"videos' measured views/hour and CTR)\n")
+    # EXPLORATION directive (measured A/B): overrides the exploit hint so
+    # the channel's policy keeps getting tested against alternatives.
+    if explore_hook:
+        _hnames2 = {"question": "a QUESTION headline",
+                    "number": "a NUMBER-led headline",
+                    "quote": "a QUOTE-led headline",
+                    "power": "a power-word hook",
+                    "plain": "a plain factual headline"}
+        learned_block += (
+            f"\n# 🧪 EXPLORATION (measured test — this round only)\n"
+            f"Write the title as {_hnames2.get(explore_hook, explore_hook)} "
+            f"this time, NOT the channel's usual form. This is a deliberate "
+            f"A/B probe; its performance will be measured.\n")
+
+    # ── Competitor intelligence block (opt-in; topic-matched only) ──
+    competitor_block = ""
+    if competitor and competitor.get("rivals"):
+        competitor_block = (
+            "\n# ⚔ MARKET INTELLIGENCE — tracked competitors' WINNERS on "
+            "THIS topic (public data)\n"
+            "Their best-performing videos on this story:\n")
+        for rv in competitor["rivals"][:5]:
+            competitor_block += (f"- [{rv['vph']} views/hr] "
+                                 f"\"{rv['title']}\"\n")
+        competitor_block += (
+            "RULES: target the SAME search queries but DIFFERENTIATE — a "
+            "fresher angle, never a near-copy of their titles.\n")
+        if competitor.get("cover_terms"):
+            competitor_block += (
+                "- Query terms their winners carry — cover the relevant "
+                "ones: " + ", ".join(competitor["cover_terms"][:8]) + "\n")
+        if competitor.get("harvest_tags"):
+            competitor_block += (
+                "- Their proven tags — include the ones that fit THIS "
+                "video in `keywords`: "
+                + ", ".join(competitor["harvest_tags"][:12]) + "\n")
+
+    # ── Per-channel distinctness (angle + sibling titles to avoid) ──
+    distinct_block = ""
+    if angle_hint:
+        distinct_block += (
+            f"\n# 🎯 ANGLE FOR THIS CHANNEL'S VERSION\n"
+            f"Write this channel's title from a DISTINCT angle: {angle_hint}. "
+            f"It must read differently from the sibling versions below.\n")
+    if avoid_titles:
+        distinct_block += (
+            "\n# 🚫 SIBLING TITLES ALREADY USED — do NOT reuse their opening "
+            "words, structure or phrasing:\n")
+        for t in list(avoid_titles)[:8]:
+            _t = str(t).strip()
+            if _t:
+                distinct_block += f'- "{_t}"\n'
+
     # ── Retry feedback (from verifier) ──
     retry_block = ""
     if retry_feedback:
@@ -272,7 +385,8 @@ and produce CHANNEL-AGNOSTIC content (no channel names, no footer).
 - Key locations: {', '.join(key_locations) if key_locations else '(none)'}
 - Sentiment / mood: {sentiment or '(unspecified)'}
 - Clip duration: {duration_str}
-- Target language: {language}
-{news_block}{trends_block}{yt_block}{corpus_block}{retry_block}
+- Target language: {language} (for description / tags / hashtags)
+- Title language: {"mostly ENGLISH (this channel's measured winner)" if script_policy == "english" else ("NATIVE script (this channel's measured winner)" if script_policy == "native" else "BILINGUAL — English searchable terms + native-script core mixed in one headline")}
+{news_block}{trends_block}{yt_block}{corpus_block}{learned_block}{competitor_block}{distinct_block}{retry_block}
 Write the JSON now.
 """

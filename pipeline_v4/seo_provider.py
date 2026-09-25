@@ -35,6 +35,27 @@ class SeoInput:
     # the editor can show which voice was used. The resolved Channel is
     # passed separately to generate_seo(style_source=...).
     style_source_id: Optional[int] = None
+    # Optional facts for the UNIFIED (advanced-engine) path — feed the
+    # competitor topic-match + richer grounding. All default empty so the
+    # legacy Engine-B path is byte-identical when they're absent.
+    key_people: Optional[list] = None
+    key_topics: Optional[list] = None
+    key_locations: Optional[list] = None
+    sentiment: str = ""
+    duration: float = 0.0
+    # CLEAN content (transcript / story text) for grounding — kept separate
+    # from `body`, which per-channel packs with steer instructions. The unified
+    # engine grounds on this so per-channel SEO stays about the actual video.
+    content: str = ""
+
+
+# Master switch for the unified engine: when "1", generate_seo* delegate to
+# the advanced seo.generator (learned policy + competitor intel + script
+# policy + dedupe + 100-pt verifier + Gemini|Claude) via a synthetic clip,
+# with the legacy in-file Gemini path kept as an automatic fallback. Read per
+# call so a .env flip + restart is the full rollback.
+def _unified_enabled() -> bool:
+    return (os.environ.get("KAIZER_SEO_UNIFIED", "0") or "0").strip() == "1"
 
 
 def _build_user_prompt(inp: SeoInput, corpus: Optional[dict] = None) -> str:
@@ -132,6 +153,11 @@ def generate_seo(
     *,
     model_name: Optional[str] = None,
     style_source=None,
+    db=None,
+    own_channel=None,
+    avoid_titles: Optional[list] = None,
+    angle_hint: Optional[str] = None,
+    engine_choice: Optional[str] = None,
 ) -> dict:
     """Single-shot SEO generation. Returns the V2-compatible dict on
     success, an empty-but-valid skeleton on failure. Never raises so
@@ -143,6 +169,19 @@ def generate_seo(
     hooks / power words) is injected as rhythm examples. Resolve it from
     the caller's DB session BEFORE calling (we read its ``.corpus``
     relationship here, so the session must still be open)."""
+    # UNIFIED path (KAIZER_SEO_UNIFIED=1): delegate to the advanced engine so
+    # even single-shot SEO gets learned policy + competitor intel + script
+    # policy + the 100-pt verifier + Gemini|Claude. Falls back to the legacy
+    # in-file Gemini path below on any failure — SEO is never blocked.
+    if _unified_enabled() and db is not None:
+        try:
+            return generate_seo_from_input(
+                inp, db=db, own_channel=own_channel, style_source=style_source,
+                avoid_titles=avoid_titles, angle_hint=angle_hint,
+                engine_choice=engine_choice)
+        except Exception as exc:
+            print(f"[v4/seo] unified engine failed, using legacy path: "
+                  f"{str(exc)[:160]}", flush=True)
     try:
         from seo.generator import _gemini_client
         from seo.prompts import build_system_prompt
@@ -256,10 +295,101 @@ def generate_seo(
     return seo
 
 
+def generate_seo_from_input(
+    inp: SeoInput,
+    *,
+    db,
+    own_channel=None,
+    style_source=None,
+    avoid_titles: Optional[list] = None,
+    angle_hint: Optional[str] = None,
+    engine_choice: Optional[str] = None,
+) -> dict:
+    """UNIFIED path: run the ADVANCED engine (seo.generator.generate_seo_for_clip)
+    from a SeoInput, so render/publish SEO gets learned policy + competitor
+    intel + script policy + dedupe + the 100-pt verifier + Gemini|Claude choice.
+
+    Builds a DETACHED synthetic clip (never added to the session; persist=False)
+    carrying the facts the engine mines. Returns the V4/publish dict shape.
+    Raises on any failure so the caller can fall back to the legacy path."""
+    from seo.generator import generate_seo_for_clip
+    import models as _m
+
+    # GROUND ON THE REAL CONTENT. Quick Publish puts the transcript in `body`
+    # (transcript mode) or the user's blurb in `summary` (description mode), and
+    # a raw upload's title is a GENERIC placeholder ('bulletin'). If we seed the
+    # topic from that placeholder the engine writes SEO for the WRONG topic
+    # (verified: a finance video got a "Jr NTR surgery" title). So derive the
+    # topic + grounding from the actual content, not the placeholder title.
+    _summary = (inp.summary or "").strip()
+    # Prefer the CLEAN content (per-channel packs `body` with steer text) so the
+    # grounding stays about the actual video, not the steer instructions.
+    _clean = (inp.content or "").strip()
+    _body = (_clean or inp.body or "").strip()
+    _content = (_clean or _summary or _body).strip()
+    _title = (inp.title_native or inp.title_english or "").strip()
+    _generic = _title.lower() in (
+        "", "bulletin", "short", "shorts", "clip", "video", "raw", "untitled")
+    topic_seed = _title if not _generic else (_content[:160] or _title)
+
+    meta = {
+        # English-summary line (description mode) + native-summary line grounds
+        # on the real transcript/content so the writer stays ON topic.
+        "summary": _summary[:2500],
+        "summary_native": (_body or (inp.title_native if not _generic else ""))[:3000],
+        "key_people": list(inp.key_people or []),
+        "key_topics": list(inp.key_topics or []),
+        "key_locations": list(inp.key_locations or []),
+        "text": (_content or _title)[:2500],
+    }
+    clip = _m.Clip()                       # transient, NOT added to the session
+    clip.text = topic_seed
+    clip.meta = json.dumps(meta, ensure_ascii=False)
+    clip.sentiment = inp.sentiment or ""
+    clip.duration = float(inp.duration or 0.0)
+
+    rich = generate_seo_for_clip(
+        clip, db=db, style_source=style_source, own_channel=own_channel,
+        include_news=True, include_trends=True, include_yt_benchmark=True,
+        language=inp.language, avoid_titles=avoid_titles, angle_hint=angle_hint,
+        engine_choice=engine_choice, persist=False,
+    )
+
+    out = _empty_seo(inp.language)
+    out.update({
+        "title":          str(rich.get("title", "")).strip(),
+        "description":    str(rich.get("description", "")).strip(),
+        "keywords":       [str(k).strip() for k in (rich.get("keywords") or [])
+                           if str(k).strip()][:30],
+        "hashtags":       [str(h).strip() for h in (rich.get("hashtags") or [])
+                           if str(h).strip()][:12],
+        "hook":           str(rich.get("hook", "")).strip(),
+        "thumbnail_text": str(rich.get("thumbnail_text", "")).strip(),
+        "model":          rich.get("model") or DEFAULT_MODEL,
+        "style_source_id": inp.style_source_id,
+    })
+    if not (out["title"]).strip():
+        raise ValueError("unified engine returned an empty title")
+    out["description"] = inline_hashtags_into_description(
+        description=out["description"], hashtags=out["hashtags"])
+    # Carry the advanced engine's REAL 100-pt verifier score + provenance.
+    out["seo_score"] = rich.get("seo_score")
+    out["tool_score"] = rich.get("seo_score")
+    out["verifier_breakdown"] = rich.get("verifier_breakdown")
+    out["verifier_reasons"] = rich.get("verifier_reasons")
+    out["engine"] = "unified"
+    return out
+
+
 def generate_seo_to_score(
     inp: SeoInput,
     *,
+    db=None,
+    own_channel=None,
     style_source=None,
+    avoid_titles: Optional[list] = None,
+    angle_hint: Optional[str] = None,
+    engine_choice: Optional[str] = None,
     target_score: int = 85,
     max_attempts: int = 4,
 ) -> dict:
@@ -273,6 +403,19 @@ def generate_seo_to_score(
     Cost note: up to ``max_attempts`` Gemini calls. 85 isn't always reachable (sparse/thin
     content yields low relevance); we then return the highest-scoring attempt rather than loop.
     """
+    # UNIFIED path (KAIZER_SEO_UNIFIED=1): the advanced engine self-improves via
+    # its own verifier retry loop, so one call replaces this score loop. Falls
+    # back to the legacy loop below on any failure — a publish is never blocked.
+    if _unified_enabled() and db is not None:
+        try:
+            return generate_seo_from_input(
+                inp, db=db, own_channel=own_channel, style_source=style_source,
+                avoid_titles=avoid_titles, angle_hint=angle_hint,
+                engine_choice=engine_choice)
+        except Exception as exc:
+            print(f"[v4/seo] unified engine failed, using legacy path: "
+                  f"{str(exc)[:160]}", flush=True)
+
     from dataclasses import replace as _dc_replace
     base_body = inp.body or ""
     best: Optional[dict] = None
@@ -285,8 +428,9 @@ def generate_seo_to_score(
         if attempt > 0 and suggestions:
             steer = (
                 f"\n\nIMPROVE THIS SEO — the previous attempt scored {int(round(best_score))}"
-                f"/100 (target {target_score}+). Fix these specifically, keeping it accurate "
-                f"and in the target language:\n- " + "\n- ".join(str(s) for s in suggestions[:6])
+                f"/100 (target {target_score}+). Fix these specifically, keeping it accurate — "
+                f"TITLE in ENGLISH, description/tags in the target language:\n- "
+                + "\n- ".join(str(s) for s in suggestions[:6])
             )
             cur = _dc_replace(inp, body=(base_body + steer)[:1800])
         seo = generate_seo(cur, style_source=style_source)

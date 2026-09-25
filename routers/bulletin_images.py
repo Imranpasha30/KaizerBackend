@@ -136,8 +136,11 @@ def _media_url_for(abs_path: Path) -> str:
     return f"/api/file/?path={str(abs_path)}"
 
 
-def _row_for_image(story_idx: int, slot_idx: int, abs_path: Path) -> dict:
-    """Standard image record shape used by every code path below."""
+def _row_for_image(story_idx: int, slot_idx: int, abs_path: Path,
+                   label: str = "") -> dict:
+    """Standard image record shape used by every code path below.
+    ``label`` = subject line from the manifest (name-tag contract);
+    "" when the entry predates labels."""
     try:
         size = abs_path.stat().st_size
     except OSError:
@@ -149,6 +152,7 @@ def _row_for_image(story_idx: int, slot_idx: int, abs_path: Path) -> dict:
         "abs_path":    str(abs_path),
         "url":         _media_url_for(abs_path),
         "size_bytes":  int(size),
+        "label":       (label or "")[:120],
     }
 
 
@@ -198,7 +202,8 @@ def _resolve_image_paths(bdir: Path) -> list[dict]:
                 if key in seen:
                     continue
                 seen.add(key)
-                rows.append(_row_for_image(story_idx, slot_idx, p))
+                rows.append(_row_for_image(story_idx, slot_idx, p,
+                                           label=str(entry.get("label", "") or "")))
             if rows:
                 return rows
         except (OSError, json.JSONDecodeError):
@@ -357,6 +362,7 @@ def replace_bulletin_image(
     story_index: int = Form(...),
     slot_index:  int = Form(...),
     image:       UploadFile = File(...),
+    label:       Optional[str] = Form(None),   # subject line (name-tag contract)
     db: Session = Depends(get_db),
     _: models.User = Depends(auth.current_user),
 ) -> dict:
@@ -477,17 +483,22 @@ def replace_bulletin_image(
                     entry["path"]     = str(target)
                     entry["filename"] = target_filename
                     entry["user_replaced_at"] = datetime.now(timezone.utc).isoformat()
+                    if label and label.strip():
+                        entry["label"] = label.strip()[:120]
                     updated_any = True
                     break
             if not updated_any:
                 # No matching slot in manifest — append a new entry so
                 # recompose still picks up the user's edit.
-                data.append({
+                new_entry = {
                     "story_index": int(story_index),
                     "path":        str(target),
                     "filename":    target_filename,
                     "user_replaced_at": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                if label and label.strip():
+                    new_entry["label"] = label.strip()[:120]
+                data.append(new_entry)
             manifest_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",

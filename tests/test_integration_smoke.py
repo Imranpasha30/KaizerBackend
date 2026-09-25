@@ -153,6 +153,14 @@ def test_full_pipeline_5s_youtube_short():
             )
         assert os.path.exists(output), "Output file not created by re-encode"
 
+        # ── Step 3b: broadcast loudness conform — the same finalization the
+        # production paths run (v1_bridge render_bulletin/render_short).
+        # One-pass dynamic loudnorm on 5s content routinely misses by 2-3 LU;
+        # the two-pass conform is what actually guarantees the -14±1 gate
+        # asserted below.
+        from pipeline_v4.audio_conform import conform_loudness
+        conform_loudness(output)
+
         # ── Step 4: QA on output ─────────────────────────────────────────────
         qa_result = validate_output(output, platform="youtube_short", expected_duration_s=5.0)
         assert qa_result.ok, (

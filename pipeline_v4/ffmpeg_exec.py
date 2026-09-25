@@ -23,6 +23,8 @@ import re
 import subprocess
 from typing import List
 
+import os
+
 # Case-insensitive substrings that identify an NVENC/CUDA-specific
 # failure (as opposed to e.g. a bad filtergraph, which would fail on
 # CPU exactly the same way).
@@ -31,6 +33,11 @@ _NVENC_FAILURE_SUBSTRINGS = (
     "no capable devices",    # no NVENC-capable GPU visible
     "cannot init cuda",      # CUDA context creation failed
     "nvenc",                 # generic h264_nvenc error chatter
+    # Leaked/exhausted sessions right after force-killed renders (job
+    # 601): the encoder never opens, and the run ALSO reports "received
+    # no packets" — the encoder is the root, so this must outrank the
+    # stream-failure rung.
+    "could not open encoder",
 )
 
 # Failures where the OUTPUT came out empty / no frames decoded. The classic
@@ -43,6 +50,12 @@ _STREAM_FAILURE_SUBSTRINGS = (
     "output file is empty",
     "received no packets",
     "no frames",
+    # Decoder-side death signatures (job 600 re-render): NVDEC session
+    # exhaustion under parallel slice+compose surfaces as the h264
+    # decoder's "no frame!" plus AVERROR_EXTERNAL — the ENCODER never
+    # ran, so dropping GPU decode is the right first rung.
+    "no frame!",
+    "generic error in an external library",
 )
 
 # NVENC preset names (p1..p7) — used to recognise (and drop) the NVENC
@@ -50,6 +63,16 @@ _STREAM_FAILURE_SUBSTRINGS = (
 _NVENC_PRESET_RE = re.compile(r"^p[1-7]$")
 
 _STDERR_TAIL_CHARS = 800
+
+
+def _threads_already_one(cmd: List[str]) -> bool:
+    """True when the command already runs the filtergraph single-threaded —
+    the OOM rung has nowhere lower to go and must cascade to a CPU rewrite."""
+    try:
+        i = cmd.index("-filter_complex_threads")
+        return i + 1 < len(cmd) and str(cmd[i + 1]) == "1"
+    except ValueError:
+        return False
 
 
 def _is_nvenc_failure(stderr: str) -> bool:
@@ -68,6 +91,16 @@ def _is_stream_failure(stderr: str) -> bool:
     failure), as opposed to an encoder failure."""
     s = (stderr or "").lower()
     return any(pat in s for pat in _STREAM_FAILURE_SUBSTRINGS)
+
+
+def _is_oom_failure(stderr: str) -> bool:
+    """True when ffmpeg died on memory allocation. ffmpeg 8's THREADED
+    filtergraph executor (the ``fc#N`` tasks) keeps frame queues per
+    filter link — a branch-heavy graph can demand tens of GB even on a
+    box with plenty of free RAM (job 600: single compose OOM'd with
+    25GB free). Single-threading the graph collapses that memory."""
+    s = (stderr or "").lower()
+    return "cannot allocate memory" in s or "error code: -12" in s
 
 
 def _uses_hwaccel(cmd: List[str]) -> bool:
@@ -174,6 +207,14 @@ def run_ffmpeg(
         try:
             proc = subprocess.run(
                 attempt_cmd, capture_output=True, text=True, timeout=timeout,
+                # ffmpeg/ffprobe print filenames + container metadata in the
+                # system codepage (latin1), so their stderr routinely carries
+                # non-UTF-8 bytes (e.g. 0xf6 'ö' from Sony camera tags). The
+                # default strict decode crashes the stdlib reader THREAD with
+                # UnicodeDecodeError — spamming the backend log and losing the
+                # stderr we classify failures by. errors="replace" keeps the
+                # text intact-enough and never raises.
+                errors="replace",
             )
         except subprocess.TimeoutExpired as exc:
             stderr = exc.stderr
@@ -201,6 +242,10 @@ def run_ffmpeg(
         )
         if attempt < total_attempts:
             # Mitigation cascade, each applied at most once:
+            #   0. OOM on a -filter_complex command -> single-thread the
+            #      filtergraph (ffmpeg 8's threaded executor queues frames
+            #      per link; huge graphs demand tens of GB — threads=1
+            #      collapses it). Keeps GPU decode/encode.
             #   1. Empty/stream-less output WITH GPU decode  -> drop -hwaccel
             #      (the encoder never ran; the GPU input-seek decoded 0 frames).
             #      Keep the encoder so the fast NVENC encode is retained.
@@ -208,22 +253,47 @@ def run_ffmpeg(
             #      (libx264 + drop -hwaccel).
             #   3. Any other failure on a still-GPU command   -> full CPU rewrite
             #      as a last resort before giving up.
-            if (_is_stream_failure(stderr) and _uses_hwaccel(attempt_cmd)
-                    and not dropped_hwaccel and not rewrote_cpu):
-                attempt_cmd = _drop_hwaccel(attempt_cmd)
-                dropped_hwaccel = True
+            if (_is_oom_failure(stderr) and "-filter_complex" in attempt_cmd
+                    and not _threads_already_one(attempt_cmd)):
+                # LOWER filter threads to 1 (the callers now set a moderate
+                # proactive cap, so the OOM path must REWRITE the value, not
+                # only add it). Single-threaded runs several times slower —
+                # give the rescue attempt a matching time budget.
+                if "-filter_complex_threads" in attempt_cmd:
+                    _ti = attempt_cmd.index("-filter_complex_threads")
+                    attempt_cmd[_ti + 1] = "1"
+                else:
+                    _fci = attempt_cmd.index("-filter_complex")
+                    attempt_cmd = (attempt_cmd[:_fci]
+                                   + ["-filter_complex_threads", "1"]
+                                   + attempt_cmd[_fci:])
+                timeout = int(timeout * 4)
                 print(
-                    f"[ffmpeg/{log_label}] empty output with GPU decode -- "
-                    f"retrying with CPU decode (-hwaccel dropped)",
+                    f"[ffmpeg/{log_label}] out-of-memory in the filtergraph -- "
+                    f"retrying single-threaded (-filter_complex_threads 1, "
+                    f"timeout {timeout}s)",
                     flush=True,
                 )
             elif _is_nvenc_failure(stderr) and "h264_nvenc" in attempt_cmd and not rewrote_cpu:
+                # Checked BEFORE the stream rung: an encoder that never
+                # opened also yields "received no packets" (job 601) —
+                # dropping GPU decode there wastes the retry on the wrong
+                # half. Full CPU rewrite is the correct medicine.
                 attempt_cmd = _rewrite_nvenc_to_cpu(attempt_cmd)
                 rewrote_cpu = True
                 dropped_hwaccel = True
                 print(
                     f"[ffmpeg/{log_label}] NVENC failure detected -- "
                     f"retrying on CPU (libx264)",
+                    flush=True,
+                )
+            elif (_is_stream_failure(stderr) and _uses_hwaccel(attempt_cmd)
+                    and not dropped_hwaccel and not rewrote_cpu):
+                attempt_cmd = _drop_hwaccel(attempt_cmd)
+                dropped_hwaccel = True
+                print(
+                    f"[ffmpeg/{log_label}] empty output with GPU decode -- "
+                    f"retrying with CPU decode (-hwaccel dropped)",
                     flush=True,
                 )
             elif "h264_nvenc" in attempt_cmd and not rewrote_cpu:
@@ -237,6 +307,17 @@ def run_ffmpeg(
             else:
                 print(f"[ffmpeg/{log_label}] retrying unchanged command", flush=True)
 
+    # Forensics: persist the exact final failing command next to its
+    # output file, so an OOM/hang can be reproduced and bisected by hand
+    # (<output>.failcmd.txt — job 600 cost three blind re-render rounds
+    # without this).
+    try:
+        _out = str(cmd[-1]) if cmd else ""
+        if _out and (os.path.sep in _out or ":" in _out):
+            with open(_out + ".failcmd.txt", "w", encoding="utf-8") as _fh:
+                _fh.write(" ".join(str(t) for t in attempt_cmd))
+    except Exception:
+        pass
     raise RuntimeError(
         f"{log_label}: ffmpeg failed after {total_attempts} attempt(s) "
         f"(rc={last_rc}): {last_tail}"

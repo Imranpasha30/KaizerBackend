@@ -128,6 +128,18 @@ def _poll_v2(db: Session, public_client, channel_id: int | None = None) -> int:
         id_to_job = {j.youtube_video_id: j for j in jobs if j.youtube_video_id}
         video_ids = list(id_to_job.keys())
 
+        # REAL thumbnail CTR + impressions (YouTube Reporting API v1) — ONE
+        # fetch per channel, covering all its videos. The legacy
+        # analytics/ctr.py path silently returned {} on every call (the
+        # "ctr=None on every TrainingSample" bug), so the learning loop had
+        # no signal. Reporting API is the only source of per-video thumbnail
+        # impressions/CTR; falls back soft to {} when the scope/job is absent.
+        try:
+            from insights.reporting_api import fetch_thumbnail_ctr
+            ctr_map = fetch_thumbnail_ctr(db, ch_id)
+        except Exception:
+            ctr_map = {}
+
         for batch in _chunks(video_ids, BATCH_SIZE):
             try:
                 resp = yt.videos().list(
@@ -136,11 +148,6 @@ def _poll_v2(db: Session, public_client, channel_id: int | None = None) -> int:
             except HttpError as e:
                 print(f"[analytics] v2 videos.list failed: {e}")
                 continue
-            try:
-                from analytics.ctr import fetch_video_ctr
-                ctr_map = fetch_video_ctr(db, ch_id, batch)
-            except Exception:
-                ctr_map = {}
 
             for item in resp.get("items") or []:
                 vid = item.get("id")
@@ -152,6 +159,7 @@ def _poll_v2(db: Session, public_client, channel_id: int | None = None) -> int:
                 likes = int(stats.get("likeCount") or 0)
                 comments = int(stats.get("commentCount") or 0)
                 ctr_val = (ctr_map.get(vid) or {}).get("ctr")
+                imp_val = (ctr_map.get(vid) or {}).get("impressions")
 
                 ref = job.finished_at or job.updated_at or job.created_at
                 hours_since = 0.0
@@ -167,6 +175,7 @@ def _poll_v2(db: Session, public_client, channel_id: int | None = None) -> int:
                         db, upload_job=shim, clip=clip,
                         views=views, likes=likes, comments=comments,
                         hours_since_publish=hours_since, ctr=ctr_val,
+                        impressions=imp_val,
                     ) is not None:
                         sampled += 1
                 except Exception:

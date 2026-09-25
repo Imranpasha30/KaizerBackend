@@ -51,6 +51,7 @@ def record_sample(
     hours_since_publish: float = 0.0,
     platform: str = "youtube",
     ctr: Optional[float] = None,
+    impressions: Optional[int] = None,
 ) -> Optional["models.TrainingSample"]:
     """Upsert ONE training-ready row for a published video (keyed by video_id),
     updating it to the LATEST outcome. Does NOT commit — the caller owns the
@@ -114,6 +115,13 @@ def record_sample(
         row.keyword_count = len(kws)
         row.hashtag_count = len(tags)
         row.seo_score = score
+        # A/B exploration ledger: the hook form this SEO deliberately
+        # probed (stamped by the generator), or None for exploit rounds.
+        try:
+            row.explored_hook = (str(seo.get("explored_hook") or "")[:12]
+                                 or None)
+        except Exception:
+            pass
         # labels (latest)
         row.views = int(views or 0)
         row.likes = int(likes or 0)
@@ -123,6 +131,11 @@ def record_sample(
         if ctr is not None:
             try:
                 row.ctr = float(ctr)
+            except Exception:
+                pass
+        if impressions is not None:
+            try:
+                row.impressions = int(impressions)
             except Exception:
                 pass
         return row

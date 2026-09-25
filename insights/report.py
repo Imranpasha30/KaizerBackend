@@ -48,18 +48,201 @@ def _yt(vid: str) -> str:
     return f"https://youtu.be/{vid}"
 
 
-def _ids_md(ids: List[str]) -> str:
+def _ids_md(ids: List[str], titles: Optional[dict] = None) -> str:
+    """Render evidence videos. With a titles map we show the human TITLE (linked)
+    instead of the raw video id — a creator can't read '[Tw1pRhMsFBM]'."""
     if not ids:
         return "_—_"
-    return ", ".join(f"[{v}]({_yt(v)})" for v in ids[:8])
+    titles = titles or {}
+    parts = []
+    for v in ids[:8]:
+        t = (titles.get(v) or "").strip()
+        label = ((t[:55] + "…") if len(t) > 56 else t) if t else v
+        parts.append(f"[{label}]({_yt(v)})")
+    return ", ".join(parts)
 
 
 def _pct(x, nd=1) -> str:
     return f"{x*100:.{nd}f}%" if isinstance(x, (int, float)) else "—"
 
 
-def render_markdown(results: dict) -> str:
-    """Deterministic full report from the structured analysis results. Always evidence-backed."""
+# Plain-English names for the internal feature/factor keys — a creator reads
+# "title length", not "len_chars"; "how long people keep watching", not "retention r".
+_FEATURE_LABELS = {
+    "retention": "how long people keep watching",
+    "len_chars": "title length",
+    "title_length": "title length",
+    "early_velocity": "how fast a video takes off in its first 2 days",
+    "browse_share": "how often YouTube recommends it (Home / Browse)",
+    "power_words": "punchy, emotional words in the title",
+    "ctr": "how often people click your thumbnail",
+    "has_number": "putting a number in the title",
+    "has_question": "asking a question in the title",
+    "caps_ratio": "using CAPS in the title",
+    "has_brackets": "using [brackets] in the title",
+}
+
+
+def _label(f: str) -> str:
+    return _FEATURE_LABELS.get(f, str(f).replace("_", " "))
+
+
+def _strength(r) -> str:
+    a = abs(r or 0)
+    return "a strong" if a >= 0.30 else ("a clear" if a >= 0.15 else "a slight")
+
+
+import re as _re
+
+# Ugly internal codes → plain words (used only by the plain-report scrubber).
+_CODE_SUBS = {
+    "len_chars": "title length",
+    "power_words": "punchy title words",
+    "browse_share": "YouTube recommending it",
+    "early_velocity": "how fast it takes off",
+    "caps_ratio": "CAPS in the title",
+    "has_number": "a number in the title",
+    "has_question": "a question in the title",
+    "has_brackets": "[brackets] in the title",
+}
+
+
+def _plainify(s: str) -> str:
+    """Strip statistics jargon from a technical string for the PLAIN report:
+    drop r-values / 'measured on N videos', swap ugly codes + jargon phrases."""
+    s = str(s or "")
+    for code, lab in _CODE_SUBS.items():
+        s = _re.sub(r"'?\b" + _re.escape(code) + r"\b'?", lab, s)
+    s = _re.sub(r"\(strongest correlation[^)]*\)", "", s)
+    s = _re.sub(r"\(r\s*=\s*[+-]?\d*\.?\d+[^)]*\)", "", s)
+    s = _re.sub(r"\br\s*=\s*[+-]?\d*\.?\d+", "", s)
+    s = _re.sub(r",?\s*measured on [\d,]+ videos", "", s, flags=_re.I)
+    s = s.replace("packaging line", "click-rate cutoff").replace("sub-threshold", "low-click")
+    s = _re.sub(r"\s+([.;,])", r"\1", s)
+    return _re.sub(r"\s{2,}", " ", s).strip()
+
+
+def _titles_list_md(ids: List[str], titles: Optional[dict], n: int = 5) -> str:
+    """A bulleted list of example videos by TITLE (linked) for the plain report."""
+    if not ids:
+        return ""
+    titles = titles or {}
+    lines = []
+    for v in ids[:n]:
+        t = (titles.get(v) or "").strip()
+        label = ((t[:70] + "…") if len(t) > 71 else t) if t else v
+        lines.append(f"- [{label}]({_yt(v)})")
+    return "\n".join(lines)
+
+
+def render_markdown_plain(results: dict, titles: Optional[dict] = None) -> str:
+    """PLAIN-ENGLISH report for a creator — zero statistics jargon, no correlation
+    numbers, video TITLES not ids, every point paired with one concrete action.
+    Deterministic (always works); the analytic view keeps the precise numbers."""
+    if not results:
+        return "# Your channel report\n\n_No analysis available yet._"
+    titles = titles or {}
+    mode = results.get("mode", "deep")
+    out: List[str] = []
+    out.append("# Your channel — what to fix next (plain English)")
+    out.append("")
+    out.append("> The clearest read on what's holding your videos back and the one change most "
+               "likely to help on your next upload. Views also swing on the news cycle and luck — "
+               "this nails what you control.")
+    out.append("")
+
+    if mode == "starter":
+        out.append("## Starter plan")
+        out.append(results.get("headline") or "")
+        bm = results.get("benchmarks", {})
+        if bm:
+            out.append(f"\nAim for a click rate around **{_pct(bm.get('ctr'))}** and keep people watching "
+                       f"about **{_pct(bm.get('avg_view_pct'))}** of the video.")
+        for sect, items in (results.get("plan", {}) or {}).items():
+            out.append(f"\n### {sect.capitalize()}")
+            for it in items:
+                out.append(f"- {it}")
+        out.append("\n## Your next 10 uploads")
+        for i, step in enumerate(results.get("next_10", []), 1):
+            out.append(f"{i}. {step}")
+        return "\n".join(out)
+
+    # Big picture
+    prof = results.get("channel_profile") or {}
+    cov = results.get("data_coverage", {})
+    out.append("## The big picture")
+    if prof.get("name"):
+        out.append(f"- Your channel reads as **{prof['name']}**"
+                   + (" (high-volume — the plan keeps your volume, it never tells you to post less)."
+                      if prof.get("high_volume") else "."))
+    out.append(f"- Looked at **{cov.get('n_videos', 0):,}** of your videos. A typical one gets about "
+               f"**{int(results.get('median_views', 0)):,} views**.")
+    if results.get("headline"):
+        out.append(f"- {_plainify(results['headline'])}")
+
+    # What your winners have in common
+    tiers = results.get("tiers", {})
+    bo = tiers.get("breakout", {})
+    if bo.get("n"):
+        tops = ", ".join(bo.get("top_topics", []) or []) or "your strongest topics"
+        out.append("\n## What your best videos have in common")
+        out.append(f"**{bo['n']:,}** of your videos took off (5×+ your usual views). They lean into: "
+                   f"**{tops}**. Make more like these.")
+
+    # Biggest opportunities (ranked drivers, in plain words)
+    drivers = [d for d in (results.get("drivers", []) or []) if not d.get("limited_sample")][:4]
+    if drivers:
+        out.append("\n## Your biggest levers (most → least)")
+        for i, dr in enumerate(drivers, 1):
+            up = (dr.get("correlation", 0) or 0) >= 0
+            more = "more of it goes with **more** views" if up else "more of it goes with **fewer** views"
+            out.append(f"{i}. **{_label(dr['factor']).capitalize()}** — {_strength(dr.get('correlation'))} "
+                       f"link with your views: {more}.")
+
+    # Fix these first — dimensions with a real finding + action
+    dims = [d for d in (results.get("dimensions", []) or [])
+            if d.get("status") == "ok" and d.get("fix")]
+    if dims:
+        out.append("\n## Fix these first")
+        for d in dims:
+            out.append(f"\n### {d.get('title','')}")
+            if d.get("impact"):
+                out.append(_plainify(d["impact"]))
+            out.append(f"**Do this:** {_plainify(d['fix'])}")
+            ev = _titles_list_md(d.get("evidence") or [], titles, n=5)
+            if ev:
+                out.append("\nStart with these videos:")
+                out.append(ev)
+
+    # Best time to post — plain
+    per_day = (results.get("timing") or {}).get("per_day_best") or []
+    if per_day:
+        out.append("\n## Best time to post")
+        out.append("Your strongest hour each day (your channel's local time):")
+        for d in per_day:
+            out.append(f"- **{d['day']}:** {d['hour']:02d}:00 "
+                       f"({((d['hour'] % 12) or 12)}{'AM' if d['hour'] < 12 else 'PM'})")
+
+    # Targets — plain
+    t = results.get("targets", {})
+    tgt = []
+    if t.get("target_ctr") is not None:
+        tgt.append(f"get **{_pct(t['target_ctr'])}** of people who see your thumbnail to click")
+    if t.get("target_retention_pct") is not None:
+        tgt.append(f"keep people watching about **{round(t['target_retention_pct'])}%** of the video")
+    if tgt:
+        out.append("\n## What to aim for")
+        out.append("Match your own best videos: " + "; ".join(tgt) + ".")
+
+    out.append("\n## Your next 10 uploads")
+    for i, step in enumerate(results.get("next_10", []), 1):
+        out.append(f"{i}. {step}")
+    return "\n".join(out)
+
+
+def render_markdown(results: dict, titles: Optional[dict] = None) -> str:
+    """Deterministic full report from the structured analysis results. Always evidence-backed.
+    ANALYTIC view — keeps the precise numbers/correlations (the "Analytics" toggle)."""
     if not results:
         return "# Channel Insights\n\n_No analysis available._"
     mode = results.get("mode", "deep")
@@ -75,7 +258,7 @@ def render_markdown(results: dict) -> str:
 
     if mode == "starter":
         out.append("## Starter plan")
-        out.append(results.get("headline", ""))
+        out.append(results.get("headline") or "")
         bm = results.get("benchmarks", {})
         if bm:
             out.append(f"\n**Benchmark ({bm.get('label','')}):** target CTR "
@@ -98,7 +281,7 @@ def render_markdown(results: dict) -> str:
     if prof.get("name"):
         vol = " (high-volume — strategy is tuned for that: prioritize within your volume, never post less)" if prof.get("high_volume") else ""
         out.append(f"**Channel type detected:** {prof['name']}{vol}.\n")
-    out.append(results.get("headline", "—"))
+    out.append(results.get("headline") or "—")
     if cov.get("caveats"):
         out.append("\n**Data coverage:** " + " ".join(cov["caveats"]))
     out.append(f"\nAnalyzed **{cov.get('n_videos', 0)}** videos"
@@ -126,7 +309,7 @@ def render_markdown(results: dict) -> str:
         if d.get("impact"):
             out.append(f"\n**Impact:** {d['impact']}")
         if d.get("evidence"):
-            out.append(f"\n**Videos:** {_ids_md(d['evidence'])}")
+            out.append(f"\n**Videos:** {_ids_md(d['evidence'], titles)}")
         if d.get("fix"):
             out.append(f"\n**Fix:** {d['fix']}")
 
@@ -184,7 +367,21 @@ def _exec_summary(results: dict) -> str:
 
 # ── LLM polish (optional) ────────────────────────────────────────────────
 
-def _gemini_polish(results: dict, grounding_md: str):
+_SYSTEM_PLAIN = """\
+You are a friendly YouTube coach explaining ONE channel's report to the creator in PLAIN English.
+
+RULES:
+- Use ONLY the facts in the JSON + the draft. NEVER invent a number, CTR, date, title or video.
+- NO jargon, NO statistics words: never write "correlation", "r=", "coefficient", "median",
+  "packaging line", "velocity", or raw feature codes like "len_chars". Say it in everyday words.
+- Refer to videos by their TITLE (already in the draft), never by a video id code.
+- Every point = what's happening + ONE concrete thing to do next. Keep it warm and short.
+- Say once, briefly, that views also depend on the news cycle and luck — this covers what they control.
+- Keep the section headings from the draft. Output GitHub-flavoured markdown. No preamble, no sign-off.
+"""
+
+
+def _gemini_polish(results: dict, grounding_md: str, system: str = _SYSTEM):
     """Re-voice the deterministic report via Gemini, constrained to the given facts. Returns
     (markdown, tokens_in, tokens_out) or None on any failure."""
     try:
@@ -195,13 +392,13 @@ def _gemini_polish(results: dict, grounding_md: str):
     try:
         client = _gemini_client()
         model = os.environ.get("KAIZER_INSIGHTS_MODEL", "gemini-2.5-flash")
-        user = ("Rewrite this channel analysis into the report. Use ONLY these facts + video IDs.\n\n"
+        user = ("Rewrite this channel analysis into the report. Use ONLY these facts + video titles.\n\n"
                 "JSON facts:\n```json\n" + json.dumps(results, default=str)[:60000] + "\n```\n\n"
-                "Deterministic draft to re-voice (keep every number + ID):\n\n" + grounding_md[:40000])
+                "Draft to re-voice (keep every fact + video title):\n\n" + grounding_md[:40000])
         resp = client.models.generate_content(
             model=model, contents=user,
             config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM, temperature=0.5, max_output_tokens=8192),
+                system_instruction=system, temperature=0.5, max_output_tokens=8192),
         )
         text = (resp.text or "").strip()
         if not text:
@@ -226,14 +423,32 @@ def generate_report(db, analysis_run_id: int, *, provider: str = "gemini") -> im
     if not run:
         raise RuntimeError(f"analysis run {analysis_run_id} not found")
     results = run.results or {}
-    deterministic = render_markdown(results)
 
-    md, used_provider, tin, tout = deterministic, "deterministic", 0, 0
+    # video_id → title, so both reports name videos instead of raw id codes.
+    titles: dict = {}
+    try:
+        rows = (db.query(im.VideoMetric.video_id, im.VideoMetric.title)
+                .filter(im.VideoMetric.snapshot_id == run.snapshot_id).all())
+        titles = {vid: (t or "") for vid, t in rows}
+    except Exception:
+        titles = {}
+
+    # ANALYTIC = deterministic (precise numbers, the "Analytics" toggle).
+    analytic = render_markdown(results, titles)
+    # PLAIN = default view; deterministic, optionally Gemini-polished for voice.
+    plain = render_markdown_plain(results, titles)
+
+    used_provider, tin, tout = "deterministic", 0, 0
     if provider == "gemini":
-        polished = _gemini_polish(results, deterministic)
+        polished = _gemini_polish(results, plain, system=_SYSTEM_PLAIN)
         if polished:
-            md, tin, tout = polished[0], polished[1], polished[2]
+            plain, tin, tout = polished[0], polished[1], polished[2]
             used_provider = "gemini"
+
+    # Carry the analytic narrative in report_json so the UI can toggle to it.
+    # (Plain rides in report_md; the UI falls back to it — no need to duplicate.)
+    results_out = dict(results)
+    results_out["narrative_analytic"] = analytic
 
     prev = (db.query(im.ReportVersion)
             .filter(im.ReportVersion.analysis_run_id == analysis_run_id)
@@ -243,7 +458,7 @@ def generate_report(db, analysis_run_id: int, *, provider: str = "gemini") -> im
     rv = im.ReportVersion(
         analysis_run_id=analysis_run_id, user_id=run.user_id, version=version,
         provider=used_provider, exec_summary=_exec_summary(results),
-        report_md=md, report_json=results, tokens_in=tin, tokens_out=tout, cost_usd=0.0,
+        report_md=plain, report_json=results_out, tokens_in=tin, tokens_out=tout, cost_usd=0.0,
     )
     db.add(rv); db.commit(); db.refresh(rv)
     return rv

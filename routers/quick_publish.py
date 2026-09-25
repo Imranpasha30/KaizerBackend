@@ -292,12 +292,17 @@ def quick_seo(
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    # Honour the user's Gemini|Claude pick on the advanced (unified) path.
+    # own_channel stays None here — the base is channel-agnostic (learned
+    # policy + competitor engage on the per-channel path).
+    _engine = (getattr(user, "seo_engine", "") or "").strip().lower() or None
     # Improve-until-85 (re-generates feeding the score-checker's suggestions back in), OR a
     # single pass when this base is only a seed for per-channel SEO (improve=False) — saves passes.
     if body.improve:
-        seo = generate_seo_to_score(inp, style_source=style_source, target_score=85, max_attempts=4)
+        seo = generate_seo_to_score(inp, style_source=style_source, target_score=85,
+                                    max_attempts=4, db=db, engine_choice=_engine)
     else:
-        seo = generate_seo(inp, style_source=style_source)
+        seo = generate_seo(inp, style_source=style_source, db=db, engine_choice=_engine)
     if not (seo.get("title") or "").strip():
         raise HTTPException(
             status_code=502,

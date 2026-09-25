@@ -630,6 +630,26 @@ class R2Storage(StorageProvider):
             ExpiresIn=expires_s,
         )
 
+    def presign_put(self, key: str, *, expires_s: int = 3600) -> str:
+        """Presigned PUT URL — the client uploads bytes DIRECTLY to R2, bypassing
+        the app server (and any proxy body-size cap). No ContentType is signed so
+        the caller can PUT the raw body with no special headers."""
+        client = self._get_client()
+        return client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": self._k(key)},
+            ExpiresIn=expires_s,
+        )
+
+    def head_size(self, key: str) -> int:
+        """Object size in bytes, or -1 if it doesn't exist / on error."""
+        try:
+            client = self._get_client()
+            h = client.head_object(Bucket=self.bucket, Key=self._k(key))
+            return int(h.get("ContentLength") or 0)
+        except Exception:
+            return -1
+
 
 # ---------------------------------------------------------------------------
 # Module-level factory + per-process cache

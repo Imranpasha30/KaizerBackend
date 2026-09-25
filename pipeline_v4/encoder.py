@@ -212,6 +212,7 @@ def _selected_backend() -> str:
 def video_encoder_args(
     crf: int = 20,
     preset_hint: str = "medium",
+    tune: str = "hq",
 ) -> List[str]:
     """Return the ffmpeg args for the active video encoder.
 
@@ -228,6 +229,12 @@ def video_encoder_args(
     preset_hint
         libx264 preset name. Mapped to NVENC ``p1..p7`` via the table
         above. Unknown names fall back to ``p4`` (medium).
+    tune
+        NVENC ``-tune`` (ignored by the libx264 fallback). Defaults to
+        ``"hq"`` so every FINAL composite call site is byte-identical to
+        before. Throwaway intermediates (the trim/shorts pass) may pass
+        ``"ll"`` to skip NVENC's HQ rate-control analysis for a faster
+        encode — quality-neutral because that asset is re-encoded again.
     """
     backend = _selected_backend()
     if backend == "nvenc":
@@ -241,7 +248,7 @@ def video_encoder_args(
         return [
             "-c:v", "h264_nvenc",
             "-preset", nv_preset,
-            "-tune", "hq",
+            "-tune", (tune or "hq"),
             "-rc", "vbr",
             "-cq", str(cq),
             "-b:v", "0",
@@ -255,30 +262,37 @@ def video_encoder_args(
 
 
 def video_decoder_args() -> List[str]:
-    """Input-side GPU decode args (Wave 4, item B).
+    """Input-side decode args. DEFAULT IS NOW SOFTWARE DECODE.
 
-    Returns ``["-hwaccel", "cuda"]`` when the NVENC backend is active,
-    ``[]`` otherwise. IMPORTANT: ``-hwaccel`` is an INPUT option — the
-    caller must place these args BEFORE the ``-i`` of the video input
-    they should accelerate (V4 call sites put them before the FIRST
-    ``-i``). We deliberately do NOT emit ``-hwaccel_output_format cuda``
-    so decoded frames land back in system memory and the existing CPU
-    filtergraphs (overlay/trim/concat/scale) keep working unchanged;
-    ffmpeg also silently falls back to software decode for codecs the
-    GPU can't handle, so this is safe-by-default.
+    ``-hwaccel cuda`` without ``-hwaccel_output_format cuda`` decodes on
+    the GPU and then copies EVERY frame back to system memory through a
+    serialized transfer — measured on this host against the real job-611
+    source (1080p50 h264, the 45-span trim graph, output to null so no
+    encoder in the loop):
+
+        hwaccel cuda, default filter threads   ~134 fps
+        hwaccel cuda, 4 filter threads         ~178 fps
+        SOFTWARE decode (multi-core)           ~644 fps   (4.8x)
+
+    That transfer path capped the whole Stage-1 trim (job 611: 6m48s for
+    28.5 min of footage — encoder preset changes moved NOTHING because
+    the decoder was the binder) and throttles every other decode-bound
+    consumer (story slices, composes). Software h264 decode across the
+    box's cores is ~4.8x faster, frees the GPU to do ONLY NVENC, and is
+    bit-identical output (h264 decoding is normative).
+
+    ``-hwaccel`` remains available as an explicit opt-in. Callers place
+    these args BEFORE the ``-i`` they apply to.
 
     Override via ``KAIZER_VIDEO_DECODER``:
-      - ``auto`` / unset → follow the encoder backend (cuda iff nvenc)
-      - ``cuda``         → force GPU decode
-      - ``cpu``          → force software decode (empty list)
+      - ``auto`` / unset → software decode (fastest measured; default)
+      - ``cuda``         → force GPU decode (the old behaviour)
+      - ``cpu``          → software decode (explicit)
     """
     forced = (os.environ.get("KAIZER_VIDEO_DECODER") or "auto").strip().lower()
-    if forced in ("cpu", "none", "off", "soft", "software"):
-        return []
     if forced == "cuda":
         return ["-hwaccel", "cuda"]
-    # auto / anything else → tie to the encoder backend selection
-    return ["-hwaccel", "cuda"] if _selected_backend() == "nvenc" else []
+    return []
 
 
 def active_backend_label() -> str:

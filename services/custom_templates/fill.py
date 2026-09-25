@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from lxml import html as lxml_html
 
-from .contract import SLOT_ATTR, _classify, parse_safe
+from .contract import SLOT_ATTR, _classify, parse_safe, preserve_doctype
 
 
 def _is_loadable_url(src: str) -> bool:
@@ -71,6 +71,8 @@ def fill_html(html_str: str, texts: dict | None = None,
         # video / background / intro / logo / watermark: intentionally untouched.
 
     try:
-        return lxml_html.tostring(doc, encoding="unicode")
+        # Keep the author's doctype (lxml drops it on parse) so the builder iframe
+        # renders in the SAME mode (standards) as the final render — WYSIWYG parity.
+        return preserve_doctype(html_str, lxml_html.tostring(doc, encoding="unicode"))
     except Exception:
         return html_str

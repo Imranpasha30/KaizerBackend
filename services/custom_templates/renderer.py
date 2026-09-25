@@ -25,6 +25,13 @@ from .contract import SLOT_ATTR
 _NAV_TIMEOUT_MS = 12000
 _DONE_TIMEOUT_MS = 2500
 
+
+def _quirks_mode() -> bool:
+    """Escape hatch: KAIZER_TEMPLATE_QUIRKS=1 restores the pre-text-safety behavior —
+    no DOCTYPE injection (quirks-mode render), the legacy auto-fit predicate, and no
+    overlap guard. Read per render so it can be flipped without a restart."""
+    return os.environ.get("KAIZER_TEMPLATE_QUIRKS", "").strip().lower() in ("1", "true", "yes")
+
 # Memory-lean headless Chromium. --single-process + --no-zygote collapse the usual
 # browser/renderer/gpu/zygote process tree into ONE process (roughly halves RSS), and the
 # rest trims background services — keeping a render well under the operator's 500 MB budget.
@@ -193,10 +200,14 @@ def _indic_fonts_for_texts(texts: dict) -> list:
     return out
 
 
-# JS run in the page: set brand vars, fill slots, blank video slots, return video rects.
+# JS run in the page: set brand vars, fill slots, auto-fit + overlap-guard the text,
+# blank video slots, return {rects, fit_warnings}. Async so Playwright awaits it natively.
 _FILL_JS = r"""
-(payload) => {
+async (payload) => {
   const ATTR = payload.attr;
+  // KAIZER_TEMPLATE_QUIRKS=1 -> legacy fit predicate, no Indic floor, no overlap guard.
+  const LEGACY = !!payload.legacyFit;
+  const _warns = [];
   const root = document.documentElement;
   for (const [k, v] of Object.entries(payload.brand || {})) {
     try { root.style.setProperty(k, v); } catch (e) {}
@@ -220,6 +231,12 @@ _FILL_JS = r"""
         } catch (e) {}
       });
     } catch (e) {}
+  }
+  // Wait for the injected @font-face faces (and the template's own fonts) BEFORE any
+  // measuring, so the fit loop sees the REAL Indic glyph metrics — not the pre-swap
+  // fallback (the legacy post-fit wait measured the wrong font, then the swap reflowed).
+  if (!LEGACY) {
+    try { if (document.fonts && document.fonts.ready) { await document.fonts.ready; } } catch (e) {}
   }
   const TEXT_ALIASES = new Set(["headline","hook","subtitle","title","caption","cta","kicker","body","ticker","marquee","watermark"]);
   const classify = (raw) => {
@@ -248,6 +265,19 @@ _FILL_JS = r"""
   };
   const clearUnfilled = !!payload.clearUnfilled;
   const rects = [];
+  // L3 BASELINE (captured BEFORE any fill): slot pairs that already overlap in the
+  // author's placeholder design are INTENTIONAL layers (caption chips over photos,
+  // straps over art) — the overlap guard below must never fire on those pairs.
+  const _baseBox = new Map();
+  if (!LEGACY) {
+    try {
+      document.querySelectorAll(`[${ATTR}]`).forEach((el) => {
+        if (!classify(el.getAttribute(ATTR))) return;
+        const r = el.getBoundingClientRect();
+        _baseBox.set(el, { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
+      });
+    } catch (e) {}
+  }
   const els = document.querySelectorAll(`[${ATTR}]`);
   els.forEach((el) => {
     const cls = classify(el.getAttribute(ATTR));
@@ -309,24 +339,178 @@ _FILL_JS = r"""
     if (el.getAttribute("data-kaizer-empty") === "1") return;   // cleared/hidden slot
     _textEls.push(el);
   });
+  // Fit predicate. LEGACY = scroll-vs-client only: on a HEIGHT-LESS slot clientHeight
+  // grows WITH the content (scrollHeight always == clientHeight), so it could never
+  // detect overflow there — the job-591 bug. The hardened predicate adds a canvas-bottom
+  // bound (getBoundingClientRect), which finally gives height-less slots a limit;
+  // max-height'd slots keep working because clientHeight caps at the bound.
   const _fitsSelf = (el) => (el.scrollHeight <= el.clientHeight + 1 && el.scrollWidth <= el.clientWidth + 1);
+  const _fits = LEGACY ? _fitsSelf
+    : (el) => (_fitsSelf(el) && el.getBoundingClientRect().bottom <= window.innerHeight + 2);
+  const _INDIC_RE = /[ऀ-ൿ]/;
   _textEls.forEach((el) => {
-    let f = parseFloat(getComputedStyle(el).fontSize) || 0;
+    const cs = getComputedStyle(el);
+    let f = parseFloat(cs.fontSize) || 0;
     if (!f) return;
+    if (!LEGACY) {
+      // Indic line-height floor: at tight line-heights (1.02) Telugu/Devanagari ink paints
+      // OUTSIDE the line boxes (measured 269px ink vs 244.8px boxes) and lines collide.
+      // Render-time inline style only — the stored template is never mutated.
+      try {
+        const lh = parseFloat(cs.lineHeight);
+        if (_INDIC_RE.test(el.textContent || "") && isFinite(lh) && lh / f < 1.15) {
+          el.style.lineHeight = "1.15";
+        }
+      } catch (e) {}
+    }
     const minF = Math.max(11, f * 0.35);
     let g = 0;
-    while (f > minF && !_fitsSelf(el) && g++ < 100) { f -= 1; el.style.fontSize = f + "px"; }
+    while (f > minF && !_fits(el) && g++ < 100) { f -= 1; el.style.fontSize = f + "px"; }
+    if (!LEGACY) {
+      // Still overflowing at the floor: clip a BOUNDED box (overflow:hidden clips nothing
+      // without a height bound, so height-less boxes — scrollHeight==clientHeight — skip).
+      try {
+        const cs2 = getComputedStyle(el);
+        const bounded = (cs2.maxHeight && cs2.maxHeight !== "none") ||
+                        (el.scrollHeight > el.clientHeight + 1);
+        if (cs2.overflow === "visible" && bounded) el.style.overflow = "hidden";
+      } catch (e) {}
+    }
   });
-  // Global pass: if auto-height text boxes pushed the layout past the canvas, shrink them
-  // together until the frame no longer overflows (down to a readable floor).
+  // Global pass: shrink all text together while any of it still spills past the canvas.
+  // LEGACY keyed on body.scrollHeight, which NEVER grows when the spill lives inside a
+  // position:absolute stage on a fixed-height body (measured stuck at the canvas height)
+  // — so the hardened pass checks the text elements' own bottoms instead.
+  const _pastCanvas = () => _textEls.some((el) => {
+    try { return el.getBoundingClientRect().bottom > window.innerHeight + 2; }
+    catch (e) { return false; }
+  });
+  const _overflowing = LEGACY
+    ? () => (document.body.scrollHeight > window.innerHeight + 2)
+    : _pastCanvas;
   let _g = 0;
-  while (document.body.scrollHeight > window.innerHeight + 2 && _g++ < 80) {
+  while (_overflowing() && _g++ < 80) {
     let _shrunk = false;
     _textEls.forEach((el) => {
       const f = parseFloat(getComputedStyle(el).fontSize) || 0;
       if (f > 12) { el.style.fontSize = (f - 1) + "px"; _shrunk = true; }
     });
     if (!_shrunk) break;
+  }
+
+  // ── OVERLAP GUARD (L3): no text may paint over another slot ────────────────────
+  // Runs AFTER fitting, BEFORE rect measurement. For every visible slot pair with a
+  // text member: if their boxes (border rect ∪ painted INK for text — Indic ink paints
+  // above the border box) intersect > 4px on BOTH axes, shrink the offending text 1px
+  // at a time to a 12px floor, then hard-clip if still intersecting. Exempt: pairs the
+  // author ALREADY layered (baseline overlap), background slots, and full-canvas zones.
+  // Fail-soft: any error logs a warning and the render proceeds untouched.
+  if (!LEGACY) {
+    try {
+      const TOL = 4;
+      const W = window.innerWidth, H = window.innerHeight;
+      const guardSlots = [];
+      document.querySelectorAll(`[${ATTR}]`).forEach((el) => {
+        const c = classify(el.getAttribute(ATTR));
+        if (!c) return;
+        const kind = c[0], key = c[1] || c[0];
+        if (kind === "background" || kind === "intro") return;  // intentional layers
+        if (key === "ticker" || key === "marquee") return;      // scrolls / hidden in stills
+        if (el.getAttribute("data-kaizer-empty") === "1") return;
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden") return;
+        guardSlots.push({ el: el, key: key, text: kind === "text" });
+      });
+      const box = (s) => {
+        const r = s.el.getBoundingClientRect();
+        let b = { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+        if (s.text && getComputedStyle(s.el).overflow === "visible") {
+          try {  // union with the ink rect — Telugu ink measured 13px ABOVE the border box
+            const rng = document.createRange(); rng.selectNodeContents(s.el);
+            const ir = rng.getBoundingClientRect();
+            if (ir && ir.width > 0 && ir.height > 0) {
+              b = { left: Math.min(b.left, ir.left), top: Math.min(b.top, ir.top),
+                    right: Math.max(b.right, ir.right), bottom: Math.max(b.bottom, ir.bottom) };
+            }
+          } catch (e) {}
+          // ink an overflow-clipping ancestor already crops can't paint -> clamp to it
+          let p = s.el.parentElement, hops = 0;
+          while (p && p !== document.body && hops++ < 4) {
+            const ps = getComputedStyle(p);
+            if (ps.overflow !== "visible") {
+              const pr = p.getBoundingClientRect();
+              b = { left: Math.max(b.left, pr.left), top: Math.max(b.top, pr.top),
+                    right: Math.min(b.right, pr.right), bottom: Math.min(b.bottom, pr.bottom) };
+              break;
+            }
+            p = p.parentElement;
+          }
+        }
+        return b;
+      };
+      const inter = (a, b) => {
+        const ix = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+        const iy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+        return (ix > TOL && iy > TOL);
+      };
+      const isFull = (b) => ((b.right - b.left) >= W * 0.9 && (b.bottom - b.top) >= H * 0.9);
+      const exempt = (a, b) => {
+        const ba = _baseBox.get(a.el), bb = _baseBox.get(b.el);
+        return !!(ba && bb && inter(ba, bb));
+      };
+      for (let i = 0; i < guardSlots.length; i++) {
+        for (let j = i + 1; j < guardSlots.length; j++) {
+          const A = guardSlots[i], B = guardSlots[j];
+          if (!A.text && !B.text) continue;              // only text-vs-text / text-vs-media
+          if (exempt(A, B)) continue;                    // author layered these on purpose
+          let bA = box(A), bB = box(B);
+          if (isFull(bA) || isFull(bB)) continue;        // full-canvas zones are exempt
+          if (!inter(bA, bB)) continue;
+          // Pick the text to shrink: text-vs-media always shrinks the text; text-vs-text
+          // shrinks the DOWN-SPILLER (whose ink bottom crosses the other's top; tiebreak
+          // = taller ink — the auto-grown box is the invader, not the victim).
+          let T;
+          if (A.text && B.text) {
+            const aSpills = (bA.top < bB.top && bA.bottom > bB.top);
+            const bSpills = (bB.top < bA.top && bB.bottom > bA.top);
+            if (aSpills && !bSpills) T = A;
+            else if (bSpills && !aSpills) T = B;
+            else T = ((bA.bottom - bA.top) >= (bB.bottom - bB.top)) ? A : B;
+          } else { T = A.text ? A : B; }
+          const O = (T === A) ? B : A;
+          const f0 = parseFloat(getComputedStyle(T.el).fontSize) || 0;
+          let hit = true, g = 0;
+          while (hit && g++ < 200) {
+            const f = parseFloat(getComputedStyle(T.el).fontSize) || 0;
+            if (f <= 12) break;                          // readability floor
+            T.el.style.fontSize = (f - 1) + "px";
+            bA = box(A); bB = box(B);
+            hit = inter(bA, bB);
+          }
+          if (hit) {
+            // Floor reached, still intersecting: hard-clip. overflow:hidden clips NOTHING
+            // without a height bound, so height-less boxes also get a maxHeight to O's top.
+            try {
+              T.el.style.overflow = "hidden";
+              const tb = T.el.getBoundingClientRect();
+              const ob = box(O);
+              const heightless = (T.el.scrollHeight <= T.el.clientHeight + 1);
+              const room = Math.floor(ob.top - tb.top - TOL);
+              if (heightless && tb.top < ob.top && room > 8) {
+                T.el.style.maxHeight = room + "px";
+              }
+            } catch (e) {}
+            _warns.push("overlap guard: CLIPPED text slot '" + T.key + "' against '" + O.key + "'");
+          } else if (g > 1) {
+            const f1 = parseFloat(getComputedStyle(T.el).fontSize) || 0;
+            _warns.push("overlap guard: shrank text slot '" + T.key + "' " +
+                        Math.round(f0) + "->" + Math.round(f1) + "px to clear '" + O.key + "'");
+          }
+        }
+      }
+    } catch (e) {
+      try { _warns.push("overlap guard skipped (measurement error): " + (e && e.message ? e.message : e)); } catch (e2) {}
+    }
   }
 
   // Measure video rects AFTER fills (layout settled). Read border-radius (from the
@@ -353,9 +537,91 @@ _FILL_JS = r"""
                  w: Math.round(r.width), h: Math.round(r.height),
                  radius: Math.round(rad) });
   });
-  return rects;
+  return {rects: rects, fit_warnings: _warns};
 }
 """
+
+
+def _unpack_fill(res):
+    """Unpack _FILL_JS's return: {rects, fit_warnings}. Tolerates the legacy bare-list
+    shape (a stale cached page/older JS) so a shape mismatch can never fail a render."""
+    if isinstance(res, dict):
+        rects = res.get("rects") or []
+        warns = [str(w) for w in (res.get("fit_warnings") or [])]
+        return rects, warns
+    return (res or []), []
+
+
+# ── Overlap-guard math (pure-Python MIRROR of the in-page JS above) ──────────────
+# The guard itself must run inside _FILL_JS (fonts have to shrink BEFORE the
+# screenshot), so its pair-selection/tolerance/exemption math is mirrored here as
+# pure functions to keep the logic unit-testable without a browser. KEEP IN SYNC.
+OVERLAP_TOL_PX = 4          # boxes must intersect > this on BOTH axes to count
+FULL_CANVAS_FRAC = 0.9      # a box covering >= this fraction of both dims is a "zone"
+
+
+def _boxes_intersect(a: dict, b: dict, tol: int = OVERLAP_TOL_PX) -> bool:
+    """True when boxes ({left,top,right,bottom}) overlap MORE than tol px on both axes."""
+    try:
+        ix = min(a["right"], b["right"]) - max(a["left"], b["left"])
+        iy = min(a["bottom"], b["bottom"]) - max(a["top"], b["top"])
+        return ix > tol and iy > tol
+    except Exception:
+        return False
+
+
+def _is_full_canvas(box: dict, canvas: tuple, frac: float = FULL_CANVAS_FRAC) -> bool:
+    """A near-full-canvas box is a background/mood ZONE — text over it is intentional."""
+    try:
+        cw, ch = float(canvas[0]), float(canvas[1])
+        return ((box["right"] - box["left"]) >= cw * frac
+                and (box["bottom"] - box["top"]) >= ch * frac)
+    except Exception:
+        return False
+
+
+def overlap_guard_pairs(slots: list, canvas: tuple, tol: int = OVERLAP_TOL_PX,
+                        baseline: dict | None = None) -> list:
+    """Which slot pairs would the overlap guard act on?
+
+    ``slots``   : [{key, kind, box:{left,top,right,bottom}}]
+    ``baseline``: {key: box} measured BEFORE the fill (author-placeholder state) —
+                  pairs already intersecting there are intentional layers, exempt.
+    Returns [(text_key, other_key)] — only TEXT-vs-TEXT / TEXT-vs-media pairs beyond
+    ``tol``; background/intro/ticker slots and full-canvas zones never participate.
+    Fail-soft: a malformed slot is skipped, never raises."""
+    out = []
+    cand = []
+    for s in (slots or []):
+        try:
+            kind = s.get("kind") or ""
+            if kind in ("background", "intro"):
+                continue
+            if (s.get("key") or "") in ("ticker", "marquee"):
+                continue
+            if _is_full_canvas(s.get("box") or {}, canvas):
+                continue
+            cand.append(s)
+        except Exception:
+            continue
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            a, b = cand[i], cand[j]
+            try:
+                a_text = (a.get("kind") == "text")
+                b_text = (b.get("kind") == "text")
+                if not (a_text or b_text):
+                    continue                      # media-vs-media: not our problem
+                if baseline is not None:
+                    ba = baseline.get(a.get("key")); bb = baseline.get(b.get("key"))
+                    if ba and bb and _boxes_intersect(ba, bb, tol):
+                        continue                  # author layered these on purpose
+                if _boxes_intersect(a.get("box") or {}, b.get("box") or {}, tol):
+                    t, o = (a, b) if a_text else (b, a)
+                    out.append((t.get("key"), o.get("key")))
+            except Exception:
+                continue
+    return out
 
 
 def _build_payload(data: RenderData) -> dict:
@@ -369,18 +635,34 @@ def _build_payload(data: RenderData) -> dict:
         "hideTicker": bool(getattr(data, "hide_ticker", False)),
         "carouselKeys": [str(k) for k in (getattr(data, "carousel_keys", []) or [])],
         "fonts": _indic_fonts_for_texts(data.texts),
+        # KAIZER_TEMPLATE_QUIRKS=1 -> _FILL_JS uses the legacy fit predicate and skips
+        # the Indic line-height floor + overlap guard (full old-behavior rollback).
+        "legacyFit": _quirks_mode(),
     }
 
 
-def _make_network_guard(bundle_root: str):
+def _make_network_guard(bundle_root: str, entry_path: str | None = None):
     """Build a Playwright route handler that allows ONLY: data:/blob: URIs and file://
     URLs *under the template's own folder*. Everything else (http/https/ws, file:// to
     any other path like /etc/passwd) is aborted — closing SSRF, remote fetch, and local
-    file-read (incl. JS-driven fetch('file:///...')) for untrusted template code."""
+    file-read (incl. JS-driven fetch('file:///...')) for untrusted template code.
+
+    When ``entry_path`` is given, the entry document is served in STANDARDS mode: the
+    upload-time sanitizer historically stripped the ``<!DOCTYPE html>`` (lxml round-trip),
+    so every already-stored bundle rendered in quirks mode. Fulfilling the entry request
+    with the doctype prepended fixes ALL stored bundles at render time — no re-ingest.
+    (Verified pixel-identical on the built-ins; standards is the mode they were authored
+    in.) KAIZER_TEMPLATE_QUIRKS=1 disables the prepend (old behavior)."""
     try:
         allowed = Path(bundle_root).resolve().as_uri().rstrip("/").lower() + "/"
     except Exception:
         allowed = ""
+    entry_uri = ""
+    if entry_path and not _quirks_mode():
+        try:
+            entry_uri = Path(entry_path).resolve().as_uri().lower()
+        except Exception:
+            entry_uri = ""
 
     def _guard(route):
         try:
@@ -391,6 +673,19 @@ def _make_network_guard(bundle_root: str):
                 return
             if low.startswith("file:"):
                 if allowed and low.startswith(allowed):
+                    if entry_uri and low == entry_uri:
+                        # fail-soft: any hiccup falls through to the normal file serve —
+                        # a doctype problem must never abort the entry navigation.
+                        try:
+                            raw = Path(entry_path).read_text(encoding="utf-8",
+                                                             errors="replace")
+                            if not raw.lstrip("\ufeff \t\r\n").lower().startswith("<!doctype"):
+                                route.fulfill(status=200,
+                                              content_type="text/html; charset=utf-8",
+                                              body="<!DOCTYPE html>\n" + raw)
+                                return
+                        except Exception:
+                            pass
                     route.continue_()
                 else:
                     route.abort()
@@ -432,7 +727,8 @@ def render(bundle, data: RenderData, out_png: str, canvas: tuple[int, int],
                 accept_downloads=False,
             )
             context.set_default_timeout(_NAV_TIMEOUT_MS)
-            context.route("**/*", _make_network_guard(bundle.root_dir))
+            context.route("**/*", _make_network_guard(bundle.root_dir,
+                                                      entry_path=bundle.entry_path))
 
             page = context.new_page()
             context.on("page", lambda pp: (pp is not page) and pp.close())  # kill popups
@@ -442,9 +738,17 @@ def render(bundle, data: RenderData, out_png: str, canvas: tuple[int, int],
                 page.wait_for_function("window._done === true", timeout=_DONE_TIMEOUT_MS)
             except Exception:
                 pass  # templates need not signal _done
-            rects = page.evaluate(_FILL_JS, payload)
+            rects, _fit_warns = _unpack_fill(page.evaluate(_FILL_JS, payload))
+            for _w in _fit_warns:
+                # surface the guard's decisions in the render report AND the server log
+                warnings.append(_w)
+                try:
+                    print(f"[templates] {_w}")
+                except Exception:
+                    pass
             if payload.get("fonts"):
-                # let the injected Indic @font-face faces finish loading before the shot
+                # belt-and-braces: _FILL_JS already awaits document.fonts.ready pre-fit,
+                # but keep the post-fill wait for the quirks/legacy path.
                 try:
                     page.evaluate("async () => { if (document.fonts) { await document.fonts.ready; } return true; }")
                 except Exception:
@@ -599,7 +903,8 @@ def probe_candidates(bundle, canvas: tuple[int, int]) -> list:
                                           device_scale_factor=1, java_script_enabled=True,
                                           accept_downloads=False)
                 ctx.set_default_timeout(_NAV_TIMEOUT_MS)
-                ctx.route("**/*", _make_network_guard(bundle.root_dir))
+                ctx.route("**/*", _make_network_guard(bundle.root_dir,
+                                                      entry_path=bundle.entry_path))
                 page = ctx.new_page()
                 ctx.on("page", lambda pp: (pp is not page) and pp.close())
                 page.set_default_navigation_timeout(_NAV_TIMEOUT_MS)
@@ -727,13 +1032,22 @@ def render_animated(bundle, data: RenderData, frames_dir: str, canvas: tuple[int
                                           device_scale_factor=1, java_script_enabled=True,
                                           accept_downloads=False)
             context.set_default_timeout(_NAV_TIMEOUT_MS)
-            context.route("**/*", _make_network_guard(bundle.root_dir))
+            context.route("**/*", _make_network_guard(bundle.root_dir,
+                                                      entry_path=bundle.entry_path))
             page = context.new_page()
             context.on("page", lambda pp: (pp is not page) and pp.close())  # kill popups
             page.set_default_navigation_timeout(_NAV_TIMEOUT_MS)
             page.goto(entry_uri, wait_until="load")
-            rects = page.evaluate(_FILL_JS, payload)
+            rects, _fit_warns = _unpack_fill(page.evaluate(_FILL_JS, payload))
+            for _w in _fit_warns:
+                # flows into AnimatedResult.warnings -> engine.render_template's report
+                warnings.append(_w)
+                try:
+                    print(f"[templates] {_w}")
+                except Exception:
+                    pass
             if payload.get("fonts"):
+                # belt-and-braces for the quirks/legacy path (see render() above)
                 try:
                     page.evaluate("async () => { if (document.fonts) { await document.fonts.ready; } return true; }")
                 except Exception:

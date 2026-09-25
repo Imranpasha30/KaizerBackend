@@ -29,7 +29,7 @@ from pipeline_v4 import canvas_engine
 from pipeline_v4 import v1_bridge
 from pipeline_v4 import image_provider
 from pipeline_v4 import seo_provider
-from pipeline_v4.canvas_schema import Canvas, CanvasSEO, V4JobCanvas
+from pipeline_v4.canvas_schema import Canvas, CanvasImage, CanvasSEO, V4JobCanvas
 
 
 router = APIRouter(prefix="/api/v4", tags=["v4-editor"])
@@ -384,10 +384,310 @@ def put_canvas(
     except Exception as exc:
         print(f"[v4/editor] clip sync failed (soft-skip): {exc}", flush=True)
         n = -1
-    return {"ok": True, "saved": True, "clips_synced": n}
+    # Layout safety (spec 3.13) — WARN, never block: the operator may
+    # knowingly park a tile over the ticker; the render QC logs it too.
+    layout_warnings: list[str] = []
+    try:
+        from pipeline_v4 import layout_safety
+        if jc.bulletin:
+            layout_warnings = layout_safety.check(
+                jc.bulletin.layout, jc.bulletin.stories)
+    except Exception:
+        pass
+    return {"ok": True, "saved": True, "clips_synced": n,
+            "layout_warnings": layout_warnings}
+
+
+# ─── Trailer (movie-style teaser of the job) ─────────────────────────
+
+_TRAILER_STATE: dict[int, dict] = {}
+_TRAILER_LOCK = threading.Lock()
+
+
+class TrailerIn(BaseModel):
+    aspect: str = "16:9"          # "16:9" | "9:16"
+    # Style pack key ("news", "crime", "horror", …) or "auto" — the
+    # planner classifies the content itself. See /api/v4/trailer/styles.
+    style: str = "auto"
+    # Assembly structure ("classic", "cold_open", "crescendo", …) — how
+    # the teaser is BUILT, orthogonal to the style pack's look/sound.
+    structure: str = "classic"
+
+
+@router.get("/trailer/styles")
+def trailer_styles(
+    _: models.User = Depends(auth.current_user),
+) -> dict:
+    """Style packs + assembly structures for the trailer picker."""
+    from pipeline_v4.trailer_styles import structure_catalog, style_catalog
+    return {"styles": style_catalog(), "structures": structure_catalog()}
+
+
+@router.get("/overlay-catalog")
+def overlay_catalog(
+    _: models.User = Depends(auth.current_user),
+) -> dict:
+    """Every broadcast graphic (overlay / HUD) the editor can place on a story,
+    with its editable TEXT fields + defaults — so the editor can add a graphic
+    or change which one, and show the right text inputs to edit."""
+    from pipeline_v4.overlays import REGISTRY, overlay_text_fields
+    items = []
+    for r in REGISTRY:
+        items.append({
+            "id": r["id"],
+            "label": r["label"],
+            "family": r["family"],
+            "used_for": r["used_for"],
+            # editable text kwargs + their default values (str-valued only)
+            "fields": overlay_text_fields(r["id"]),
+        })
+    return {"overlays": items, "total": len(items)}
+
+
+@router.post("/jobs/{job_id}/trailer")
+def create_trailer(
+    job_id: int,
+    payload: TrailerIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """Cut a movie-style trailer of this job (pipeline_v4/trailer.py):
+    the most dramatic transcript moments, punch grade, fast varied
+    transitions, hook/end cards, synthesized sound design, -14 LUFS.
+    Runs in a background thread; poll GET /trailer/state."""
+    job = _owned_job(job_id, user, db)
+    out_dir = _v4_dir_for(job)
+    jc = _read_canvas(out_dir)
+    if not jc.bulletin or not jc.bulletin.stories:
+        raise HTTPException(400, "Job has no bulletin stories to cut a trailer from")
+    aspect = "9:16" if payload.aspect.strip() == "9:16" else "16:9"
+    src = jc.bulletin.trimmed_video_path
+    if not (src and Path(src).is_file()):
+        raise HTTPException(409, "Trimmed master not on disk — re-run the job first")
+
+    with _TRAILER_LOCK:
+        cur = _TRAILER_STATE.get(job_id) or {}
+        if cur.get("state") == "running":
+            raise HTTPException(409, f"trailer already rendering for job {job_id}")
+        _TRAILER_STATE[job_id] = {"state": "running", "aspect": aspect, "msg": "cutting"}
+
+    words_path = out_dir / "story_words.json"
+    words_by_story: dict = {}
+    if words_path.is_file():
+        try:
+            words_by_story = (json.loads(words_path.read_text(encoding="utf-8"))
+                              .get("stories") or {})
+        except (OSError, json.JSONDecodeError):
+            words_by_story = {}
+
+    stories = list(jc.bulletin.stories)
+    language = jc.language or "te"
+    suffix = "9x16" if aspect == "9:16" else "16x9"
+    out_path = str(out_dir / f"trailer_{suffix}.mp4")
+
+    _style = (payload.style or "auto").strip().lower()
+    _structure = (payload.structure or "classic").strip().lower()
+    # "user:<id>" = the user's own composed pack — resolve NOW (owner-
+    # checked, needs the db session) and hand the built style to the
+    # worker thread.
+    _style_override = None
+    if _style.startswith("user:"):
+        from routers.style_packs import resolve_user_style
+        _style_override = resolve_user_style(_style, user.id, db)
+
+    def _worker():
+        try:
+            from pipeline_v4 import trailer as _tr
+            _tr.render_trailer(
+                source_path=src, stories=stories,
+                words_by_story=words_by_story,
+                out_path=out_path, work_dir=out_dir / "_trailer",
+                aspect=aspect, language=language,
+                channel_name="", style=_style, structure=_structure,
+                style_override=_style_override,
+            )
+            with _TRAILER_LOCK:
+                _TRAILER_STATE[job_id] = {
+                    "state": "done", "aspect": aspect,
+                    "url": f"/api/file/?path={out_path}", "msg": "",
+                }
+        except Exception as exc:
+            print(f"[v4/trailer] job {job_id} failed: {exc}", flush=True)
+            with _TRAILER_LOCK:
+                _TRAILER_STATE[job_id] = {"state": "failed", "aspect": aspect,
+                                          "msg": str(exc)[:300]}
+
+    threading.Thread(target=_worker, daemon=True,
+                     name=f"v4-trailer-{job_id}").start()
+    return {"ok": True, "state": "running", "aspect": aspect}
+
+
+@router.get("/jobs/{job_id}/trailer/state")
+def trailer_state(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    _owned_job(job_id, user, db)
+    return _TRAILER_STATE.get(job_id) or {"state": "idle"}
+
+
+# ─── Bleep censor report ─────────────────────────────────────────────
+
+@router.get("/jobs/{job_id}/bleep-report")
+def get_bleep_report(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """What the channel censor did on this job: the spans that were
+    muted + beeped and the words that triggered them (Stage 1.5,
+    pipeline_v4/bleep.py). 200 with enabled=False when the job predates
+    the censor or nothing was scanned."""
+    job = _owned_job(job_id, user, db)
+    out_dir = _v4_dir_for(job)
+    from pipeline_v4.bleep import BLEEP_REPORT_NAME
+    p = out_dir / BLEEP_REPORT_NAME
+    if not p.is_file():
+        return {"enabled": False, "spans": [], "applied": False}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"bleep report unreadable: {exc}")
+
+
+# ─── Image↔speech sync: re-run the timing engine on demand ──────────
+
+class ResyncTimingsIn(BaseModel):
+    """'Sync images to speech' from the editor. ``story_index=None`` →
+    every story."""
+    story_index: Optional[int] = None
+
+
+@router.post("/jobs/{job_id}/bulletin/resync-timings")
+def resync_image_timings(
+    job_id: int,
+    payload: ResyncTimingsIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """Re-place the bulletin's images on the spoken words using the
+    timing engine (pipeline_v4/image_timing.py) — the editor's manual
+    trigger after the operator relabels/replaces images.
+
+    Reads word timestamps from the ``story_words.json`` sidecar Stage 1
+    wrote (no re-transcription). Images the operator PINNED
+    (``timing_mode="pinned"``) keep their windows verbatim; the engine
+    routes new windows around them. Writes the canvas back through the
+    normal validated path. Stories the engine can't improve (no words,
+    no images, model failure) are left untouched."""
+    from pipeline_v4 import image_timing
+
+    job = _owned_job(job_id, user, db)
+    out_dir = _v4_dir_for(job)
+    jc = _read_canvas(out_dir)
+    if not jc.bulletin:
+        raise HTTPException(400, "Job has no bulletin canvas")
+
+    words_path = out_dir / "story_words.json"
+    if not words_path.is_file():
+        raise HTTPException(
+            409, "No word timestamps on disk for this job (story_words.json "
+                 "is written by Stage 1 for jobs rendered after the "
+                 "image-sync engine shipped). Re-run the job to capture them.")
+    try:
+        words_by_story = (json.loads(words_path.read_text(encoding="utf-8"))
+                          .get("stories") or {})
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"story_words.json unreadable: {exc}")
+
+    resynced: list[int] = []
+    skipped: list[dict] = []
+    for story in (jc.bulletin.stories or []):
+        if payload.story_index is not None and story.story_index != payload.story_index:
+            continue
+        words = words_by_story.get(str(story.story_index)) or []
+        imgs = list(story.images or [])
+        duration = float(story.video_t_end) - float(story.video_t_start)
+        if not words or not imgs or duration <= 0:
+            skipped.append({"story_index": story.story_index,
+                            "reason": "no words" if not words else "no images"})
+            continue
+        pinned = [i for i in imgs if i.timing_mode == "pinned"]
+        content = [i for i in imgs if i.timing_mode != "pinned"]
+        # The pool the engine picks from = the story's DISTINCT content
+        # images (dedup by src, first occurrence keeps its styling).
+        pool_imgs: list[CanvasImage] = []
+        seen_src: set[str] = set()
+        for i in content:
+            if i.src not in seen_src:
+                seen_src.add(i.src)
+                pool_imgs.append(i)
+        if not pool_imgs:
+            skipped.append({"story_index": story.story_index, "reason": "all pinned"})
+            continue
+        plan = image_timing.decide_story_timings(
+            title_native=story.title_native,
+            title_english=story.title_english,
+            summary=story.summary,
+            duration=duration,
+            words=words,
+            pool=[{"label": i.label or Path(i.src).stem, "kind": "photo"}
+                  for i in pool_imgs],
+            pinned_windows=tuple((float(i.t_start), float(i.t_end)) for i in pinned),
+            language=jc.language or "",
+        )
+        if not plan:
+            skipped.append({"story_index": story.story_index, "reason": "engine returned nothing"})
+            continue
+        new_images: list[CanvasImage] = list(pinned)
+        for e in plan:
+            tmpl = pool_imgs[e["pool_index"]]
+            new_images.append(tmpl.model_copy(update={
+                "t_start": e["t_start"], "t_end": e["t_end"],
+                "timing_mode": "content",
+                "confidence": e.get("confidence"),
+                "importance": e.get("importance"),
+                # Operator's explicit spotlight choice (off/fullscreen/pip)
+                # wins; None (= auto) takes the engine's fresh decision.
+                "spotlight": tmpl.spotlight if tmpl.spotlight else e.get("spotlight"),
+                "matched_text": e.get("matched_text") or None,
+            }))
+        new_images.sort(key=lambda i: float(i.t_start))
+        story.images = new_images
+        # Engine-placed windows have meaningful subject labels → the
+        # name-strap (polish A) becomes worth showing.
+        story.name_strap = True
+        resynced.append(story.story_index)
+
+    if resynced:
+        _write_canvas(out_dir, jc)
+    # Return the updated image arrays so the editor can reflect the new
+    # timings instantly without a full canvas refetch (same contract as
+    # /bulletin/auto-distribute).
+    images_by_story = {
+        str(s.story_index): [json.loads(i.model_dump_json()) for i in (s.images or [])]
+        for s in (jc.bulletin.stories or [])
+        if s.story_index in resynced
+    }
+    return {"ok": True, "stories_resynced": resynced, "skipped": skipped,
+            "saved": bool(resynced), "images_by_story": images_by_story}
 
 
 # ─── Pool: upload a new image ────────────────────────────────────────
+
+def _focal_hint(path) -> tuple[float, float]:
+    """Face-aware framing hint for a freshly-landed pool image — the
+    detected focal point as (offset_x_pct, offset_y_pct). The pool routes
+    return it so the editor can stamp it onto the CanvasImage it attaches
+    (the 9-point grid still overrides — user framing always wins).
+    Fail-soft to centered: a hint can never fail an upload/generate."""
+    try:
+        from pipeline_v4 import face_focus
+        return face_focus.focal_point(path)
+    except Exception:
+        return (50.0, 50.0)
+
 
 @router.post("/jobs/{job_id}/pool/upload")
 async def upload_pool_image(
@@ -418,12 +718,17 @@ async def upload_pool_image(
         stem, ext = os.path.splitext(safe_stem)
         target = pool_dir / f"{stem}_{i}{ext}"
     target.write_bytes(raw)
+    _fx, _fy = _focal_hint(target)
     return {
         "ok": True,
         "filename": target.name,
         "label": label or target.stem,
         "size_bytes": target.stat().st_size,
         "url": f"/api/v4/jobs/{job_id}/pool/{target.name}",
+        # Face-aware framing hint — the editor copies these onto the
+        # CanvasImage it creates so cover-crops keep heads in frame.
+        "offset_x_pct": _fx,
+        "offset_y_pct": _fy,
     }
 
 
@@ -492,6 +797,10 @@ def ai_generate_pool_image(
         except Exception:
             previous_prompt = ""
 
+    # Honor the job's image-engine pick (wizard → Job.v4_image_provider);
+    # this route runs in the API process, so read the row, not the env.
+    _engine = ("openai" if (getattr(job, "v4_image_provider", None) or "auto")
+               .strip().lower() == "openai" else "gemini")
     saved, final_prompt = _iai.make_image_for_story(
         title_native=payload.title or "",
         title_english=payload.title_english or "",
@@ -500,17 +809,20 @@ def ai_generate_pool_image(
         out_path=str(out_path),
         previous_prompt=previous_prompt,
         tweak=tweak,
+        engine=_engine,
     )
     if not saved or not out_path.is_file():
         raw = getattr(_iai.generate_image, "last_error", "") or ""
         hint = ""
-        if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
-            hint = ("Gemini quota/credits exhausted. Top up at "
-                    "https://ai.studio/projects or check GCP billing.")
+        if "OPENAI_API_KEY missing" in raw:
+            hint = "OpenAI image engine selected but OPENAI_API_KEY is not configured."
+        elif "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
+            hint = ("Image quota/credits exhausted — check the selected "
+                    "engine's billing (GCP/Gemini or OpenAI).")
         elif "PERMISSION_DENIED" in raw or " 403" in raw:
             hint = ("Vertex AI permission denied — check the SA has "
                     "the 'Vertex AI User' role on the project.")
-        detail = hint or (raw[:300] if raw else "Nano Banana returned no image.")
+        detail = hint or (raw[:300] if raw else "The image engine returned no image.")
         raise HTTPException(502, detail)
 
     try:
@@ -518,14 +830,20 @@ def ai_generate_pool_image(
     except Exception as exc:
         print(f"[v4/image-ai] prompt persist soft-fail: {exc}", flush=True)
 
+    _fx, _fy = _focal_hint(out_path)
     return {
         "ok": True,
         "filename": out_path.name,
         "size_bytes": out_path.stat().st_size,
         "url": f"/api/v4/jobs/{job_id}/pool/{out_path.name}",
-        "label": payload.label or (payload.title or "")[:60],
+        # Subject label (name-tag contract): explicit user label wins, else
+        # derive one from the final prompt, else the story title.
+        "label": payload.label or _iai.derive_label(final_prompt) or (payload.title or "")[:60],
         "prompt": final_prompt,
         "iterated": bool(previous_prompt and tweak),
+        # Face-aware framing hint (see upload_pool_image).
+        "offset_x_pct": _fx,
+        "offset_y_pct": _fy,
     }
 
 
@@ -559,12 +877,16 @@ def fetch_pool_image(
         raise HTTPException(502, "no authentic image found")
     pool_dir = out_dir / "_pool"
     p = pool_dir / fn
+    _fx, _fy = _focal_hint(p)
     return {
         "ok": True,
         "filename": fn,
         "size_bytes": p.stat().st_size,
         "url": f"/api/v4/jobs/{job_id}/pool/{fn}",
         "label": (payload.title or payload.title_english or "")[:60],
+        # Face-aware framing hint (see upload_pool_image).
+        "offset_x_pct": _fx,
+        "offset_y_pct": _fy,
     }
 
 
@@ -763,6 +1085,27 @@ def auto_distribute_bulletin(
         effect=payload.effect,
         effect_duration=payload.effect_duration,
     )
+    # FACE-AWARE FRAMING carry-over: _spread_images_evenly builds FRESH
+    # dicts, which used to silently RESET any focal framing back to the
+    # 50/50 center (a redistribute wiped the operator's 9-point reframes).
+    # Prior non-default offsets for the same src win (user framing is
+    # never overwritten); images without one get a face detection.
+    _prior: dict = {}
+    for im in existing:
+        try:
+            # None check (not `or`): a user-set 0 (edge framing) must carry
+            # over — `or 50.0` treated it as unset and dropped the framing.
+            _po = 50.0 if im.offset_x_pct is None else float(im.offset_x_pct)
+            _pv = 50.0 if im.offset_y_pct is None else float(im.offset_y_pct)
+        except (TypeError, ValueError):
+            continue
+        if (_po, _pv) != (50.0, 50.0) and im.src not in _prior:
+            _prior[im.src] = (_po, _pv)
+    _pool_dir = out_dir / "_pool"
+    for _d in new_images:
+        _ox, _oy = _prior.get(_d["src"]) or _focal_hint(_pool_dir / _d["src"])
+        if (_ox, _oy) != (50.0, 50.0):
+            _d["offset_x_pct"], _d["offset_y_pct"] = _ox, _oy
     # Mutate the canvas in place; Pydantic re-validation on write catches
     # any malformed timings before they land on disk.
     raw_bulletin = raw.get("bulletin") or {}
@@ -784,6 +1127,29 @@ def auto_distribute_bulletin(
 class RenderIn(BaseModel):
     target: str = "bulletin"      # "bulletin" | "short"
     index: int = 0                # for target=short
+
+
+@router.get("/jobs/{job_id}/director-trace")
+def get_director_trace(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """The AI Director's full decision trail for this job — sensors it
+    gathered, every per-story choice with the model's own WHY, the
+    self-review findings and whether the revision was adopted. Written by
+    plan_direction as ``director_trace.json``; powers the job page's
+    Director-decisions debug view."""
+    import json as _json
+    job = _owned_job(job_id, user, db)
+    p = _v4_dir_for(job) / "director_trace.json"
+    if not p.is_file():
+        raise HTTPException(404, "No Director trace for this job yet — it is "
+                                 "written when Stage 3 plans the direction.")
+    try:
+        return _json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(500, f"Director trace unreadable: {exc}")
 
 
 @router.post("/jobs/{job_id}/render")
@@ -879,6 +1245,11 @@ def trigger_render(
                     support_images=pool_paths, stories=_ff_stories,
                     # per-job visual edit (inline builder) -> render verbatim if present
                     template_html_override=_v4_orch._load_html_override(job_id, "bulletin", 0),
+                    # Director/effects-mode grade for the template FOOTAGE only (design
+                    # stays crisp). uvicorn has NO per-job env, so the canvas's
+                    # effects_mode is authoritative here (same rule as render_bulletin).
+                    effects_vf=v1_bridge._effects_vf_from_env(
+                        getattr(jc, "effects_mode", "") or ""),
                 ))
             elif payload.target == "bulletin":
                 # Re-render the whole bulletin via V1 broadcast layout.
@@ -898,6 +1269,18 @@ def trigger_render(
                         # into a timed sidebar so replace/reorder/timing/fade
                         # actually show (previously the carousel was ignored).
                         images=list(s.images or []),
+                        text_blocks=list(s.text_blocks or []),
+                        name_strap=getattr(s, "name_strap", False),
+                        # Broadcast graphics (overlays / HUD) with the editor's
+                        # text — v1_bridge renders these (with per-instance text)
+                        # instead of the live Director plan when present.
+                        overlays=list(getattr(s, "overlays", None) or []),
+                        # LIVE LAYOUTS: per-story designed layout + its
+                        # mid-story moments must survive the editor
+                        # re-render path too.
+                        layout_key=str(getattr(s, "layout_key", "") or ""),
+                        layout_moments=list(getattr(s, "layout_moments", None) or []),
+                        story_index=s.story_index,
                     )
                     for s in jc.bulletin.stories
                 ]
@@ -917,6 +1300,10 @@ def trigger_render(
                     watermark_position=wm_pos,
                     ticker_speed_s=_t_spd,
                     ticker_bg_color=_t_col,
+                    story_transition=getattr(jc.bulletin, "story_transition", None),
+                    # canvas carries the job's pick — no process-global env
+                    # in uvicorn (editor re-renders honour the choice)
+                    effects_mode=getattr(jc, "effects_mode", "") or "",
                 ))
             else:
                 # Single short — full V1-parity editor knobs from
@@ -972,6 +1359,13 @@ def trigger_render(
                     # per-job visual edit (inline builder) -> render verbatim if present
                     template_html_override=(_v4_orch._load_html_override(job_id, "short", payload.index)
                                             if _is_short_custom else None),
+                    # Custom short: Director/effects-mode grade for the slot FOOTAGE only
+                    # (design stays crisp); canvas effects_mode is authoritative — uvicorn
+                    # has no per-job env. Guarded so NON-custom editor short re-renders
+                    # keep their legacy behaviour (effects_vf default "").
+                    effects_vf=(v1_bridge._effects_vf_from_env(
+                                    getattr(jc, "effects_mode", "") or "")
+                                if _is_short_custom else ""),
                 ))
             _set_state(job_id, state="done", msg="render complete")
             _se.emit_lane(_rr_env, "rerender", "compose", _se.EXITED)
@@ -2892,11 +3286,13 @@ def get_custom_template(job_id: int, target: str = "bulletin", index: int = 0,
                     | (models.CustomTemplate.visibility == "public"))
             .order_by(models.CustomTemplate.created_at.desc()).all())
     options = [{"id": r.id, "name": r.name or "Untitled", "key": f"custom:{r.id}",
+                "format": getattr(r, "format", None) or "html",
                 "preview_url": f"/api/templates/{r.id}/preview"}
                for r in rows if ct.aspect_kind(r.canvas_w, r.canvas_h) == kind]
     return {
         "is_custom": True, "kind": kind, "target": target, "index": index, "layout": layout,
         "template": {"id": t.id, "name": t.name or "Untitled",
+                     "format": getattr(t, "format", None) or "html",
                      "preview_url": f"/api/templates/{t.id}/preview"},
         "text_slots": text_slots, "image_slots": image_slots,
         "template_media": _jdict(job.template_media),
@@ -2942,6 +3338,14 @@ def save_custom_template(job_id: int, body: CustomTemplateSaveIn,
             if ct.aspect_kind(t.canvas_w, t.canvas_h) != want:
                 raise HTTPException(400, f"'{t.name}' is a {ct.aspect_kind(t.canvas_w, t.canvas_h)}-form "
                                          f"template — it can't be used for a {want}-form output.")
+            # Switching onto an SVG template: a saved per-job HTML override
+            # (authored against the PREVIOUS template) can never apply to it,
+            # yet the orchestrator would render the stale HTML verbatim and
+            # silently ignore the new template — drop the override now.
+            if (getattr(t, "format", None) or "html") == "svg":
+                _ovr = dict(_jdict(job.custom_html_overrides))
+                if _ovr.pop(_override_key(body.target, 0), None) is not None:
+                    job.custom_html_overrides = _ovr
             if body.target == "bulletin":
                 job.fullform_layout = lv
             else:
@@ -3043,6 +3447,10 @@ def get_custom_html(job_id: int, target: str = "bulletin", index: int = 0,
     t = db.get(models.CustomTemplate, int(layout.split(":", 1)[1]))
     if not t or not t.dir_path:
         return {"is_custom": False}
+    if (getattr(t, "format", None) or "html") == "svg":
+        # SVG templates have a GENERATED entry — no builder editing, so no
+        # per-job design override either (re-upload the SVG to change it).
+        return {"is_custom": False, "reason": "svg_template"}
     try:
         bundle = ct.Bundle(root_dir=t.dir_path, entry_rel=t.entry_rel or "index.html", files=[])
         with open(bundle.entry_path, encoding="utf-8", errors="replace") as fh:
@@ -3124,6 +3532,15 @@ def save_custom_html(job_id: int, body: CustomHtmlSaveIn,
         job.custom_html_overrides = overrides
         db.commit()
         return {"ok": True, "is_override": False}
+
+    # SVG guard AFTER the revert branch: reverting only pops a dict key and
+    # must always work (it is the escape hatch for a stale override), but
+    # SAVING a new HTML override can never apply to an SVG template.
+    _t = db.get(models.CustomTemplate, int(layout.split(":", 1)[1]))
+    if _t is not None and (getattr(_t, "format", None) or "html") == "svg":
+        raise HTTPException(
+            400, "This job uses an SVG layout template — per-job design "
+                 "overrides apply only to HTML templates.")
 
     if len(raw.encode("utf-8", "ignore")) > _OVERRIDE_MAX_BYTES:
         raise HTTPException(413, "Edited design is too large.")

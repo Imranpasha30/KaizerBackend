@@ -9,7 +9,10 @@ Required to contain:
   -b:v 8M  -maxrate 10M  -bufsize 16M
   -pix_fmt yuv420p
   -color_primaries bt709
-  -af loudnorm=I=-14:TP=-1.5:LRA=11
+  -af loudnorm=I=-14:TP=-2:LRA=11   (TP widened from -1.5 to -2 on purpose —
+                                     see the _AUDIO_ARGS comment in pipeline.py;
+                                     final outputs are additionally conformed by
+                                     pipeline_v4/audio_conform.py two-pass)
   -movflags +faststart
   AAC codec at 48 kHz
 """
@@ -129,7 +132,8 @@ def test_encode_args_includes_color_primaries_bt709():
 # ===========================================================================
 
 def test_encode_args_includes_loudnorm():
-    """Must contain an -af flag with loudnorm=I=-14:TP=-1.5:LRA=11."""
+    """Must contain an -af flag with loudnorm=I=-14:TP=-2:LRA=11 (TP -2 is
+    the deliberate widened margin; two-pass conform finishes the job)."""
     args = list(ENCODE_ARGS_SHORT_FORM)
     # -af may appear as a separate flag with the filter string as the next element
     flat = _args_as_string(args)
@@ -145,8 +149,8 @@ def test_encode_args_includes_loudnorm():
     assert "I=-14" in af_value, (
         f"loudnorm must set I=-14. Got af value: {af_value!r}"
     )
-    assert "TP=-1.5" in af_value, (
-        f"loudnorm must set TP=-1.5. Got af value: {af_value!r}"
+    assert "TP=-2" in af_value, (
+        f"loudnorm must set TP=-2 (widened margin). Got af value: {af_value!r}"
     )
     assert "LRA=11" in af_value, (
         f"loudnorm must set LRA=11. Got af value: {af_value!r}"

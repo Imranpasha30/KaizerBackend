@@ -260,7 +260,8 @@ def _gpu_snapshot() -> dict:
             [nvidia_smi,
              "--query-gpu=memory.total,memory.used,utilization.gpu,temperature.gpu",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2.5,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=2.5,
         )
         if out.returncode != 0 or not out.stdout.strip():
             return {}
@@ -416,9 +417,15 @@ def _kaizer_family_gpu(family_pids: set[int]) -> Optional[float]:
     if not nvidia_smi or not family_pids:
         return None
     try:
+        # NOTE errors="replace" is LOAD-BEARING here: on this box
+        # `nvidia-smi pmon` truncates process names to 16 chars and then
+        # emits raw garbage bytes (e.g. "ApplicationFrame\x90\xfc\x7f...")
+        # — the utf-8 reader thread died on byte ~241 of every sample and
+        # spammed backend.err.log with UnicodeDecodeError tracebacks.
         out = subprocess.run(
             [nvidia_smi, "pmon", "-c", "1", "-s", "u"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=3,
         )
         if out.returncode != 0 or not out.stdout.strip():
             return None

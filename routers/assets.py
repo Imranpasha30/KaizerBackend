@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import (
-    APIRouter, Depends, File, Form, HTTPException, Request, UploadFile,
-    status,
+    APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request,
+    UploadFile, status,
 )
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -80,6 +80,7 @@ def _to_dict(a: models.UserAsset) -> dict:
         "height":         a.height,
         "is_default_ad":  bool(a.is_default_ad),
         "tags":           list(a.tags or []),
+        "description":    getattr(a, "description", "") or "",
         "folder_path":    a.folder_path or "",
         "created_at":     a.created_at.isoformat() if a.created_at else None,
         "url":            primary_url,
@@ -174,11 +175,13 @@ def list_assets_for_video(
 
 @router.post("/upload", status_code=201)
 async def upload_asset(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     kind: str = Form("image"),
     tags: str = Form(""),
     is_default_ad: bool = Form(False),
     folder_path: str = Form(""),
+    description: str = Form(""),
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.current_user),
 ):
@@ -269,6 +272,7 @@ async def upload_asset(
         width=w, height=h,
         is_default_ad=bool(is_default_ad),
         tags=tag_list,
+        description=(description or "").strip()[:500],
         folder_path=_normalize_folder(folder_path),
         storage_backend=storage_backend,
         storage_key=storage_key,
@@ -276,7 +280,43 @@ async def upload_asset(
         thumb_storage_url=thumb_storage_url,
     )
     db.add(row); db.commit(); db.refresh(row)
+
+    # Name-tag contract: an unlabeled image can never be speech-synced, so
+    # when the user skips the label we can vision-caption it in the
+    # background (opt-in — costs a Gemini call per upload).
+    if (
+        not row.description
+        and mime.startswith("image/")
+        and os.environ.get("KAIZER_AUTO_CAPTION_UPLOADS", "0") == "1"
+    ):
+        background_tasks.add_task(_auto_caption_asset, row.id)
+
     return _to_dict(row)
+
+
+def _auto_caption_asset(asset_id: int) -> None:
+    """Background task: vision-caption an unlabeled upload into
+    ``UserAsset.description``. Fail-soft — a caption is a nicety, the
+    upload already succeeded."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        row = db.query(models.UserAsset).filter(models.UserAsset.id == asset_id).first()
+        if not row or (row.description or "").strip():
+            return
+        path = row.file_path if row.file_path and Path(row.file_path).is_file() else ""
+        if not path:
+            return
+        from pipeline_v4.image_ai import caption_image
+        label = caption_image(path, mime=row.mime or "image/jpeg")
+        if label:
+            row.description = label[:500]
+            db.commit()
+            print(f"[assets] auto-captioned asset {asset_id}: {label!r}", flush=True)
+    except Exception as exc:
+        print(f"[assets] auto-caption failed for asset {asset_id}: {exc}", flush=True)
+    finally:
+        db.close()
 
 
 class ImportSampleIn(BaseModel):
@@ -351,9 +391,12 @@ def import_sample_asset(
     return _to_dict(row)
 
 
-def _persist_ai_image(db: Session, user: models.User, out_path: Path, folder_path: str) -> dict:
+def _persist_ai_image(db: Session, user: models.User, out_path: Path, folder_path: str,
+                      description: str = "") -> dict:
     """Save a freshly-generated image file as a UserAsset (storage + thumb + row), mirroring
-    /upload. Used by both the single and the batch AI-image routes. Returns the asset dict."""
+    /upload. Used by both the single and the batch AI-image routes. ``description`` is the
+    image's subject label (name-tag contract), derived from the generation beat/prompt.
+    Returns the asset dict."""
     mime = "image/jpeg"
     size_bytes = out_path.stat().st_size
     thumb_path, w, h = _thumb_for(out_path)
@@ -380,11 +423,34 @@ def _persist_ai_image(db: Session, user: models.User, out_path: Path, folder_pat
         user_id=user.id, filename=out_path.name, file_path=str(out_path.resolve()),
         thumb_path=thumb_path, kind="image", mime=mime, size_bytes=size_bytes, width=w, height=h,
         is_default_ad=False, tags=["ai-generated"], folder_path=_normalize_folder(folder_path),
+        description=(description or "").strip()[:500],
         storage_backend=storage_backend, storage_key=storage_key,
         storage_url=storage_url, thumb_storage_url=thumb_storage_url,
     )
     db.add(row); db.commit(); db.refresh(row)
     return _to_dict(row)
+
+
+def _resolve_engine(requested: str) -> str:
+    """Image ENGINE for the direct-generate routes: the caller's explicit
+    pick wins (the wizard forwards its per-job provider); "" falls back to
+    the env default. These routes always RENDER (the user pressed
+    Generate), so "auto" — the web-photo-first pool policy — means Gemini
+    here, never the search chain."""
+    eng = (requested or os.environ.get("KAIZER_V4_IMAGE_PROVIDER", "") or "").strip().lower()
+    return "openai" if eng == "openai" else "gemini"
+
+
+def _gen_error_detail(_iai) -> str:
+    """Human error for a failed generation, engine-aware."""
+    raw = getattr(_iai.generate_image, "last_error", "") or ""
+    if "OPENAI_API_KEY missing" in raw:
+        return "OpenAI image engine selected but OPENAI_API_KEY is not configured."
+    if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
+        return "Image quota/credits exhausted — check the selected engine's billing (GCP/Gemini or OpenAI)."
+    if "PERMISSION_DENIED" in raw or " 403" in raw:
+        return "Vertex AI permission denied — check the service account's role."
+    return raw[:300] if raw else "Image generation returned nothing — try again."
 
 
 class AiGenerateImageIn(BaseModel):
@@ -398,6 +464,8 @@ class AiGenerateImageIn(BaseModel):
     width: int = 1280
     height: int = 720
     folder_path: str = ""
+    note: str = ""            # optional per-slot direction merged into the image prompt
+    engine: str = ""          # "gemini" | "openai"; "" = env default (KAIZER_V4_IMAGE_PROVIDER)
 
 
 @router.post("/ai-generate", status_code=201)
@@ -428,22 +496,31 @@ def ai_generate_asset(
 
     # Story-aware: write_image_prompt turns the story into a relevant image prompt, THEN renders —
     # so the image fits the content instead of being a literal take on a raw prompt.
-    saved, _final_prompt = _iai.make_image_for_story(
+    saved, final_prompt = _iai.make_image_for_story(
         title_native=(payload.title or story)[:200],
         summary=story[:1200],
         language=(payload.language or "te"),
         out_path=str(out_path), width=w_req, height=h_req,
+        note=(payload.note or "").strip()[:300],
+        engine=_resolve_engine(payload.engine),
     )
     if not saved or not out_path.is_file():
-        raw = getattr(_iai.generate_image, "last_error", "") or ""
-        hint = ""
-        if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
-            hint = "Image quota/credits exhausted — top up GCP/Gemini billing."
-        elif "PERMISSION_DENIED" in raw or " 403" in raw:
-            hint = "Vertex AI permission denied — check the service account's role."
-        raise HTTPException(502, hint or (raw[:300] if raw else "Image generation returned nothing — try again."))
+        raise HTTPException(502, _gen_error_detail(_iai))
 
-    return _persist_ai_image(db, user, out_path, payload.folder_path)
+    # Face-aware framing hint (response-only — UserAsset has no offsets
+    # column; the caller persists them on whatever struct references the
+    # asset, e.g. the template carousel's slot). Computed BEFORE persist:
+    # remote storage may unlink the local file. Fail-soft to centered.
+    try:
+        from pipeline_v4 import face_focus
+        _fx, _fy = face_focus.focal_point(out_path)
+    except Exception:
+        _fx, _fy = (50.0, 50.0)
+    res = _persist_ai_image(db, user, out_path, payload.folder_path,
+                            description=_iai.derive_label(final_prompt))
+    if (_fx, _fy) != (50.0, 50.0):
+        res["offset_x_pct"], res["offset_y_pct"] = _fx, _fy
+    return res
 
 
 # Max images one batch may generate — cost guard ("8 images" was the operator's example;
@@ -463,6 +540,8 @@ class AiGenerateBatchIn(BaseModel):
     width: int = 1280
     height: int = 720
     folder_path: str = ""
+    note: str = ""               # optional per-slot direction merged into the image prompt
+    engine: str = ""             # "gemini" | "openai"; "" = env default (KAIZER_V4_IMAGE_PROVIDER)
 
 
 @router.post("/ai-generate-batch", status_code=201)
@@ -499,19 +578,26 @@ def ai_generate_asset_batch(
         title_native=(payload.title or story)[:200], summary=story[:1200],
         language=(payload.language or "te"), count=want, out_dir=str(user_dir), base=base,
         width=w_req, height=h_req, max_images=_AI_BATCH_MAX,
+        note=(payload.note or "").strip()[:300],
+        engine=_resolve_engine(payload.engine),
     )
     if not pairs:
-        raw = getattr(_iai.generate_image, "last_error", "") or ""
-        hint = ""
-        if "RESOURCE_EXHAUSTED" in raw or " 429" in raw:
-            hint = "Image quota/credits exhausted — top up GCP/Gemini billing."
-        elif "PERMISSION_DENIED" in raw or " 403" in raw:
-            hint = "Vertex AI permission denied — check the service account's role."
-        raise HTTPException(502, hint or (raw[:300] if raw else "Image generation returned nothing — try again."))
+        raise HTTPException(502, _gen_error_detail(_iai))
 
     assets, prompts = [], []
-    for path, prompt in pairs:
-        assets.append(_persist_ai_image(db, user, Path(path), payload.folder_path))
+    for path, prompt, label in pairs:
+        # Face-aware framing hint per frame (same rules as the single
+        # route: response-only, computed before persist, fail-soft).
+        try:
+            from pipeline_v4 import face_focus
+            _fx, _fy = face_focus.focal_point(path)
+        except Exception:
+            _fx, _fy = (50.0, 50.0)
+        _row = _persist_ai_image(db, user, Path(path), payload.folder_path,
+                                 description=label)
+        if (_fx, _fy) != (50.0, 50.0):
+            _row["offset_x_pct"], _row["offset_y_pct"] = _fx, _fy
+        assets.append(_row)
         prompts.append(prompt)
     return {"assets": assets, "prompts": prompts, "count": len(assets)}
 
@@ -521,6 +607,7 @@ class AssetPatch(BaseModel):
     tags:          Optional[List[str]] = None
     kind:          Optional[str] = None
     folder_path:   Optional[str]   = None   # "" = move to root; any string = move to that folder
+    description:   Optional[str]   = None   # subject label ("name-tag contract")
 
 
 @router.patch("/{asset_id}")
@@ -554,6 +641,8 @@ def patch_asset(
         # Channel.logo_asset_id is an FK by id, not by path.  No rewrite
         # needed.  File on disk does NOT move (we store virtual folders only).
         row.folder_path = _normalize_folder(payload.folder_path)
+    if payload.description is not None:
+        row.description = payload.description.strip()[:500]
     db.commit(); db.refresh(row)
     return _to_dict(row)
 

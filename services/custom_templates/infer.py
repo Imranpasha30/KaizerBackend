@@ -20,7 +20,7 @@ import re
 from lxml import html as lxml_html
 
 from .contract import (DEFAULT_CANVAS, MAX_CANVAS_DIM, MIN_CANVAS_DIM, SLOT_ATTR,
-                       _classify, parse_safe)
+                       _classify, parse_safe, preserve_doctype)
 
 # Attributes (besides id/class) that often carry the author's intent for a region.
 _MARKER_ATTRS = ("data-role", "data-field", "data-slot", "data-type", "data-name",
@@ -144,6 +144,23 @@ def infer_slots(doc) -> list:
     vid_n = [0]
     img_n = [0]
 
+    # Elements inside inline <svg> artwork are DESIGN, never slots: the fill
+    # mechanics (innerHTML / background-image / textContent) don't paint
+    # meaningfully on SVG nodes, and design-tool layer names (id="Background",
+    # "logo-mark", "photo-frame", "main-title") match the keyword table —
+    # inferring on them hijacks the artwork (backgrounds wiped pre-screenshot,
+    # phantom logo rects in .slots.json, static design text overwritten).
+    _svg_art: set = set()
+    try:
+        for _s in doc.xpath("//svg | //*[local-name()='svg']"):
+            for _d in _s.iter():
+                _svg_art.add(_d)
+    except Exception:
+        pass
+
+    def _outside_art(els):
+        return [e for e in els if e not in _svg_art]
+
     def has(name: str) -> bool:
         return name in taken or name in explicit_roles
 
@@ -177,6 +194,8 @@ def infer_slots(doc) -> list:
         tag = getattr(el, "tag", None)
         if not isinstance(tag, str) or tag in _SKIP_TAGS:
             continue
+        if el in _svg_art:
+            continue
         if el.get(SLOT_ATTR):
             continue
         role = _match_role(_haystack(el))
@@ -195,28 +214,28 @@ def infer_slots(doc) -> list:
             mark(el, name, kind, name)
 
     # 2) semantic-tag fallback for whatever's still missing
-    for v in doc.xpath("//video"):
+    for v in _outside_art(doc.xpath("//video")):
         if not v.get(SLOT_ATTR):
             add_video(v)
     if not has("ticker"):
-        for m in doc.xpath("//marquee"):
+        for m in _outside_art(doc.xpath("//marquee")):
             if not m.get(SLOT_ATTR):
                 taken.add("ticker"); mark(m, "ticker", "text", "ticker"); break
     if not has("headline"):
-        for h in (doc.xpath("//h1") or doc.xpath("//h2")):
+        for h in _outside_art(doc.xpath("//h1") or doc.xpath("//h2")):
             if not h.get(SLOT_ATTR):
                 taken.add("headline"); mark(h, "headline", "text", "headline"); break
     if not has("subtitle"):
-        for h in (doc.xpath("//h2") + doc.xpath("//h3")):
+        for h in _outside_art(doc.xpath("//h2") + doc.xpath("//h3")):
             if not h.get(SLOT_ATTR):
                 taken.add("subtitle"); mark(h, "subtitle", "text", "subtitle"); break
     if not has("body"):
-        for p in doc.xpath("//p"):
+        for p in _outside_art(doc.xpath("//p")):
             if p.get(SLOT_ATTR):
                 continue
             if len((p.text_content() or "").strip()) >= 12:
                 taken.add("body"); mark(p, "body", "text", "body"); break
-    for im in doc.xpath("//img"):
+    for im in _outside_art(doc.xpath("//img")):
         if not im.get(SLOT_ATTR):
             add_image(im)
 
@@ -231,6 +250,8 @@ def infer_slots(doc) -> list:
         tag = getattr(el, "tag", None)
         if not isinstance(tag, str) or tag in _SKIP_TAGS or el.get(SLOT_ATTR):
             continue
+        if el in _svg_art:
+            continue
         st = (el.get("style") or "").lower()
         if "background-image" in st and "url(" in st:
             add_image(el)
@@ -242,6 +263,8 @@ def infer_slots(doc) -> list:
                 break
             tag = getattr(el, "tag", None)
             if not isinstance(tag, str) or tag in _SKIP_TAGS or el.get(SLOT_ATTR):
+                continue
+            if el in _svg_art:
                 continue
             if not (el.text or "").strip():
                 continue
@@ -340,7 +363,9 @@ def normalize_template(html: str):
         out = lxml_html.tostring(doc, encoding="unicode")
     except Exception:
         return html, canvas, list(warns)
-    return out, canvas, list(warns)
+    # Keep the author's doctype: lxml drops it on parse, and this normalized HTML is
+    # written back to the stored entry — losing it would demote renders to quirks mode.
+    return preserve_doctype(html, out), canvas, list(warns)
 
 
 def normalize_and_discover(html: str):

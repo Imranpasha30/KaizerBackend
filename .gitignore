@@ -35,3 +35,50 @@ logs/
 # Google Cloud service-account keys (never commit)
 shyra-*.json
 *-sa.json
+
+# Media & large scratch (GitHub rejects >100 MB — keep on disk only)
+media/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.mkv
+*.webm
+*.avi
+# Audio (audio-first narration uploads etc.) — keep the dev repo light
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.opus
+*.wma
+job53_repro/
+job53_repro_source/
+
+# Local scratch data dumps (not source; may contain job/channel data)
+ch.json
+jobs.json
+probe.json
+.kaizer.code-workspace
+engines/
+vendor/
+
+# Promote/premix leaves timestamped copies of main.py and models.py
+# beside the originals every time it runs. Backups, not source.
+*.promotebak-*
+*.premixbak-*
+
+# Bundler output accidentally written to the Windows null device.
+NUL.css
+nul.css
+
+# Render reproduction dumps: multi-GB video written when a specific job is
+# being debugged. Never source, and job53_repro/bul.mp4 alone is 1.8 GB --
+# eighteen times GitHub's 100 MB per-file hard limit, which made the whole
+# repository unpushable until it was stripped from history.
+job53_repro/
+job53_repro_source/
+*_repro/
+*_repro_source/

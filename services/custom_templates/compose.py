@@ -18,6 +18,19 @@ import tempfile
 from dataclasses import dataclass
 
 
+def _venc(crf: int = 20, preset_hint: str = "medium") -> list[str]:
+    """NVENC-aware video-encoder args (GPU when available), with a CPU
+    fallback. The custom-template composite hard-coded libx264 (CPU), so
+    every short encoded on the processor while the rest of the pipeline
+    used the GPU — the dominant cost of a short render (job 608: ~3-4x
+    realtime). This routes shorts through the same NVENC path."""
+    try:
+        from pipeline_v4.encoder import video_encoder_args
+        return list(video_encoder_args(crf=crf, preset_hint=preset_hint))
+    except Exception:
+        return ["-c:v", "libx264", "-preset", preset_hint, "-crf", str(crf)]
+
+
 @dataclass
 class Placement:
     x: int
@@ -30,6 +43,26 @@ class Placement:
 
 def _ffmpeg() -> str:
     return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def sanitize_effects_vf(fx: str) -> str:
+    """Reduce a caller-supplied effects chain (the Director's grade) to a safe
+    LINEAR ``-vf`` fragment, or ``""``.
+
+    The fragment is inlined into each per-clip scale/crop chain of ONE shared
+    filter_complex, so anything that is not a plain linear chain — graph
+    separators (``;``) or stream labels (``[...]``) — would corrupt the whole
+    composite graph and kill the render. Fail-soft: reject such fragments
+    outright (the footage simply renders ungraded) instead of risking the job.
+    Stray commas/whitespace are trimmed so the join never emits ``,,``."""
+    s = (fx or "").strip().strip(",").strip()
+    if not s:
+        return ""
+    if ";" in s or "[" in s or "]" in s:
+        print("[custom_templates] effects_vf rejected (graph fragment, not a "
+              "linear chain); rendering footage ungraded", flush=True)
+        return ""
+    return s
 
 
 def _ffprobe() -> str | None:
@@ -52,11 +85,18 @@ def probe_duration(path: str) -> float:
 
 
 def compose(design, placements: list[Placement], out_path: str,
-            canvas: tuple[int, int], *, fps: int = 30, duration: float | None = None) -> str:
+            canvas: tuple[int, int], *, fps: int = 30, duration: float | None = None,
+            effects_vf: str = "") -> str:
     """Render the final mp4. Returns out_path. Raises RuntimeError on ffmpeg failure.
 
     ``design`` is either a single PNG path (static overlay) OR a dict describing an
-    animated frame sequence: ``{"frames_dir", "pattern", "fps"}`` (transparent PNGs)."""
+    animated frame sequence: ``{"frames_dir", "pattern", "fps"}`` (transparent PNGs).
+
+    ``effects_vf`` is an optional LINEAR filter chain (the Director's mood grade /
+    effects-mode polish) applied to the FOOTAGE inside every video slot — appended
+    AFTER the per-clip scale/crop/fps so edge effects (vignette) fit the slot's
+    visible rect — while the design PNG overlay stays crisp/ungraded. ``""`` (the
+    default) emits a character-identical filtergraph to the pre-effects engine."""
     cw, ch = int(canvas[0]), int(canvas[1])
     if duration is None:
         duration = (probe_duration(placements[0].video) if placements else 0.0) or 6.0
@@ -79,11 +119,16 @@ def compose(design, placements: list[Placement], out_path: str,
         cmd += ["-loop", "1", "-i", design]
     design_idx = len(placements)
 
+    # The grade goes on ALL video placements uniformly (main + background alike) so
+    # every slot's footage carries the same look; the design PNG + the additive
+    # post-passes (ticker / carousel / element entrances, applied later by the
+    # engine) are deliberately NOT graded — template graphics/text stay crisp.
+    fx = sanitize_effects_vf(effects_vf)
     fc: list[str] = []
     for i, pl in enumerate(placements):
         fc.append(
             f"[{i}:v]scale={pl.w}:{pl.h}:force_original_aspect_ratio=increase,"
-            f"crop={pl.w}:{pl.h},setsar=1,fps={fps}[v{i}]"
+            f"crop={pl.w}:{pl.h},setsar=1,fps={fps}{(',' + fx) if fx else ''}[v{i}]"
         )
     fc.append(f"color=c=black:s={cw}x{ch}:r={fps}:d={dur:.3f}[bg]")
     # Overlay order: background placements first (bottom), then foreground tiles.
@@ -104,7 +149,7 @@ def compose(design, placements: list[Placement], out_path: str,
     if audio_idx is not None:
         cmd += ["-map", f"{audio_idx}:a?"]           # audio from the main clip
     cmd += [
-        "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+        *_venc(crf=20, preset_hint="medium"), "-pix_fmt", "yuv420p",
         "-r", str(fps), "-t", f"{dur:.3f}",
         "-c:a", "aac", "-b:a", "160k",
         out_path,
@@ -136,7 +181,7 @@ def _normalize_for_concat(src: str, dst: str, cw: int, ch: int, fps: int) -> Non
     so two clips can be concat-demuxed losslessly."""
     vf = (f"scale={cw}:{ch}:force_original_aspect_ratio=increase,"
           f"crop={cw}:{ch},setsar=1,fps={fps}")
-    common = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+    common = [*_venc(crf=20, preset_hint="veryfast"), "-pix_fmt", "yuv420p",
               "-r", str(fps), "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "160k"]
     if _has_audio(src):
         cmd = [_ffmpeg(), "-y", "-i", src, "-vf", vf, *common, dst]

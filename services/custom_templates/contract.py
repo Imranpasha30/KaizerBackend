@@ -29,6 +29,29 @@ _TEXT_ALIASES = {"headline", "hook", "subtitle", "title", "caption", "cta", "kic
                  "body", "ticker", "marquee", "watermark"}
 _CANVAS_RE = re.compile(r"^\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})\s*$")
 
+# The doctype the AUTHOR actually wrote, at the very start of the source (BOM tolerated).
+_DOCTYPE_RE = re.compile("^\ufeff?\\s*(<!doctype[^>]*>)", re.I)
+
+
+def preserve_doctype(src_html: str, out_html: str) -> str:
+    """Re-attach the SOURCE's doctype to lxml-serialized HTML.
+
+    lxml's HTML parser drops the doctype on ``fromstring`` and re-serializes without it,
+    so every sanitize/normalize/fill round-trip silently demoted stored templates to
+    quirks mode (a latent standards-correctness hazard: %-heights, line-box quirks).
+    Only a doctype the author actually wrote is restored — lxml *fabricates* an HTML-4.0
+    default in ``docinfo`` even for doctype-less input, so we read the source string,
+    never docinfo. Fail-soft: returns ``out_html`` unchanged on any error."""
+    try:
+        if (out_html or "").lstrip("\ufeff \t\r\n").lower().startswith("<!doctype"):
+            return out_html
+        m = _DOCTYPE_RE.match(src_html or "")
+        if m:
+            return m.group(1) + "\n" + out_html
+    except Exception:
+        pass
+    return out_html
+
 
 def aspect_kind(canvas_w: int, canvas_h: int) -> str:
     """Categorise a template's output form purely from its canvas aspect — the one

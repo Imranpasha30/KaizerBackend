@@ -295,6 +295,26 @@ def sanitize_tags(raw: Optional[list]) -> list[str]:
 # ─── Body builder ───────────────────────────────────────────────────
 
 
+def add_to_playlist(creds: Credentials, video_id: str, playlist_id: str) -> dict:
+    """Best-effort: add an uploaded video to a playlist. NEVER raises —
+    playlist membership is non-critical, so a failure must not fail the
+    publish (the video is already live). Returns {"ok": bool, ...}."""
+    if not (video_id and playlist_id):
+        return {"ok": False, "skipped": True}
+    try:
+        yt = _yt(creds)
+        yt.playlistItems().insert(
+            part="snippet",
+            body={"snippet": {
+                "playlistId": str(playlist_id),
+                "resourceId": {"kind": "youtube#video", "videoId": str(video_id)},
+            }},
+        ).execute()
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+
+
 def _build_body(
     *,
     title: str,
@@ -305,6 +325,8 @@ def _build_body(
     publish_at: Optional[Any],
     made_for_kids: bool,
     publish_kind: str,
+    default_language: str = "te",
+    license_kind: str = "youtube",
 ) -> dict:
     """Construct the ``videos.insert`` body.
 
@@ -328,18 +350,23 @@ def _build_body(
                 else "#Shorts"
             )
 
+    _lang = (default_language or "te")
+    _lic = (license_kind or "youtube")
+    if _lic not in ("youtube", "creativeCommon"):
+        _lic = "youtube"
     body: dict = {
         "snippet": {
             "title": (title or "Untitled")[:100],
             "description": effective_desc,
             "tags": sanitize_tags(tags or []),
             "categoryId": category_id or "25",
-            "defaultLanguage": "te",
-            "defaultAudioLanguage": "te",
+            "defaultLanguage": _lang,
+            "defaultAudioLanguage": _lang,
         },
         "status": {
             "privacyStatus": (privacy_status or "private").lower(),
             "selfDeclaredMadeForKids": bool(made_for_kids),
+            "license": _lic,
             "embeddable": True,
             "publicStatsViewable": True,
         },
@@ -370,6 +397,8 @@ def upload_video(
     publish_at: Optional[Any] = None,
     made_for_kids: bool = False,
     publish_kind: str = "video",
+    default_language: str = "te",
+    license_kind: str = "youtube",
     progress_cb: Optional[Callable[[int, int], None]] = None,
     upload_uri: Optional[str] = None,
     on_uri_obtained: Optional[Callable[[str], None]] = None,
@@ -417,6 +446,8 @@ def upload_video(
         publish_at=publish_at,
         made_for_kids=made_for_kids,
         publish_kind=publish_kind,
+        default_language=default_language,
+        license_kind=license_kind,
     )
 
     media: Optional[MediaFileUpload] = None

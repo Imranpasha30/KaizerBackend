@@ -188,7 +188,8 @@ def generate_channel_seo(
             "YouTube duplicate-content flags. Write a headline with a DISTINCT "
             "structure unique to this channel using this angle: " + angle +
             " Rephrase substantially — do NOT echo the reference/base title verbatim, "
-            "and vary the opening words. Keep it accurate and in the target language."
+            "and vary the opening words. Keep it accurate; the TITLE must be in "
+            "ENGLISH (description/tags stay in the target language)."
         )
         # The angle alone isn't enough when a strong base hook (e.g. 'Shocking:')
         # magnetises every channel to the same opening. So we also hand this
@@ -202,19 +203,50 @@ def generate_channel_seo(
                 "clearly differently from every one of them:\n- "
                 + "\n- ".join(_avoid[:8])
             )
+        # UNIFIED-path extras (used only when KAIZER_SEO_UNIFIED=1; harmless
+        # otherwise): the OWN channel's DB session drives its learned policy +
+        # competitor intel + dedupe; the publishing user's Gemini|Claude pick
+        # is honoured; candidate terms feed competitor topic-matching. The
+        # angle + sibling titles pass as STRUCTURED params (the advanced engine
+        # renders them itself) — the body `steer` above stays for the legacy path.
+        _db = None
+        _engine = None
+        _terms: list[str] = []
+        try:
+            if not isinstance(channel, dict):
+                from sqlalchemy.orm import object_session as _os
+                import models as _m
+                _db = _os(channel)
+                _uid = getattr(channel, "user_id", None)
+                if _db is not None and _uid:
+                    _u = _db.query(_m.User).filter(_m.User.id == _uid).first()
+                    _engine = (getattr(_u, "seo_engine", "") or "").strip().lower() or None
+            for _src in (rel, winning_keywords, content_keywords):
+                for _t in (_src or []):
+                    _t = str(_t).strip()
+                    if _t and _t not in _terms:
+                        _terms.append(_t)
+        except Exception:
+            _db, _engine, _terms = None, None, []
+
         inp = SeoInput(
             kind="bulletin",
             language=language or "te",
             title_native=bt[:200],
             summary=bd[:500],
             body=((content_text or "") + steer)[:1800],
+            content=(content_text or "")[:3000],   # CLEAN, no steer — unified grounding
+            key_topics=_terms[:12],
         )
         # KEEP IMPROVING until this channel's SEO scores 85+ (bounded passes). The helper
         # re-generates feeding the score-checker's suggestions back in, returns the best
         # attempt + its seo_score/seo_attempts, and never raises (empty title -> fall back
         # to the safe adapted base, so a rate limit never collapses to the shared title).
         from pipeline_v4.seo_provider import generate_seo_to_score
-        gen = generate_seo_to_score(inp, style_source=channel, target_score=85, max_attempts=3)
+        gen = generate_seo_to_score(
+            inp, style_source=channel, target_score=85, max_attempts=3,
+            db=_db, own_channel=(None if isinstance(channel, dict) else channel),
+            avoid_titles=_avoid, angle_hint=angle, engine_choice=_engine)
         gtitle = (gen.get("title") or "").strip()
         if not gtitle:
             return base

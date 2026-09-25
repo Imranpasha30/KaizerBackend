@@ -28,6 +28,10 @@ class User(Base):
     # below). Admins implicitly have this. Toggled by an admin via the
     # admin UI or a one-shot SQL update.
     is_creative   = Column(Boolean, default=False, nullable=False)
+    # Which LLM writes this user's SEO: 'gemini' (default) | 'claude'.
+    # Same prompts, same verifier, same learning either way — only the
+    # writer is swapped.
+    seo_engine    = Column(String(10), default="gemini")
     # Profile picture (image or GIF). Stored on R2 at
     # ``library/users/<id>/avatar.<ext>``. URL minted on demand by the
     # storage provider; empty = show initials fallback. Used everywhere
@@ -186,6 +190,39 @@ class Job(Base):
     #   legacy + non-V4 rows.
     v4_output_format = Column(String(20), default="both", nullable=True)
 
+    # V4 only: full-form EFFECTS mode the user picked in the wizard —
+    #   "auto" (tasteful broadcast polish, the default for new jobs),
+    #   "rich" (the job's content-type style-pack look on every story) or
+    #   "off". NULL = legacy job → renders byte-identically (no effects,
+    #   no cache invalidation). Forwarded as KAIZER_V4_EFFECTS_MODE.
+    v4_effects_mode = Column(String(12), nullable=True)
+    # V4 THEME PACK key ("" / NULL = classic look). Forwarded as
+    # KAIZER_V4_THEME; the canvas persists it so re-renders wear it too.
+    v4_theme = Column(String(24), nullable=True)
+
+    # V4 only: the user's per-category effect picks ("edit using THESE") — a
+    #   JSON object {style_packs,transitions,frame_fx,overlays,typography,
+    #   story_category:[...]}. Empty/NULL = leave every category to the AI
+    #   Director; any picked category constrains the Director to those ids
+    #   (and forces it on). Forwarded as KAIZER_V4_STYLE_DIRECTIVES.
+    v4_style_directives = Column(Text, nullable=True)
+
+    # V4 only: WHICH AI Director engine plans the per-story direction.
+    #   "v4" (default/NULL) = our full-arsenal per-story Director;
+    #   "platform" = the ported kaizer-platform 3-layer engine (5 moods,
+    #   signal formula + LLM confirm) adapted onto the V4 vocabulary.
+    #   Forwarded as KAIZER_V4_DIRECTOR_ENGINE. Selects WHICH director
+    #   runs, never WHETHER (that stays with v4_effects_mode).
+    v4_director_engine = Column(String(12), default="v4", nullable=True)
+
+    # V4 only: which BRAIN writes the Director's per-story plan.
+    #   "gemini" (default/NULL) — also runs the tone/vision sensors
+    #   (multimodal; Claude/ChatGPT plans are text-only by design);
+    #   "claude" | "openai" (BYO key). Forwarded as
+    #   KAIZER_V4_DIRECTOR_PROVIDER after key-aware resolution in the
+    #   runner. Orthogonal to v4_director_engine (which LOGIC plans).
+    v4_director_provider = Column(String(20), default="gemini", nullable=True)
+
     # V4 only: the original publish target the operator picked in the wizard
     #   ("instagram" / "youtube" / "facebook"). Reel/Short/Full all run on the
     #   same V4 engine, so this is the ONLY record of which platform was
@@ -199,6 +236,11 @@ class Job(Base):
     # then happens on demand ("export") in the editor. Edit-first jobs finish fast. Default off
     # so existing/auto-publish jobs are unaffected.
     v4_defer_render = Column(Boolean, default=False, nullable=True)
+
+    # V4 only: AUDIO-FIRST mode. True when the job was created from an uploaded
+    # AUDIO narration (the master track) + optional MUTED reference video +
+    # generated/uploaded images. NULL/False = normal video-first V4.
+    v4_audio_first = Column(Boolean, default=False, nullable=True)
 
     # V4 only: the channels the operator chose AT GENERATE TIME to publish
     # this job to (JSON list of Channel ids, e.g. "[3,7,12]"). Recorded by
@@ -309,6 +351,10 @@ class Channel(Base):
     # its token disappears — the bug this column fixes.
     kind               = Column(String(10), default="account", nullable=True, index=True)
     language           = Column(String(10), default="te")
+    # OPT-IN (operator requirement): when True, SEO generation for this
+    # channel receives the tracked competitors' topic-matched intelligence
+    # (their winning titles to differentiate from + tags to harvest).
+    use_competitor_intel = Column(Boolean, default=False)
     title_formula      = Column(Text, default="")
     desc_style         = Column(String(50), default="hook_first")
     footer             = Column(Text, default="")
@@ -753,10 +799,33 @@ class TrainingSample(Base):
     comments        = Column(Integer, default=0)
     hours_since_publish = Column(Float, default=0.0)
     views_per_hour  = Column(Float, default=0.0)             # derived label
-    ctr             = Column(Float, nullable=True)           # YouTube Analytics, when scoped
+    ctr             = Column(Float, nullable=True)           # REAL thumbnail CTR (Reporting API v1)
+    impressions     = Column(BigInteger, nullable=True)      # thumbnail impressions (Reporting API v1)
+    explored_hook   = Column(String(12), nullable=True)      # A/B ledger: hook form probed (or NULL)
     # ── bookkeeping ──
     first_seen_at   = Column(DateTime(timezone=True), server_default=func.now())
     captured_at     = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SeoLearningSnapshot(Base):
+    """Point-in-time per-channel SEO learning state (learning/seo_learning.py).
+
+    One row per (channel, window) per refresh: measured hook/script/length
+    performance buckets + top keywords + the derived POLICY the generator
+    consumes. Append-only so the Insights UI can graph how learning evolves
+    week over week — a real curve, not a mock."""
+    __tablename__ = "seo_learning_snapshots"
+
+    id           = Column(Integer, primary_key=True)
+    channel_id   = Column(Integer, index=True, nullable=False)
+    # 'own' = channel_id is a models.Channel id (the user's channel);
+    # 'competitor' = channel_id is a models.CompetitorChannel id. Keeps
+    # both intelligences in one store without id collisions.
+    kind         = Column(String(12), nullable=False, default="own")
+    window_days  = Column(Integer, nullable=False, default=30)
+    samples      = Column(Integer, nullable=False, default=0)
+    payload      = Column(JSON, nullable=False, default=dict)
+    computed_at  = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -837,6 +906,9 @@ class ChannelVideo(Base):
     like_count         = Column(Integer, default=0)
     comment_count      = Column(Integer, default=0)
     thumbnail_url      = Column(String(500), default="")
+    # Public video tags from the Data API — the raw material for
+    # competitor tag harvesting (and our own tag-performance learning).
+    tags               = Column(JSON, nullable=True)
     last_synced_at     = Column(DateTime(timezone=True), server_default=func.now(),
                                  onupdate=func.now())
 
@@ -940,6 +1012,12 @@ class UserAsset(Base):
     height        = Column(Integer, default=0)
     is_default_ad = Column(Boolean, default=False, index=True)
     tags          = Column(JSON, default=list)              # ["news", "telugu", …]
+    # Subject label ("name-tag contract"): one line describing WHAT/WHO the
+    # image shows (e.g. "PM addressing parliament"). Stamped at upload
+    # (user-typed or vision auto-caption) or at AI generation (from the
+    # image prompt's beat subject). The image↔speech timing AI matches
+    # images to spoken words by THIS label — never by pixels.
+    description   = Column(Text, default="")
     # Virtual folder path — slash-separated like "logos/english/".  Empty
     # = Assets root.  No physical folders on disk; this is purely a UI
     # organization string the frontend groups by.
@@ -1510,6 +1588,35 @@ class SystemMetric(Base):
     kaizer_gpu_util     = Column(Float,   nullable=True)   # best-effort, via nvidia-smi pmon
 
 
+class LoginCode(Base):
+    """A one-shot six-digit code emailed to sign somebody in.
+
+    Shaped after ``PasswordResetToken`` and for the same reasons: only the
+    HASH is stored, so a leaked snapshot cannot be replayed; ``used_at``
+    makes it one-shot; a separate table keeps every request auditable.
+
+    ``attempts`` is the one addition. A reset link is 32 random bytes and
+    nobody guesses it, but six digits is a million possibilities -- ample
+    until you notice nothing stopped an attacker making a million guesses.
+    Five wrong tries and the row is dead.
+
+    ``email`` is stored beside ``user_id`` because the account may not exist
+    yet: the first successful code CREATES it, so there is no separate
+    sign-up to get wrong.
+    """
+    __tablename__ = "login_codes"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    email       = Column(String(320), nullable=False, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    code_hash   = Column(String(64), nullable=False, index=True)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at  = Column(DateTime(timezone=True), nullable=False)
+    used_at     = Column(DateTime(timezone=True), nullable=True)
+    attempts    = Column(Integer, nullable=False, default=0)
+    requested_ip = Column(String(64), nullable=True)
+
+
 class PasswordResetToken(Base):
     """One-shot, time-limited reset token issued by /auth/forgot.
 
@@ -1670,6 +1777,14 @@ class LiveStream(Base):
     # than a user-uploaded file, we record the original URL here for
     # history / audit. NULL = file-upload source.
     source_url        = Column(String(1024), nullable=True)
+
+    # Quick Live branding conveyor: when True the orchestrator stamps the
+    # channel's logo/watermark onto the source (pipeline_v4.watermark.
+    # stamp_for_channel) BEFORE going live — status passes through
+    # "branding" and the stamped temp file lands in branded_path (deleted
+    # after the broadcast). False = stream the source as-is, instantly.
+    apply_branding    = Column(Boolean, nullable=False, default=False)
+    branded_path      = Column(String(512), nullable=True)
 
     created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -1939,6 +2054,14 @@ class UploadJobV2(Base):
     # comes from the channel either way; this only chooses WHERE.
     brand_placement         = Column(String(16), nullable=False, default="template",
                                      server_default="template")
+    # Per-publish YouTube setting OVERRIDES carried from the publish modal.
+    # NULL = no override for this publish → fall back to the channel's yt_*
+    # default at upload. These WIN over the channel default when set.
+    yt_category_id          = Column(String(10), nullable=True)
+    yt_default_language     = Column(String(10), nullable=True)
+    yt_playlist_id          = Column(String(64), nullable=True)
+    yt_license              = Column(String(20), nullable=True)
+    yt_made_for_kids        = Column(Boolean, nullable=True)
     attempts                = Column(Integer, nullable=False, default=0)
     last_error              = Column(Text, nullable=True)
     # SHA256(master_video_id|channel_id|publish_version) as hex.
@@ -2106,6 +2229,10 @@ class CustomTemplate(Base):
     # storage
     dir_path      = Column(String(500), default="")                # extracted bundle dir
     entry_rel     = Column(String(300), default="index.html")
+    # Authoring format: "html" (the builder-editable HTML/CSS system) or
+    # "svg" (an uploaded SVG layout auto-wrapped into an HTML entry at
+    # upload; original kept as template.svg; builder editing blocked).
+    format        = Column(String(8), default="html", nullable=True)
     preview_path  = Column(String(500), default="")                # generated preview image
     # contract (machine understanding of the template)
     canvas_w      = Column(Integer, default=1080)
@@ -2114,6 +2241,10 @@ class CustomTemplate(Base):
     # builder: id of the template this was forked/derived from (NULL = an original).
     # Drives the "Built on <name>" attribution shown on public forks.
     derived_from  = Column(Integer, nullable=True)
+    # Remix: whether other users may fork+edit this template into their own copy.
+    # Default True (open). SVG templates are never remixable (no editable HTML);
+    # built-in/system templates are always remixable regardless of this flag.
+    allow_remix   = Column(Boolean, nullable=False, default=True)
     # meta
     description   = Column(Text, default="")
     when_to_use   = Column(Text, default="")    # shown in the preview modal
@@ -2121,6 +2252,167 @@ class CustomTemplate(Base):
     use_count     = Column(Integer, default=0)
     rating_sum    = Column(Integer, default=0)  # community rating (sum of 1..5 stars)
     rating_count  = Column(Integer, default=0)
+    # First-party curated design: shown under "Built-in templates" in the
+    # job-selection picker (above user/community creations). NULL/false =
+    # a normal user creation. Set by operators, never by the upload API.
+    is_builtin    = Column(Boolean, nullable=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     updated_at    = Column(DateTime(timezone=True), server_default=func.now(),
                            onupdate=func.now())
+
+
+class UserStylePack(Base):
+    """A user-COMPOSED style pack: pick the LOOK of one built-in pack,
+    the MOTION (transitions+pace) of another, the SOUND identity of a
+    third and the CARD design of a fourth — saved with a name and
+    reusable on any future job (operator: 'creative users build new
+    styles from existing ones'). PRIVATE to its owner; admins see every
+    user creation in the admin tab."""
+    __tablename__ = "user_style_packs"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    owner_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                        index=True, nullable=False)
+    name       = Column(String(80), nullable=False)
+    # {"look": packKey, "motion": packKey, "sound": packKey, "cards": packKey}
+    spec       = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+# Ported from kaizer-platform@d5fd482 server/models.py (class DesktopLicense).
+# Changes: columns verbatim; docstring trimmed of vendor-only cross-references
+# (tenancy/seed_plans.py, Organization/OrganizationQuota — modules/tables that
+# do not exist in this backend). Table is created by main.py's existing
+# Base.metadata.create_all(bind=engine) — no migration entry needed.
+class DesktopLicense(Base):
+    """Desktop app machine activation.
+
+    One row per machine fingerprint activated against a user's account.
+    The desktop shell generates a fingerprint client-side (hash of
+    hostname + a hardware identifier) and calls `POST /api/desktop/activate`
+    on first launch; this table is the server-side record of which machines
+    are currently allowed to run the app under that account.
+
+    `ACTIVATION_LIMIT` (routers/desktop.py) is a placeholder constant —
+    "configurable placeholder pending real economics" ("N systems per
+    contract" has no locked number yet). Revoking sets `revoked=True`
+    rather than deleting the row, so activation history stays auditable.
+
+    Scoped to `user_id` only — a per-user limit is the correct scope for
+    today's single-tenant-first reality, and adding a tenant FK later is
+    an additive migration, not a breaking one.
+    """
+    __tablename__ = "desktop_licenses"
+    __table_args__ = (
+        UniqueConstraint("user_id", "machine_fingerprint", name="uq_desktop_license_user_machine"),
+    )
+
+    id                  = Column(Integer, primary_key=True, index=True)
+    # index=True auto-generates "ix_desktop_licenses_user_id" — no separate
+    # explicit Index() needed (that would collide on the same name).
+    user_id             = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                                  nullable=False, index=True)
+    machine_fingerprint = Column(String(128), nullable=False, index=True)
+    # Human-readable label only (e.g. hostname) — never used for identity,
+    # only for display in the "your activated machines" list.
+    machine_label       = Column(String(255), default="")
+    activated_at        = Column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at        = Column(DateTime(timezone=True), nullable=True)
+    revoked             = Column(Boolean, nullable=False, default=False)
+
+
+class AccountRequest(Base):
+    """A prospective user asking the admin for a Kaizer X account.
+
+    The desktop login screen submits email + password + an optional note;
+    the password is bcrypt-hashed IMMEDIATELY (never stored raw) so an
+    admin approval later can mint the User row without a second password
+    exchange. status: pending → approved | rejected.
+    """
+    __tablename__ = "account_requests"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    email         = Column(String(255), nullable=False, index=True)
+    name          = Column(String(255), default="")
+    password_hash = Column(String(255), nullable=False)
+    # Why they want access — free text shown to the admin.
+    note          = Column(Text, default="")
+    status        = Column(String(12), nullable=False, default="pending", index=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    decided_at    = Column(DateTime(timezone=True), nullable=True)
+    decided_by    = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"),
+                           nullable=True)
+
+
+class ManagedApiKey(Base):
+    """Server-managed API keys injected into desktop installs at sign-in.
+
+    user_id NULL = the DEFAULT bundle every user receives; a row with a
+    user_id overrides the default for that key name. Values are Fernet-
+    encrypted with the same KAIZER_ENCRYPTION_KEY that protects YouTube
+    OAuth tokens (crypto.encrypt/decrypt). Only names in the desktop
+    injectable whitelist (routers/account_requests.INJECTABLE_KEYS) are
+    ever accepted or served.
+    """
+    __tablename__ = "managed_api_keys"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_managed_key_user_name"),
+    )
+
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                        nullable=True, index=True)
+    name       = Column(String(64), nullable=False, index=True)
+    value_enc  = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())
+
+
+class GoogleMintedKey(Base):
+    """Metadata for a Google Cloud API key we minted FOR a specific user.
+
+    The key STRING never lives here — it goes into ManagedApiKey (Fernet)
+    so the existing keys-bundle injection delivers it to the desktop. This
+    table maps the key's Cloud-Monitoring credential_id ("apikey:<uid>")
+    back to the user for the per-user usage/billing view, and carries mint
+    status so account approval can soft-fail (Google down → user stays on
+    the shared bundle) without losing track of what to retry.
+
+    status: pending | active | failed | revoked
+    """
+    __tablename__ = "google_minted_keys"
+    __table_args__ = (
+        UniqueConstraint("user_id", "env_name", name="uq_minted_key_user_env"),
+    )
+
+    id                = Column(Integer, primary_key=True, index=True)
+    user_id           = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                               nullable=False, index=True)
+    env_name          = Column(String(64), nullable=False)   # YOUTUBE_DATA_API_KEY | GEMINI_API_KEY
+    key_resource_name = Column(String(256), default="")      # projects/*/locations/global/keys/*
+    key_uid           = Column(String(64), default="", index=True)  # credential_id = "apikey:"+uid
+    display_name      = Column(String(128), default="")
+    status            = Column(String(12), nullable=False, default="pending", index=True)
+    error             = Column(Text, default="")
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), server_default=func.now(),
+                               onupdate=func.now())
+    revoked_at        = Column(DateTime(timezone=True), nullable=True)
+
+
+class BillingRate(Base):
+    """Operator-configured $/1000-request rates for the admin billing view.
+
+    cost_per_1000   = operator's estimated underlying cost basis
+    charge_per_1000 = what the operator suggests billing the user
+    metric ∈ {'youtube_requests', 'gemini_requests'}.
+    """
+    __tablename__ = "billing_rates"
+
+    id              = Column(Integer, primary_key=True)
+    metric          = Column(String(32), unique=True, nullable=False)
+    cost_per_1000   = Column(Float, nullable=False, default=0.0)
+    charge_per_1000 = Column(Float, nullable=False, default=0.0)
+    currency        = Column(String(8), nullable=False, default="USD")
+    updated_at      = Column(DateTime(timezone=True), server_default=func.now(),
+                             onupdate=func.now())

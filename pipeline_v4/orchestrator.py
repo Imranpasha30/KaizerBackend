@@ -51,6 +51,28 @@ CANVAS_JSON_NAME = "canvas.json"
 
 # ─── Image-pool ingest ──────────────────────────────────────────────
 
+def _decode_pool_labels() -> dict[str, str]:
+    """Decode ``KAIZER_BULLETIN_IMAGE_LABELS_B64`` — a base64 utf-8 JSON map
+    ``{absolute_source_path: subject_label}`` the runner builds from each
+    picked asset's ``UserAsset.description`` (name-tag contract). Base64 for
+    the same reason as KAIZER_V4_PREDEFINED_DESCRIPTION: Telugu/Hindi text
+    and Windows paths survive env passage without escaping shenanigans.
+    Returns {} when unset or undecodable — labels then fall back to the
+    filename stem."""
+    raw = (os.environ.get("KAIZER_BULLETIN_IMAGE_LABELS_B64") or "").strip()
+    if not raw:
+        return {}
+    try:
+        import base64 as _b64
+        data = json.loads(_b64.b64decode(raw).decode("utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v}
+    except Exception as exc:
+        print(f"[v4/pool] failed to decode image labels (using filename stems): {exc}",
+              flush=True)
+    return {}
+
+
 def _ingest_image_pool(output_dir: Path, env_pool: str) -> list[dict]:
     """Copy/link user-provided images (via KAIZER_BULLETIN_IMAGES env)
     into ``<output_dir>/_pool/`` and return a list of
@@ -62,6 +84,7 @@ def _ingest_image_pool(output_dir: Path, env_pool: str) -> list[dict]:
     out: list[dict] = []
     if not env_pool:
         return out
+    labels = _decode_pool_labels()
     seen: set[str] = set()
     for raw in (p.strip() for p in env_pool.split("|")):
         if not raw:
@@ -83,8 +106,62 @@ def _ingest_image_pool(output_dir: Path, env_pool: str) -> list[dict]:
         except OSError as exc:
             print(f"[v4/pool] skip {src}: {exc}")
             continue
-        out.append({"filename": candidate, "label": src.stem, "kind": "photo"})
+        label = (labels.get(raw) or labels.get(str(src)) or src.stem)[:120]
+        out.append({"filename": candidate, "label": label, "kind": "photo"})
     return out
+
+
+def _identity_words(words: list[dict], t0: float, t1: float) -> list[dict]:
+    """Remap Deepgram words to STORY-RELATIVE time for timelines where
+    output == source (source-preserved / audio-first modes — no cuts):
+    keep words inside [t0, t1], subtract t0. Same {"w","s","e"} shape
+    trim_engine stamps onto TrimmedStory.words."""
+    out: list[dict] = []
+    for w in (words or []):
+        try:
+            ws = float(w.get("s") or w.get("start") or 0.0)
+            we = float(w.get("e") or w.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if we < t0 or ws > t1:
+            continue
+        tok = (w.get("w") or w.get("word") or "").strip()
+        if not tok:
+            continue
+        obj = {
+            "w": tok,
+            "s": round(max(ws, t0) - t0, 2),
+            "e": round(max(min(we, t1) - t0, max(ws, t0) - t0), 2),
+        }
+        if w.get("spk") is not None:
+            obj["spk"] = w["spk"]
+        out.append(obj)
+    return out
+
+
+def _write_story_words_sidecar(output_dir: Path, trim_result, language: str = "") -> None:
+    """Persist per-story word timestamps to ``<out_dir>/story_words.json`` so
+    the editor's "Sync images to speech" endpoint can re-run the timing AI
+    later without re-transcribing. Fail-soft: the sidecar is a convenience,
+    never a render blocker."""
+    try:
+        payload = {
+            "schema": 1,
+            "language": language or os.environ.get("KAIZER_V4_LANGUAGE", ""),
+            "stories": {
+                str(s.story_index): list(getattr(s, "words", []) or [])
+                for s in (trim_result.stories or [])
+            },
+        }
+        (Path(output_dir) / "story_words.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+        )
+        n = sum(len(v) for v in payload["stories"].values())
+        print(f"[v4/step1] story_words.json written ({n} words, "
+              f"{len(payload['stories'])} stories)", flush=True)
+    except Exception as exc:
+        print(f"[v4/step1] story_words.json write failed (soft-skip): {exc}",
+              flush=True)
 
 
 # ─── Initial canvas builder (called once after Step 1) ──────────────
@@ -192,6 +269,10 @@ def _build_source_preserved_trim_result(*, source_video: str, output_dir: Path,
 
     # 3) Run the planner JUST for story boundaries — we'll ignore
     #    the CUT spans and treat every KEEP span as in-bulletin.
+    from pipeline_v4 import content_type as _ct
+    _ct.resolve_and_record(words=words, duration=src_duration,
+                           out_dir=output_dir,
+                           language=os.environ.get("KAIZER_V4_LANGUAGE", ""))
     planner_label, planner_fn = trim_engine._select_planner()
     print(f"[v4/step1] source-preserved mode -- planner={planner_label} "
           f"will be used ONLY for short story boundaries", flush=True)
@@ -243,15 +324,21 @@ def _build_source_preserved_trim_result(*, source_video: str, output_dir: Path,
                     if tok:
                         story_txt_words.append(tok)
             transcript_text = " ".join(story_txt_words)[:1200]
+            _t0 = story_spans[0].start_sec
+            _t1 = story_spans[-1].end_sec
             stories_out.append(trim_engine.TrimmedStory(
                 story_index=s_idx,
                 title_native=str(s.get("title_native") or "")[:200],
                 title_english=str(s.get("title_english") or "")[:200],
                 summary=str(s.get("summary") or "")[:500],
-                video_t_start=story_spans[0].start_sec,
-                video_t_end=story_spans[-1].end_sec,
+                video_t_start=_t0,
+                video_t_end=_t1,
                 source_spans=story_spans,
                 transcript_text=transcript_text,
+                # Nothing is cut in source-preserved mode → identity remap.
+                # Include EVERY word inside the story window (not just the
+                # planner's spans — between-span speech still plays).
+                words=_identity_words(words, _t0, _t1),
             ))
     if not stories_out:
         # Last-resort fallback: ONE story spanning the whole video.
@@ -268,6 +355,7 @@ def _build_source_preserved_trim_result(*, source_video: str, output_dir: Path,
             transcript_text=" ".join(
                 (w.get("w") or w.get("word") or "").strip() for w in words
             ).strip()[:1200],
+            words=_identity_words(words, 0.0, src_duration),
         ))
 
     print(f"[v4/step1] source-preserved DONE -- "
@@ -279,6 +367,233 @@ def _build_source_preserved_trim_result(*, source_video: str, output_dir: Path,
         trimmed_duration_sec=src_duration,
         stories=stories_out,
         source_duration_sec=src_duration,
+        removed_sec_total=0.0,
+    )
+
+
+def _mux_audio_master(*, narration: str, ref_video: Optional[str], audio_dur: float,
+                      out_path: Path, layout_w: int = 1920, layout_h: int = 1080) -> None:
+    """Build the audio-first ``trimmed_bulletin.mp4`` — a real A/V file whose
+    AUDIO is the uploaded narration (the master track) and whose VIDEO is
+    either the optional muted reference b-roll (looped/padded to the narration
+    length) or a black filler (hidden behind the full-screen image layout).
+
+    The whole audio-first design hinges on this: downstream Stage 2/3, the
+    editor re-render, QC and shorts all read this single file as [0:v]+[0:a],
+    so once it carries the narration as its audio, the narration is the master
+    everywhere with ZERO changes to the composers. Length-locked with ``-t`` so
+    the video track can't drift from the audio (a drift would blank the
+    bulletin at the QC duration gate).
+    """
+    from pipeline_v4 import encoder as _encoder
+    from pipeline_v4.ffmpeg_exec import run_ffmpeg as _run_ffmpeg
+
+    ff = shutil.which("ffmpeg") or "ffmpeg"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # veryfast: this is a plain mux/loop, not a quality-critical compose.
+    venc = _encoder.video_encoder_args(crf=20, preset_hint="veryfast")
+    dur = f"{max(0.1, audio_dur):.3f}"
+
+    if ref_video:
+        # Loop the muted reference b-roll to cover the narration. Keep its
+        # NATIVE aspect (only round to even dims) so the bulletin panel sizing
+        # (built from src_aspect = the ref's aspect) matches — same contract as
+        # a normal V4 source video. No crop, no pad.
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30,setsar=1"
+        cmd = [
+            ff, "-y", "-v", "error",
+            "-stream_loop", "-1", "-i", ref_video,
+            "-i", narration,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-t", dur,
+            "-vf", vf,
+            *venc, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:
+        # No reference video → black filler (the full-screen image layout
+        # covers it entirely; it exists only so the composers have a [0:v]).
+        cmd = [
+            ff, "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s={layout_w}x{layout_h}:r=30",
+            "-i", narration,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-t", dur,
+            *venc, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    _run_ffmpeg(cmd, timeout=max(180, int(audio_dur) + 180),
+                log_label="audio_first_mux", retry=1)
+
+
+def _build_audio_driven_trim_result(*, narration_audio: str, ref_video: Optional[str],
+                                    output_dir: Path, language: str = "multi",
+                                    output_filename: str = "trimmed_bulletin.mp4",
+                                    layout_w: int = 1920, layout_h: int = 1080
+                                    ) -> trim_engine.TrimResult:
+    """Audio-first Stage 1. The uploaded AUDIO is the master: transcribe it
+    with Deepgram, run the SAME KEEP/CUT planner purely for story boundaries +
+    titles/summaries (nothing is cut), then mux the narration onto the muted
+    reference b-roll (or a black filler) to produce a normal
+    ``trimmed_bulletin.mp4`` that the rest of V4 consumes unchanged.
+
+    Returns the same ``trim_engine.TrimResult`` shape as ``run_step1`` /
+    ``_build_source_preserved_trim_result`` so run_job needs no structural
+    change beyond the Stage-1 branch selection.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lang = (language or "multi").strip() or "multi"
+
+    # 1) Transcribe the NARRATION (not any video). Normalise to mp3 first so
+    #    Deepgram gets a small payload; _extract_audio_mp3's "-vn" is a
+    #    harmless no-op on an audio-only input.
+    audio_mp3 = str(output_dir / "_step1_narration.mp3")
+    trim_engine._extract_audio_mp3(narration_audio, audio_mp3)
+    try:
+        words, audio_dur = trim_engine._deepgram_words(audio_mp3, language=lang)
+    finally:
+        try:
+            os.unlink(audio_mp3)
+        except OSError:
+            pass
+    # Deepgram metadata.duration can come back 0 — fall back to a direct
+    # ffprobe of the narration so the timeline is never zero.
+    if audio_dur <= 0.5:
+        audio_dur = _ffprobe_duration(narration_audio)
+    if audio_dur <= 0.5:
+        raise RuntimeError(
+            f"audio-first: could not read a positive duration from the "
+            f"narration {narration_audio!r} — aborting before an empty render"
+        )
+
+    # 2) Story boundaries via the SAME planner (Claude/Gemini) — used ONLY for
+    #    titles/summaries/segmentation; no spans are cut.
+    from pipeline_v4 import content_type as _ct
+    _ct.resolve_and_record(words=words, duration=audio_dur,
+                           out_dir=output_dir, language=lang)
+    planner_label, planner_fn = trim_engine._select_planner()
+    print(f"[v4/step1] AUDIO-FIRST mode -- planner={planner_label} for story "
+          f"boundaries over {audio_dur:.1f}s of narration", flush=True)
+    try:
+        planner_stories, _ = planner_fn(
+            words=words, language=lang, duration_sec=audio_dur,
+        )
+    except Exception as exc:
+        print(f"[v4/step1] planner soft-fail in audio-first mode "
+              f"(falling back to single full-duration story): {exc}", flush=True)
+        planner_stories = []
+
+    # Length-lock the mux to the TRUE narration length. Deepgram's
+    # metadata.duration is measured on the mp3 transcode and can drift by a
+    # fraction of a second (LAME padding / VBR), which would truncate or pad the
+    # MASTER track. ffprobe the original narration directly; keep the Deepgram
+    # value only for the planner's word timeline.
+    timeline_dur = _ffprobe_duration(narration_audio)
+    if timeline_dur <= 0.5:
+        timeline_dur = audio_dur
+
+    # 3) Build CONTIGUOUS stories that TILE [0, timeline_dur] with NO gaps.
+    #    CRITICAL: the bulletin composer (v1_bridge.render_bulletin) slices each
+    #    story's [video_t_start, video_t_end] out of trimmed_bulletin.mp4 and
+    #    concatenates them. If stories had gaps (the KEEP/CUT planner leaves
+    #    them by design), the narration in those gaps would be silently DROPPED
+    #    — but audio-first must keep the FULL narration. So we use the planner
+    #    ONLY for topic boundaries + titles/summaries, and make each story a
+    #    contiguous segment from its start to the NEXT story's start. Every
+    #    second of narration then belongs to exactly one story; sum of ranges
+    #    == timeline_dur, so nothing is cut and QC's duration gate stays honest.
+    planned: list[dict] = []
+    for s in (planner_stories or []):
+        starts = []
+        for sp in (s.get("kept_spans") or []):
+            try:
+                starts.append(float(sp.get("start_sec") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if not starts:
+            continue
+        seg_start = min(starts)
+        if seg_start < 0.0 or seg_start >= timeline_dur:
+            continue
+        planned.append({
+            "start": seg_start,
+            "title_native": str(s.get("title_native") or "")[:200],
+            "title_english": str(s.get("title_english") or "")[:200],
+            "summary": str(s.get("summary") or "")[:500],
+        })
+    planned.sort(key=lambda p: p["start"])
+    # Drop near-duplicate starts (avoid <1s slivers that would break slicing).
+    deduped: list[dict] = []
+    for p in planned:
+        if deduped and (p["start"] - deduped[-1]["start"]) < 1.0:
+            continue
+        deduped.append(p)
+    planned = deduped
+
+    def _seg_transcript(a: float, b: float) -> str:
+        toks = []
+        for w in words:
+            ws = float(w.get("s") or w.get("start") or 0.0)
+            if a <= ws < b:
+                t = (w.get("w") or w.get("word") or "").strip()
+                if t:
+                    toks.append(t)
+        return " ".join(toks)[:1200]
+
+    stories_out: list[trim_engine.TrimmedStory] = []
+    if planned:
+        planned[0]["start"] = 0.0   # first segment always covers any pre-roll
+        for i, p in enumerate(planned):
+            seg_start = p["start"]
+            seg_end = planned[i + 1]["start"] if (i + 1 < len(planned)) else timeline_dur
+            if seg_end <= seg_start + 0.05:
+                continue
+            stories_out.append(trim_engine.TrimmedStory(
+                story_index=len(stories_out),
+                title_native=p["title_native"],
+                title_english=p["title_english"],
+                summary=p["summary"],
+                video_t_start=seg_start,
+                video_t_end=seg_end,
+                source_spans=[trim_engine.KeptSpan(
+                    start_sec=seg_start, end_sec=seg_end, reason="audio")],
+                transcript_text=_seg_transcript(seg_start, seg_end),
+                # Narration timeline == output timeline (nothing cut).
+                words=_identity_words(words, seg_start, seg_end),
+            ))
+    if not stories_out:
+        # Fallback: ONE story spanning the whole narration.
+        stories_out.append(trim_engine.TrimmedStory(
+            story_index=0,
+            title_native="", title_english="", summary="",
+            video_t_start=0.0, video_t_end=timeline_dur,
+            source_spans=[trim_engine.KeptSpan(
+                start_sec=0.0, end_sec=timeline_dur, reason="full")],
+            transcript_text=_seg_transcript(0.0, timeline_dur),
+            words=_identity_words(words, 0.0, timeline_dur),
+        ))
+
+    # 4) Produce the muxed A/V trimmed_bulletin.mp4 (narration = master audio),
+    #    length-locked to the TRUE narration length.
+    out_path = output_dir / output_filename
+    _mux_audio_master(
+        narration=narration_audio, ref_video=ref_video, audio_dur=timeline_dur,
+        out_path=out_path, layout_w=layout_w, layout_h=layout_h,
+    )
+
+    print(f"[v4/step1] AUDIO-FIRST DONE -- {timeline_dur:.1f}s narration, "
+          f"{len(stories_out)} contiguous stories, "
+          f"ref_video={'yes' if ref_video else 'no (fullscreen images)'}", flush=True)
+
+    return trim_engine.TrimResult(
+        trimmed_path=str(out_path),
+        trimmed_duration_sec=timeline_dur,
+        stories=stories_out,
+        source_duration_sec=timeline_dur,
         removed_sec_total=0.0,
     )
 
@@ -364,6 +679,7 @@ def _bulletin_layout(width: int = 1920, height: int = 1080,
             picture_w_pct=24.698, picture_h_pct=58.863,
             brand_logo_path=brand_logo,
             brand_logo_x_pct=92.0, brand_logo_y_pct=2.0, brand_logo_w_pct=6.0,
+            lt_ease="out_cubic",
         )
 
     # Narrow source — compute the video panel's width from the actual
@@ -392,6 +708,7 @@ def _bulletin_layout(width: int = 1920, height: int = 1080,
         picture_w_pct=picture_w_pct, picture_h_pct=58.863,
         brand_logo_path=brand_logo,
         brand_logo_x_pct=92.0, brand_logo_y_pct=2.0, brand_logo_w_pct=6.0,
+        lt_ease="out_cubic",
     )
 
 
@@ -421,20 +738,58 @@ def _short_layout(width: int = 1080, height: int = 1920,
     )
 
 
+def _audio_fullscreen_layout(width: int = 1920, height: int = 1080,
+                             brand_logo: Optional[str] = None) -> CanvasLayout:
+    """Audio-first, NO reference video: the generated image fills the ENTIRE
+    frame (a 16:9 image over the 16:9 canvas = perfect cover) while the
+    narration plays. The muted black filler [0:v] sits fully behind the image.
+    The red headline strap + yellow ticker still overlay at the bottom (drawn
+    after the image), so it reads as a full-screen news explainer.
+    """
+    return CanvasLayout(
+        width=width, height=height, bg_color="#000000",
+        # Filler video fills the frame (hidden behind the image below).
+        video_x_pct=0.0, video_y_pct=0.0, video_w_pct=100.0, video_h_pct=100.0,
+        # Image full-frame on top.
+        picture_x_pct=0.0, picture_y_pct=0.0, picture_w_pct=100.0, picture_h_pct=100.0,
+        # Black (not the default white) tile border → the 3px frame is invisible
+        # on the black canvas, so the image reads as true full-bleed.
+        tile_border_color="#000000",
+        brand_logo_path=brand_logo,
+        brand_logo_x_pct=90.0, brand_logo_y_pct=2.5, brand_logo_w_pct=8.0,
+        lt_ease="out_cubic",
+    )
+
+
 def _default_image_timings(story_duration: float, pool_count: int) -> list[tuple[int, float, float]]:
-    """Heuristic fallback when Claude doesn't decide. Cycles the pool
-    in ~4s windows. Returns [(pool_index, t_start, t_end), ...]."""
+    """Heuristic fallback when the timing AI doesn't decide. Returns
+    [(pool_index, t_start, t_end), ...].
+
+    The OLD version cut a fixed 4s window in a while-loop, so ONE image on
+    a 96s story became 24 identical windows → a 24-LAYER carousel rendered
+    frame-by-frame (job 608: ~43min for 4 stories). Now the window count
+    scales with the POOL: one image = one window; more images cycle at a
+    readable ~10s dwell, each shown at most ~twice. No frantic slideshow,
+    no redundant layers. KAIZER_V4_IMG_DWELL_S tunes the dwell."""
     if pool_count == 0 or story_duration <= 0:
         return []
-    window = 4.0
+    if pool_count == 1:
+        # One image = one window covering the story (the prior behaviour
+        # was 24 contiguous windows of it — same look, 24× the render).
+        return [(0, 0.0, round(float(story_duration), 3))]
+    try:
+        dwell = max(4.0, float(os.environ.get("KAIZER_V4_IMG_DWELL_S", "10") or 10))
+    except (TypeError, ValueError):
+        dwell = 10.0
+    # each image shown once..twice; never fewer than the pool (show them
+    # all), never more than 2 full cycles.
+    n = max(pool_count, min(int(round(story_duration / dwell)), pool_count * 2))
+    window = story_duration / n
     out: list[tuple[int, float, float]] = []
-    t = 0.0
-    idx = 0
-    while t < story_duration:
-        end = min(story_duration, t + window)
-        out.append((idx % pool_count, t, end))
-        t = end
-        idx += 1
+    for i in range(n):
+        t = i * window
+        end = float(story_duration) if i == n - 1 else (i + 1) * window
+        out.append((i % pool_count, round(t, 3), round(end, 3)))
     return out
 
 
@@ -464,9 +819,36 @@ def _build_initial_canvas(
     # cover-crop-zoomed into 16:9 chrome. Defaults to 16:9 for back-
     # compat with callers that haven't been updated to probe yet.
     source_aspect: float = 16.0 / 9.0,
+    # Audio-first with NO reference video → the image fills the whole frame
+    # (the muted filler [0:v] sits hidden behind it).
+    fullscreen_image: bool = False,
 ) -> Canvas:
     if kind == "bulletin":
-        layout = _bulletin_layout(brand_logo=brand_logo, source_aspect=source_aspect)
+        if fullscreen_image:
+            layout = _audio_fullscreen_layout(brand_logo=brand_logo)
+        else:
+            layout = _bulletin_layout(brand_logo=brand_logo, source_aspect=source_aspect)
+        # Designed layout from the library ("lib:<key>" in the wizard's
+        # full-form picker): override the tile geometry with the design's
+        # zone percentages. Unknown/non-renderable key → default layout
+        # (fail-soft; the job still renders).
+        _ffl = (os.environ.get("KAIZER_V4_FULLFORM_LAYOUT", "") or "").strip().lower()
+        if _ffl.startswith("lib:") and not fullscreen_image:
+            try:
+                from pipeline_v4.layout_library import to_canvas_pcts
+                _pcts = to_canvas_pcts(_ffl[4:])
+                if _pcts:
+                    for _k, _v in _pcts.items():
+                        setattr(layout, _k, float(_v))
+                    print(f"[v4] designed layout applied: {_ffl[4:]}",
+                          flush=True)
+            except Exception as _lx:
+                print(f"[v4] designed layout skipped ({_lx})", flush=True)
+        # THEME PACK: stamp the job's theme onto the canvas so the render
+        # AND every editor re-render wear it ("" = classic, byte-identical).
+        _thm_env = (os.environ.get("KAIZER_V4_THEME") or "").strip().lower()
+        if _thm_env:
+            layout.theme = _thm_env
         # Studio-background video the operator picked in the new-job
         # wizard (forwarded via env so the orchestrator subprocess can
         # see it without a DB lookup). Only stamped on the bulletin —
@@ -484,6 +866,17 @@ def _build_initial_canvas(
                 layout.bg_intro_seconds = 0.0
     else:
         layout = _short_layout(brand_logo=brand_logo)
+
+    # Layout safety (spec 3.13): generated bulletin layouts are clamped so
+    # media can never start life overlapping the headline/ticker strips.
+    if kind == "bulletin":
+        try:
+            from pipeline_v4 import layout_safety
+            if layout_safety.clamp_media(layout):
+                print("[v4] layout-safety: clamped media tiles out of the "
+                      "text strip", flush=True)
+        except Exception as _ls_exc:
+            print(f"[v4] layout-safety clamp skipped: {_ls_exc}", flush=True)
 
     stories: list[CanvasStory] = []
     for s in trim_result.stories:
@@ -513,16 +906,81 @@ def _build_initial_canvas(
         # while still rendering something useful if the AI fetch
         # failed for this story specifically.
         story_pool = own_pool if own_pool else shared_pool
-        timings = _default_image_timings(s.duration, len(story_pool))
-        images = [
-            CanvasImage(
-                src=story_pool[local_idx][1]["filename"],
-                t_start=ts, t_end=te,
-                source="manual" if story_pool[local_idx][1].get("kind") == "user" else "claude",
-                label=story_pool[local_idx][1].get("label"),
-            )
-            for (local_idx, ts, te) in timings
-        ]
+
+        # Transcript-grounded timing (Phase-1 engine): the timing AI
+        # places each image on the exact spoken words, matching by the
+        # pool labels (name-tag contract). Gaps are expected — the
+        # renderer cuts back to the main video. ANY failure/empty plan
+        # → the legacy 4s heuristic below, so a paid job never fails
+        # because of timing.
+        images: list[CanvasImage] = []
+        plan = None
+        if story_pool:
+            try:
+                from pipeline_v4 import image_timing
+                plan = image_timing.decide_story_timings(
+                    title_native=s.title_native,
+                    title_english=s.title_english,
+                    summary=s.summary,
+                    duration=s.duration,
+                    words=list(getattr(s, "words", None) or []),
+                    pool=[{"label": p.get("label"), "kind": p.get("kind")}
+                          for _, p in story_pool],
+                    language=language,
+                )
+            except Exception as exc:
+                print(f"[v4] image timing failed for story {s.story_index + 1} "
+                      f"({exc}) — heuristic fallback", flush=True)
+                plan = None
+        if plan:
+            for e in plan:
+                _, p = story_pool[e["pool_index"]]
+                dwell = float(e["t_end"]) - float(e["t_start"])
+                # A VIDEO pool entry (.mp4/.mov/…) is a full-screen
+                # reference-video CUTAWAY (B-roll), placed by the same
+                # label↔speech engine as images, then always shown
+                # full-screen for its window (never a sidebar still).
+                _vid = str(p.get("filename") or "").lower().endswith(
+                    (".mp4", ".mov", ".webm", ".m4v", ".mkv"))
+                images.append(CanvasImage(
+                    src=p["filename"],
+                    t_start=e["t_start"], t_end=e["t_end"],
+                    source="manual" if p.get("kind") == "user" else "claude",
+                    label=p.get("label"),
+                    # Polish C motion: long dwells get a gentle Ken-Burns
+                    # zoom instead of sitting static; short ones keep the
+                    # crossfade.
+                    effect="zoom_in" if dwell >= 4.0 else "fade",
+                    timing_mode="content",
+                    confidence=e.get("confidence"),
+                    importance=e.get("importance"),
+                    spotlight=("fullscreen" if _vid else e.get("spotlight")),
+                    matched_text=e.get("matched_text") or None,
+                    media_kind=("video" if _vid else "image"),
+                    # Face-aware framing: the pool ingest stamped a detected
+                    # focal point; absent → schema default 50/50 (centered).
+                    offset_x_pct=float(p.get("offset_x_pct") or 50.0),
+                    offset_y_pct=float(p.get("offset_y_pct") or 50.0),
+                ))
+        else:
+            timings = _default_image_timings(s.duration, len(story_pool))
+            def _mk_img(local_idx, ts, te):
+                _pe = story_pool[local_idx][1]
+                _fn = _pe["filename"]
+                _vid = str(_fn or "").lower().endswith(
+                    (".mp4", ".mov", ".webm", ".m4v", ".mkv"))
+                return CanvasImage(
+                    src=_fn, t_start=ts, t_end=te,
+                    source="manual" if _pe.get("kind") == "user" else "claude",
+                    label=_pe.get("label"),
+                    spotlight=("fullscreen" if _vid else None),
+                    media_kind=("video" if _vid else "image"),
+                    # Face-aware framing from the pool ingest (see the
+                    # timing-plan branch above) — same fill-when-present rule.
+                    offset_x_pct=float(_pe.get("offset_x_pct") or 50.0),
+                    offset_y_pct=float(_pe.get("offset_y_pct") or 50.0),
+                )
+            images = [_mk_img(local_idx, ts, te) for (local_idx, ts, te) in timings]
         text_blocks = []
         if s.title_native:
             # BREAKING headline — red strap below the video+image row.
@@ -551,6 +1009,10 @@ def _build_initial_canvas(
             images=images,
             text_blocks=text_blocks,
             claude_decided_timings=True,
+            # Polish A: the name-strap only makes sense when the timing
+            # engine placed the images (labels = real subjects). Heuristic
+            # fallbacks keep it off — labels may be filename stems.
+            name_strap=bool(plan),
         ))
 
     # Default short_config — V1's torn_card with the right script font
@@ -583,6 +1045,10 @@ def _build_initial_canvas(
         stories=stories,
         trimmed_video_path=trim_result.trimmed_path,
         short_config=short_config,
+        # NEW multi-story bulletins crossfade between stories (native
+        # motion); single-story and legacy canvases keep the hard cut.
+        story_transition=("fade" if (kind == "bulletin" and len(stories) > 1)
+                          else None),
     )
 
 
@@ -1025,6 +1491,253 @@ def _load_template_media(job_id: int) -> tuple[dict, str]:
     return out, main
 
 
+def _template_autoimages_on() -> bool:
+    """KAIZER_V4_TEMPLATE_AUTOIMAGES gate — default ON."""
+    return (os.environ.get("KAIZER_V4_TEMPLATE_AUTOIMAGES", "1") or "1").strip().lower() \
+        not in ("0", "off", "false", "no")
+
+
+def _active_custom_template_ids(output_format: str) -> list[int]:
+    """CustomTemplate ids actually used by THIS render (fullform + shorts envs)."""
+    ids: list[int] = []
+    _ff = (os.environ.get("KAIZER_V4_FULLFORM_LAYOUT", "") or "").strip().lower()
+    if (output_format not in ("shorts-only", "trailer-only")
+            and _ff.startswith("custom:") and _ff.split(":", 1)[1].isdigit()):
+        ids.append(int(_ff.split(":", 1)[1]))
+    _sl = (os.environ.get("KAIZER_V4_SHORT_LAYOUT", "") or "").strip().lower()
+    if (output_format not in ("full-only", "trailer-only")
+            and _sl.startswith("custom:") and _sl.split(":", 1)[1].isdigit()):
+        _tid = int(_sl.split(":", 1)[1])
+        if _tid not in ids:
+            ids.append(_tid)
+    return ids
+
+
+def _empty_image_slots(contract_jsons: list, template_media: dict,
+                       max_slots: int) -> list[tuple[str, bool]]:
+    """Pure slot-fill decision: which image slots have NO user media yet.
+    Dedupes by slot key across templates (first template wins — ONE shared
+    template_media map serves both the fullform and short custom templates)
+    and caps at max_slots so a slot-heavy template can't explode Gemini
+    spend. Returns [(slot_key, is_carousel), ...]."""
+    empty: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    tm = template_media if isinstance(template_media, dict) else {}
+    for cj in (contract_jsons or []):
+        if not isinstance(cj, dict):
+            continue
+        for s in (cj.get("slots") or []):
+            if not isinstance(s, dict) or s.get("kind") != "image":
+                continue
+            key = str(s.get("name") or s.get("kind") or "").strip()
+            if not key or key in seen or key in tm:
+                continue
+            seen.add(key)
+            empty.append((key, bool(s.get("carousel"))))
+    return empty[:max(1, int(max_slots or 1))]
+
+
+def _slot_fill_value(is_carousel: bool, asset_ids: list):
+    """Media-map value for a slot from the generated asset ids — single slot
+    -> the first id (scalar, the shape _load_template_media resolves), carousel
+    slot -> the carousel struct the create_job/editor save paths write. None
+    when no asset survived generation (slot stays empty, so the positional
+    support_images pool fill still applies at render)."""
+    ids = [int(a) for a in (asset_ids or []) if a]
+    if not ids:
+        return None
+    if not is_carousel:
+        return ids[0]
+    return {"carousel": [{"id": i, "duration_s": 3.0, "effect": "fade",
+                          "effect_duration": 0.4}
+                         # defense-in-depth: same 50-frame cap as _load_template_media
+                         for i in ids[:50]],
+            "fit": "cover"}
+
+
+def _merge_template_media(existing: dict, filled: dict) -> dict:
+    """Fresh-dict merge (JSON column — never mutate in place, see the
+    models.py:249 pattern or the commit silently no-ops). User-filled slot
+    keys always win over auto-generated ones."""
+    merged = dict(existing or {})
+    for k, v in (filled or {}).items():
+        merged.setdefault(k, v)
+    return merged
+
+
+def _persist_generated_slot_asset(sess, *, user_id: int, src_path: str,
+                                  label: str, job_id: int) -> Optional[int]:
+    """UserAsset row for a pipeline-generated slot image. Unlike routers.assets.
+    _persist_ai_image this NEVER deletes the local file — _load_template_media
+    resolves by local file_path (isfile check). Storage upload + thumb are
+    best-effort. Returns the asset id or None."""
+    import models
+    p = Path(src_path)
+    if not p.is_file():
+        return None
+    thumb_path, w, h = "", 0, 0
+    try:
+        from routers.assets import _thumb_for           # lazy: pulls FastAPI once
+        thumb_path, w, h = _thumb_for(p)
+    except Exception:
+        pass
+    storage_backend = storage_key = storage_url = thumb_storage_url = ""
+    try:
+        from pipeline_core.storage import get_storage_provider
+        storage = get_storage_provider()
+        rel_dir = f"user_assets/{user_id}/"
+        obj = storage.upload(str(p), rel_dir + p.name, content_type="image/jpeg")
+        storage_backend, storage_key, storage_url = storage.name, obj.key, obj.url
+        if thumb_path:
+            thumb_storage_url = storage.upload(
+                thumb_path, rel_dir + Path(thumb_path).name,
+                content_type="image/jpeg").url
+        # NOTE: local file intentionally KEPT even on remote storage.
+    except Exception as exc:
+        print(f"[v4] slot-asset storage upload failed (soft): {exc}", flush=True)
+    row = models.UserAsset(
+        user_id=user_id, filename=p.name, file_path=str(p.resolve()),
+        thumb_path=thumb_path, kind="image", mime="image/jpeg",
+        size_bytes=p.stat().st_size, width=w, height=h, is_default_ad=False,
+        tags=["ai-generated", f"job:{job_id}"], folder_path="generated",
+        description=(label or "").strip()[:500],
+        storage_backend=storage_backend, storage_key=storage_key,
+        storage_url=storage_url, thumb_storage_url=thumb_storage_url,
+    )
+    sess.add(row); sess.commit(); sess.refresh(row)
+    return row.id
+
+
+def _autofill_template_images(*, job_id: int, trim_result, language: str,
+                              output_format: str) -> int:
+    """PIPELINE AUTO-FILL: for a custom-template job whose image slots the user
+    left EMPTY, plan imagery FROM THE STORY CONTENT and generate + attach it —
+    single slot -> 1 image, carousel-marked slot -> story-driven N — persisting
+    to Job.template_media so THIS render (Stage 3 re-reads the row via
+    _load_template_media) AND the editor both see the images. Never overwrites
+    a user-filled slot. Returns the number of slots filled; 0 on any skip.
+    Caller wraps in try/except — any failure -> render proceeds with template
+    defaults (fail-soft)."""
+    if not _template_autoimages_on():
+        return 0
+    tids = _active_custom_template_ids(output_format)
+    if not tids:
+        return 0
+    from database import SessionLocal
+    import models
+    sess = SessionLocal()
+    try:
+        j = sess.query(models.Job).filter(models.Job.id == job_id).first()
+        if not j or not j.user_id:
+            return 0
+        tm = getattr(j, "template_media", None) or {}
+        if isinstance(tm, str):
+            try:
+                tm = json.loads(tm)
+            except Exception:
+                tm = {}
+        if not isinstance(tm, dict):
+            tm = {}
+        # Discover EMPTY image slots across the active template(s).
+        contract_jsons = []
+        for tid in tids:
+            t = sess.get(models.CustomTemplate, tid)
+            contract_jsons.append((getattr(t, "contract_json", None) or {}) if t else {})
+        # Cost guard: don't let a slot-heavy template explode Gemini spend.
+        _max_slots = max(1, int(os.environ.get(
+            "KAIZER_V4_TEMPLATE_AUTOIMAGES_MAX_SLOTS", "4") or 4))
+        empty = _empty_image_slots(contract_jsons, tm, _max_slots)
+        if not empty:
+            return 0
+
+        stories = list(getattr(trim_result, "stories", None) or [])
+        s0 = stories[0] if stories else None
+        t_nat = (getattr(s0, "title_native", "") or "") if s0 else ""
+        t_eng = (getattr(s0, "title_english", "") or "") if s0 else ""
+        # Single slots: primary story (summary enriched with its transcript, the
+        # image_provider._generate_via_gemini precedent). Carousels: the WHOLE
+        # narrative so the planner's beats span every story.
+        s0_sum = (getattr(s0, "summary", "") or "") if s0 else ""
+        s0_tr = (getattr(s0, "transcript_text", "") or "") if s0 else ""
+        single_summary = (f"{s0_sum}\n\nSpoken transcript: {s0_tr[:600]}"
+                          if s0_tr else s0_sum)[:1200]
+        combined = "\n".join(
+            f"- {(getattr(s, 'title_native', '') or getattr(s, 'title_english', '') or '').strip()}: "
+            f"{(getattr(s, 'summary', '') or '').strip()}"
+            for s in stories)[:1200] or single_summary
+
+        out_root = image_provider._user_assets_dir_for(j.user_id)
+        if out_root is None:
+            return 0
+        from pipeline_v4 import image_ai as _iai
+        import uuid as _uuid
+        # Honor the job's image-engine pick (wizard → Job.v4_image_provider →
+        # KAIZER_V4_IMAGE_PROVIDER env, set per-job by the runner). "auto"
+        # keeps Gemini here — the web-photo chain has no slot-fill notion.
+        _engine = ("openai" if image_provider._selected_image_provider() == "openai"
+                   else "gemini")
+        filled: dict = {}
+        for key, is_car in empty:
+            safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in key)[:32]
+            if is_car:
+                triples = _iai.make_images_for_story(
+                    title_native=t_nat, title_english=t_eng, summary=combined,
+                    language=language, count=None, out_dir=str(out_root),
+                    base=f"tmpl_{job_id}_{safe}_{_uuid.uuid4().hex[:6]}",
+                    max_images=max(1, min(int(os.environ.get(
+                        "KAIZER_AI_IMAGE_MAX", "8") or 8), 12)),
+                    engine=_engine)
+                frame_ids = []
+                _first_frame_path = None
+                for path, _prompt, label in triples:
+                    aid = _persist_generated_slot_asset(
+                        sess, user_id=j.user_id, src_path=path,
+                        label=label, job_id=job_id)
+                    if aid:
+                        frame_ids.append(aid)
+                        if _first_frame_path is None:
+                            _first_frame_path = path
+                val = _slot_fill_value(True, frame_ids)
+                if val:
+                    # Face-aware framing for the slot's cover-crop: the
+                    # SLOT-level offsets are the only channel the renderer
+                    # reads (_load_template_media; per-frame offsets aren't
+                    # plumbed), so the first surviving frame's face decides.
+                    # Centered/failed → omit (legacy struct shape). Scalar
+                    # slots have NO offset channel (bare asset id) — a known
+                    # limitation, not widened in this pass.
+                    try:
+                        if _first_frame_path:
+                            from pipeline_v4 import face_focus
+                            _fox, _foy = face_focus.focal_point(_first_frame_path)
+                            if (_fox, _foy) != (50.0, 50.0):
+                                val["offset_x_pct"] = _fox
+                                val["offset_y_pct"] = _foy
+                    except Exception:
+                        pass
+                    filled[key] = val
+            else:
+                out_path = out_root / f"tmpl_{job_id}_{safe}_{_uuid.uuid4().hex[:6]}.jpg"
+                saved, final_prompt = _iai.make_image_for_story(
+                    title_native=t_nat, title_english=t_eng,
+                    summary=single_summary or combined, language=language,
+                    out_path=str(out_path), engine=_engine)
+                if saved and out_path.is_file():
+                    aid = _persist_generated_slot_asset(
+                        sess, user_id=j.user_id, src_path=str(out_path),
+                        label=_iai.derive_label(final_prompt), job_id=job_id)
+                    val = _slot_fill_value(False, [aid] if aid else [])
+                    if val:
+                        filled[key] = val
+        if not filled:
+            return 0
+        j.template_media = _merge_template_media(tm, filled)
+        sess.commit()
+        return len(filled)
+    finally:
+        sess.close()
+
+
 def _load_template_overrides(job_id: int) -> dict:
     """Per-slot TEXT overrides set in the custom-template editor (Job.template_overrides).
     Returns {slot_key: text}. {} on any error / when none."""
@@ -1113,7 +1826,21 @@ def run_job(
     # the inner video panel to match. Without this, a vertical (9:16)
     # phone-shot source gets cover-crop-zoomed into a 16:9 chrome
     # panel and the operator's face ends up massively cropped.
-    src_aspect = _probe_source_aspect(source_video)
+    # Audio-first mode: the narration AUDIO is the master track (it arrives as
+    # --source); the optional MUTED reference b-roll comes via env. When there
+    # is no reference video the generated image fills the frame (operator's
+    # choice). Read the flags up front so Stage 1 + the canvas can branch.
+    audio_first = (os.environ.get("KAIZER_V4_AUDIO_FIRST", "0") or "0").strip().lower() in ("1", "true", "yes")
+    ref_video = (os.environ.get("KAIZER_V4_REF_VIDEO_PATH", "") or "").strip() or None
+    if audio_first:
+        _log(f"[v4] AUDIO-FIRST MODE active (narration={source_video}; "
+             f"ref_video={ref_video or 'none -> fullscreen images'})")
+
+    if audio_first:
+        # No video to probe for a no-ref job; a ref b-roll drives panel sizing.
+        src_aspect = _probe_source_aspect(ref_video) if ref_video else (16.0 / 9.0)
+    else:
+        src_aspect = _probe_source_aspect(source_video)
     src_aspect_label = (
         "wide (>=1.2)" if src_aspect >= 1.2 else f"narrow ({src_aspect:.2f})"
     )
@@ -1132,7 +1859,7 @@ def run_job(
     # Forwarded from runner.py via KAIZER_V4_OUTPUT_FORMAT. Validated here
     # again so a stray value never reaches the render gates.
     output_format = (os.environ.get("KAIZER_V4_OUTPUT_FORMAT", "both") or "both").strip().lower()
-    if output_format not in {"both", "full-only", "shorts-only"}:
+    if output_format not in {"both", "full-only", "shorts-only", "trailer-only"}:
         output_format = "both"
     if output_format != "both":
         _log(f"[v4] output_format={output_format} -- "
@@ -1150,7 +1877,18 @@ def run_job(
     try:
         # ─── Stage 1/3 — atomic trim+concat (or source-preserved) ──
         stage_t0 = time.time()
-        if predef_description:
+        if audio_first:
+            # AUDIO-FIRST wins over source-preserved (they are mutually
+            # exclusive). Narration is the master; the muted ref b-roll (if
+            # any) is muxed under it, else a black filler for fullscreen images.
+            trim_result = _build_audio_driven_trim_result(
+                narration_audio=source_video,
+                ref_video=ref_video,
+                output_dir=out_dir,
+                language=language,
+                output_filename="trimmed_bulletin.mp4",
+            )
+        elif predef_description:
             trim_result = _build_source_preserved_trim_result(
                 source_video=source_video,
                 output_dir=out_dir,
@@ -1167,6 +1905,18 @@ def run_job(
              f"-- {trim_result.trimmed_duration_sec:.1f}s output, "
              f"{len(trim_result.stories)} stories  (total {_fmt_elapsed(time.time() - job_t0)})")
 
+        # Persist per-story word timestamps for the editor's
+        # "Sync images to speech" (fail-soft, never blocks the render).
+        _write_story_words_sidecar(out_dir, trim_result, language=language)
+
+        # ─── Stage 1.5 — TV-style profanity bleep ───────────────────
+        # Mute + 1kHz tone over censorable words on the trimmed master
+        # (audio-only rewrite, video stream copied). Fail-soft; report
+        # lands in bleep_report.json for the editor. KAIZER_V4_BLEEP=0
+        # turns the channel censor off.
+        from pipeline_v4 import bleep as v4_bleep
+        v4_bleep.run_bleep_pass(trim_result=trim_result, out_dir=out_dir)
+
         # ─── Ingest user-supplied image pool ────────────────────────
         pool = _ingest_image_pool(out_dir, bulletin_images_env)
         _log(f"[v4] pool ingested -- {len(pool)} images")
@@ -1176,20 +1926,99 @@ def run_job(
         # do we run V1's CSE/DDG/Pexels/OpenAI chain to land one image
         # per story. Generated images also land in the operator's
         # user_assets/ folder so they're reusable across future jobs.
+        if output_format == "trailer-only":
+            # Trailer-only: no bulletin compose → sidebar images are never
+            # shown. Skip the whole fetch/generate spend.
+            _log("[v4] output_format=trailer-only -- skipping image auto-fetch")
+        else:
+            try:
+                user_assets = image_provider._user_assets_dir_for(_get_job_user_id(job_id))
+                new_imgs = image_provider.auto_populate_pool(
+                    stories=list(trim_result.stories),
+                    pool_dir=out_dir / "_pool",
+                    language=language,
+                    user_assets_dir=user_assets,
+                    only_if_empty=True,
+                )
+                if new_imgs:
+                    pool.extend(new_imgs)
+                    _log(f"[v4] auto-fetched {len(new_imgs)} authentic image(s)")
+            except Exception as exc:
+                _log(f"[v4] image auto-fetch failed (soft-skip): {exc}")
+
+        # ─── FACE-AWARE FRAMING: stamp a focal point on every pool image ──
+        # ONE choke point covers env-pool ingest + auto-fetch + AI-generate:
+        # each image entry carries the detected face center as
+        # offset_x/y_pct, which _build_initial_canvas copies onto the
+        # CanvasImage so every cover-crop keeps heads in frame. Stamped
+        # ONLY when non-default (offsets already hash unconditionally in
+        # v1_bridge._carousel_blob) so face-less images keep the schema
+        # default and old canvases stay hash-identical. The editor's
+        # 9-point grid overwrites the fields later — user framing wins.
+        # Fail-soft: detection can never block a paid render.
         try:
-            user_assets = image_provider._user_assets_dir_for(_get_job_user_id(job_id))
-            new_imgs = image_provider.auto_populate_pool(
-                stories=list(trim_result.stories),
-                pool_dir=out_dir / "_pool",
-                language=language,
-                user_assets_dir=user_assets,
-                only_if_empty=True,
-            )
-            if new_imgs:
-                pool.extend(new_imgs)
-                _log(f"[v4] auto-fetched {len(new_imgs)} authentic image(s)")
-        except Exception as exc:
-            _log(f"[v4] image auto-fetch failed (soft-skip): {exc}")
+            from pipeline_v4 import face_focus
+            for _pe in pool:
+                _fn = str(_pe.get("filename") or "")
+                if (_fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                        and "offset_x_pct" not in _pe):
+                    _ox, _oy = face_focus.focal_point(out_dir / "_pool" / _fn)
+                    if (_ox, _oy) != (50.0, 50.0):
+                        _pe["offset_x_pct"], _pe["offset_y_pct"] = _ox, _oy
+        except Exception as _ffx:
+            _log(f"[v4] face-focus skipped (soft): {_ffx}")
+
+        # ─── Reference-video AUTO-SOURCE fallback (opt-in, OFF by default) ──
+        # For each story with NO uploaded reference clip, best-effort fetch one
+        # short related clip (yt-dlp) so the AI has B-roll to cut to. Gated by
+        # KAIZER_V4_AUTOSOURCE_VIDEO; capped by KAIZER_V4_AUTOSOURCE_MAX.
+        # COPYRIGHT is the operator's responsibility (see ref_video_source.py);
+        # the uploaded-clip path is the safe primary source. Fully fail-soft.
+        try:
+            from pipeline_v4 import ref_video_source as _rvs
+            _VEXT = (".mp4", ".mov", ".webm", ".m4v", ".mkv")
+            if _rvs.autosource_enabled() and output_format != "trailer-only":
+                _have_vid = {p.get("story_index") for p in pool
+                             if str(p.get("filename") or "").lower().endswith(_VEXT)}
+                _cap = int(os.environ.get("KAIZER_V4_AUTOSOURCE_MAX", "3") or "3")
+                _got = 0
+                for s in trim_result.stories:
+                    if _got >= _cap:
+                        break
+                    if s.story_index in _have_vid:
+                        continue
+                    _q = (getattr(s, "title_english", "")
+                          or getattr(s, "title_native", "") or "").strip()
+                    if not _q:
+                        continue
+                    _clip = _rvs.autosource_clip(_q, out_dir / "_pool", label=_q)
+                    if _clip:
+                        _clip["story_index"] = s.story_index
+                        _clip["kind"] = "autosource"
+                        pool.append(_clip)
+                        _got += 1
+                if _got:
+                    _log(f"[v4] auto-sourced {_got} reference video(s)")
+        except Exception as _asx:
+            _log(f"[v4] reference-video auto-source skipped (soft): {_asx}")
+
+        # ─── Custom-template AUTO-IMAGES (story-driven slot fill) ───────
+        # Image slots the user left EMPTY get AI imagery planned FROM THE
+        # STORY CONTENT (single slot -> 1 image; carousel slot -> story-
+        # driven N) and persisted to Job.template_media BEFORE Stage 3 —
+        # both the full-form custom branch and the shorts custom path
+        # re-read the row via _load_template_media, and the editor sees
+        # the same asset ids. Fully fail-soft; KAIZER_V4_TEMPLATE_
+        # AUTOIMAGES=0 turns it off.
+        try:
+            if output_format != "trailer-only":
+                _n_auto = _autofill_template_images(
+                    job_id=job_id, trim_result=trim_result,
+                    language=language, output_format=output_format)
+                if _n_auto:
+                    _log(f"[v4] template auto-images: filled {_n_auto} empty image slot(s)")
+        except Exception as _tai_exc:
+            _log(f"[v4] template auto-images skipped (soft): {_tai_exc}")
 
         # ─── Stage 2/3 — build canvas + per-story short trims ──────
         stage_t0 = time.time()
@@ -1208,6 +2037,8 @@ def run_job(
             brand_logo=brand_logo,
             language=language,
             source_aspect=src_aspect,
+            # Audio-first with no reference video → image fills the frame.
+            fullscreen_image=(audio_first and not ref_video),
         )
 
         # ─── Per-story shorts ───────────────────────────────────────
@@ -1240,6 +2071,25 @@ def run_job(
                 chunks.append(cur)
             return chunks
 
+        def _subdivide_long_spans(spans: list, target_sec: float) -> list:
+            """Split any single span longer than ~target_sec into ~equal
+            sub-spans. Audio-first stories are ONE contiguous span each (the
+            full segment), so without this a long story would yield one
+            over-long 'short'. Time-based split (contiguous audio, no gaps)."""
+            out: list = []
+            for sp in spans:
+                d = max(0.0, sp.duration)
+                if d <= target_sec * 1.35:
+                    out.append(sp)
+                    continue
+                n = max(2, int(d // target_sec) + (1 if (d % target_sec) > 1.0 else 0))
+                step = d / n
+                for k in range(n):
+                    a = sp.start_sec + k * step
+                    b = sp.end_sec if k == n - 1 else sp.start_sec + (k + 1) * step
+                    out.append(trim_engine.KeptSpan(start_sec=a, end_sec=b, reason=sp.reason))
+            return out
+
         # Build candidate list first (no I/O), then trim. Each candidate
         # is (display_idx, title_native, title_english, summary, spans, est_dur).
         candidates: list[tuple] = []
@@ -1250,7 +2100,11 @@ def run_job(
             # story yields MULTIPLE short clips (not one long "short"). A short story
             # (≤ target) stays a single window. Split is at kept-span boundaries, so
             # windows never cut mid-sentence.
-            chunks = _split_spans(list(s.source_spans), SHORT_TARGET_SEC)
+            # Audio-first stories are single contiguous spans → subdivide long
+            # ones by time first so they become multiple ~25s short windows.
+            _short_spans = (_subdivide_long_spans(list(s.source_spans), SHORT_TARGET_SEC)
+                            if audio_first else list(s.source_spans))
+            chunks = _split_spans(_short_spans, SHORT_TARGET_SEC)
             multi = len(chunks) > 1
             for sub_i, chunk in enumerate(chunks):
                 chunk_dur = sum(sp.duration for sp in chunk)
@@ -1295,7 +2149,7 @@ def run_job(
         # candidates=[] cascades cleanly: the trim pool (`if candidates`),
         # the canvas loop (zip over empty), the SEO loop and the shorts
         # render (`if shorts_canvases`) all no-op.
-        if output_format == "full-only" and candidates:
+        if output_format in ("full-only", "trailer-only") and candidates:
             _log(f"[v4] output_format=full-only -- skipping all {len(candidates)} shorts")
             candidates = []
 
@@ -1348,7 +2202,11 @@ def run_job(
             short_trimmed_path = str(out_dir / f"trimmed_{label}.mp4")
             try:
                 trim_engine.atomic_trim_concat(
-                    source_video=source_video,
+                    # Audio-first: carve shorts from the muxed A/V master (it has
+                    # real video + the narration audio). source_video is the raw
+                    # narration audio, which has NO [0:v] stream → the trim would
+                    # fail and the short would be silently dropped.
+                    source_video=(trim_result.trimmed_path if audio_first else source_video),
                     spans=c_spans,
                     output_path=short_trimmed_path,
                 )
@@ -1477,6 +2335,24 @@ def run_job(
         seo_executor = None
         seo_futures: list[tuple[str, object, object]] = []   # (label, canvas, future)
         seo_max_workers = 0
+        # Render-time SEO gate (operator decision 2026-07-14): SEO is
+        # regenerated on demand later anyway (editor Regenerate button,
+        # per-channel "Write distinct SEO", POST /clips/{id}/seo/generate,
+        # quick-seo), so the render-time Gemini calls are pure spend — and
+        # the parallel burst drained the Vertex per-minute quota that the
+        # Director needs (429s starved the layout/effects plan mid-render).
+        # Default "0" = SKIP. Set KAIZER_V4_SEO_AT_RENDER=1 to restore the
+        # old overlap-with-Stage-3 generation. Skipping leaves
+        # canvas.seo=None and Clip.seo="" — every consumer handles that:
+        # the editor panel shows empty fields + Regenerate, publish falls
+        # back to clip.text title + channel footer, and per-channel
+        # variants in clip.seo_variants still take precedence once applied.
+        if seo_jobs and os.environ.get(
+                "KAIZER_V4_SEO_AT_RENDER", "0").strip() != "1":
+            _log(f"[v4] SEO at render OFF (KAIZER_V4_SEO_AT_RENDER!=1) -- "
+                 f"skipping {len(seo_jobs)} SEO call(s); generate on-demand "
+                 f"in the editor / at publish")
+            seo_jobs = []
         if seo_jobs:
             # Cap concurrency so a 12-short batch doesn't fan out to 12
             # Gemini calls at once and trip rate limits. 4 is the sweet
@@ -1510,6 +2386,7 @@ def run_job(
             bulletin=bulletin_canvas,
             shorts=shorts_canvases,
             output_format=output_format,
+            effects_mode=(os.environ.get("KAIZER_V4_EFFECTS_MODE") or "").strip().lower(),
             trimmed_bulletin_path=trim_result.trimmed_path,
             trimmed_shorts_paths=trimmed_shorts_paths,
         )
@@ -1525,6 +2402,18 @@ def run_job(
         # BEFORE we burn NVENC slots, but NEVER blocks the render — thresholds
         # are still being tuned on real Telugu-news distributions.
         if os.environ.get("KAIZER_PRECOMPOSE_QC", "0").strip() == "1":
+            # Layout safety (spec 3.13): media must never cover the
+            # headline/ticker strips. Fail LOUD in the log — the clamp at
+            # canvas build should make this unreachable, so a hit here
+            # means an operator-forced layout or a builder bug.
+            try:
+                from pipeline_v4 import layout_safety
+                _viol = layout_safety.check(
+                    job_canvas.bulletin.layout, job_canvas.bulletin.stories)
+                for _v in _viol:
+                    _log(f"[v4][qc] LAYOUT-SAFETY VIOLATION: {_v}")
+            except Exception as _ls_exc:
+                _log(f"[v4][qc] layout-safety check skipped: {_ls_exc}")
             try:
                 from pipeline_v4.quality import score_canvas_quality
                 _q = score_canvas_quality(json.loads(job_canvas.model_dump_json()))
@@ -1588,9 +2477,114 @@ def run_job(
         _bull_dur_tol = max(0.5, 0.06 * _n_stories)
         _bull_av_tol = max(0.1, 0.05 * _n_stories)
 
+        # AI DIRECTOR plan — computed ONCE here so the bulletin AND the
+        # shorts share the same per-story mood decisions (a crime short
+        # gets the same cold grade as its bulletin story). Gated by
+        # KAIZER_V4_DIRECTOR (set when effects_mode='rich'); any failure →
+        # None → renders proceed exactly as without the Director.
+        _stage3_director_plan = None
+        try:
+            from pipeline_v4.director import (directives_enabled as _dir_on,
+                                              parse_style_directives as _parse_dirs,
+                                              plan_direction as _plan_dir)
+            # The user's per-category effect picks ("edit using THESE").
+            # When present they force the Director on even if the render's
+            # effects mode wouldn't otherwise (an explicit user direction),
+            # and constrain its vocabulary per category.
+            _user_picks, _cat_override = _parse_dirs(
+                os.environ.get("KAIZER_V4_STYLE_DIRECTIVES"))
+            if _dir_on() or _user_picks or _cat_override:
+                _wbs_s3 = {}
+                try:
+                    _sw_s3 = Path(out_dir) / "story_words.json"
+                    if _sw_s3.is_file():
+                        _wbs_s3 = json.loads(_sw_s3.read_text(encoding="utf-8"))
+                        # The sidecar is envelope-wrapped ({"schema":1,
+                        # "language":..., "stories":{idx:[words]}}) but the
+                        # sensors expect the bare {idx:[words]} map. Passing
+                        # the wrapper made sense_pacing hit int("schema") and
+                        # skip EVERYTHING — the Director ran with "pacing 0
+                        # stories" on every job (job 610 trace).
+                        if isinstance(_wbs_s3, dict) and "stories" in _wbs_s3:
+                            _wbs_s3 = _wbs_s3.get("stories") or {}
+                except Exception:
+                    _wbs_s3 = {}
+                _dir_kwargs = dict(
+                    stories=list(bulletin_canvas.stories),
+                    words_by_story=_wbs_s3,
+                    category=(_cat_override
+                              or os.environ.get("KAIZER_V4_CONTENT_TYPE") or "news"),
+                    source_path=trim_result.trimmed_path, language=language,
+                    user_picks=(_user_picks or None))
+                # DIRECTOR ENGINE pick (Job.v4_director_engine → env):
+                # "platform" runs the ported kaizer-platform 3-layer engine
+                # (adapter validates onto our vocabulary); any failure or
+                # empty plan falls back to OUR V4 engine — a paid job always
+                # gets a direction. Default/"v4" = unchanged behavior.
+                _deng = (os.environ.get("KAIZER_V4_DIRECTOR_ENGINE", "v4")
+                         or "v4").strip().lower()
+                if _deng == "platform":
+                    try:
+                        from pipeline_v4.director_platform import (
+                            plan_direction_platform as _plan_platform)
+                        _stage3_director_plan = _plan_platform(**_dir_kwargs)
+                        print(f"[v4] director engine=platform planned "
+                              f"{len(_stage3_director_plan or {})} stories",
+                              flush=True)
+                    except Exception as _px:
+                        print(f"[v4] platform director failed (soft) — "
+                              f"falling back to v4 engine: {_px}", flush=True)
+                        _stage3_director_plan = None
+                if not _stage3_director_plan:
+                    if _deng == "platform":
+                        print("[v4] platform plan empty — using v4 engine",
+                              flush=True)
+                    _stage3_director_plan = _plan_dir(**_dir_kwargs)
+        except Exception as _dx_s3:
+            print(f"[v4] stage-3 director plan skipped (soft): {_dx_s3}", flush=True)
+            _stage3_director_plan = None
+        # LIVE LAYOUTS gate: when the user PINNED a whole-job layout
+        # (an explicit lib:/custom: full-form pick) or the kill switch is
+        # set, strip the plan's per-story layout decisions so neither the
+        # render nor the canvas seeding ever sees them — the user's
+        # explicit choice always wins over the Director.
+        if _stage3_director_plan:
+            _ffl_gate = (os.environ.get("KAIZER_V4_FULLFORM_LAYOUT", "")
+                         or "").strip().lower()
+            _ll_off = ((os.environ.get("KAIZER_V4_LIVE_LAYOUTS", "1")
+                        or "1").strip().lower() in ("0", "off", "false"))
+            if (_ll_off or _ffl_gate.startswith("lib:")
+                    or _ffl_gate.startswith("custom:")):
+                for _dstrip in _stage3_director_plan.values():
+                    _dstrip.layout = ""
+                    _dstrip.layout_moments = []
+                print("[v4] live layouts disabled for this job "
+                      f"(gate={'kill-switch' if _ll_off else _ffl_gate})",
+                      flush=True)
+        # Per-short effects -vf resolver: the short's story mood grade (+
+        # garnish) when the Director planned it, else the effects-mode base
+        # grade. '' when effects are off → the short renders byte-identically.
+        _efx_mode_s3 = (os.environ.get("KAIZER_V4_EFFECTS_MODE") or "").strip().lower()
+        def _short_effects_vf(story_index) -> str:
+            if _efx_mode_s3 in ("", "off", "none", "legacy"):
+                return ""
+            try:
+                from pipeline_v4.director import story_fx_chain as _story_fx
+                d = _stage3_director_plan.get(int(story_index)) if _stage3_director_plan else None
+                if d is not None:
+                    return _story_fx(d)
+                return v1_bridge._effects_vf_from_env()
+            except Exception:
+                return ""
+
         # Bulletin: V1 broadcast layout (left video / right sidebar /
         # animated lower-third / scrolling ticker).
         bull_t0 = time.time()
+        # Set on ANY full-video failure so the job can finish "done" for
+        # the shorts while still TELLING the user the full video is
+        # missing (job 600 rendered 8 shorts, silently dropped the full
+        # video, and the UI claimed everything was fine).
+        _bulletin_fail_note = ""
         try:
             user_d = _load_user_defaults(job_id)
             channel_name = (
@@ -1605,6 +2599,42 @@ def run_job(
             # with N different brand stamps.
             def _render_bulletin_once() -> str:
                 _out = str(out_dir / bulletin_canvas.output_filename)
+                # TRAILER-ONLY jobs: the "full video" IS the trailer. The
+                # 16:9 cut lands as bulletin.mp4 so every downstream step
+                # (clips, preview, SEO, publish, branding) works unchanged;
+                # a 9:16 companion lands beside it for Shorts/Reels.
+                if output_format == "trailer-only":
+                    from pipeline_v4 import trailer as _tr
+                    _wbs = {str(s.story_index): list(getattr(s, "words", []) or [])
+                            for s in trim_result.stories}
+                    _style = (os.environ.get("KAIZER_V4_TRAILER_STYLE") or "auto")
+                    _plan = _tr.plan_trailer_moments(
+                        stories=bulletin_canvas.stories, words_by_story=_wbs,
+                        duration=trim_result.trimmed_duration_sec,
+                        language=language)
+                    _tr.render_trailer(
+                        source_path=trim_result.trimmed_path,
+                        stories=bulletin_canvas.stories, words_by_story=_wbs,
+                        out_path=_out, work_dir=out_dir / "_trailer",
+                        aspect="16:9", language=language,
+                        channel_name=channel_name, plan=_plan, style=_style)
+                    try:
+                        _tr.render_trailer(
+                            source_path=trim_result.trimmed_path,
+                            stories=bulletin_canvas.stories, words_by_story=_wbs,
+                            out_path=str(out_dir / "trailer_9x16.mp4"),
+                            work_dir=out_dir / "_trailer", aspect="9:16",
+                            language=language, channel_name=channel_name,
+                            plan=_plan, style=_style)
+                    except Exception as _t9exc:
+                        _log(f"[v4] 9:16 trailer companion failed (soft): {_t9exc}")
+                    try:
+                        (out_dir / "render_report.json").write_text(
+                            json.dumps({"bulletin_method": "trailer_engine",
+                                        "trailer_style": _style}), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return _out
                 # "Full form video" custom template: render the FULL trimmed video
                 # through the verified custom engine at the template's own (16:9) canvas,
                 # instead of the built-in multi-story bulletin composer.
@@ -1647,6 +2677,11 @@ def run_job(
                         stories=_ff_stories,
                         # per-job visual edit (inline builder) -> render verbatim if present
                         template_html_override=_load_html_override(job_id, "bulletin", 0),
+                        # Director/effects-mode grade for the template FOOTAGE only (the
+                        # design overlay stays crisp): whole-video mode-based chain — the
+                        # KAIZER_V4_EFFECTS_MODE env is set in this orchestrator subprocess.
+                        # "" (mode off) keeps the render byte-identical to legacy.
+                        effects_vf=v1_bridge._effects_vf_from_env(),
                     ))
                     try:
                         (out_dir / "render_report.json").write_text(
@@ -1662,9 +2697,34 @@ def run_job(
                 except Exception:
                     pass
                 _t_spd, _t_col = v1_bridge.extract_ticker_overrides(bulletin_canvas.stories)
+                # Render from the CANVAS stories (same shape the editor's
+                # re-render uses) — the initial output already carries the
+                # engine-decided image windows, gaps, spotlight/PiP and
+                # name-straps instead of a static sidebar. Previously the
+                # raw TrimmedStory list (no .images) was passed here, so
+                # the first render silently ignored the canvas timings.
+                from types import SimpleNamespace as _NS
+                _render_stories = [
+                    _NS(
+                        title_native=cs.title_native,
+                        title_english=cs.title_english,
+                        summary=cs.summary,
+                        video_t_start=cs.video_t_start,
+                        video_t_end=cs.video_t_end,
+                        images=list(cs.images or []),
+                        text_blocks=list(cs.text_blocks or []),
+                        name_strap=getattr(cs, "name_strap", False),
+                        story_index=cs.story_index,
+                    )
+                    for cs in bulletin_canvas.stories
+                ]
+                # AI DIRECTOR (gated): computed once at Stage-3 scope and
+                # shared with the shorts loop so both get the same per-story
+                # moods. See _stage3_director_plan above.
+                _director_plan = _stage3_director_plan
                 return v1_bridge.render_bulletin(v1_bridge.BulletinRenderInputs(
                     trimmed_bulletin_path=trim_result.trimmed_path,
-                    stories=list(trim_result.stories),
+                    stories=_render_stories,
                     output_path=_out,
                     work_dir=out_dir,
                     language=language,
@@ -1677,6 +2737,9 @@ def run_job(
                     watermark_position="top-right",
                     ticker_speed_s=_t_spd,
                     ticker_bg_color=_t_col,
+                    story_transition=getattr(bulletin_canvas, "story_transition", None),
+                    effects_mode=(os.environ.get("KAIZER_V4_EFFECTS_MODE") or "").strip().lower(),
+                    directives=_director_plan,
                 ))
 
             # Output-format gate (shorts-only): skip the full-video render
@@ -1712,12 +2775,14 @@ def run_job(
                     if _viols:
                         _log(f"[v4] QC FAILED bulletin: {'; '.join(_viols)}")
                         bulletin_out = ""
+                        _bulletin_fail_note = "QC: " + "; ".join(_viols)[:200]
             if bulletin_out:
                 _log(f"[v4] bulletin rendered in {_fmt_elapsed(time.time() - bull_t0)} -> {bulletin_out}")
         except Exception as exc:
             _log(f"[v4] bulletin render failed after "
                  f"{_fmt_elapsed(time.time() - bull_t0)}: {exc}")
             bulletin_out = ""
+            _bulletin_fail_note = str(exc)[:300]
 
         # Shorts: pull every V1-parity knob from sc.short_config so the
         # editor's controls drive the render. Title falls back to the
@@ -1765,6 +2830,9 @@ def run_job(
                     section_pct=(cfg.section_pct.model_dump() if cfg else None),
                     card_style=(cfg.card_style.model_dump() if cfg else None),
                     follow_params=(cfg.follow_params.model_dump() if cfg else None),
+                    # dual_video layout: the audio-first reference b-roll (if
+                    # any) becomes the second cam; absent → torn_card fallback.
+                    second_video_path=(os.environ.get("KAIZER_V4_REF_VIDEO_PATH") or None),
                     # Clean render — per-channel stamping happens in the
                     # upload worker. See orchestrator.py bulletin block.
                     watermark_text="",
@@ -1782,6 +2850,9 @@ def run_job(
                     support_images=([short_image] if short_image else None),
                     # per-job visual edit (inline builder) -> render verbatim if present
                     template_html_override=_load_html_override(job_id, "short", s_idx),
+                    # Phase 2: per-story mood grade so the short matches its
+                    # bulletin story's look ('' when effects are off).
+                    effects_vf=_short_effects_vf(getattr(story0, "story_index", s_idx)),
                 ))
 
             try:
@@ -1883,6 +2954,23 @@ def run_job(
         # re-edit those in the editor if needed. Shorts SEO stays
         # AI-generated because the operator only supplied one
         # bulletin-level description, not per-short text.
+        # SEO-at-render skipped: still carry the operator's verbatim
+        # description into canvas.json + clip.seo via an empty SEO shell
+        # (title/tags stay empty until an on-demand generate fills them).
+        if predef_description and bulletin_canvas.seo is None:
+            bulletin_canvas.seo = CanvasSEO()
+            # A TITLE-LESS seo dict is discarded wholesale at publish
+            # (upload_dispatch._compose_metadata gates on title), which
+            # would silently drop the operator's verbatim description.
+            # Seed the title from the first story so the shell survives
+            # to YouTube; the on-demand generate can still improve it.
+            try:
+                _s0 = (bulletin_canvas.stories or [None])[0]
+                bulletin_canvas.seo.title = ((getattr(_s0, "title_english", "")
+                                              or getattr(_s0, "title_native", "")
+                                              or "").strip()[:95])
+            except Exception:
+                pass
         if predef_description and bulletin_canvas.seo:
             try:
                 bulletin_canvas.seo.description = predef_description
@@ -1891,6 +2979,61 @@ def run_job(
                      f"operator-supplied text ({len(predef_description)} chars)")
             except Exception as exc:
                 _log(f"[v4] failed to apply predef description override (soft): {exc}")
+
+        # Persist the AI-Director's broadcast graphics (overlays / HUD) onto
+        # each story so the EDITOR can change their text / timing / which
+        # graphic and re-render. Seed once with each graphic's default text;
+        # never clobber a story that already carries overlays (an editor edit
+        # on a re-run). Empty plan (effects off / defer without director) →
+        # no-op, renderer keeps its live-Director fallback (byte-identical).
+        try:
+            from pipeline_v4.overlays import overlay_text_fields as _otf
+            from pipeline_v4.canvas_schema import CanvasOverlay as _CO
+            if _stage3_director_plan:
+                for _st in bulletin_canvas.stories:
+                    if getattr(_st, "overlays", None):
+                        continue
+                    _dvp = _stage3_director_plan.get(int(_st.story_index))
+                    if not _dvp or not getattr(_dvp, "overlays", None):
+                        continue
+                    _seeded = []
+                    for _o in (_dvp.overlays or [])[:3]:
+                        _oid = str(_o.get("id", "") or "")
+                        if not _oid:
+                            continue
+                        _seeded.append(_CO(id=_oid,
+                                           t=float(_o.get("t", 0.8) or 0.8),
+                                           fields=dict(_otf(_oid))))
+                    if _seeded:
+                        _st.overlays = _seeded
+        except Exception as _oxe:
+            _log(f"[v4] overlay seed into canvas skipped (soft): {_oxe}")
+
+        # Persist the AI-Director's LIVE-LAYOUT decisions onto each story
+        # (same discipline as overlays: seed once, never clobber an
+        # editor's persisted value; empty plan → no-op, byte-identical).
+        try:
+            from pipeline_v4.canvas_schema import CanvasLayoutMoment as _CLM
+            if _stage3_director_plan:
+                for _st in bulletin_canvas.stories:
+                    _dvp = _stage3_director_plan.get(int(_st.story_index))
+                    if not _dvp:
+                        continue
+                    if (not getattr(_st, "layout_key", "")
+                            and getattr(_dvp, "layout", "")):
+                        _st.layout_key = _dvp.layout
+                    if (not getattr(_st, "layout_moments", None)
+                            and getattr(_dvp, "layout_moments", None)):
+                        _st.layout_moments = [
+                            _CLM(layout=str(_m.get("layout", "") or ""),
+                                 t=float(_m.get("t", 0.0) or 0.0),
+                                 dur=float(_m.get("dur", 4.0) or 4.0),
+                                 transition=(_m.get("transition", "push")
+                                             or "push"))
+                            for _m in (_dvp.layout_moments or [])
+                            if isinstance(_m, dict) and _m.get("layout")]
+        except Exception as _lxe:
+            _log(f"[v4] layout seed into canvas skipped (soft): {_lxe}")
 
         # Re-save canvas.json now that SEO (+ the predef override) has
         # landed. Rebuilding V4JobCanvas from the same canvases makes
@@ -1903,6 +3046,7 @@ def run_job(
             bulletin=bulletin_canvas,
             shorts=shorts_canvases,
             output_format=output_format,
+            effects_mode=(os.environ.get("KAIZER_V4_EFFECTS_MODE") or "").strip().lower(),
             trimmed_bulletin_path=trim_result.trimmed_path,
             trimmed_shorts_paths=trimmed_shorts_paths,
         )
@@ -1957,8 +3101,13 @@ def run_job(
                 _log(f"[v4] auto-publish soft-skip: {exc}")
 
         _belt("compose", "exited")
-        _update_job_status(job_id, status="done",
-                           current_stage=("render_deferred" if defer_render else "done"))
+        _update_job_status(
+            job_id, status="done",
+            current_stage=("render_deferred" if defer_render else "done"),
+            error=(("Full video render FAILED: " + _bulletin_fail_note
+                    + " — the shorts are ready; re-render the full video "
+                      "from the canvas editor.")
+                   if _bulletin_fail_note else ""))
         _log(f"[v4] job {job_id} DONE -- total {_fmt_elapsed(time.time() - job_t0)}")
 
         # Machine-readable markers the runner picks up

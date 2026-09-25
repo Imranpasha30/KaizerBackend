@@ -16,7 +16,12 @@ load_dotenv()
 
 
 BASE_DIR = Path(__file__).parent
-ENV_PATH = BASE_DIR / ".env"
+# Desktop mode (KAIZER_DESKTOP=1): desktop_entry.py points KAIZER_ENV_DIR at
+# the app's userData folder so everything we WRITE to .env — most critically
+# the auto-provisioned Fernet key below — persists there, never inside the
+# (possibly read-only / wiped-on-update) install dir. Unset → byte-identical
+# to the old behavior: BASE_DIR/.env.
+ENV_PATH = Path(os.environ.get("KAIZER_ENV_DIR") or BASE_DIR) / ".env"
 
 
 def _get(name: str, default: str = "") -> str:

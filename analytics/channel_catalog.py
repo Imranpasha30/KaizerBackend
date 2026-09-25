@@ -237,6 +237,9 @@ def sync_channel_videos(
                 "view_count":        int(st.get("viewCount") or 0),
                 "like_count":        int(st.get("likeCount") or 0),
                 "comment_count":     int(st.get("commentCount") or 0),
+                # Public tags — own-channel tag-performance learning reads
+                # the same field competitor harvesting uses.
+                "tags":              ((sn.get("tags") or [])[:40] or None),
                 "thumbnail_url":     thumb_url,
             }
 

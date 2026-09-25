@@ -4144,12 +4144,18 @@ def run_pipeline(video_path: str, platform: str = None, frame_layout: str = None
             try:
                 _gen_manifest = []
                 for _idx, _imgs in enumerate(story_images):
+                    # Subject label (name-tag contract): best available text
+                    # for what this story's images show — the search query /
+                    # summary that fetched them.
+                    _label = ((clips[_idx].get("summary") or "").strip()[:120]
+                              if _idx < len(clips) else "")
                     for _p in (_imgs or []):
                         if _p and os.path.isfile(_p):
                             _gen_manifest.append({
                                 "story_index": _idx,
                                 "path":        os.path.abspath(_p),
                                 "filename":    os.path.basename(_p),
+                                "label":       _label,
                             })
                 if _gen_manifest:
                     _manifest_path = os.path.join(bulletin_dir, "_generated_images.json")

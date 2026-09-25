@@ -243,13 +243,19 @@ def update_clip_seo(
     for key, val in updates.items():
         seo[key] = val
 
-    # Re-score with the deterministic verifier
+    # Re-score with the deterministic verifier, honouring the SAME title-script
+    # policy generation used (env force / channel-learned / bilingual default) so
+    # a manual edit isn't scored under a different rubric than it was written.
+    # This clip's SEO is generic (channel-less) here, so no channel is passed —
+    # the env override + bilingual default still apply.
     from seo import verifier as _verifier
+    from learning.seo_learning import resolve_script_policy
     report = _verifier.verify(
         seo,
         clip_topic=(clip.text or ""),
         trend_keywords=seo.get("trending_keywords") or [],
         news_items=seo.get("news_context") or [],
+        script_policy=resolve_script_policy(db),
     )
     seo["seo_score"]           = report["score"]
     seo["verifier_breakdown"]  = report["breakdown"]

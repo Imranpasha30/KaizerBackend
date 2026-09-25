@@ -27,11 +27,30 @@ from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session, selectinload
 from dotenv import load_dotenv
 
-# override=True so a `.env` edit + uvicorn restart actually replaces
-# any stale value already present in the parent shell's environment.
-# Without override, load_dotenv silently keeps the OS-level value when
-# both exist, which led to "key still empty" surprises during dev.
-load_dotenv(override=True)
+# ── Desktop mode (KAIZER_DESKTOP=1) ──────────────────────────────────────────
+# Set by desktop_entry.py BEFORE this module imports. One backend codebase,
+# two shapes: SaaS (default — everything on) and desktop (localhost-only,
+# single user, SQLite in userData, publish/scheduler/admin surfaces off).
+# _DESKTOP is defined HERE (before dotenv/CORS/routers) because every gate
+# below needs it; the router-registration section references it heavily.
+_DESKTOP = (os.environ.get("KAIZER_DESKTOP", "") or "").strip() == "1"
+
+if _DESKTOP:
+    # Desktop: desktop_entry already set the authoritative env (DATABASE_URL
+    # → userData SQLite, KAIZER_OUTPUT_ROOT, KAIZER_ENV_DIR). The SaaS-style
+    # load_dotenv(override=True) below would let an install-dir .env STOMP
+    # those (the documented ".env beats process env" gotcha) and silently
+    # point the desktop at a server database. Instead load ONLY the userData
+    # .env (saved API keys), never overriding what desktop_entry set.
+    _kx_env_dir = (os.environ.get("KAIZER_ENV_DIR", "") or "").strip()
+    if _kx_env_dir:
+        load_dotenv(Path(_kx_env_dir) / ".env", override=False)
+else:
+    # override=True so a `.env` edit + uvicorn restart actually replaces
+    # any stale value already present in the parent shell's environment.
+    # Without override, load_dotenv silently keeps the OS-level value when
+    # both exist, which led to "key still empty" surprises during dev.
+    load_dotenv(override=True)
 
 from database import engine, SessionLocal, Base, get_db
 import models
@@ -79,6 +98,9 @@ from routers.admin_upload_v2 import router as admin_upload_v2_router  # Phase 3.
 from routers.ws_progress import router as ws_progress_router       # Wave 3 — WebSocket live progress
 from routers.quick_publish import router as quick_publish_router   # Quick Publish — SEO + thumbnail glue
 from routers.custom_templates import router as custom_templates_router  # developer-uploaded HTML/CSS templates
+from routers.avatar import router as avatar_router      # News Anchor — provider-agnostic AI presenter (ported kaizer-platform@d5fd482)
+from routers.podcast import router as podcast_router    # Podcast editor — cutlist/punch-in/promo, ffmpeg or Remotion (ported)
+from routers.desktop import router as desktop_router    # Desktop app licensing — activate/heartbeat/revoke (ported, Phase 4a)
 from seo.default_channels import seed_channels
 from youtube import worker as upload_worker
 from learning import scheduler as corpus_scheduler
@@ -123,6 +145,61 @@ def _migrate_schema():
                     print(f"[startup] master_videos.source_upload_id UNIQUE → non-unique ({_ix['name']})")
     except Exception as _e:
         print(f"[startup] master_videos source_upload_id index fix skipped: {_e}")
+    # training_samples.impressions — real thumbnail impressions from the
+    # YouTube Reporting API (learning/seo_learning.py real-CTR ingest).
+    # Nullable add: existing rows read NULL until the next learn pass.
+    try:
+        _inspTS = inspect(engine)
+        if "training_samples" in _inspTS.get_table_names():
+            _tscols = {c["name"] for c in _inspTS.get_columns("training_samples")}
+            if "impressions" not in _tscols:
+                with engine.begin() as _cTS:
+                    _cTS.execute(text(
+                        "ALTER TABLE training_samples ADD COLUMN impressions BIGINT"))
+                print("[startup] training_samples.impressions added")
+    except Exception as _e:
+        print(f"[startup] training_samples.impressions migration skipped: {_e}")
+    # SEO competitor-intelligence wave (all nullable/default adds):
+    #   channel_videos.tags            — public tags for harvest learning
+    #   seo_learning_snapshots.kind    — 'own' | 'competitor' id namespaces
+    #   training_samples.explored_hook — the A/B exploration ledger
+    #   channels.use_competitor_intel  — the per-channel opt-in toggle
+    try:
+        _inspCI = inspect(engine)
+        _adds = [
+            ("users", "seo_engine",
+             "ALTER TABLE users ADD COLUMN seo_engine VARCHAR(10) DEFAULT 'gemini'"),
+            ("channel_videos", "tags", "ALTER TABLE channel_videos ADD COLUMN tags JSON"),
+            ("seo_learning_snapshots", "kind",
+             "ALTER TABLE seo_learning_snapshots ADD COLUMN kind VARCHAR(12) NOT NULL DEFAULT 'own'"),
+            ("training_samples", "explored_hook",
+             "ALTER TABLE training_samples ADD COLUMN explored_hook VARCHAR(12)"),
+            ("channels", "use_competitor_intel",
+             "ALTER TABLE channels ADD COLUMN use_competitor_intel BOOLEAN DEFAULT FALSE"),
+            # Template remix: creator opt-in for others to fork+edit a template.
+            ("custom_templates", "allow_remix",
+             "ALTER TABLE custom_templates ADD COLUMN allow_remix BOOLEAN NOT NULL DEFAULT TRUE"),
+        ]
+        for _tbl, _col, _sql in _adds:
+            if _tbl in _inspCI.get_table_names():
+                _cols = {c["name"] for c in _inspCI.get_columns(_tbl)}
+                if _col not in _cols:
+                    with engine.begin() as _cCI:
+                        _cCI.execute(text(_sql))
+                    print(f"[startup] {_tbl}.{_col} added")
+    except Exception as _e:
+        print(f"[startup] competitor-intel migrations skipped: {_e}")
+    # Per-user Google key minting: mark any mint left 'pending' by a
+    # mid-mint restart as failed so the admin sees it's retryable. New
+    # tables (google_minted_keys, billing_rates) are auto-created by
+    # create_all — no ALTER needed.
+    try:
+        from services.google_key_minter import sweep_stale_pending
+        _swept = sweep_stale_pending()
+        if _swept:
+            print(f"[startup] {_swept} stale pending key-mints marked failed")
+    except Exception as _e:
+        print(f"[startup] key-mint sweep skipped: {_e}")
     # upload_jobs_v2 gained privacy_status + publish_at so the user's
     # public/unlisted/private choice (and scheduled publish time) carried by
     # the PublishRequest survives fan-out to the upload worker. Without them
@@ -156,6 +233,23 @@ def _migrate_schema():
                         "ALTER TABLE upload_jobs_v2 ADD COLUMN brand_placement "
                         "VARCHAR(16) NOT NULL DEFAULT 'template'"))
                     print("[startup] upload_jobs_v2.brand_placement added")
+                # Per-publish YouTube setting OVERRIDES (win over the channel's
+                # yt_* defaults at upload). NULL = no override → use channel default.
+                if "yt_category_id" not in _ujcols:
+                    _c2.execute(text("ALTER TABLE upload_jobs_v2 ADD COLUMN yt_category_id VARCHAR(10)"))
+                    print("[startup] upload_jobs_v2.yt_category_id added")
+                if "yt_default_language" not in _ujcols:
+                    _c2.execute(text("ALTER TABLE upload_jobs_v2 ADD COLUMN yt_default_language VARCHAR(10)"))
+                    print("[startup] upload_jobs_v2.yt_default_language added")
+                if "yt_playlist_id" not in _ujcols:
+                    _c2.execute(text("ALTER TABLE upload_jobs_v2 ADD COLUMN yt_playlist_id VARCHAR(64)"))
+                    print("[startup] upload_jobs_v2.yt_playlist_id added")
+                if "yt_license" not in _ujcols:
+                    _c2.execute(text("ALTER TABLE upload_jobs_v2 ADD COLUMN yt_license VARCHAR(20)"))
+                    print("[startup] upload_jobs_v2.yt_license added")
+                if "yt_made_for_kids" not in _ujcols:
+                    _c2.execute(text("ALTER TABLE upload_jobs_v2 ADD COLUMN yt_made_for_kids BOOLEAN"))
+                    print("[startup] upload_jobs_v2.yt_made_for_kids added")
     except Exception as _e:
         print(f"[startup] upload_jobs_v2 privacy columns migration skipped: {_e}")
     with engine.connect() as conn:
@@ -214,11 +308,23 @@ def _migrate_schema():
             # "shorts-only"). NULL on pre-rollout rows; orchestrator +
             # runner fall back to "both".
             "v4_output_format": "VARCHAR(20) DEFAULT 'both'",
+            # V4 only: full-form effects mode ("auto"/"rich"/"off").
+            # NULL = legacy job -> byte-identical render, warm cache.
+            "v4_effects_mode": "VARCHAR(12)",
+            "v4_theme": "VARCHAR(24)",
+            # V4 only: user-directed effect picks ("edit using THESE") — a JSON
+            # object of per-category id lists. NULL = full AI-Director autonomy.
+            "v4_style_directives": "TEXT",
+            # V4 only: which AI Director engine plans direction —
+            # "v4" (ours, default) | "platform" (ported 3-layer engine).
+            "v4_director_engine": "VARCHAR(12) DEFAULT 'v4'",
             # V4 only: original publish target ("instagram"/"youtube"/
             # "facebook"). Editor leads with this platform's SEO.
             "v4_target_platform": "VARCHAR(20) DEFAULT 'youtube'",
             # V4 Stage 2: defer the up-front MP4 render (edit-first; export on demand).
             "v4_defer_render": "BOOLEAN DEFAULT FALSE",
+            # V4 audio-first mode (narration master + optional muted b-roll).
+            "v4_audio_first": "BOOLEAN DEFAULT FALSE",
             # V4 only: channels chosen at generate time (JSON list of Channel
             # ids). Recorded by the New Job "Choose channels" step.
             "target_channel_ids": "TEXT",
@@ -255,7 +361,9 @@ def _migrate_schema():
             _ct_cols = {c["name"] for c in inspector.get_columns("custom_templates")}
             for col, dtype in (("when_to_use", "TEXT"), ("how_to_use", "TEXT"),
                                ("rating_sum", "INTEGER"), ("rating_count", "INTEGER"),
-                               ("derived_from", "INTEGER")):
+                               ("derived_from", "INTEGER"),
+                               ("is_builtin", "BOOLEAN"),
+                               ("format", "VARCHAR(8) DEFAULT 'html'")):
                 if col not in _ct_cols:
                     conn.execute(text(f"ALTER TABLE custom_templates ADD COLUMN {col} {dtype}"))
 
@@ -436,6 +544,12 @@ def _migrate_schema():
             if "source_video_hash" not in cols:
                 conn.execute(text(
                     "ALTER TABLE user_assets ADD COLUMN source_video_hash VARCHAR(64) DEFAULT ''"
+                ))
+            # Subject label ("name-tag contract") — what/who the image
+            # shows; the image↔speech timing AI matches by this label.
+            if "description" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE user_assets ADD COLUMN description TEXT DEFAULT ''"
                 ))
 
         # ── users.socials (cross-promo links for SEO footer) ────────────
@@ -946,19 +1060,61 @@ system_observer.install_log_capture()
 system_observer.start_metric_sampler()
 
 BASE_DIR    = Path(__file__).parent
-MEDIA_ROOT  = BASE_DIR / "media"
+# KAIZER_MEDIA_ROOT: uploads/media land here when set (desktop_entry points
+# it at <userData>/media — the frozen install dir may be read-only). Unset →
+# byte-identical to the historical BASE_DIR/media.
+MEDIA_ROOT  = Path((os.getenv("KAIZER_MEDIA_ROOT", "") or "").strip()
+                   or (BASE_DIR / "media"))
 OUTPUT_ROOT = Path(os.getenv("KAIZER_OUTPUT_ROOT", "/tmp/kaizer_output"))
-MEDIA_ROOT.mkdir(exist_ok=True)
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(exist_ok=True)
 
 app = FastAPI(title="Kaizer Pipeline API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if _DESKTOP:
+    # Desktop: the only legitimate caller is the local shell/SPA on
+    # 127.0.0.1 (any port — Electron/dev pick ephemeral ones), so pin CORS
+    # to that origin family instead of "*".
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^http://127\.0\.0\.1(:\d+)?$",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # DNS-rebinding belt: the desktop API is unauthenticated-by-transport
+    # (it trusts "whoever can reach localhost"). A malicious website can
+    # point its OWN domain's DNS at 127.0.0.1 and make the victim's browser
+    # call this API cross-origin with a foreign Host header (CORS doesn't
+    # stop simple requests). Reject anything whose Host isn't literally
+    # this machine.
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    _ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+    @app.middleware("http")
+    async def _desktop_host_guard(request: Request, call_next):
+        raw = (request.headers.get("host") or "").strip().lower()
+        if raw.startswith("["):          # IPv6 literal, e.g. [::1]:8765
+            hostname = raw.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = raw.split(":", 1)[0]
+        if hostname not in _ALLOWED_LOCAL_HOSTS:
+            return _JSONResponse(
+                status_code=403,
+                content={"detail": "For your security, Kaizer X only "
+                                   "answers requests made from this "
+                                   "computer."},
+            )
+        return await call_next(request)
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Wave 2 (API scale): gzip JSON responses — the jobs list / status
 # payloads shrink ~10x over the wire. minimum_size skips tiny payloads
@@ -1007,33 +1163,53 @@ app.include_router(auth_router)
 # Phases 1–7: channels, SEO, OAuth, uploads.
 app.include_router(channels_router)
 app.include_router(seo_router)
-app.include_router(youtube_oauth_router)
-app.include_router(youtube_upload_router)
-app.include_router(publish_tasks_router)    # Phase 1.B — new publish path (KAIZER_NEW_PUBLISH_PATH gated; legacy route above stays on)
-app.include_router(insights_router)         # Insights / Trend Finder — channel root-cause analyzer
-app.include_router(meta_oauth_router)
-app.include_router(linkedin_oauth_router)
-app.include_router(youtube_quota_router)
-# Billion-dollar phases A–E: campaigns, performance, translation, trending radar.
-app.include_router(campaigns_router)
-app.include_router(performance_router)
+# SaaS-only surfaces — SKIPPED in desktop mode (_DESKTOP): publishing/OAuth/
+# quota/scheduling/analytics/admin all assume the multi-tenant server (its
+# publish workers, its YouTube app credentials, its billing). The desktop app
+# is render+edit only; publishing happens through the user's own channels on
+# the SaaS. Local render/edit surfaces (avatar, podcast, templates,
+# v4_editor, jobs, assets...) stay mounted below.
+if not _DESKTOP:
+    app.include_router(youtube_oauth_router)
+    app.include_router(youtube_upload_router)
+    app.include_router(publish_tasks_router)    # Phase 1.B — new publish path (KAIZER_NEW_PUBLISH_PATH gated; legacy route above stays on)
+    app.include_router(insights_router)         # Insights / Trend Finder — channel root-cause analyzer
+    app.include_router(meta_oauth_router)
+    app.include_router(linkedin_oauth_router)
+    app.include_router(youtube_quota_router)
+    # Billion-dollar phases A–E: campaigns, performance, translation, trending radar.
+    app.include_router(campaigns_router)
+    app.include_router(performance_router)
+    app.include_router(trending_router)
+    app.include_router(billing_router)
+    app.include_router(live_director_router)  # Phase 6 — Autonomous Live Director
+    app.include_router(admin_router)           # Phase 12 — admin panel REST surface
+    app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
+    app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
+    app.include_router(yt_lookup_router)        # YouTube channel lookup for Style References (auth'd)
+    app.include_router(analytics_ai_router)     # AI-powered Insights — coach reports + any-channel compare (auth'd + rate-limited)
+    app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
+    app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)
 app.include_router(translation_router)
-app.include_router(trending_router)
 app.include_router(assets_router)
 app.include_router(channel_groups_router)
-app.include_router(billing_router)
 app.include_router(job_progress_router)   # Phase 2B — job progress endpoint
 app.include_router(feedback_router)       # Phase 3.5 — post-publish feedback endpoint
 app.include_router(editor_router)         # Wave 2 — editor beta endpoints
-app.include_router(live_director_router)  # Phase 6 — Autonomous Live Director
-app.include_router(admin_router)           # Phase 12 — admin panel REST surface
-app.include_router(work_monitor_router)     # Live work-monitor dashboard (Claude/agents progress)
-app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
-app.include_router(yt_lookup_router)        # YouTube channel lookup for Style References (auth'd)
-app.include_router(analytics_ai_router)     # AI-powered Insights — coach reports + any-channel compare (auth'd + rate-limited)
 app.include_router(bulletin_images_router)  # Per-image bulletin carousel mgmt (list/replace/recompose)
-app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
-app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)
+from routers.editing_features import router as editing_features_router  # noqa: E402
+app.include_router(editing_features_router)  # Admin: full editing-engine catalog + dummy previews
+from routers.editing_features import user_router as style_catalog_router  # noqa: E402
+app.include_router(style_catalog_router)  # User: style picker (direct the AI Director per category)
+from routers.style_packs import router as style_packs_router  # noqa: E402
+app.include_router(style_packs_router)  # user-composed style packs + admin user-creations
+app.include_router(avatar_router)           # News Anchor — AI presenter (avatar_studio | echomimic | heygen)
+app.include_router(podcast_router)          # Podcast editor — single-cam cutdown + promos
+app.include_router(desktop_router)          # Desktop app — device activation/licensing (3-device limit)
+from routers.account_requests import router as account_requests_router  # noqa: E402
+app.include_router(account_requests_router)  # Desktop account requests + admin approval + managed key bundle
+from routers.admin_billing import router as admin_billing_router  # noqa: E402
+app.include_router(admin_billing_router)     # Per-user Google key minting + usage/billing view
 app.include_router(live_studio_router)      # Live Studio — bulk RTMP-live publishing (multi-video × multi-channel)
 app.include_router(v4_editor_router)        # V4 — canvas editor (read/write canvas.json, re-render)
 app.include_router(v4_defaults_router)      # V4 — user auto-pipeline defaults
@@ -1047,6 +1223,12 @@ app.include_router(admin_upload_v2_router)  # Phase 3.G — admin observability 
 app.include_router(ws_progress_router, prefix="/api")
 app.include_router(quick_publish_router)    # Quick Publish — /api/clips/{id}/quick-*
 app.include_router(custom_templates_router) # /api/templates — developer-uploaded HTML/CSS templates
+if _DESKTOP:
+    # Desktop-ONLY local control surface (API keys + per-feature preflight).
+    # No auth — the backend binds 127.0.0.1 for a single local user; the
+    # strict _DESKTOP gate is what keeps the SaaS from ever exposing it.
+    from routers.desktop_local import router as desktop_local_router  # noqa: E402
+    app.include_router(desktop_local_router)
 
 # ── Static files: /media → BASE_DIR/output  ──────────────────────────────────
 # Serves beta-rendered MP4s (and any other output files) to the frontend
@@ -1063,10 +1245,28 @@ _output_dir = os.path.abspath(
 os.makedirs(_output_dir, exist_ok=True)
 app.mount("/media", _StaticFiles(directory=_output_dir), name="media")
 
+# ── Static files: /releases → desktop installer downloads (SaaS) ─────────────
+# When KAIZER_RELEASES_DIR points at an existing folder, serve it so the
+# site's /desktop page can offer the desktop installer for download.
+# Deliberately NOT desktop-gated (env-gated instead): unset → exact
+# historical behavior, no mount.
+_releases_dir = (os.environ.get("KAIZER_RELEASES_DIR", "") or "").strip()
+if _releases_dir and os.path.isdir(_releases_dir):
+    app.mount("/releases", _StaticFiles(directory=_releases_dir),
+              name="releases")
+    print(f"[startup] /releases served from {_releases_dir}")
+
+# Desktop SPA note: the desktop build ALSO serves the built frontend at "/",
+# but that mount lives at the very BOTTOM of this file — a "/" mount matches
+# every path by prefix, so registering it here would shadow all the @app.*
+# routes defined further down. Search for "Desktop SPA" below.
+
 
 # ── Upload worker lifecycle ──────────────────────────────────────────────────
 @app.on_event("startup")
 async def _start_upload_worker():
+    if _DESKTOP:
+        return  # desktop: no publish path → no upload worker
     try:
         await upload_worker.start()
         print("[startup] upload worker running")
@@ -1096,6 +1296,8 @@ def _durable_queue_enabled() -> bool:
 
 @app.on_event("startup")
 async def _start_publish_v2_scheduler():
+    if _DESKTOP:
+        return  # desktop: no publish path → no v2 scheduler / durable worker
     if _durable_queue_enabled():
         try:
             from services import publish_worker as _pw
@@ -1119,6 +1321,8 @@ async def _start_pipeline_factory():
     KAIZER_PIPELINE_FACTORY_WORKERS=1. Fully additive: the existing publish
     path is untouched, and stage-event instrumentation (the admin Pipeline
     Flow view) works whether or not this is enabled."""
+    if _DESKTOP:
+        return  # desktop: no publish factory
     try:
         from services import pipeline_factory as _pf
         if _pf.workers_enabled():
@@ -1139,6 +1343,8 @@ async def _stop_pipeline_factory():
 
 @app.on_event("shutdown")
 async def _stop_publish_v2_scheduler():
+    if _DESKTOP:
+        return  # desktop: scheduler was never started
     if _durable_queue_enabled():
         try:
             from services import publish_worker as _pw
@@ -1168,6 +1374,8 @@ async def _stop_publish_v2_scheduler():
 # table CANNOT prevent FastAPI from coming up.
 @app.on_event("startup")
 async def _v2_recovery_and_crons():
+    if _DESKTOP:
+        return  # desktop: no publish path → no recovery sweep / crons
     if _durable_queue_enabled():
         # Durable mode: boot-time recovery + crons.py are superseded.
         # The leader-elected cron runner's lease reaper does recovery
@@ -1203,6 +1411,8 @@ async def _v2_recovery_and_crons():
 
 @app.on_event("shutdown")
 async def _stop_v2_crons():
+    if _DESKTOP:
+        return  # desktop: crons were never started
     if _durable_queue_enabled():
         try:
             from services import cron_runner as _cr
@@ -1220,6 +1430,8 @@ async def _stop_v2_crons():
 # ── Channel learning cron (Phase 7) ──────────────────────────────────────────
 @app.on_event("startup")
 async def _start_corpus_scheduler():
+    if _DESKTOP:
+        return  # desktop: no channel-learning corpus crawler
     try:
         corpus_scheduler.start()
     except Exception as e:
@@ -1235,6 +1447,8 @@ async def _start_corpus_scheduler():
 # free for healthy startups with no orphans).
 @app.on_event("startup")
 async def _reconcile_rtmp_orphans():
+    if _DESKTOP:
+        return  # desktop: no RTMP publishing → nothing to reconcile on YT
     try:
         from youtube.rtmp_agent import reconcile_orphan_broadcasts
         # Run in a thread so we never block FastAPI startup if the API call hangs.
@@ -1253,6 +1467,8 @@ async def _live_studio_recovery():
     """After a backend crash mid-broadcast, scan for stuck streams + try
     to resume from their R2 preview backup. Daemon thread so a slow R2
     download doesn't block startup."""
+    if _DESKTOP:
+        return  # desktop: no Live Studio broadcasting → no R2 recovery
     try:
         from live_studio import r2_backup
         import threading
@@ -1269,6 +1485,8 @@ async def _live_studio_recovery():
 async def _live_studio_expiry_sweeper():
     """Daily-ish sweep that deletes R2 preview backups whose 48 h
     window has elapsed. Runs once on boot + every 6 h thereafter."""
+    if _DESKTOP:
+        return  # desktop: no R2 preview backups to expire
     try:
         from live_studio import r2_backup
         import threading, time as _t
@@ -1297,6 +1515,8 @@ async def _live_studio_orphan_sweeper():
 
     Runs synchronously on boot before serving requests.
     """
+    if _DESKTOP:
+        return  # desktop: no Live Studio broadcasting → no live_streams rows
     try:
         from sqlalchemy import text as _text
         with engine.begin() as conn:
@@ -1316,6 +1536,78 @@ async def _live_studio_orphan_sweeper():
                 print(f"[startup] marked {n} orphaned live_streams as failed (backend was restarted mid-broadcast)")
     except Exception as e:
         print(f"[startup] WARN: live studio orphan sweeper failed: {e}")
+
+
+@app.on_event("startup")
+async def _reconcile_v4_render_orphans():
+    """After a backend restart, V4 render subprocesses (spawned detached) can be
+    orphaned and jobs left stuck in 'running' — and a re-run of a still-orphaned
+    job spawns a DUPLICATE orchestrator that collides on the same output and
+    hangs the job (the exact stuck-job bug). On boot: (1) kill any orphan
+    ``pipeline_v4.orchestrator`` process whose --output-dir is under THIS
+    backend's OUTPUT_ROOT (so a LIVE restart never touches DEV renders), then
+    (2) mark any full_video_shorts_v4 Job still 'running' as failed so it is
+    never stuck in the UI and can be cleanly re-run. Daemon thread so a slow
+    process scan never blocks startup."""
+    def _run():
+        import time as _t
+        _t.sleep(2)  # let the app settle before scanning
+        killed = 0
+        try:
+            import psutil  # already a dependency (runner/admin use it)
+            root = str(OUTPUT_ROOT).replace("\\", "/").lower()
+            me = os.getpid()
+            for p in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    if p.info["pid"] == me:
+                        continue
+                    cmd = " ".join(p.info.get("cmdline") or []).replace("\\", "/").lower()
+                except Exception:
+                    continue
+                # Two spawn shapes: dev/SaaS = "python -m pipeline_v4.orchestrator
+                # --job-id N ..."; frozen desktop = "<exe> render --job-id N ..."
+                # (runner.build_v4_spawn_cmd). Match BOTH or orphan reaping
+                # silently dies on desktop. The OUTPUT_ROOT check below still
+                # applies to both (the frozen argv carries --output-dir too).
+                _is_render = ("pipeline_v4.orchestrator" in cmd
+                              or " render --job-id" in cmd)
+                if _is_render and root and root in cmd:
+                    try:
+                        p.kill(); killed += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[startup] v4 orphan-render kill skipped: {e}")
+        try:
+            from database import SessionLocal as _S
+            import models as _m
+            from datetime import datetime as _dt, timezone as _tz
+            db = _S()
+            try:
+                stuck = db.query(_m.Job).filter(
+                    _m.Job.platform == "full_video_shorts_v4",
+                    _m.Job.status == "running",
+                ).all()
+                for j in stuck:
+                    j.status = "failed"
+                    try:
+                        j.finished_at = _dt.now(_tz.utc)
+                    except Exception:
+                        pass
+                    try:
+                        j.log = (j.log or "") + "\n[recovered] backend restarted mid-render — marked failed; re-run to render cleanly."
+                    except Exception:
+                        pass
+                if stuck:
+                    db.commit()
+                print(f"[startup] v4 orphan reconcile: killed {killed} orphan render(s), "
+                      f"marked {len(stuck)} stuck job(s) failed")
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[startup] WARN: v4 orphan reconcile failed: {e}")
+    import threading as _threading
+    _threading.Thread(target=_run, name="kaizer-v4-orphan-reconcile", daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -1392,9 +1684,13 @@ from asset_resolver import materialize_asset_locally as _materialize_asset_local
 
 # ── Health ───────────────────────────────────────────────────────────────────
 
-@app.get("/")
-def root():
-    return {"app": "Kaizer Pipeline API", "docs": "/docs", "health": "/api/health/"}
+# Desktop: NO "/" banner — routes registered here beat the bottom-of-file
+# SPA mount (Starlette matches in registration order), so this JSON banner
+# would shadow the desktop frontend's index.html. The SaaS keeps it.
+if not _DESKTOP:
+    @app.get("/")
+    def root():
+        return {"app": "Kaizer Pipeline API", "docs": "/docs", "health": "/api/health/"}
 
 @app.get("/api/health/")
 def health():
@@ -1744,6 +2040,12 @@ async def create_job(
     # Persisted on Job.platform_meta JSON for later display.
     # Ignored by V1/V2 platforms.
     v4_trim_planner:    str = Form("claude"),
+    # V4 only: content type / edit profile. "auto" (default) = the
+    # system classifies the transcript and picks the right editing
+    # persona (news/podcast/interview/vlog/generic); an explicit value
+    # is the operator answering the "what type of video is this?"
+    # question up front. Runner forwards as KAIZER_V4_CONTENT_TYPE.
+    v4_content_type:    str = Form("auto"),
     # V4 only: which provider generates per-story images.
     # "auto" (multi-source V1 chain), "gemini" (Nano Banana), or
     # "openai" (gpt-image-1). Persisted on Job.v4_image_provider.
@@ -1758,6 +2060,25 @@ async def create_job(
     # bulletin/full video). Validated below; runner forwards as
     # KAIZER_V4_OUTPUT_FORMAT and the orchestrator gates rendering on it.
     v4_output_format:   str = Form("both"),
+    # V4 only: full-form EFFECTS on the bulletin stories — "rich" (AI Director:
+    # per-story mood/color/fx/transitions/overlays + sound design, the DEFAULT
+    # for new V4 jobs), "auto" (broadcast-polish grade only) or "off". Runner
+    # forwards as KAIZER_V4_EFFECTS_MODE and turns "rich" into KAIZER_V4_DIRECTOR=1;
+    # the per-story cache hashes the resolved chain (legacy NULL rows stay byte-identical).
+    v4_effects_mode:    str = Form("rich"),
+    v4_theme:           str = Form(""),
+    # V4 only: the user's per-category effect picks ("edit using THESE") — a
+    # JSON object {style_packs,transitions,frame_fx,overlays,typography,
+    # story_category:[...]}. Empty (the default) leaves every category to the
+    # AI Director; any picked category constrains the Director to those ids
+    # (and forces it on). Persisted on the Job + forwarded via the runner as
+    # KAIZER_V4_STYLE_DIRECTIVES.
+    v4_style_directives: str = Form(""),
+    # V4 only: which AI Director ENGINE plans per-story direction — "v4"
+    # (ours, full arsenal, DEFAULT) | "platform" (ported kaizer-platform
+    # 3-layer engine: 5-mood signal formula + LLM confirm, adapted onto the
+    # V4 vocabulary). Selects WHICH director, never WHETHER (effects mode).
+    v4_director_engine: str = Form("v4"),
     # V4 Stage 2: defer the up-front MP4 render (edit-first; export on demand). Default off so
     # existing/auto-publish behaviour is unchanged. Persisted on the Job + forwarded to the runner.
     v4_defer_render:    bool = Form(False),
@@ -1765,6 +2086,13 @@ async def create_job(
     # at job start. Runner forwards as KAIZER_V4_MAX_SHORTS; the orchestrator
     # caps the candidate list (a CEILING — content still decides the real count).
     v4_max_shorts:      int = Form(8),
+    # V4 audio-first mode: the narration AUDIO is the master track. When true,
+    # `audio` (below) is the required narration and `video` above becomes the
+    # OPTIONAL muted reference b-roll (not the source). Images generated/uploaded
+    # as usual. Persisted on Job.v4_audio_first; forwarded to the orchestrator.
+    v4_audio_first:     bool = Form(False),
+    # The narration audio upload (required when v4_audio_first).
+    audio: Optional[UploadFile] = File(None),
     # V4 only: original publish target the operator picked ("instagram" /
     # "youtube" / "facebook"). Editor metadata only — not used for rendering.
     v4_target_platform: str = Form("youtube"),
@@ -1803,38 +2131,70 @@ async def create_job(
     upload_dir = MEDIA_ROOT / "uploads"
     upload_dir.mkdir(exist_ok=True)
 
-    # Exactly one of (video upload, library_item_id) must be present.
-    if (video is None or not getattr(video, "filename", "")) and not library_item_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Either 'video' (upload) or 'library_item_id' must be provided.",
-        )
-    if video is not None and getattr(video, "filename", "") and library_item_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Pass 'video' OR 'library_item_id' — not both.",
-        )
+    # Audio-first: the narration AUDIO is the master/source; the optional
+    # `video` upload becomes a MUTED reference b-roll (forwarded separately),
+    # not the pipeline source. Stays None for normal video-first jobs.
+    _ref_video_path: Optional[str] = None
 
-    # Resolve the source video to a local path + name + mime regardless
-    # of which branch we came through; everything downstream reads these.
-    if library_item_id:
-        from routers.library import fetch_library_video_to as _fetch_lib
-        video_path, _lib_item = _fetch_lib(library_item_id, upload_dir, db)
-        _src_filename     = _lib_item.original_name or video_path.name
-        _src_content_type = "video/mp4"
-    else:
-        video_path = upload_dir / video.filename
-        # Wave 2 (API scale): stream the upload to disk in 1 MiB chunks
-        # instead of buffering the whole file in RAM (a 2 GB upload used
-        # to hold 2 GB resident per concurrent request).
+    if v4_audio_first:
+        # ── AUDIO-FIRST: narration audio is the source (video_path) ──
+        if audio is None or not getattr(audio, "filename", ""):
+            raise HTTPException(
+                status_code=400,
+                detail="Audio-first job requires an 'audio' narration upload.",
+            )
+        video_path = upload_dir / audio.filename
         with open(video_path, "wb") as f:
             while True:
-                chunk = await video.read(1024 * 1024)
+                chunk = await audio.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
-        _src_filename     = video.filename
-        _src_content_type = video.content_type or "video/mp4"
+        _src_filename     = audio.filename
+        _src_content_type = audio.content_type or "audio/mpeg"
+        # Optional muted reference b-roll (the `video` field, if supplied).
+        if video is not None and getattr(video, "filename", ""):
+            _rv_path = upload_dir / video.filename
+            with open(_rv_path, "wb") as f:
+                while True:
+                    chunk = await video.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            _ref_video_path = str(_rv_path)
+    else:
+        # Exactly one of (video upload, library_item_id) must be present.
+        if (video is None or not getattr(video, "filename", "")) and not library_item_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'video' (upload) or 'library_item_id' must be provided.",
+            )
+        if video is not None and getattr(video, "filename", "") and library_item_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Pass 'video' OR 'library_item_id' — not both.",
+            )
+
+        # Resolve the source video to a local path + name + mime regardless
+        # of which branch we came through; everything downstream reads these.
+        if library_item_id:
+            from routers.library import fetch_library_video_to as _fetch_lib
+            video_path, _lib_item = _fetch_lib(library_item_id, upload_dir, db)
+            _src_filename     = _lib_item.original_name or video_path.name
+            _src_content_type = "video/mp4"
+        else:
+            video_path = upload_dir / video.filename
+            # Wave 2 (API scale): stream the upload to disk in 1 MiB chunks
+            # instead of buffering the whole file in RAM (a 2 GB upload used
+            # to hold 2 GB resident per concurrent request).
+            with open(video_path, "wb") as f:
+                while True:
+                    chunk = await video.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            _src_filename     = video.filename
+            _src_content_type = video.content_type or "video/mp4"
 
     # Mirror the source video to R2 right after the local write. The
     # pipeline subprocess still reads from the local copy (faster than
@@ -1870,8 +2230,10 @@ async def create_job(
         import sys as _sys
         _sys.path.insert(0, str(BASE_DIR / "pipeline_core"))
         from pipeline_core.validator import validate_input as _validate_input  # type: ignore
-        _val_result = _validate_input(str(video_path))
-        if not _val_result.ok:
+        # Audio-first: the upload is narration AUDIO, not a video — skip the
+        # video-codec/resolution validator (Deepgram fails loud later if bad).
+        _val_result = None if v4_audio_first else _validate_input(str(video_path))
+        if _val_result is not None and not _val_result.ok:
             # Clean up uploaded file so it doesn't accumulate on disk
             try:
                 video_path.unlink(missing_ok=True)
@@ -1884,7 +2246,7 @@ async def create_job(
                     "warnings": _val_result.warnings,
                 },
             )
-        _validation_warnings = _val_result.warnings
+        _validation_warnings = _val_result.warnings if _val_result is not None else []
     except HTTPException:
         raise
     except Exception as _ve:
@@ -1934,13 +2296,75 @@ async def create_job(
     _predef_desc_clean = (v4_predefined_description or "").strip()
     if len(_predef_desc_clean) > 8000:
         _predef_desc_clean = _predef_desc_clean[:8000]
-    _predef_desc_for_row = _predef_desc_clean if (platform == "full_video_shorts_v4" and _predef_desc_clean) else None
+    # Audio-first is mutually exclusive with source-preserved (predefined
+    # description) — the orchestrator prefers audio-first, so never carry a
+    # predef under an audio-first job (it would be silently ignored anyway).
+    _predef_desc_for_row = _predef_desc_clean if (platform == "full_video_shorts_v4" and _predef_desc_clean and not v4_audio_first) else None
 
     # Output-format pick — V4 only. Same validate-before-persist shape.
     _output_format_clean = (v4_output_format or "both").strip().lower()
-    if _output_format_clean not in {"both", "full-only", "shorts-only"}:
+    if _output_format_clean not in {"both", "full-only", "shorts-only", "trailer-only"}:
         _output_format_clean = "both"
     _output_format_for_row = _output_format_clean if platform == "full_video_shorts_v4" else None
+
+    # Effects-mode pick — V4 only. Same validate-before-persist shape.
+    _effects_mode_clean = (v4_effects_mode or "rich").strip().lower()
+    if _effects_mode_clean not in {"auto", "rich", "off"}:
+        _effects_mode_clean = "rich"
+    _effects_mode_for_row = _effects_mode_clean if platform == "full_video_shorts_v4" else None
+    # Director ENGINE pick — V4 only. Garbage coerces to "v4" (our engine).
+    _director_engine_clean = (v4_director_engine or "v4").strip().lower()
+    if _director_engine_clean not in {"v4", "platform"}:
+        _director_engine_clean = "v4"
+    _director_engine_for_row = _director_engine_clean if platform == "full_video_shorts_v4" else None
+    # THEME PACK — validated against the real registry; unknown → classic.
+    _theme_clean = (v4_theme or "").strip().lower()
+    if _theme_clean:
+        try:
+            from pipeline_v4.theme_packs import get_theme as _gt_theme
+            if _gt_theme(_theme_clean) is None:
+                _theme_clean = ""
+        except Exception:
+            _theme_clean = ""
+    _theme_for_row = _theme_clean if platform == "full_video_shorts_v4" else None
+
+    # User-directed effect picks ("edit using THESE") — V4 only. Parse the JSON,
+    # keep only recognized catalog categories, coerce each to a de-duped list of
+    # non-empty string ids (story_category kept as a single string). Empty /
+    # invalid → None (full AI-Director autonomy). Re-serialized canonically so a
+    # stale/garbage payload never reaches the DB or the render env.
+    _style_directives_for_row = None
+    if platform == "full_video_shorts_v4":
+        _sd_raw = (v4_style_directives or "").strip()
+        if _sd_raw:
+            try:
+                _sd_in = json.loads(_sd_raw)
+            except Exception:
+                _sd_in = None
+            if isinstance(_sd_in, dict):
+                _sd_out = {}
+                _list_keys = ("style_packs", "transitions", "frame_fx",
+                              "overlays", "typography", "color_grades",
+                              "sound", "layouts", "pip")
+                for _k in _list_keys:
+                    _v = _sd_in.get(_k)
+                    if isinstance(_v, str):
+                        _v = [_v]
+                    if isinstance(_v, (list, tuple)):
+                        _clean = []
+                        for _x in _v:
+                            _xs = str(_x).strip()[:80]
+                            if _xs and _xs not in _clean:
+                                _clean.append(_xs)
+                        if _clean:
+                            _sd_out[_k] = _clean[:64]
+                _cat = _sd_in.get("story_category") or _sd_in.get("category")
+                if isinstance(_cat, (list, tuple)):
+                    _cat = _cat[0] if _cat else None
+                if _cat and str(_cat).strip():
+                    _sd_out["story_category"] = str(_cat).strip()[:60]
+                if _sd_out:
+                    _style_directives_for_row = json.dumps(_sd_out)
 
     # Target-platform pick — V4 only. Editor leads with this platform's SEO.
     _target_platform_clean = (v4_target_platform or "youtube").strip().lower()
@@ -2119,7 +2543,12 @@ async def create_job(
         v4_image_provider=_image_provider_for_row,
         v4_predefined_description=_predef_desc_for_row,
         v4_output_format=_output_format_for_row,
+        v4_effects_mode=_effects_mode_for_row,
+        v4_theme=_theme_for_row,
+        v4_style_directives=_style_directives_for_row,
+        v4_director_engine=_director_engine_for_row,
         v4_defer_render=bool(v4_defer_render),
+        v4_audio_first=bool(v4_audio_first),
         v4_target_platform=_target_platform_for_row,
         target_channel_ids=_chan_ids_for_row,
         intro_overrides=_intro_overrides_for_row,
@@ -2207,6 +2636,7 @@ async def create_job(
     # separator was picked because Windows paths contain ':' so a
     # colon-separator would break on the dev box.
     bulletin_image_paths: list[str] = []
+    bulletin_image_labels: dict[str, str] = {}   # path → subject label (name-tag contract)
     if bulletin_image_ids.strip():
         for _raw_id in bulletin_image_ids.split(","):
             _raw_id = _raw_id.strip()
@@ -2224,6 +2654,9 @@ async def create_job(
             _path = _materialize_asset_locally(_asset)
             if _path and os.path.exists(_path):
                 bulletin_image_paths.append(_path)
+                _label = (getattr(_asset, "description", "") or "").strip()
+                if _label:
+                    bulletin_image_labels[_path] = _label[:120]
             else:
                 job.log = (job.log or "") + (
                     f"[bulletin-images] asset {_asset.id} ({_asset.filename!r}) "
@@ -2251,6 +2684,7 @@ async def create_job(
         default_image=default_img_path,
         default_logo=default_logo_path,
         bulletin_images=bulletin_image_paths,
+        bulletin_image_labels=bulletin_image_labels,
         # V2 only (Step 11.4): ignored unless platform=full_video_shorts_v2.
         stt_provider=stt_provider,
         # Item 104: V2 only. V1 paths ignore.
@@ -2266,6 +2700,9 @@ async def create_job(
         # V4 only: planner pick from the wizard — runner validates +
         # forwards as KAIZER_V4_TRIM_PLANNER env to the orchestrator.
         v4_trim_planner=(v4_trim_planner or "claude").strip().lower(),
+        # V4 only: content type ("auto" = classify; explicit = the
+        # operator's answer). Runner forwards as KAIZER_V4_CONTENT_TYPE.
+        v4_content_type=(v4_content_type or "auto").strip().lower(),
         # V4 only: image-provider pick — runner forwards as
         # KAIZER_V4_IMAGE_PROVIDER to image_provider._selected_image_provider.
         v4_image_provider=(v4_image_provider or "auto").strip().lower(),
@@ -2277,12 +2714,28 @@ async def create_job(
         # KAIZER_V4_OUTPUT_FORMAT so the orchestrator skips the bulletin
         # or the shorts accordingly.
         v4_output_format=_output_format_for_row or "both",
+        # V4 only: full-form effects mode — runner validates + forwards as
+        # KAIZER_V4_EFFECTS_MODE; per-story compose applies the chain and
+        # hashes it (legacy NULL rows render byte-identically).
+        v4_effects_mode=_effects_mode_for_row or "off",
+        v4_theme=_theme_for_row or "",
+        # V4 only: the user's per-category effect picks — runner validates +
+        # forwards as KAIZER_V4_STYLE_DIRECTIVES so the AI Director's vocab is
+        # constrained to the picks (empty categories stay AI-decided).
+        v4_style_directives=(getattr(job, "v4_style_directives", "") or ""),
+        # V4 only: which AI Director engine — runner forwards as
+        # KAIZER_V4_DIRECTOR_ENGINE ("v4" default | "platform").
+        v4_director_engine=(getattr(job, "v4_director_engine", "") or "v4"),
         # V4 Stage 2: defer the up-front render (persisted on the job above).
         v4_defer_render=bool(getattr(job, "v4_defer_render", False)),
         # V4 only: shorts-per-job ceiling (default 8; operator opt-in for more).
         v4_max_shorts=max(1, min(50, int(v4_max_shorts or 8))),
         # "Full form video" (16:9) custom template, e.g. "custom:<id>".
         fullform_layout=(job.fullform_layout or ""),
+        # V4 audio-first: narration is the source (video_path above); forward
+        # the optional muted reference b-roll so the orchestrator muxes it.
+        v4_audio_first=bool(v4_audio_first),
+        v4_ref_video_path=_ref_video_path,
         db_session_factory=SessionLocal,
     )
 
@@ -3007,6 +3460,95 @@ def cancel_job_endpoint(
         "found_running":  kill_result.get("found_running", False),
         "killed_pids":    kill_result.get("killed_pids", []),
     }
+
+
+@app.post("/api/jobs/{job_id}/pause/")
+def pause_job_endpoint(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Hold a QUEUED job so it doesn't run when its turn comes.
+
+    Pause only applies to a job still waiting in the queue (``pending`` /
+    ``queued``). It sets ``status='paused'``; the render worker's post-slot
+    gate then skips it, letting the next job proceed. A ``running`` job can't
+    be suspended mid-encode — cancel it (and retry) instead. Resume with
+    ``/resume/``.
+    """
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status == "running":
+        raise HTTPException(status_code=409, detail=(
+            "This job is already rendering — you can't pause it mid-render. "
+            "Cancel it and retry later instead."))
+    if job.status not in ("pending", "queued"):
+        raise HTTPException(status_code=409, detail=(
+            f"Only a queued job can be paused (this one is '{job.status}')."))
+    job.status = "paused"
+    db.commit()
+    return {"job_id": job_id, "status": "paused"}
+
+
+@app.post("/api/jobs/{job_id}/resume/")
+def resume_job_endpoint(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Put a paused job back in the queue (re-launches it via the runner)."""
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "paused":
+        raise HTTPException(status_code=409, detail=(
+            f"Only a paused job can be resumed (this one is '{job.status}')."))
+    try:
+        import runner as _runner
+        result = _runner.relaunch_job(job_id, SessionLocal)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Resume failed: {exc}")
+    if not result.get("relaunched"):
+        raise HTTPException(status_code=409,
+                            detail=result.get("error", "Could not resume this job."))
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.post("/api/jobs/{job_id}/retry/")
+def retry_job_endpoint(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Re-run a finished/failed/cancelled/paused job WITHOUT re-uploading.
+
+    Reconstructs the render from the job's saved settings (source upload + all
+    V4 render params) and re-queues it. Creation-time-only extras that aren't
+    stored on the row (custom logo/default image, pre-picked bulletin images, a
+    studio bg clip) are not re-applied.
+    """
+    job = db.query(models.Job).filter(
+        models.Job.id == job_id, models.Job.user_id == user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in ("running", "queued"):
+        raise HTTPException(status_code=409, detail=(
+            f"This job is currently {job.status} — cancel it before retrying."))
+    try:
+        import runner as _runner
+        result = _runner.relaunch_job(job_id, SessionLocal)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Retry failed: {exc}")
+    if not result.get("relaunched"):
+        raise HTTPException(status_code=409,
+                            detail=result.get("error", "Could not retry this job."))
+    return {"job_id": job_id, "status": "pending"}
 
 
 @app.get("/api/jobs/{job_id}/log/")
@@ -3777,3 +4319,25 @@ def _estimate_progress(log_lines: list, status: str) -> int:
 # ── V2 Inngest serve mount — REMOVED 2026-06-17 ──────────────────────────────
 # The Inngest-orchestrated pipeline v2 was retired; its /api/inngest webhook
 # mount and the pipeline_v2 package are gone. V4 is the single render path.
+
+
+# ── Desktop SPA ──────────────────────────────────────────────────────────────
+# Desktop mode serves the built frontend from the backend itself so the app
+# is one local origin (http://127.0.0.1:<port>) — no separate web server.
+# MUST be the LAST route registered in this module: a "/" mount matches every
+# path by prefix, so anything registered after it would be unreachable
+# (that's why it is NOT next to the /media mount up top). API routes above
+# win because Starlette matches routes in registration order.
+if _DESKTOP:
+    _spa_dir = (os.environ.get("KAIZER_SPA_DIR", "") or "").strip() \
+        or str(BASE_DIR / "spa_dist")
+    if os.path.isdir(_spa_dir):
+        # SPA-aware static server: 404s outside api/ and media/ fall back
+        # to index.html so client-side routes (/app, /jobs/5 ...) survive a
+        # hard reload / deep link; api/media 404s stay real JSON 404s.
+        from routers.desktop_local import SPAStaticFiles as _SPAStaticFiles  # noqa: E402
+        app.mount("/", _SPAStaticFiles(directory=_spa_dir, html=True),
+                  name="spa")
+        print(f"[startup] desktop SPA served from {_spa_dir}")
+    else:
+        print(f"[startup] desktop SPA dir not found ({_spa_dir}) — API only")

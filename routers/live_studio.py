@@ -382,9 +382,15 @@ def generate_seo(
         # Verifier scores against the brief as the topic. No
         # trend_keywords / news_items since Live Studio doesn't run
         # the research phase — that's fine, verifier handles empty.
+        # Score the title under the SAME script policy generation uses
+        # (env force / this channel's learned best_script / bilingual) so
+        # Live Studio scores consistently with the editor.
+        from learning.seo_learning import resolve_script_policy
         report = seo_verifier.verify(
             cleaned, clip_topic=brief_text,
             trend_keywords=[], news_items=[],
+            script_policy=resolve_script_policy(
+                db, getattr(style_source, "id", None)),
         )
         attempts_log.append({
             "attempt": attempt,

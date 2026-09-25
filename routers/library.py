@@ -1198,6 +1198,142 @@ async def upload_library_item(
             pass
 
 
+# ─── Large-file path: presigned DIRECT-to-R2 upload (up to 2 GB) ───────────
+# The streamed upload above runs the bytes THROUGH the app server, so a proxy
+# (Cloudflare ~100 MB) 413s big files. This path hands the client a presigned
+# R2 PUT URL — the bytes go straight to storage, bypassing the proxy — then a
+# finalize call probes the object (rejecting a non-video), makes the thumbnail
+# off a signed URL (ffmpeg reads it over HTTP range — no full download), and
+# commits the row. Existing small-file uploads keep the hardened streamed path.
+MAX_PRESIGN_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB
+
+
+class PresignUploadIn(BaseModel):
+    filename: str
+    content_type: str = "video/mp4"
+    size: int = 0
+    title: str = ""
+    description: str = ""
+    category_id: Optional[int] = None
+
+
+def _cleanup_presigned(r2, key: str, item, db) -> None:
+    try:
+        r2.delete(key)
+    except Exception:
+        pass
+    try:
+        db.delete(item); db.commit()
+    except Exception:
+        db.rollback()
+
+
+@router.post("/presign-upload")
+def presign_upload(body: PresignUploadIn, request: Request,
+                   db: Session = Depends(get_db),
+                   user: models.User = Depends(auth.current_user)):
+    """Issue a presigned R2 PUT for a direct (up to 2 GB) upload. Creates a
+    PENDING LibraryItem (video_key empty); the client PUTs the bytes to the URL,
+    then calls /finalize-upload with the returned item_id."""
+    _check_origin(request)
+    _require_creative(user)
+    _rate_limit_check(user.id)
+    fname = _safe_filename(body.filename or "upload.mp4")
+    ext = Path(fname).suffix.lower() or ".mp4"
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(415, f"Unsupported video extension {ext!r}. Allowed: {sorted(ALLOWED_EXTS)}")
+    if body.size and body.size > MAX_PRESIGN_BYTES:
+        raise HTTPException(413, f"Video exceeds {MAX_PRESIGN_BYTES // (1024*1024)} MiB limit")
+    r2 = _r2()
+    resolved_category_id: Optional[int] = None
+    if body.category_id:
+        cat = db.query(models.LibraryCategory).get(int(body.category_id))
+        if cat and cat.deleted_at is None:
+            resolved_category_id = cat.id
+    item = models.LibraryItem(
+        uploader_id   = user.id,
+        title         = (body.title or "").strip()[:200],
+        description   = (body.description or "").strip()[:2000],
+        original_name = fname[:255],
+        video_key     = "",
+        thumb_key     = "",
+        category_id   = resolved_category_id,
+    )
+    db.add(item); db.commit(); db.refresh(item)
+    key = _video_key(item.id, ext, user.id)
+    try:
+        put_url = r2.presign_put(key, expires_s=3600)
+    except Exception as exc:
+        db.delete(item); db.commit()
+        log.error("library: presign failed: %s", exc)
+        raise HTTPException(503, f"Could not start the upload: {exc}")
+    audit.info("presign issued user=%d item=%d ext=%s", user.id, item.id, ext)
+    return {"item_id": item.id, "put_url": put_url, "key": key, "ext": ext, "expires_in": 3600}
+
+
+class FinalizeUploadIn(BaseModel):
+    item_id: int
+
+
+@router.post("/finalize-upload")
+def finalize_upload(body: FinalizeUploadIn, request: Request,
+                    db: Session = Depends(get_db),
+                    user: models.User = Depends(auth.current_user)):
+    """Complete a presigned upload: verify the object exists + is within the cap,
+    probe it (a non-video is rejected + swept), make a thumbnail off a signed URL,
+    and commit the row. Idempotent once finalized."""
+    _check_origin(request)
+    _require_creative(user)
+    item = db.query(models.LibraryItem).get(int(body.item_id))
+    if not item or item.uploader_id != user.id:
+        raise HTTPException(404, "not found")
+    if item.video_key:  # already finalized — return idempotently
+        rows = _serialize_page([item], db, user)
+        return rows[0] if rows else {}
+    ext = Path(item.original_name or "video.mp4").suffix.lower() or ".mp4"
+    key = _video_key(item.id, ext, user.id)
+    r2 = _r2()
+    size = r2.head_size(key)
+    if size < 0:
+        raise HTTPException(400, "Upload not found in storage — the transfer may have failed. Try again.")
+    if size == 0:
+        _cleanup_presigned(r2, key, item, db)
+        raise HTTPException(400, "Uploaded file is empty.")
+    if size > MAX_PRESIGN_BYTES:
+        _cleanup_presigned(r2, key, item, db)
+        raise HTTPException(413, f"Video exceeds {MAX_PRESIGN_BYTES // (1024*1024)} MiB limit")
+    # Probe + thumbnail straight off a short-lived signed URL (ffmpeg reads it
+    # over HTTP range requests — the whole 2 GB is never downloaded here).
+    get_url = r2.get_url(key, signed=True, expires_s=1800)
+    info = _ffprobe(get_url)
+    if not info or not (int(info.get("width") or 0) or float(info.get("duration") or 0)):
+        _cleanup_presigned(r2, key, item, db)
+        raise HTTPException(415, "That file doesn't look like a video. Allowed: MP4/MOV/MKV/WebM/AVI.")
+    thumb_key = ""
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"library_fin_{item.id}_"))
+    try:
+        local_thumb = tmp_dir / "thumb.jpg"
+        if _extract_thumb(get_url, str(local_thumb), at_seconds=1.0):
+            t_key = _thumb_key(item.id, user.id)
+            r2.upload(str(local_thumb), t_key, content_type="image/jpeg")
+            thumb_key = t_key
+    except Exception as exc:
+        log.warning("library: finalize thumbnail failed item=%d: %s", item.id, exc)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    item.video_key     = key
+    item.thumb_key     = thumb_key
+    item.duration_secs = float(info.get("duration") or 0)
+    item.width         = int(info.get("width") or 0)
+    item.height        = int(info.get("height") or 0)
+    item.file_size     = int(size)
+    db.commit(); db.refresh(item)
+    audit.info("finalize OK user=%d item=%d size=%d %sx%s",
+               user.id, item.id, size, item.width, item.height)
+    rows = _serialize_page([item], db, user)
+    return rows[0] if rows else {}
+
+
 # Per-user playback rate limit (independent from upload rate limit so
 # heavy library browsing doesn't tax the upload bucket and vice versa).
 # Sliding window: 60 ticket issuances / 60 s — enough headroom for a

@@ -445,16 +445,20 @@ def make_sidebar_placeholder(
     *,
     width: int = _SIDE_W,
     height: int = _SIDE_H,
+    offset_x_pct: float = 50.0,
+    offset_y_pct: float = 50.0,
 ) -> str:
     """Build a static sidebar placeholder PNG. Either the supplied image
-    cropped to fit or a flat dark blue panel."""
+    cropped to fit or a flat dark blue panel. ``offset_x/y_pct`` = the
+    canvas focal point (face-aware framing / 9-point grid); 50/50 keeps
+    the legacy center-crop."""
     from PIL import Image
     img = Image.new("RGB", (width, height), (8, 18, 40))
     if image_path and os.path.isfile(image_path):
         try:
             with Image.open(image_path) as src:
                 src = src.convert("RGB")
-                # Cover-fit: scale up + center-crop to fill the panel.
+                # Cover-fit: scale up + focal-crop to fill the panel.
                 src_ratio = src.width / max(1, src.height)
                 tgt_ratio = width / height
                 if src_ratio > tgt_ratio:
@@ -465,8 +469,18 @@ def make_sidebar_placeholder(
                     nw = width
                     nh = int(src.height * (width / src.width))
                 src = src.resize((nw, nh), Image.LANCZOS)
-                left = (nw - width) // 2
-                top = (nh - height) // 2
+                if offset_x_pct == 50.0 and offset_y_pct == 50.0:
+                    # Legacy center MUST stay (n)//2, not round(n*0.5):
+                    # they differ by 1px when the overhang is odd, which
+                    # would break the PNG byte-identity guarantee for
+                    # every default (pre-focal) render.
+                    left = (nw - width) // 2
+                    top = (nh - height) // 2
+                else:
+                    ox = max(0.0, min(100.0, float(offset_x_pct))) / 100.0
+                    oy = max(0.0, min(100.0, float(offset_y_pct))) / 100.0
+                    left = max(0, min(nw - width, int(round((nw - width) * ox))))
+                    top = max(0, min(nh - height, int(round((nh - height) * oy))))
                 src = src.crop((left, top, left + width, top + height))
                 img.paste(src, (0, 0))
         except Exception as exc:

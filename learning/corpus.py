@@ -1,7 +1,9 @@
 """Channel corpus miner — pulls top-performing videos + extracts patterns.
 
 Flow (per channel):
-  1. Resolve the channel's YouTube channel_id from its oauth_token row.
+  1. Resolve the channel's YouTube channel_id — from its oauth_token row
+     (Connected own accounts) OR its public @handle (study/competitor
+     channels that are never connected).
   2. List its uploads playlist (YouTube Data API v3, public).
   3. Fetch view counts → sort → take top 20% (min 5, max 30).
   4. Send the titles + descriptions to Gemini → JSON with:
@@ -54,6 +56,35 @@ class TransientCorpusError(CorpusError):
     """Temporary error — retry with backoff."""
 
 
+def _loads_lenient(text: str) -> Any:
+    """json.loads with best-effort repair of a TRUNCATED response (Gemini
+    occasionally hits the output cap mid-string/array). Strips code fences,
+    then if a clean parse fails, trims back to the last balanced structure so
+    a cut-off tail loses only the final item instead of failing the whole
+    corpus refresh. Raises json.JSONDecodeError if nothing parses."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.split("```", 2)[1] if t.count("```") >= 2 else t.strip("`")
+        if t.lstrip().lower().startswith("json"):
+            t = t.lstrip()[4:]
+    t = t.strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    # Truncated tail: walk back to the last '}' that yields a valid object,
+    # closing any still-open braces/brackets we trimmed through.
+    for i in range(len(t) - 1, -1, -1):
+        if t[i] in "}]":
+            head = t[: i + 1]
+            for suffix in ("", "}", "]}", "}}", "]}}"):
+                try:
+                    return json.loads(head + suffix)
+                except json.JSONDecodeError:
+                    continue
+    return json.loads(t)  # re-raise the original decode error
+
+
 # ─── YouTube Data API client ──────────────────────────────────────────────
 
 def _yt_service(db: Session, channel: models.Channel):
@@ -72,13 +103,32 @@ def _yt_service(db: Session, channel: models.Channel):
 
 
 def _resolve_google_channel_id(channel: models.Channel) -> str:
-    """Read the YouTube channel_id from the OAuth row (set during Connect)."""
+    """The YouTube channel_id to mine top videos from.
+
+    Prefer the OAuth row (own accounts we've Connected). For a study /
+    writing-voice channel (a competitor like "TV9 Telugu" — kind='style',
+    NOT connected), resolve its PUBLIC @handle via the Data API instead:
+    mining a rival's public top videos never needs (and can't get) OAuth.
+    """
     tok = channel.oauth_token
-    if not tok or not tok.google_channel_id:
-        raise CorpusError(
-            f"Channel '{channel.name}' has no YouTube identity on file — Connect it first."
-        )
-    return tok.google_channel_id
+    if tok and tok.google_channel_id:
+        return tok.google_channel_id
+    handle = (getattr(channel, "handle", "") or "").strip()
+    if handle:
+        try:
+            from routers.trending import _resolve_channel_id
+            gcid, _ = _resolve_channel_id(handle)
+            if gcid:
+                return gcid
+        except Exception as e:
+            raise CorpusError(
+                f"Could not find '{channel.name}' on YouTube from its handle "
+                f"'{handle}': {e}"
+            ) from e
+    raise CorpusError(
+        f"Channel '{channel.name}' has no YouTube identity — add its @handle "
+        f"or channel URL so we can study its public videos."
+    )
 
 
 def _fetch_top_videos(yt, google_channel_id: str) -> List[Dict[str, Any]]:
@@ -212,7 +262,7 @@ def _extract_patterns(channel: models.Channel,
             response_mime_type="application/json",
             response_schema=_PATTERN_SCHEMA,
             temperature=0.4,
-            max_output_tokens=2048,
+            max_output_tokens=4096,
         )
         with log_gemini_call(
             db=None,  # corpus refresh runs in background scheduler — no request-scoped session
@@ -228,7 +278,7 @@ def _extract_patterns(channel: models.Channel,
         text = (resp.text or "").strip()
         if not text:
             raise TransientCorpusError("Gemini returned empty response")
-        data = json.loads(text)
+        data = _loads_lenient(text)
         if not isinstance(data, dict):
             raise CorpusError(f"Gemini returned non-object JSON: {type(data).__name__}")
         return data
@@ -291,7 +341,9 @@ def refresh_channel(db: Session, channel_id: int) -> Dict[str, Any]:
 
 
 def refresh_all_priority(db: Session) -> Dict[str, Any]:
-    """Refresh every channel that's priority AND connected. Returns a summary."""
+    """Refresh every priority channel that has a YouTube identity — either a
+    Connected account OR a public @handle (study/competitor channels). Returns
+    a summary."""
     rows = (
         db.query(models.Channel)
           .filter(models.Channel.is_priority == True)  # noqa: E712
@@ -300,8 +352,10 @@ def refresh_all_priority(db: Session) -> Dict[str, Any]:
     refreshed: List[str] = []
     failed:    List[Dict[str, str]] = []
     for ch in rows:
-        if not ch.oauth_token or not ch.oauth_token.google_channel_id:
-            continue  # silently skip unconnected priority channels
+        connected = ch.oauth_token and ch.oauth_token.google_channel_id
+        has_handle = (getattr(ch, "handle", "") or "").strip()
+        if not connected and not has_handle:
+            continue  # no identity to study from — skip
         try:
             refresh_channel(db, ch.id)
             refreshed.append(ch.name)

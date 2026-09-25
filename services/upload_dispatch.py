@@ -486,8 +486,19 @@ def _compose_metadata(
     pre_title = (getattr(job, "title", None) or "")
     pre_desc = (getattr(job, "description", None) or "")
     pre_tags = list(getattr(job, "tags", None) or [])
-    pre_cat = (getattr(job, "category_id", None) or "25")
-    pre_mfk = bool(getattr(job, "made_for_kids", False) or False)
+    # Category + made-for-kids resolution: per-publish OVERRIDE (job.yt_*, set
+    # from the publish modal) WINS over the channel's saved default
+    # (channel.yt_*), which wins over the system default. (Previously the V2
+    # path ignored the channel default entirely and hard-defaulted to "25"/False.)
+    pre_cat = (
+        getattr(job, "yt_category_id", None)
+        or getattr(job, "category_id", None)
+        or (getattr(channel, "yt_category_id", None) if channel else None)
+        or "25"
+    )
+    _mfk_job = getattr(job, "yt_made_for_kids", None)
+    _mfk_ch = getattr(channel, "yt_made_for_kids", None) if channel else None
+    pre_mfk = bool(_mfk_job if _mfk_job is not None else (_mfk_ch if _mfk_ch is not None else False))
 
     if channel is None:
         # Channel deleted between Fanout and dispatch — fail soft with
@@ -523,6 +534,11 @@ def _compose_metadata(
                 _v = _variants.get(str(job.channel_id)) or _variants.get(job.channel_id)
                 if isinstance(_v, dict) and _v.get("_per_channel") and _v.get("title"):
                     generic = {k: val for k, val in _v.items() if k != "_per_channel"}
+                    # Per-channel variants store the tag list under "tags", but
+                    # the composer reads "keywords" — bridge it so a channel's
+                    # custom tags actually reach the upload (they were dropped).
+                    if not generic.get("keywords") and generic.get("tags"):
+                        generic["keywords"] = generic["tags"]
                     log.info("upload_dispatch: job=%d using per-channel SEO for channel=%s",
                              job.id, job.channel_id)
         except Exception:
@@ -1397,7 +1413,19 @@ def _do_direct_upload(
     privacy_status = (getattr(job, "privacy_status", None) or "private")
     publish_at = getattr(job, "publish_at", None)
 
-    return uploader_v2.upload_video(
+    # YouTube language / license / playlist: per-publish OVERRIDE (job.yt_*,
+    # from the publish modal) > channel saved default (channel.yt_*) > system
+    # default. (The V2 path previously hard-coded language='te', set no license,
+    # and never added to a playlist — channel defaults were ignored.)
+    _ch = db.query(models.Channel).filter(models.Channel.id == job.channel_id).first()
+    _lang = (getattr(job, "yt_default_language", None)
+             or (getattr(_ch, "yt_default_language", None) if _ch else None) or "te")
+    _lic = (getattr(job, "yt_license", None)
+            or (getattr(_ch, "yt_license", None) if _ch else None) or "youtube")
+    _pl = (getattr(job, "yt_playlist_id", None)
+           or (getattr(_ch, "yt_playlist_id", None) if _ch else None) or None)
+
+    _res = uploader_v2.upload_video(
         creds=creds,
         branded_path=branded_local,
         title=title,
@@ -1408,6 +1436,8 @@ def _do_direct_upload(
         publish_at=publish_at,
         made_for_kids=made_for_kids,
         publish_kind=publish_kind,
+        default_language=_lang,
+        license_kind=_lic,
         progress_cb=None,
         upload_uri=(job.upload_uri or None),
         on_uri_obtained=_on_uri,
@@ -1420,6 +1450,21 @@ def _do_direct_upload(
         google_channel_id=google_channel_id,
         clip_id=job.clip_id,
     )
+
+    # Best-effort: add the new video to the configured playlist. NEVER fails
+    # the publish — the video is already live; playlist membership is extra.
+    if _pl:
+        _vid = (_res or {}).get("video_id")
+        if _vid:
+            try:
+                _pr = uploader_v2.add_to_playlist(creds, _vid, _pl)
+                if not _pr.get("ok"):
+                    log.warning("upload_dispatch: job=%d playlist add failed (non-fatal): %s",
+                                job.id, _pr.get("error"))
+            except Exception as _e:
+                log.warning("upload_dispatch: job=%d playlist add crashed (non-fatal): %s", job.id, _e)
+
+    return _res
 
 
 def _do_rtmp_upload(

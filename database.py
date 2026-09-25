@@ -21,6 +21,26 @@ if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
         DATABASE_URL, connect_args={"check_same_thread": False}
     )
+
+    # Desktop runs TWO writers on this file at once — the serve process and
+    # the spawned render orchestrator (its own engine, same URL). Default
+    # sqlite journaling locks the whole DB per write and a concurrent writer
+    # gets "database is locked" immediately. WAL lets readers and one writer
+    # overlap across processes; busy_timeout makes a second writer WAIT (up
+    # to 15s) instead of failing. Applied on every new connection (WAL is
+    # sticky on the file, busy_timeout is per-connection); safe/no-op for
+    # in-memory DBs and single-process use.
+    from sqlalchemy import event as _sa_event
+
+    @_sa_event.listens_for(engine, "connect")
+    def _sqlite_tune(dbapi_conn, _record):
+        try:
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=15000")
+            cur.close()
+        except Exception:
+            pass  # never block a connection over a pragma
 else:
     # Wave 1.7 of the enterprise push — the default pool (5 + 10
     # overflow) starved under load: dispatch holds a session for the

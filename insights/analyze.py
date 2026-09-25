@@ -254,12 +254,88 @@ def dim_title(videos) -> dict:
         fix=f"Lean into the title patterns your top videos use; test '{top_k}' deliberately.")
 
 
-def dim_thumbnail(videos) -> dict:
+def _thumbnail_vision(winners: list, losers: list):
+    """Gemini-vision comparison of WINNING vs LOSING thumbnails → concrete,
+    channel-specific rules in plain English. Returns (finding, fix) or None
+    (fail-soft: no key, no images, download/vision error)."""
+    try:
+        import os as _os, httpx as _httpx
+        from seo.generator import _gemini_client
+        from google.genai import types as _gt
+    except Exception:
+        return None
+
+    def _urls(vids, k):
+        out = []
+        for v in vids or []:
+            u = (v.get("thumbnail_url") or "").strip()
+            if u:
+                out.append(u)
+            if len(out) >= k:
+                break
+        return out
+
+    win_u, los_u = _urls(winners, 6), _urls(losers, 6)
+    if len(win_u) < 3 or len(los_u) < 3:
+        return None
+    try:
+        client = _gemini_client()
+    except Exception:
+        return None
+
+    def _parts(urls):
+        ps = []
+        for u in urls:
+            try:
+                r = _httpx.get(u, timeout=10)
+                if r.status_code == 200 and r.content:
+                    ps.append(_gt.Part.from_bytes(data=r.content, mime_type="image/jpeg"))
+            except Exception:
+                continue
+        return ps
+
+    win_p, los_p = _parts(win_u), _parts(los_u)
+    if len(win_p) < 3 or len(los_p) < 3:
+        return None
+    model = _os.environ.get("KAIZER_INSIGHTS_VISION_MODEL", "gemini-2.5-flash")
+    prompt = (
+        "You are a YouTube thumbnail analyst. The FIRST images are this channel's WINNING "
+        "thumbnails (high views); the SECOND set are its LOSING thumbnails (low views). "
+        "In plain creator English, say what the WINNERS do differently — faces & expressions, "
+        "amount and size of on-image text, colours, contrast, clutter, focal point — based on "
+        "what you actually SEE. Then give 2-3 specific thumbnail rules for this channel. "
+        "Under 110 words, no preamble, no headings.")
+    contents = ["WINNING thumbnails:"] + win_p + ["LOSING thumbnails:"] + los_p + [prompt]
+    try:
+        resp = client.models.generate_content(
+            model=model, contents=contents,
+            config=_gt.GenerateContentConfig(temperature=0.4, max_output_tokens=400))
+        txt = (resp.text or "").strip()
+    except Exception:
+        return None
+    if not txt:
+        return None
+    return txt, ("Re-shoot or re-design the weakest thumbnails to follow these rules; "
+                 "match what your winning thumbnails do.")
+
+
+def dim_thumbnail(videos, tiers) -> dict:
+    winners = (tiers.get("breakout") or
+               sorted(videos, key=lambda v: v.get("view_count") or 0, reverse=True)[:8])
+    losers = (tiers.get("under") or
+              sorted(videos, key=lambda v: v.get("view_count") or 0)[:8])
+    ev = _ids(sorted(videos, key=lambda v: v.get("view_count") or 0, reverse=True), 5)
+    vis = _thumbnail_vision(winners, losers)
+    if vis:
+        finding, fix = vis
+        return _finding("thumbnail", "Thumbnails", finding=finding, fix=fix, status="ok",
+                        impact="Vision comparison of your winning vs losing thumbnails.",
+                        evidence=ev)
     return _finding("thumbnail", "Thumbnails", status="needs_vision",
-                    finding="Thumbnail-style clustering (face/text/colour/contrast) needs a vision pass "
-                            "over the thumbnail images — queued as an enrichment step.",
+                    finding="Thumbnail comparison needs the thumbnail images — set a public YouTube "
+                            "Data API key (YOUTUBE_DATA_API_KEY) and re-analyze to unlock it.",
                     fix="Until then, mirror the thumbnails of your breakout videos.",
-                    evidence=_ids(sorted(videos, key=lambda v: v.get("view_count") or 0, reverse=True), 5))
+                    evidence=ev)
 
 
 def _avg_retention(videos):
@@ -592,7 +668,7 @@ def analyze_videos(videos: List[dict], *, mode: str, subscriber_count: int = 0,
     category = detect_category(videos)
     tiers = compute_tiers(videos)
     dims = [
-        dim_ctr(videos, tiers), dim_title(videos), dim_thumbnail(videos),
+        dim_ctr(videos, tiers), dim_title(videos), dim_thumbnail(videos, tiers),
         dim_retention(videos), dim_velocity(videos), dim_traffic(videos),
         dim_timing(videos), dim_cadence(videos, category), dim_topic(videos),
     ]

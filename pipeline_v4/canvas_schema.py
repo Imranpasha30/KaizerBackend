@@ -50,6 +50,41 @@ class CanvasImage(BaseModel):
     # Driven by the 9-point focal-grid editor in the UI.
     offset_x_pct: float = Field(50.0, ge=0.0, le=100.0)
     offset_y_pct: float = Field(50.0, ge=0.0, le=100.0)
+    # ─── Image↔speech sync (Phase-1 engine) ─────────────────────────
+    # All Optional-with-default so canvases from before this feature
+    # validate unchanged and render byte-identically.
+    #
+    # content = the timing AI may (re)place this image on the spoken
+    #           words; pinned = the operator fixed t_start/t_end by hand
+    #           and every re-sync must keep them verbatim.
+    timing_mode: Literal["content", "pinned"] = "content"
+    # Timing AI's certainty (0-1) that this image's label matches the
+    # words in its window. Below the confidence gate the window became a
+    # gap instead (main video shows). None = timed by the old heuristic.
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    # How central this moment is to the story (0-1). Drives spotlight
+    # auto-selection; operator can override via `spotlight`.
+    importance: Optional[float] = Field(None, ge=0.0, le=1.0)
+    # Spotlight override: None = auto (engine decides from importance),
+    # "off" = never spotlight, "fullscreen" = pop full-screen for the
+    # window, "pip" = picture-in-picture inset.
+    spotlight: Optional[Literal["off", "fullscreen", "pip"]] = None
+    # The anchor words the timing AI matched (joined text) — shown in the
+    # editor so the operator sees WHY the image sits at this moment.
+    matched_text: Optional[str] = None
+    # ─── Reference-video cutaway (Phase 3) ──────────────────────────
+    # media_kind="video" turns this entry into a full-screen VIDEO
+    # cutaway (B-roll): `src` is an .mp4/.webm in _pool, played full-
+    # screen for [t_start, t_end] (honours spotlight="fullscreen").
+    # Back-compat: default "image" → every existing canvas is unchanged
+    # and renders byte-identically.
+    media_kind: Literal["image", "video"] = "image"
+    # Where in the source clip the cutaway starts (seconds). 0 = head.
+    video_trim_start: float = Field(0.0, ge=0.0)
+    # Cutaway audio: "mute" = keep only the anchor narration; "duck" =
+    # lower the anchor and play the clip's own sound during the window;
+    # "auto" = the AI Director decides per moment. (duck/auto = Phase 3d.)
+    audio_mode: Literal["mute", "duck", "auto"] = "mute"
 
 
 # ─── Text overlays ──────────────────────────────────────────────────
@@ -78,6 +113,33 @@ class CanvasTextBlock(BaseModel):
     ticker_color: Optional[str] = Field(None, description="Ticker only: hex background color e.g. '#FFD400'. None = default navy/gold.")
 
 
+# ─── Broadcast graphics (overlays / HUD) ────────────────────────────
+
+class CanvasOverlay(BaseModel):
+    """An AI-Director-placed (or user-added) broadcast graphic from the
+    overlays REGISTRY — a banner, bug, stamp, locator, HUD, etc. — shown at a
+    timed window over this story. Persisted in canvas.json so the editor can
+    change its TEXT, timing, and which graphic, then re-render. ``fields``
+    overrides the graphic's text kwargs (e.g. {"text": "BREAKING NEWS",
+    "sub": "..."}); empty values fall back to the graphic's built-in defaults."""
+    id: str = Field(..., description="overlays REGISTRY id, e.g. 'breaking_news_banner'.")
+    t: float = Field(0.0, ge=0.0, description="Seconds into the story when it appears.")
+    dur: Optional[float] = Field(None, gt=0.0, description="Seconds on screen (None = ~4.5s default).")
+    fields: dict[str, str] = Field(default_factory=dict, description="Per-instance text overrides for the graphic's kwargs (text / sub / city / title / label…). Empty = REGISTRY defaults.")
+
+
+class CanvasLayoutMoment(BaseModel):
+    """One mid-story layout window: at ``t`` (story-relative seconds)
+    the screen switches to ``layout`` for ``dur`` seconds, entering and
+    leaving with ``transition``. The render sanitizes windows (edge
+    clamps, min duration, overlap resolution) — a bad moment degrades
+    to nothing, never to a broken frame."""
+    layout: str
+    t: float = Field(0.0, ge=0.0)
+    dur: float = Field(4.0, gt=0.0)
+    transition: Literal["push", "cut"] = "push"
+
+
 # ─── Per-story clip on the timeline ─────────────────────────────────
 
 class CanvasStory(BaseModel):
@@ -96,6 +158,31 @@ class CanvasStory(BaseModel):
     # on the next re-render. Defaults to using whatever timings are in
     # `images`.
     claude_decided_timings: bool = True
+    # Polish A — name-strap lower-third: while an image is on screen, a
+    # small strap shows its subject label ("who/what you're looking at").
+    # Default False so every pre-engine canvas renders byte-identically;
+    # the orchestrator turns it on for stories the timing engine placed
+    # (their labels are meaningful subjects, not filename stems).
+    name_strap: bool = False
+    # Broadcast graphics (banners / bugs / stamps / HUD) shown over this
+    # story. Seeded by the AI Director at render time (id + timing + default
+    # text) and PERSISTED here so the editor can change the text / timing /
+    # which graphic and re-render. Empty on legacy canvases → the renderer
+    # falls back to the live Director plan (byte-identical).
+    overlays: list[CanvasOverlay] = Field(default_factory=list)
+    # LIVE LAYOUTS: the designed screen layout for THIS story (a
+    # layout_library key, e.g. "news_ots_right"). Seeded by the AI
+    # Director, persisted so editor re-renders honour it. "" = the job's
+    # default layout — every pre-layout canvas renders byte-identically.
+    # Resolved fail-soft at render via layout_library.story_geometry().
+    layout_key: str = ""
+    # LIVE LAYOUTS: mid-story layout switches — timed windows where the
+    # screen changes to a DIFFERENT (video-centric) designed layout,
+    # then returns: the "live broadcast direction" feel. Video-only:
+    # narration audio is untouched (the branch overlays in the same
+    # graph — no time is consumed). Image-importance moments use the
+    # existing per-image spotlight="fullscreen" instead.
+    layout_moments: list[CanvasLayoutMoment] = Field(default_factory=list)
 
 
 # ─── Top-level canvas (one per output format) ───────────────────────
@@ -122,6 +209,11 @@ class CanvasLayout(BaseModel):
     brand_logo_x_pct: float = 92.0
     brand_logo_y_pct: float = 4.0
     brand_logo_w_pct: float = 6.0
+    # Tile-frame border colour. v1_bridge draws a 3px border around the video +
+    # picture tiles; default None → white (legacy). Set to the canvas bg colour
+    # (e.g. "#000000") for a full-bleed look — used by the audio-first
+    # fullscreen-image layout so the 3px frame is invisible.
+    tile_border_color: Optional[str] = None
     # ─── Background video ────────────────────────────────────────────
     # Replaces the dead-black bg_color with a looping video — gives the
     # finished bulletin a TV-news studio feel instead of a flat backdrop.
@@ -140,6 +232,16 @@ class CanvasLayout(BaseModel):
     # bg_video_volume. 0 = no intro (current behaviour). Capped at 30s
     # so a typo can't produce a 5-minute intro.
     bg_intro_seconds: float = Field(0.0, ge=0.0, le=30.0)
+    # Lower-third entrance easing (native motion toolkit). None = the
+    # legacy linear slide (pre-motion canvases render byte-identically);
+    # the orchestrator stamps "out_cubic" on NEW canvases for the
+    # broadcast-grade decelerating entrance.
+    lt_ease: Optional[Literal["out_cubic"]] = None
+    # THEME PACKS: the visual skin of the built-in render ("" = classic,
+    # byte-identical legacy). Resolved fail-soft via theme_packs.get_theme:
+    # backdrop plate + tile frame colour + ticker colourway. Themes never
+    # move placements — layouts/moments/animations run inside them.
+    theme: str = ""
 
 
 # ─── V1 short-template edit config ──────────────────────────────────
@@ -235,6 +337,12 @@ class Canvas(BaseModel):
     short_config: Optional[ShortConfig] = None
     # SEO metadata generated post-canvas, editable before upload.
     seo: Optional[CanvasSEO] = None
+    # Story-to-story transition at the stitch (bulletin only). None =
+    # legacy hard cut (pre-motion canvases render identically); the
+    # orchestrator stamps "fade" on NEW multi-story bulletins. The
+    # renderer validates against its safe xfade set and falls back to
+    # a hard cut on any failure.
+    story_transition: Optional[str] = None
 
 
 class V4JobCanvas(BaseModel):
@@ -248,6 +356,10 @@ class V4JobCanvas(BaseModel):
     #   "shorts-only" (shorts/reels, no bulletin). Carried here for
     #   display + audit; the actual gating happens in the orchestrator.
     output_format: str = "both"
+    # Full-form effects mode picked at job time ("auto"/"rich"/"off").
+    # "" = pre-effects canvas → renders exactly as before. Carried on the
+    # doc so EDITOR re-renders (in-process, no runner env) honour it.
+    effects_mode: str = ""
     # Bookkeeping
     schema_version: int = 1
     # Step 1 output paths (kept for editor's "rebuild bulletin only"

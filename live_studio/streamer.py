@@ -43,6 +43,15 @@ from typing import Callable, Optional
 _FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 _TIME_RE    = re.compile(r"time=(-?\d+):(\d+):(\d+\.?\d*)")
 
+# On Windows, ``CTRL_BREAK_EVENT`` (used by ``_terminate`` to stop a broadcast)
+# is delivered to the ENTIRE console process group. If the ffmpeg/yt-dlp child
+# shares the parent's group, cancelling a live ALSO signals the uvicorn backend
+# and shuts it down (this is why the server died whenever a live was stopped).
+# Spawning each child with CREATE_NEW_PROCESS_GROUP puts it in its own group so
+# the cancel signal stays contained to ffmpeg/yt-dlp and never reaches uvicorn.
+# The attr only exists on Windows; falls back to 0 (no-op) elsewhere.
+_NEW_GROUP_FLAGS = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
 
 class StreamerError(RuntimeError):
     """ffmpeg push failed terminally."""
@@ -108,7 +117,8 @@ def push_loop(
     ]
 
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE, bufsize=0)
+                            stderr=subprocess.PIPE, bufsize=0,
+                            creationflags=_NEW_GROUP_FLAGS)
 
     last_progress = 0.0
     last_update = 0.0
@@ -243,6 +253,7 @@ def push_passthrough(
             ytdlp_args,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=0,
+            creationflags=_NEW_GROUP_FLAGS,
         )
     except FileNotFoundError as exc:
         raise StreamerError(f"yt-dlp not on PATH: {exc}")
@@ -253,6 +264,7 @@ def push_passthrough(
             stdin=ytdlp.stdout,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             bufsize=0,
+            creationflags=_NEW_GROUP_FLAGS,
         )
     except FileNotFoundError as exc:
         try: ytdlp.kill()

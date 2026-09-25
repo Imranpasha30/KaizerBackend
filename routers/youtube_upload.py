@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
@@ -88,6 +88,30 @@ class PublishRequest(BaseModel):
     # Logo/watermark placement when overlaying: 'template' (use the template's
     # marked slot — the default) | 'channel' (use this channel's own position).
     brand_placement: Optional[str] = "template"
+
+    # ── Thumbnail selection (videos only; shorts never get a thumbnail) ──
+    # Global mode for every destination unless overridden per-channel below:
+    #   None       → legacy behaviour (rendered thumbnail, or a clip.meta
+    #                 publish_thumbnail_key if Quick Publish stored one)
+    #   "rendered" → use the pipeline-rendered thumbnail
+    #   "custom"   → use custom_thumbnail_r2_key (staged via /thumbnail/stage)
+    #   "none"     → upload with no custom thumbnail
+    thumbnail_mode: Optional[str] = None
+    # R2 key of a staged custom thumbnail applied to ALL destinations when
+    # thumbnail_mode == "custom". Produced by POST /clips/{id}/thumbnail/stage.
+    custom_thumbnail_r2_key: Optional[str] = None
+    # Per-CHANNEL thumbnail override: { "12": "rendered" | "none" |
+    # "custom:<r2_key>" | "<r2_key>" }. Wins over thumbnail_mode for the
+    # channels it names. Lets each channel publish with its own thumbnail,
+    # mirroring per-channel SEO. Keys are stringified channel IDs.
+    thumbnail_by_channel: Optional[dict[str, str]] = None
+    # Per-CHANNEL YouTube publish-setting OVERRIDES for THIS upload:
+    #   { "12": {"category_id": "25", "language": "te", "playlist_id": "PL..",
+    #            "license": "youtube"|"creativeCommon", "made_for_kids": false} }
+    # Any field omitted/null = no override for that channel → the channel's
+    # saved yt_* default is used. Each present value WINS over the default for
+    # this publish only (the saved Style-Profile default is not changed).
+    publish_settings_by_channel: Optional[dict[str, dict]] = None
 
     @field_validator("brand_mode")
     @classmethod
@@ -352,6 +376,32 @@ def _legacy_publish_to_v2_enabled() -> bool:
     """Re-read every request so an ops flip doesn't require a restart."""
     import os as _os
     return (_os.environ.get("KAIZER_NEW_PUBLISH_PATH", "0") or "0").strip() == "1"
+
+
+def _ensure_rendered_thumb_key(clip) -> Optional[str]:
+    """Upload the clip's locally-rendered thumbnail to storage and return its
+    key. The V4 render leaves the thumbnail on local disk (``clip.thumb_path``,
+    e.g. ``…/job_<id>/bulletin_thumb.jpg``) but NOT in R2 — and the dispatch
+    layer only pushes a thumbnail to YouTube when an ``thumbnail_r2_key`` is
+    present. Without this the "rendered" thumbnail silently never reaches
+    YouTube. Returns the storage key, or None if there's no usable file.
+    """
+    try:
+        import os as _os
+        tp = (getattr(clip, "thumb_path", "") or "").strip()
+        if not tp or not _os.path.exists(tp):
+            return None
+        ext = "png" if tp.lower().endswith(".png") else "jpg"
+        ct = "image/png" if ext == "png" else "image/jpeg"
+        from pipeline_core.storage import get_storage_provider
+        # Deterministic key (overwrites on re-publish — the rendered thumb for
+        # a clip is stable, so we don't accumulate duplicates).
+        key = f"publish_thumbs/rendered/clip_{int(clip.id)}.{ext}"
+        stored = get_storage_provider().upload(tp, key, content_type=ct)
+        return stored.key
+    except Exception as exc:
+        print(f"[uploads] rendered-thumb upload failed for clip {getattr(clip,'id','?')}: {exc}")
+        return None
 
 
 def _map_legacy_upload_provider(provider: Optional[str]) -> str:
@@ -800,20 +850,61 @@ def _legacy_to_v2_redirect(
             thumb_src = None
             thumb_key = None
         else:
-            thumb_src = "pipeline_generated"
-            thumb_key = None
-            try:
-                import json as _json
-                _cm = _json.loads(clip.meta) if clip.meta else {}
-                _ptk = (
-                    (_cm.get("publish_thumbnail_key") or "").strip()
-                    if isinstance(_cm, dict) else ""
-                )
-                if _ptk:
-                    thumb_src = "user_uploaded"
-                    thumb_key = _ptk
-            except Exception:
-                pass
+            # Resolve the thumbnail for THIS channel. Precedence:
+            #   1. payload.thumbnail_by_channel[ch.id]  (per-channel override)
+            #   2. payload.thumbnail_mode (+ custom_thumbnail_r2_key)  (batch)
+            #   3. legacy default: rendered, or a clip.meta publish_thumbnail_key
+            _spec = None
+            if payload.thumbnail_by_channel:
+                _spec = payload.thumbnail_by_channel.get(str(ch.id))
+            if _spec is None and payload.thumbnail_mode:
+                _m = (payload.thumbnail_mode or "").strip().lower()
+                if _m == "custom" and (payload.custom_thumbnail_r2_key or "").strip():
+                    _spec = "custom:" + payload.custom_thumbnail_r2_key.strip()
+                elif _m in ("rendered", "none"):
+                    _spec = _m
+            if _spec is not None:
+                _s = str(_spec).strip()
+                if _s == "none":
+                    thumb_src, thumb_key = None, None
+                elif _s in ("rendered", ""):
+                    thumb_src, thumb_key = "pipeline_generated", None
+                elif _s.startswith("custom:"):
+                    thumb_src, thumb_key = "user_uploaded", _s[len("custom:"):]
+                else:
+                    thumb_src, thumb_key = "user_uploaded", _s
+            else:
+                # Legacy default — rendered, unless Quick Publish stored a key.
+                thumb_src = "pipeline_generated"
+                thumb_key = None
+                try:
+                    import json as _json
+                    _cm = _json.loads(clip.meta) if clip.meta else {}
+                    _ptk = (
+                        (_cm.get("publish_thumbnail_key") or "").strip()
+                        if isinstance(_cm, dict) else ""
+                    )
+                    if _ptk:
+                        thumb_src = "user_uploaded"
+                        thumb_key = _ptk
+                except Exception:
+                    pass
+
+        # Materialise a "rendered" thumbnail into storage so it actually
+        # reaches YouTube — dispatch only calls thumbnails.set when an
+        # thumbnail_r2_key is present, and the V4 render leaves the rendered
+        # thumbnail on local disk only. (Shorts have thumb_src=None, so this
+        # is a no-op for them.)
+        if thumb_src == "pipeline_generated" and not thumb_key:
+            _rk = _ensure_rendered_thumb_key(clip)
+            if _rk:
+                thumb_key = _rk
+
+        # Per-channel YouTube publish-setting overrides for THIS upload.
+        # Any field absent/blank ⇒ no override ⇒ channel yt_* default used.
+        _ps = (payload.publish_settings_by_channel or {}).get(str(ch.id)) or {}
+        _ov_lang = (_ps.get("language") or _ps.get("default_language") or None)
+        _mfk_raw = _ps.get("made_for_kids")
 
         targets.append(
             _fanout.FanoutTarget(
@@ -831,6 +922,11 @@ def _legacy_to_v2_redirect(
                 brand_profile_version=brand_v,
                 seo_version=seo_v,
                 metadata_version=metadata_v,
+                yt_category_id=(_ps.get("category_id") or None),
+                yt_default_language=_ov_lang,
+                yt_playlist_id=(_ps.get("playlist_id") or None),
+                yt_license=(_ps.get("license") or None),
+                yt_made_for_kids=(bool(_mfk_raw) if _mfk_raw is not None else None),
             )
         )
 
@@ -1095,6 +1191,52 @@ def clips_published_status(
     for e in by_channel.values():
         e["count"] = len(e["clip_ids"])
     return {"clip_count": len(owned_ids), "by_channel": by_channel}
+
+
+@router.post("/clips/{clip_id}/thumbnail/stage")
+def stage_thumbnail(
+    clip_id: int,
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+):
+    """Store a custom thumbnail for a clip and return its storage key WITHOUT
+    mutating the clip. Lets the publish modals assign different thumbnails per
+    channel: the returned ``key`` goes into PublishRequest.thumbnail_by_channel
+    (as ``"custom:<key>"``) or ``custom_thumbnail_r2_key`` (shared across all).
+    """
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    # Ownership check (mirrors quick_publish._owned_clip).
+    clip = db.query(models.Clip).filter(models.Clip.id == int(clip_id)).first()
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    job = db.query(models.Job).filter(models.Job.id == clip.job_id).first()
+    if job is not None and job.user_id is not None:
+        if int(job.user_id) != int(user.id) and not bool(user.is_admin):
+            raise HTTPException(status_code=403, detail="Not your clip")
+    ct = (image.content_type or "").lower()
+    if ct not in ("image/jpeg", "image/jpg", "image/png"):
+        raise HTTPException(status_code=400, detail="Thumbnail must be JPG or PNG")
+    _MAX = 4 * 1024 * 1024
+    data = image.file.read(_MAX + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+    if len(data) > _MAX:
+        raise HTTPException(status_code=400, detail="Thumbnail must be ≤ 4 MB")
+    ext = "png" if "png" in ct else "jpg"
+    tmp = _tempfile.mkdtemp(prefix="kaizer_stagethumb_")
+    try:
+        local = _os.path.join(tmp, f"thumb.{ext}")
+        with open(local, "wb") as f:
+            f.write(data)
+        from pipeline_core.storage import get_storage_provider
+        key = f"publish_thumbs/{int(user.id)}/clip_{int(clip.id)}/thumb_{int(time.time())}.{ext}"
+        stored = get_storage_provider().upload(local, key, content_type=ct)
+        return {"key": stored.key, "url": stored.url}
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
 
 
 @router.post("/clips/{clip_id}/publish")

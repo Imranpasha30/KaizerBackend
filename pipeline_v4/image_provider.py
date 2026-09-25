@@ -50,10 +50,12 @@ def _selected_image_provider() -> str:
 def _generate_via_gemini(*, story_index: int, title_native: str,
                          title_english: str, summary: str, language: str,
                          pool_dir: Path,
-                         transcript_text: str = "") -> Optional[str]:
-    """Pure Gemini Nano Banana story-image generation. Returns the
-    pool filename on success or None on any failure (caller can fall
-    back to the multi-source chain when this returns None).
+                         transcript_text: str = "") -> tuple[Optional[str], str]:
+    """Pure Gemini Nano Banana story-image generation. Returns
+    ``(pool_filename, subject_label)`` on success or ``(None, "")`` on any
+    failure (caller can fall back to the multi-source chain). The label is
+    derived from the final image prompt (name-tag contract) so the
+    image↔speech sync knows what the picture shows.
 
     ``transcript_text`` is the verbatim spoken text for this story
     (collected by trim_engine from the Deepgram word array). When
@@ -65,7 +67,7 @@ def _generate_via_gemini(*, story_index: int, title_native: str,
         from pipeline_v4 import image_ai
     except Exception as exc:
         print(f"[v4/image] gemini SDK unavailable: {exc}", flush=True)
-        return None
+        return None, ""
     fname = f"story{story_index:02d}_gemini_{uuid.uuid4().hex[:8]}.jpg"
     out_path = pool_dir / fname
     # Merge transcript into summary so write_image_prompt sees the
@@ -78,7 +80,7 @@ def _generate_via_gemini(*, story_index: int, title_native: str,
             if rich_summary else f"Spoken transcript: {transcript_text}"
         )
     try:
-        saved, _ = image_ai.make_image_for_story(
+        saved, final_prompt = image_ai.make_image_for_story(
             title_native=title_native,
             title_english=title_english,
             summary=rich_summary,
@@ -87,54 +89,58 @@ def _generate_via_gemini(*, story_index: int, title_native: str,
         )
     except Exception as exc:
         print(f"[v4/image] gemini gen failed (story {story_index + 1}): {exc}", flush=True)
-        return None
-    return Path(saved).name if saved else None
+        return None, ""
+    if not saved:
+        return None, ""
+    return Path(saved).name, image_ai.derive_label(final_prompt)
 
 
 def _generate_via_openai(*, story_index: int, title_native: str,
                          title_english: str, summary: str,
                          pool_dir: Path,
-                         transcript_text: str = "") -> Optional[str]:
-    """Pure OpenAI gpt-image-1 story-image generation. Wraps the
-    existing ``express/ai_image.py`` helper. Returns pool filename
-    on success or None on failure.
-
-    ``transcript_text`` is the verbatim spoken text for this story.
-    Folded into the raw prompt so gpt-image-1 sees the specific
-    incident words ("PM Modi launched X in Hyderabad") rather than
-    just an abstract headline — sharply improves event-specificity.
-    """
+                         language: str = "te",
+                         transcript_text: str = "") -> tuple[Optional[str], str]:
+    """OpenAI gpt-image-1 story-image generation with the SAME two-step
+    art-director treatment as the Gemini path: the prompt-writer turns
+    headline + summary + this story's verbatim transcript into a refined
+    documentary B-roll brief, and gpt-image-1 renders it. (The old direct
+    path pushed a garish BIG-TV thumbnail template — right for thumbnails,
+    wrong for sidebar B-roll.) Returns ``(pool_filename, subject_label)``
+    like the Gemini twin so the image↔speech sync gets its name-tag."""
     try:
-        from express.ai_image import generate_short_inset
+        from pipeline_v4 import image_ai
     except Exception as exc:
-        print(f"[v4/image] openai wrapper unavailable: {exc}", flush=True)
-        return None
+        print(f"[v4/image] image_ai unavailable: {exc}", flush=True)
+        return None, ""
     headline = (title_native or title_english or "").strip()
     if not headline:
         print(f"[v4/image] openai: story {story_index + 1} has no headline, skipping",
               flush=True)
-        return None
-    brief = (summary or "").strip()[:300]
-    # The styled wrapper in express/ai_image only gets ~600-1000 chars
-    # of prompt before quality degrades, so we cap transcript at 500.
-    transcript_chunk = (transcript_text or "").strip()[:500]
-    pieces = [headline]
-    if brief:
-        pieces.append(f"Summary: {brief}")
-    if transcript_chunk:
-        pieces.append(f"What was said on-air: {transcript_chunk}")
-    raw_prompt = "\n\n".join(pieces)
-    fname = f"story{story_index:02d}_openai_{uuid.uuid4().hex[:8]}.png"
+        return None, ""
+    # Same transcript enrichment as _generate_via_gemini: the spoken words
+    # carry place names + dates the one-line summary drops.
+    rich_summary = (summary or "").strip()
+    chunk = (transcript_text or "").strip()[:800]
+    if chunk:
+        rich_summary = (f"{rich_summary}\n\nSpoken transcript: {chunk}"
+                        if rich_summary else f"Spoken transcript: {chunk}")
+    fname = f"story{story_index:02d}_openai_{uuid.uuid4().hex[:8]}.jpg"
     out_path = pool_dir / fname
-    saved = generate_short_inset(
-        api_key="",  # falls back to OPENAI_API_KEY env
-        raw_prompt=raw_prompt,
-        output_path=str(out_path),
-        size="1536x1024",
-        quality="medium",
-        timeout_s=90,
-    )
-    return Path(saved).name if saved else None
+    try:
+        saved, final_prompt = image_ai.make_image_for_story(
+            title_native=title_native,
+            title_english=title_english,
+            summary=rich_summary,
+            language=language,
+            out_path=str(out_path),
+            engine="openai",
+        )
+    except Exception as exc:
+        print(f"[v4/image] openai gen failed (story {story_index + 1}): {exc}", flush=True)
+        return None, ""
+    if not saved:
+        return None, ""
+    return Path(saved).name, image_ai.derive_label(final_prompt)
 
 
 @dataclass
@@ -279,24 +285,38 @@ def auto_populate_pool(
         if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
     ]
     if existing and only_if_empty:
-        print(f"[v4/image] pool already has {len(existing)} user image(s) -- "
-              f"skipping auto-fetch", flush=True)
-        return []
+        # RE-RUN FIX: returning [] here ORPHANED the images a previous run
+        # had already fetched into this job dir — the pool LIST came back
+        # empty, so the canvas got zero images (blank dark sidebar, no
+        # spotlights/PiP/name-straps) even though files sat on disk.
+        # Register the existing files as pool entries instead of dropping
+        # them; the user-image-wins rule still holds (no new fetches).
+        print(f"[v4/image] pool already has {len(existing)} image(s) -- "
+              f"skipping auto-fetch, registering them", flush=True)
+        return [{"filename": p.name, "label": p.stem} for p in sorted(existing)]
 
     provider = _selected_image_provider()
     print(f"[v4/image] auto_populate_pool: provider={provider!r}", flush=True)
 
-    added: list[dict] = []
-    for s in stories:
+    # Each story's image is fetched independently (unique pool filenames,
+    # own story_index) and is entirely I/O-bound — a web search + download
+    # (or a Gemini/OpenAI call), ~15-30s each. Running them SEQUENTIALLY
+    # made Stage 2 crawl (job 606: 14 stories × 3 web queries ≈ 11 min).
+    # Fetch them CONCURRENTLY (bounded pool) → the stage collapses to about
+    # the slowest single fetch. Identical output; only the wall-clock
+    # changes. KAIZER_V4_IMAGE_FETCH_CONCURRENCY tunes the width (default 6,
+    # low enough to stay friendly to the image-source rate limits).
+    def _fetch_one(s) -> Optional[dict]:
         title    = getattr(s, "title_native",  "") or ""
         title_en = getattr(s, "title_english", "") or ""
         summary  = getattr(s, "summary",       "") or ""
         transcript_text = getattr(s, "transcript_text", "") or ""
-        story_index = getattr(s, "story_index", len(added))
+        story_index = getattr(s, "story_index", 0)
 
         fn: Optional[str] = None
+        beat_label = ""   # subject label from the generation prompt (name-tag contract)
         if provider == "gemini":
-            fn = _generate_via_gemini(
+            fn, beat_label = _generate_via_gemini(
                 story_index=story_index,
                 title_native=title, title_english=title_en,
                 summary=summary, language=language,
@@ -304,11 +324,12 @@ def auto_populate_pool(
                 transcript_text=transcript_text,
             )
         elif provider == "openai":
-            fn = _generate_via_openai(
+            fn, beat_label = _generate_via_openai(
                 story_index=story_index,
                 title_native=title, title_english=title_en,
                 summary=summary,
                 pool_dir=pool_dir,
+                language=language,
                 transcript_text=transcript_text,
             )
 
@@ -333,10 +354,33 @@ def auto_populate_pool(
                 pool_dir=pool_dir,
                 user_assets_dir=user_assets_dir,
             )
+        # A fetched "image" can be an HTML bot-wall / error page saved
+        # under a .jpg name (job 625: a 685KB DOCTYPE-html file) — verify
+        # with PIL before it enters the pool, else the sidebar-carousel
+        # ffmpeg hangs on the undecodable input until its 300s timeout.
         if fn:
-            added.append({
+            _fp = pool_dir / fn
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(_fp) as _im:
+                    _im.verify()
+            except Exception as _bad:
+                print(f"[v4/image] story {story_index + 1}: fetched file is "
+                      f"not a valid image ({_bad}) -- discarded {fn}",
+                      flush=True)
+                try:
+                    _fp.unlink()
+                except OSError:
+                    pass
+                fn = None
+        if fn:
+            print(f"[v4/image] story {story_index + 1}: {fn}", flush=True)
+            return {
                 "filename": fn,
-                "label": (title or title_en or f"Story {story_index + 1}")[:60],
+                # Prefer the generation beat's subject label (says what the
+                # PICTURE shows); the story title is the fallback — still
+                # subject-ish, just less specific.
+                "label": (beat_label or title or title_en or f"Story {story_index + 1}")[:120],
                 "kind":  "ai",
                 # Bind the image to its parent story so the canvas builder
                 # can scope visibility — without this every story ended
@@ -344,10 +388,29 @@ def auto_populate_pool(
                 # for story 7, etc.). Per-story scoping is what the
                 # operator wants ("topic 1's image shows only in topic 1").
                 "story_index": int(story_index),
-            })
-            print(f"[v4/image] story {story_index + 1}: {fn}", flush=True)
-        else:
-            print(f"[v4/image] story {story_index + 1}: no image found",
-                  flush=True)
+            }
+        print(f"[v4/image] story {story_index + 1}: no image found", flush=True)
+        return None
 
+    stories = list(stories or [])
+    try:
+        _fw = max(1, int(os.environ.get(
+            "KAIZER_V4_IMAGE_FETCH_CONCURRENCY", "6") or "6"))
+    except ValueError:
+        _fw = 6
+    added: list[dict] = []
+    if len(stories) > 1 and _fw > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_fw, len(stories)),
+                                thread_name_prefix="v4-imgfetch") as _pool:
+            for _r in _pool.map(_fetch_one, stories):
+                if _r:
+                    added.append(_r)
+    else:
+        for s in stories:
+            _r = _fetch_one(s)
+            if _r:
+                added.append(_r)
+    # Deterministic order (map preserves input order, but be explicit).
+    added.sort(key=lambda d: d.get("story_index", 0))
     return added

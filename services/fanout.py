@@ -155,6 +155,14 @@ class FanoutTarget:
     # Logo/watermark placement when overlaying: 'template' (use the template's
     # marked slot) | 'channel' (use this channel's own position instead).
     brand_placement: str = "template"
+    # Per-publish YouTube setting OVERRIDES (from the publish modal). NULL = no
+    # override → dispatch falls back to the channel's yt_* default. When set,
+    # these WIN over the channel default for this one upload.
+    yt_category_id: Optional[str] = None
+    yt_default_language: Optional[str] = None
+    yt_playlist_id: Optional[str] = None
+    yt_license: Optional[str] = None
+    yt_made_for_kids: Optional[bool] = None
 
 
 @dataclass
@@ -434,6 +442,13 @@ def create_publish_task(
     plan_tier = getattr(user, "plan_tier", None)
     _enforce_plan_tier(plan_tier, request.targets)
 
+    # Internal-credit exemption: admins and the dedicated "unlimited" testing
+    # tier publish WITHOUT consuming internal credits. (This is the SaaS usage
+    # meter only — real YouTube API quota still applies as normal.) Lets the
+    # operator test freely without topping up credits.
+    _tier_name = str(getattr(plan_tier, "name", "") or "").strip().lower()
+    credit_exempt = bool(getattr(user, "is_admin", False)) or _tier_name in {"unlimited", "internal"}
+
     # Step 3 — MasterVideo exists + ready.
     master = (
         db.query(models.MasterVideo)
@@ -663,7 +678,7 @@ def create_publish_task(
             "upload_direct" if t.upload_path == "direct"
             else ("upload_postiz" if is_postiz else "upload_rtmp")
         )
-        if not is_postiz:
+        if not is_postiz and not credit_exempt:
             try:
                 credits_svc.reserve(
                     db,
@@ -712,6 +727,12 @@ def create_publish_task(
             publish_at=_eff_publish_at,
             thumbnail_source=t.thumbnail_source,
             thumbnail_r2_key=t.thumbnail_r2_key,
+            # Per-publish YouTube setting overrides (NULL = use channel default).
+            yt_category_id=getattr(t, "yt_category_id", None),
+            yt_default_language=getattr(t, "yt_default_language", None),
+            yt_playlist_id=getattr(t, "yt_playlist_id", None),
+            yt_license=getattr(t, "yt_license", None),
+            yt_made_for_kids=getattr(t, "yt_made_for_kids", None),
             status="queued",
             attempts=0,
             idempotency_key=idem_key,

@@ -23,7 +23,7 @@ import json
 import os
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 
 from google import genai
@@ -240,6 +240,38 @@ def _try_one_model(
         raise SEOGenerationError(msg) from e
 
 
+def _call_claude_seo(system_prompt: str, user_prompt: str,
+                     model: str = "") -> tuple[Dict[str, Any], str]:
+    """Anthropic writer path (user-selectable engine). Same prompts, same
+    downstream sanitize/verify/retry — only the writer differs. Claude has
+    no response-schema enforcement, so we demand raw JSON and parse
+    leniently; any failure raises and the caller falls back to Gemini so
+    engine choice can never break SEO."""
+    from anthropic import Anthropic
+    from pipeline_v4.trim_engine import _loads_lenient
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    model = model or os.environ.get("KAIZER_SEO_CLAUDE_MODEL",
+                                    "claude-sonnet-4-6")
+    client = Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model=model, max_tokens=8192,
+        system=(system_prompt
+                + "\n\nReturn ONLY the JSON object — no prose, no fences."),
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    text = (msg.content[0].text if msg.content else "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    raw = _loads_lenient(text)
+    if not isinstance(raw, dict) or not raw.get("title"):
+        raise RuntimeError("claude SEO returned no usable JSON object")
+    return raw, model
+
+
 def _call_gemini(
     system_prompt: str,
     user_prompt: str,
@@ -305,10 +337,15 @@ def generate_seo_for_clip(
     *,
     db,
     style_source: models.Channel | None = None,
+    own_channel: models.Channel | None = None,
     include_news: bool = True,
     include_trends: bool = True,
     include_yt_benchmark: bool = True,
     language: str = "te",
+    avoid_titles: list | None = None,
+    angle_hint: str | None = None,
+    engine_choice: str | None = None,
+    persist: bool = True,
     progress_cb=None,
 ) -> Dict[str, Any]:
     """End-to-end GENERIC SEO generation for one clip.
@@ -317,6 +354,16 @@ def generate_seo_for_clip(
       clip.job.language, overridden by explicit arg).
     - `style_source` — optional Channel whose corpus + title-formula-style
       voice teaches Gemini how to write.  Its branding is NOT injected.
+    - `own_channel` — the OWN publishing account whose MEASURED performance
+      drives learned policy / dedupe / competitor intel. When None we fall
+      back to `style_source` (legacy behaviour). Set this on a per-channel
+      publish so the channel's own learning steers its SEO.
+    - `avoid_titles` — sibling per-channel titles to differ from (joins the
+      dedupe pool so cross-channel variants stay distinct).
+    - `angle_hint` — a structural angle for THIS variant (per-channel).
+    - `engine_choice` — 'gemini' | 'claude' override (else env / user pref).
+    - `persist` — write the result to `clip.seo` + commit. False for a
+      synthetic clip (delegation) where the caller owns persistence.
     - `progress_cb(stage, info)` — optional callback for UI status updates.
 
     Persists the top-scoring attempt to `clip.seo` and returns the same dict.
@@ -373,6 +420,123 @@ def generate_seo_for_clip(
     if style_source and style_source.corpus is not None:
         corpus_payload = style_source.corpus.payload or None
 
+    # Learned policy (learning/seo_learning.py) — the channel's MEASURED
+    # hook/script/length/keyword performance, refreshed by the analytics
+    # poll. None until the channel has >=5 sampled videos; then every
+    # generation is steered by what actually earned views/CTR there.
+    learned_policy = None
+    recent_titles: list = []
+    explore_hook = None
+    explored = False
+    # The channel whose MEASURED YouTube performance drives learned policy /
+    # dedupe / competitor intel: the OWN publishing account when known, else
+    # the style_source (legacy). Its corpus/voice still comes from style_source.
+    policy_channel = own_channel or style_source
+    if policy_channel is not None and getattr(policy_channel, "id", None):
+        try:
+            from sqlalchemy.orm import object_session
+            from learning.seo_learning import (latest_policy, pick_hook,
+                                               merged_rows)
+            # NOTE: use the MODULE-level datetime/timezone/timedelta — a local
+            # `from datetime import ...` here would make `datetime` function-
+            # local and crash the channel-less path (UnboundLocalError at the
+            # bookkeeping `datetime.now()` when this block is skipped).
+            _ls = object_session(policy_channel)
+            if _ls is not None:
+                learned_policy = latest_policy(_ls, policy_channel.id)
+                # DEDUPE GUARD input: this channel's recent titles — a
+                # candidate matching one becomes a retry failure (two
+                # identical published titles happened; never again).
+                _since = datetime.now(timezone.utc) - timedelta(days=60)
+                recent_titles = [
+                    (getattr(r, "seo_title", "") or "")
+                    for r in merged_rows(_ls, policy_channel.id, _since)][:400]
+        except Exception:
+            learned_policy = None
+        # EXPLORATION: mostly exploit the measured best hook, but at
+        # KAIZER_SEO_EXPLORE_RATE (default 0.2) deliberately test a
+        # non-favored form — published, measured, and fed back, so the
+        # policy can never freeze on a local optimum.
+        try:
+            from learning.seo_learning import pick_hook as _ph
+            _rate = float(os.environ.get("KAIZER_SEO_EXPLORE_RATE", "0.2")
+                          or "0.2")
+            explore_hook, explored = _ph(learned_policy, explore_rate=_rate)
+        except Exception:
+            explore_hook, explored = None, False
+
+    # COMPETITOR INTELLIGENCE (opt-in per channel): rivals' best videos on
+    # THIS video's topic — their tags to harvest, terms to cover, titles
+    # to DIFFERENTIATE from (rival titles also join the dedupe list so we
+    # can never ship a near-copy of a bigger channel's headline).
+    competitor = None
+    if (policy_channel is not None
+            and bool(getattr(policy_channel, "use_competitor_intel", False))):
+        try:
+            from sqlalchemy.orm import object_session
+            from learning.competitor_intel import topic_intel
+            import json as _json
+            _ls2 = object_session(policy_channel)
+            if _ls2 is not None:
+                _meta = {}
+                try:
+                    _meta = _json.loads(clip.meta or "{}")
+                except (ValueError, TypeError):
+                    pass
+                _terms = ([str(x) for x in (_meta.get("key_people") or [])]
+                          + [str(x) for x in (_meta.get("key_topics") or [])]
+                          + [str(x) for x in (_meta.get("key_locations") or [])])
+                competitor = topic_intel(
+                    _ls2, getattr(policy_channel, "user_id", 0) or 0, _terms)
+                if competitor and competitor.get("rival_titles"):
+                    recent_titles = list(recent_titles) + \
+                        competitor["rival_titles"]
+        except Exception:
+            competitor = None
+
+    # Cross-channel distinctness: sibling per-channel titles join the dedupe
+    # pool so is_duplicate_title rejects reused openings on other channels.
+    if avoid_titles:
+        recent_titles = list(recent_titles) + [str(t) for t in avoid_titles if t]
+
+    # SEO WRITER ENGINE (user-selectable): 'gemini' (default) | 'claude'.
+    # Env KAIZER_SEO_ENGINE forces globally; otherwise the publishing
+    # user's saved preference decides. Claude failures fall back to the
+    # Gemini chain per attempt — engine choice can never break SEO.
+    # Explicit engine_choice (per-channel delegation passes the publishing
+    # user's pick) > env force > the clip's user preference > gemini.
+    seo_engine = (engine_choice or os.environ.get("KAIZER_SEO_ENGINE")
+                  or "").strip().lower()
+    if seo_engine not in ("gemini", "claude"):
+        seo_engine = "gemini"
+        try:
+            from sqlalchemy.orm import object_session
+            _jb = getattr(clip, "job", None)
+            _uid = getattr(_jb, "user_id", None) if _jb else None
+            _cs = object_session(clip)
+            if _uid and _cs is not None:
+                _usr = (_cs.query(models.User)
+                        .filter(models.User.id == _uid).first())
+                if _usr and (getattr(_usr, "seo_engine", "") or "") == "claude":
+                    seo_engine = "claude"
+        except Exception:
+            seo_engine = "gemini"
+
+    # TITLE SCRIPT POLICY (operator decision 2026-08): per-channel-LEARNABLE.
+    # 'learned' (default) = follow the channel's measured best script when
+    # confident, bilingual otherwise; or force via KAIZER_SEO_SCRIPT_POLICY=
+    # bilingual|english|native.
+    _sp_env = (os.environ.get("KAIZER_SEO_SCRIPT_POLICY", "learned")
+               or "learned").strip().lower()
+    if _sp_env in ("bilingual", "english", "native"):
+        script_policy = _sp_env
+    else:
+        script_policy = ((learned_policy or {}).get("best_script")
+                         if (learned_policy or {}).get("best_script")
+                         in ("english", "native", "mixed") else None)
+        script_policy = {"mixed": "bilingual", "english": "english",
+                         "native": "native"}.get(script_policy, "bilingual")
+
     # ── 2. Prompts (base, no retry feedback yet) ──
     system_prompt = prompts.build_system_prompt(
         language=language, style_source=style_source, target_score=TARGET_SCORE,
@@ -387,6 +551,12 @@ def generate_seo_for_clip(
             corpus=corpus_payload,
             style_source=style_source,
             retry_feedback=retry_feedback,
+            learned=learned_policy,
+            explore_hook=(explore_hook if explored else None),
+            script_policy=script_policy,
+            competitor=competitor,
+            avoid_titles=avoid_titles,
+            angle_hint=angle_hint,
         )
 
     # ── 3-5. Generate → sanitize → verify → retry loop ──
@@ -405,13 +575,24 @@ def generate_seo_for_clip(
 
         try:
             _job = getattr(clip, "job", None)
-            raw, model_used = _call_gemini(
-                system_prompt, user_prompt,
-                db=db,
-                user_id=getattr(_job, "user_id", None) if _job else None,
-                job_id=getattr(clip, "job_id", None),
-                clip_id=getattr(clip, "id", None),
-            )
+            raw = None
+            if seo_engine == "claude":
+                try:
+                    raw, model_used = _call_claude_seo(
+                        system_prompt, user_prompt)
+                except Exception as _ce:
+                    print(f"[seo] claude engine failed "
+                          f"({str(_ce)[:100]}) — falling back to gemini",
+                          flush=True)
+                    raw = None
+            if raw is None:
+                raw, model_used = _call_gemini(
+                    system_prompt, user_prompt,
+                    db=db,
+                    user_id=getattr(_job, "user_id", None) if _job else None,
+                    job_id=getattr(clip, "job_id", None),
+                    clip_id=getattr(clip, "id", None),
+                )
         except SEOGenerationError as e:
             # Hard failure — if we already have a best, ship it; else propagate
             if best:
@@ -431,7 +612,24 @@ def generate_seo_for_clip(
             clip_topic=topic,
             trend_keywords=all_trend_keywords,
             news_items=news_items,
+            script_policy=script_policy,
+            competitor_terms=((competitor or {}).get("harvest_tags") or [])
+                             + ((competitor or {}).get("cover_terms") or []),
         )
+        # DEDUPE GUARD: a title matching one of this channel's recent
+        # videos is a hard failure — dock it below target and hand the
+        # retry loop a rewrite order (identical published titles shipped
+        # once; the guard makes that structurally impossible).
+        try:
+            from learning.seo_learning import is_duplicate_title
+            if recent_titles and is_duplicate_title(
+                    cleaned.get("title", ""), recent_titles):
+                report["score"] = min(report["score"], TARGET_SCORE - 20)
+                report["reasons"].append(
+                    "title DUPLICATES a recent video on this channel — "
+                    "write a fresh headline with a different angle/wording")
+        except Exception:
+            pass
         attempts_log.append({
             "attempt": attempt,
             "score":   report["score"],
@@ -454,8 +652,39 @@ def generate_seo_for_clip(
     if not best:
         raise SEOGenerationError("SEO generation produced no candidates")
 
+    # One-line visibility into which ADVANCED features engaged for THIS
+    # generation (dev observability; no behaviour change, fail-soft).
+    try:
+        _lp = learned_policy or {}
+        _co = competitor or {}
+        print(
+            "[seo:features] clip=%s engine=%s learned=%s%s competitor=%s%s "
+            "script=%s explore=%s trends=%d news=%d dedupe_pool=%d "
+            "attempts=%d score=%d model=%s" % (
+                getattr(clip, "id", "?"), seo_engine,
+                "YES" if learned_policy else "no",
+                (f"(hooks={','.join(_lp.get('best_hooks') or []) or '-'},"
+                 f"script={_lp.get('best_script') or '-'},"
+                 f"kw={len(_lp.get('top_keywords') or [])},"
+                 f"topics={len(_lp.get('top_topics') or [])},"
+                 f"base={_lp.get('based_on', '?')})") if learned_policy else "",
+                "YES" if competitor else "no",
+                (f"(rivals={len(_co.get('rival_titles') or [])},"
+                 f"cover={len(_co.get('cover_terms') or [])},"
+                 f"tags={len(_co.get('harvest_tags') or [])})") if competitor else "",
+                script_policy, (explore_hook if explored else "-"),
+                len(all_trend_keywords or []), len(news_items or []),
+                len(recent_titles or []), len(attempts_log),
+                best_score, model_used,
+            ), flush=True)
+    except Exception:
+        pass
+
     # ── 6. Attach bookkeeping + persist ──
     best["seo_score"]   = best_score
+    if explored and explore_hook:
+        # A/B ledger stamp — flows through clip.seo into TrainingSample.
+        best["explored_hook"] = explore_hook
     best["verifier_breakdown"] = (best_report or {}).get("breakdown") or {}
     best["verifier_reasons"]   = (best_report or {}).get("reasons") or []
     best["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -497,9 +726,12 @@ def generate_seo_for_clip(
 
     # Persist as the single canonical generic SEO on the clip.  The legacy
     # per-channel `seo_variants` field is left untouched (read-only legacy).
-    clip.seo = json.dumps(best, ensure_ascii=False)
-    db.commit()
-    try: db.refresh(clip)
-    except Exception: pass
+    # persist=False for a synthetic clip (delegation) — the caller owns the
+    # returned dict and there is no real row to write.
+    if persist:
+        clip.seo = json.dumps(best, ensure_ascii=False)
+        db.commit()
+        try: db.refresh(clip)
+        except Exception: pass
 
     return best

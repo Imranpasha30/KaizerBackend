@@ -109,8 +109,14 @@ Each prompt follows these rules:
    crews, storm skies — match the actual story.
 5. Sharp focus, natural lighting, slightly desaturated like a real news photo.
 
-Output ONLY a JSON array of prompt strings, e.g.
-["prompt for beat 1", "prompt for beat 2", ...]
+Output ONLY a JSON array of objects, one per beat:
+[{"prompt": "full image prompt for beat 1", "label": "short subject line"},
+ {"prompt": "full image prompt for beat 2", "label": "short subject line"}]
+`label` is a ≤8-word subject line saying WHO/WHAT the image shows (e.g.
+"parliament building at dusk", "flooded street rescue"). When the story names
+a person/place, put the NAME in the label (native script + English is best) —
+the label is used to sync the image to the exact spoken words, it is NOT
+rendered into the picture.
 No preamble, no markdown fences, nothing but the JSON array.
 """
 
@@ -123,26 +129,80 @@ def _gemini_client():
     return build()
 
 
+_CAPTION_SYSTEM = """\
+You label news images for a broadcast archive. Given ONE image, output a
+single short subject line (max 8 words) saying WHO or WHAT it shows —
+e.g. "politician addressing parliament", "flooded street with rescue boats",
+"stock market chart falling". If a well-known public figure or landmark is
+clearly identifiable, name them. No preamble, no punctuation-heavy prose,
+no quotes — just the label text.
+"""
+
+
+def caption_image(path: str, *, mime: str = "image/jpeg") -> str:
+    """One-line subject label for an image ("name-tag contract").
+
+    Used to auto-label user uploads that arrive without a description so
+    the image↔speech timing AI can match them to spoken words. Returns ""
+    on any failure — callers treat the label as optional."""
+    try:
+        data = Path(path).read_bytes()
+    except Exception:
+        return ""
+    if not data:
+        return ""
+    try:
+        from google.genai import types as genai_types
+        client = _gemini_client()
+        resp = client.models.generate_content(
+            model=DEFAULT_PROMPT_MODEL,
+            contents=[
+                genai_types.Part.from_bytes(data=data, mime_type=mime or "image/jpeg"),
+                "Label this image.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_CAPTION_SYSTEM,
+                temperature=0.2,
+            ),
+        )
+        text = (resp.text or "").strip().strip('"').strip()
+        # One line only; defensive length cap
+        return text.splitlines()[0][:120] if text else ""
+    except Exception as exc:
+        print(f"[v4/image-ai] caption failed for {path}: {exc}", flush=True)
+        return ""
+
+
 def write_image_prompt(
     *,
     title_native: str = "",
     title_english: str = "",
     summary: str = "",
     language: str = "te",
+    note: str = "",
 ) -> str:
     """Ask Gemini for a sidebar-image brief from the story content.
-    Falls back to a deterministic stock prompt on failure."""
+    Falls back to a deterministic stock prompt on failure. ``note`` is an
+    optional per-slot operator direction (e.g. "night-time, blue tones")
+    merged into the brief so the image honours it."""
     facts = []
     if title_native:  facts.append(f"native-script headline: {title_native}")
     if title_english: facts.append(f"English headline: {title_english}")
     if summary:       facts.append(f"summary: {summary[:600]}")
     facts.append(f"language: {language}")
+    if note:
+        facts.append(f"operator note — MUST be reflected in the image: {note[:300]}")
     user_msg = (
         "Write the sidebar-image prompt for this news story.\n\n"
         + "\n".join(facts)
     )
     try:
         from google.genai import types as genai_types
+        # Space request starts: a 16-story job fires 16 prompt-writer
+        # calls at once and Vertex's per-minute quota 429s most into the
+        # generic fallback prompt (weaker images). Paced, they succeed.
+        from pipeline_v4.api_pace import pace
+        pace()
         client = _gemini_client()
         resp = client.models.generate_content(
             model=DEFAULT_PROMPT_MODEL,
@@ -164,6 +224,7 @@ def write_image_prompt(
         f"Documentary style, natural lighting, slightly desaturated colour. "
         f"Generic silhouettes only (no recognisable real people). "
         f"Sharp focus, evocative composition. No overlay text, no logo."
+        + (f" Operator direction: {note[:200]}." if note else "")
     )
 
 
@@ -198,9 +259,31 @@ def tweak_image_prompt(*, previous_prompt: str, tweak: str) -> str:
     return f"{previous_prompt}\n\nAdditional direction: {tweak}"
 
 
-def _parse_prompt_list(text: str) -> List[str]:
-    """Pull a JSON array of prompt strings out of a model response, tolerating
-    code fences / stray prose / a `[{"prompt": …}]` shape. [] when nothing usable."""
+def derive_label(prompt: str) -> str:
+    """Deterministic ≤8-word subject line from an image prompt — the
+    fallback when the planner didn't supply a ``label``. Strips the
+    prompt-writer's stock preamble and keeps the first clause."""
+    if not prompt:
+        return ""
+    t = prompt.strip().splitlines()[0]
+    # Stock preambles from write_image_prompt / the deterministic fallback:
+    # "Cinematic 16:9 news B-roll photograph about: X." / "... photo of X, ..."
+    t = re.sub(
+        r"(?i)^(a|an|the)?\s*(cinematic|documentary|photorealistic|wide|close-up)?"
+        r"[\w\s:,'-]{0,40}?(photograph|photo|image|shot|scene|b-roll)\s+"
+        r"(of|about|showing)[:\s]+",
+        "", t, count=1,
+    )
+    t = re.split(r"[.;:]", t)[0].strip().strip(",")
+    words = t.split()
+    return " ".join(words[:8])[:120]
+
+
+def _parse_beat_list(text: str) -> List[dict]:
+    """Pull a JSON array of image beats out of a model response, tolerating
+    code fences / stray prose / plain-string items / `[{"prompt": …}]` shapes.
+    Returns ``[{"prompt": str, "label": str}, …]`` ([] when nothing usable);
+    a missing label is derived from the prompt."""
     if not text:
         return []
     t = text.strip()
@@ -212,19 +295,28 @@ def _parse_prompt_list(text: str) -> List[str]:
         data = json.loads(blob)
     except Exception:
         return []
-    out: List[str] = []
+    out: List[dict] = []
     if isinstance(data, list):
         for item in data:
             if isinstance(item, str) and item.strip():
-                out.append(item.strip())
+                p = item.strip()
+                out.append({"prompt": p, "label": derive_label(p)})
             elif isinstance(item, dict):
-                v = item.get("prompt") or item.get("text") or ""
-                if isinstance(v, str) and v.strip():
-                    out.append(v.strip())
+                p = item.get("prompt") or item.get("text") or ""
+                if isinstance(p, str) and p.strip():
+                    p = p.strip()
+                    lab = item.get("label") or item.get("subject") or ""
+                    lab = lab.strip() if isinstance(lab, str) else ""
+                    out.append({"prompt": p, "label": (lab or derive_label(p))[:120]})
     return out
 
 
-def plan_story_images(
+def _parse_prompt_list(text: str) -> List[str]:
+    """Back-compat shim: prompt strings only (see ``_parse_beat_list``)."""
+    return [b["prompt"] for b in _parse_beat_list(text)]
+
+
+def plan_story_beats(
     *,
     title_native: str = "",
     title_english: str = "",
@@ -232,12 +324,16 @@ def plan_story_images(
     language: str = "te",
     count: Optional[int] = None,
     max_images: int = 8,
-) -> List[str]:
-    """Break ONE story into a SEQUENCE of distinct B-roll image prompts (one per
-    visual beat), so a carousel's length is driven by the story — not a fixed
-    template count. ``count=None`` → the model decides how many beats the story
-    needs (clamped 1..max_images); an explicit ``count`` → exactly that many.
-    Always returns ≥1 prompt (falls back to a single prompt + angle variations)."""
+    note: str = "",
+) -> List[dict]:
+    """Break ONE story into a SEQUENCE of distinct B-roll image beats
+    ``[{"prompt", "label"}, …]`` — one per visual beat, so a carousel's length is
+    driven by the story, not a fixed template count. ``label`` is the beat's
+    ≤8-word subject line (the "name-tag contract": the image↔speech sync
+    matches images to spoken words by this label). ``count=None`` → the model
+    decides how many beats (clamped 1..max_images); explicit ``count`` →
+    exactly that many. Always returns ≥1 beat (falls back to a single prompt
+    + angle variations)."""
     max_images = max(1, min(int(max_images or 8), 12))
     want = max(1, min(int(count), max_images)) if count is not None else None
     min_n = want or 2
@@ -248,6 +344,8 @@ def plan_story_images(
     if title_english: facts.append(f"English headline: {title_english}")
     if summary:       facts.append(f"summary: {summary[:800]}")
     facts.append(f"language: {language}")
+    if note:
+        facts.append(f"operator note — MUST be reflected in EVERY image: {note[:300]}")
     if want:
         facts.append(f"REQUIRED image count: exactly {want}")
     user_msg = "Plan the sidebar-image sequence for this news story.\n\n" + "\n".join(facts)
@@ -264,26 +362,46 @@ def plan_story_images(
                 max_output_tokens=4096,   # flash spends thinking tokens — keep headroom for the JSON
             ),
         )
-        prompts = _parse_prompt_list(resp.text or "")
-        if prompts:
-            return prompts[:(want or max_images)]
+        beats = _parse_beat_list(resp.text or "")
+        if beats:
+            return beats[:(want or max_images)]
     except Exception as exc:
         print(f"[v4/image-ai] multi-prompt planner failed: {exc}", flush=True)
 
     # Fallback: one solid prompt, padded with distinct angles to the wanted count.
     base = write_image_prompt(title_native=title_native, title_english=title_english,
-                              summary=summary, language=language)
+                              summary=summary, language=language, note=note)
+    base_label = derive_label(base) or (title_english or title_native or "")[:120]
     n = want or 1
     if n <= 1:
-        return [base]
+        return [{"prompt": base, "label": base_label}]
     angles = ["establishing wide shot", "close detail of the key subject",
               "the aftermath / consequence", "the wider location / context",
               "a symbolic object from the story", "reaction of bystanders",
               "an overhead / aerial perspective", "a quiet human moment"]
-    out = [base]
+    out = [{"prompt": base, "label": base_label}]
     for i in range(1, n):
-        out.append(f"{base} Variation: {angles[(i - 1) % len(angles)]}.")
+        angle = angles[(i - 1) % len(angles)]
+        out.append({"prompt": f"{base} Variation: {angle}.",
+                    "label": f"{base_label} — {angle}"[:120]})
     return out
+
+
+def plan_story_images(
+    *,
+    title_native: str = "",
+    title_english: str = "",
+    summary: str = "",
+    language: str = "te",
+    count: Optional[int] = None,
+    max_images: int = 8,
+    note: str = "",
+) -> List[str]:
+    """Back-compat shim over ``plan_story_beats`` — prompt strings only."""
+    return [b["prompt"] for b in plan_story_beats(
+        title_native=title_native, title_english=title_english, summary=summary,
+        language=language, count=count, max_images=max_images, note=note,
+    )]
 
 
 def generate_image(
@@ -352,6 +470,85 @@ def generate_image(
 generate_image.last_error = ""
 
 
+# gpt-image-1 renders from the SAME refined art-director prompts as the
+# Gemini path — documentary B-roll, NOT the garish BIG-TV thumbnail
+# template in express/ai_image (that style is for thumbnails). This
+# short suffix restates the technical constraints image models weigh
+# most when they close out a generation.
+_OPENAI_BROLL_SUFFIX = (
+    " Photorealistic 16:9 documentary news photograph, sharp focus, "
+    "natural lighting, slightly desaturated. No text, no watermarks, no logos."
+)
+
+
+def _generate_image_openai(
+    *,
+    prompt: str,
+    out_path: str,
+    width: int = 1280,
+    height: int = 720,
+) -> Optional[str]:
+    """OpenAI gpt-image-1 renderer behind the same contract as
+    ``generate_image`` (saves to out_path, stamps
+    ``generate_image.last_error`` on failure). gpt-image-1 only takes
+    fixed canvases — pick by orientation, then cover-crop to the exact
+    target like the Gemini path does."""
+    generate_image.last_error = ""
+    if not prompt:
+        return None
+    try:
+        from express.ai_image import _generate as _openai_raw
+    except Exception as exc:
+        generate_image.last_error = f"openai wrapper missing: {exc}"
+        print(f"[v4/image-ai] openai wrapper missing: {exc}", flush=True)
+        return None
+    size = "1536x1024" if width >= height else "1024x1536"
+    quality = (os.environ.get("KAIZER_OPENAI_IMAGE_QUALITY") or "high").strip().lower()
+    if quality not in {"low", "medium", "high", "auto"}:
+        quality = "high"
+    try:
+        buf = _openai_raw(
+            api_key="",  # falls back to OPENAI_API_KEY env
+            prompt=(prompt + _OPENAI_BROLL_SUFFIX)[:4000],
+            size=size,
+            quality=quality,
+            timeout_s=120,
+        )
+    except Exception as exc:
+        generate_image.last_error = str(exc)
+        print(f"[v4/image-ai] openai generate failed: {exc}", flush=True)
+        return None
+    try:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "wb") as fh:
+            fh.write(buf)
+        _ensure_aspect(out_path, width, height)
+        return out_path
+    except Exception as exc:
+        generate_image.last_error = f"save: {exc}"
+        print(f"[v4/image-ai] openai save failed: {exc}", flush=True)
+        return None
+
+
+def render_image(
+    *,
+    prompt: str,
+    out_path: str,
+    width: int = 1280,
+    height: int = 720,
+    engine: str = "gemini",
+) -> Optional[str]:
+    """Engine-routed renderer: the SAME refined prompt, the user's chosen
+    image engine. ``engine`` ∈ {"gemini", "openai"} — anything else falls
+    back to Gemini so a typo never breaks a render."""
+    eng = (engine or "gemini").strip().lower()
+    if eng == "openai":
+        return _generate_image_openai(prompt=prompt, out_path=out_path,
+                                      width=width, height=height)
+    return generate_image(prompt=prompt, out_path=out_path,
+                          width=width, height=height)
+
+
 def _ensure_aspect(path: str, width: int, height: int) -> None:
     """Cover-crop the saved JPG to exactly width x height."""
     try:
@@ -388,11 +585,17 @@ def make_image_for_story(
     tweak: str = "",
     width: int = 1280,
     height: int = 720,
+    note: str = "",
+    engine: str = "gemini",
 ) -> Tuple[Optional[str], str]:
     """Two-step: derive prompt (tweak path when previous_prompt+tweak
     supplied, otherwise fresh from SEO) -> render image -> save.
     Returns ``(saved_path or None, final_prompt)`` so the caller can
-    persist the prompt for a future tweak iteration."""
+    persist the prompt for a future tweak iteration. ``note`` = optional
+    per-slot operator direction (the tweak path ignores it — that path
+    already carries an explicit user direction). ``engine`` picks the
+    RENDERER (gemini Nano Banana / openai gpt-image-1); the art-director
+    prompt-writing step is shared by both."""
     if previous_prompt and tweak:
         prompt = tweak_image_prompt(previous_prompt=previous_prompt, tweak=tweak)
     else:
@@ -401,9 +604,11 @@ def make_image_for_story(
             title_english=title_english,
             summary=summary,
             language=language,
+            note=note,
         )
-    print(f"[v4/image-ai] prompt: {prompt[:160]}…", flush=True)
-    saved = generate_image(prompt=prompt, out_path=out_path, width=width, height=height)
+    print(f"[v4/image-ai] engine={engine} prompt: {prompt[:160]}…", flush=True)
+    saved = render_image(prompt=prompt, out_path=out_path, width=width, height=height,
+                         engine=engine)
     return saved, prompt
 
 
@@ -419,22 +624,28 @@ def make_images_for_story(
     width: int = 1280,
     height: int = 720,
     max_images: int = 8,
-) -> List[Tuple[str, str]]:
+    note: str = "",
+    engine: str = "gemini",
+) -> List[Tuple[str, str, str]]:
     """Plan a story-driven image SEQUENCE and render each beat to
-    ``out_dir/<base>_<i>.jpg``. Returns ``[(saved_path, prompt), …]`` for every
-    image that rendered (failed beats are skipped so the caller still gets the
-    successes). ``count`` forces an exact number; else the planner picks
-    1..max_images from the story. Use this for carousels / multi-image slots; for
-    a single sidebar image use ``make_image_for_story``."""
-    prompts = plan_story_images(
+    ``out_dir/<base>_<i>.jpg``. Returns ``[(saved_path, prompt, label), …]``
+    for every image that rendered (failed beats are skipped so the caller
+    still gets the successes); ``label`` is the beat's subject line for the
+    name-tag contract. ``count`` forces an exact number; else the planner
+    picks 1..max_images from the story. Use this for carousels / multi-image
+    slots; for a single sidebar image use ``make_image_for_story``."""
+    beats = plan_story_beats(
         title_native=title_native, title_english=title_english,
         summary=summary, language=language, count=count, max_images=max_images,
+        note=note,
     )
     os.makedirs(out_dir, exist_ok=True)
-    out: List[Tuple[str, str]] = []
-    for i, prompt in enumerate(prompts):
+    out: List[Tuple[str, str, str]] = []
+    for i, beat in enumerate(beats):
+        prompt = beat["prompt"]
         path = os.path.join(out_dir, f"{base}_{i + 1}.jpg")
-        saved = generate_image(prompt=prompt, out_path=path, width=width, height=height)
+        saved = render_image(prompt=prompt, out_path=path, width=width, height=height,
+                             engine=engine)
         if saved and os.path.isfile(path):
-            out.append((path, prompt))
+            out.append((path, prompt, beat.get("label") or derive_label(prompt)))
     return out

@@ -18,6 +18,7 @@ import auth as _auth
 import models
 from config import settings
 from database import get_db
+import datetime as _dt
 
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -147,6 +148,164 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     db.commit()
     return _with_token(u)
 
+# ─── Sign in with a code sent to your email ───────────────────────────
+#
+# No password. Type your address, get six digits, type them back. The
+# account is created on the first successful code, so there is no separate
+# sign-up to get out of step with this.
+#
+# The two shapes below exist to stop the two things that go wrong with
+# emailed codes: REQUESTING one tells you nothing about whether the address
+# is known (otherwise the response enumerates the customer list), and
+# VERIFYING one is rate-limited per IP and per code (otherwise six digits is
+# a million guesses nobody is counting).
+
+class CodeRequestIn(BaseModel):
+    email: str
+
+
+class CodeVerifyIn(BaseModel):
+    email: str
+    code: str
+
+
+@router.post("/login-code/request")
+def login_code_request(payload: CodeRequestIn, request: Request,
+                       db: Session = Depends(get_db)):
+    """Email a six-digit sign-in code.
+
+    ALWAYS answers the same way. Whether the address has an account, is
+    malformed, or the mail server refused, the caller gets {"ok": true} and
+    the same wording -- because anything else turns this endpoint into a
+    directory of who is a customer.
+    """
+    import login_code as _lc
+    import mailer as _mail
+    from rate_limit import check_ip_rate as _check_ip_rate
+
+    xff = request.headers.get("x-forwarded-for", "")
+    ip = (xff.split(",")[0].strip() if xff else
+          (request.client.host if request.client else "unknown"))
+    allowed, retry_after, _ = _check_ip_rate(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many attempts. Retry in {int(retry_after)}s.",
+            headers={"Retry-After": str(max(1, int(retry_after)))})
+
+    said = {"ok": True,
+            "message": "If that address can sign in, a code is on its way."}
+    email = _lc.normalise_email(payload.email)
+    if not _mail.valid_email(email):
+        return said
+
+    # Reuse a code issued seconds ago rather than minting a second one --
+    # a double-clicked button otherwise leaves the first email dead on
+    # arrival, which reads as "the code doesn't work".
+    recent = (db.query(models.LoginCode)
+                .filter(models.LoginCode.email == email)
+                .order_by(models.LoginCode.id.desc()).first())
+    if recent is not None and _lc.within_grace(recent):
+        print(f"[auth.code] reusing the code issued moments ago for {email}")
+        return said
+
+    code = _lc.make_code()
+    user = db.query(models.User).filter(models.User.email == email).first()
+    row = models.LoginCode(
+        email=email, user_id=(user.id if user else None),
+        code_hash=_lc.hash_code(code), expires_at=_lc.expiry(),
+        attempts=0, requested_ip=ip[:64])
+    db.add(row)
+    db.commit()
+
+    # ALWAYS printed. On a box with no mail credential, or the day Zoho is
+    # down, this is how the operator still gets in.
+    print(f"[auth.code] sign-in code for {email}: {code}")
+    text, html = _lc.body(code, name=(user.name if user else ""))
+    _mail.send(to_email=email, subject=_lc.subject(), text=text, html=html,
+               to_name=(user.name if user else ""))
+    return said
+
+
+@router.post("/login-code/verify")
+def login_code_verify(payload: CodeVerifyIn, request: Request,
+                      db: Session = Depends(get_db)):
+    """Exchange the code for a token. Creates the account on first use."""
+    import login_code as _lc
+    from rate_limit import check_ip_rate as _check_ip_rate
+
+    xff = request.headers.get("x-forwarded-for", "")
+    ip = (xff.split(",")[0].strip() if xff else
+          (request.client.host if request.client else "unknown"))
+    allowed, retry_after, _ = _check_ip_rate(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many attempts. Retry in {int(retry_after)}s.",
+            headers={"Retry-After": str(max(1, int(retry_after)))})
+
+    email = _lc.normalise_email(payload.email)
+    code = _lc.clean_code(payload.code)
+    WRONG = HTTPException(status_code=400,
+                          detail="That code is wrong or has expired.")
+    if not _lc.looks_like_a_code(code):
+        raise WRONG
+
+    row = (db.query(models.LoginCode)
+             .filter(models.LoginCode.email == email,
+                     models.LoginCode.used_at.is_(None))
+             .order_by(models.LoginCode.id.desc()).first())
+    if row is None or not _lc.is_live(row):
+        raise WRONG
+
+    # Count the try BEFORE comparing, and commit it, so a crash or a
+    # disconnect mid-request cannot be used to get a free guess.
+    row.attempts = int(row.attempts or 0) + 1
+    db.commit()
+
+    if row.code_hash != _lc.hash_code(code):
+        left = max(0, _lc.MAX_ATTEMPTS - int(row.attempts or 0))
+        raise HTTPException(
+            status_code=400,
+            detail=(f"That code is wrong. {left} tr{'y' if left == 1 else 'ies'} left."
+                    if left else "That code is wrong and has now expired."))
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+    created = False
+    if user is None:
+        # First code IS the sign-up, and it must build the account EXACTLY
+        # as /register does. The first version here set only the email,
+        # name and an empty password -- which leaves plan_tier_id NULL, and
+        # a NULL tier makes every publish 400 with "plan_tier_unknown".
+        # A user who signed in by code would have had a working account
+        # that silently could not publish.
+        #
+        # password_hash stays empty on purpose: the password login path
+        # already recognises that and says so, rather than failing blankly.
+        user = models.User(
+            email=email,
+            name=email.split("@")[0],
+            password_hash="",
+            is_active=True,
+            plan_tier_id=_default_plan_tier_id(db),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        created = True
+        print(f"[auth.code] created an account for {email}")
+
+    row.used_at = _dt.datetime.now(_dt.timezone.utc)
+    row.user_id = user.id
+    user.last_login_at = _dt.datetime.now(_dt.timezone.utc)
+    db.commit()
+
+    # _with_token, not a hand-rolled dict. The frontend reads res.token and
+    # the canonical user shape comes from _public_user; a bespoke
+    # {"access_token": ...} here would have signed nobody in.
+    return {**_with_token(user), "created": created}
+
+
 
 @router.post("/google")
 def google_signin(payload: GoogleIn, db: Session = Depends(get_db)):
@@ -267,6 +426,10 @@ def auth_config():
     """Exposes whether Google Sign-In is available + the client id."""
     return {
         "google_enabled":    bool(settings.yt_client_id),
+        # The sign-in screen only offers the emailed-code option where the
+        # backend says it can serve it. Without this key the routes below
+        # exist and nothing in the UI reaches them.
+        "code_login":        True,
         "google_client_id":  settings.yt_client_id or "",
         "auth_required":     (
             __import__("os").getenv("KAIZER_AUTH_REQUIRED", "false").lower()

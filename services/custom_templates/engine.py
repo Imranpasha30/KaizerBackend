@@ -142,6 +142,12 @@ class RenderRequest:
     ticker_bg_color: str | None = None
     ticker_font_px: int | None = None
     ticker_lang: str | None = None
+    # EFFECTS grade (AI Director / effects-mode): a resolved LINEAR -vf fragment applied
+    # to the FOOTAGE inside each video slot (post scale/crop, under the design overlay)
+    # so a template job's clips carry the job's look while the template design + the
+    # additive ticker/carousel/entrance passes stay crisp. "" (default) = legacy render,
+    # character-identical filtergraph — existing callers that never pass it are unchanged.
+    effects_vf: str = ""
 
 
 def _map_videos(video_rects: list[dict], videos: dict[str, str],
@@ -246,8 +252,13 @@ def render_template(bundle: "_bundle.Bundle", contract: "_contract.TemplateContr
         except Exception:
             _elem_overlays = []   # fall back: leave the elements baked (no entrance)
 
+    # NOTE: there is NO render cache on the custom-template path — every call captures
+    # frames + runs ffmpeg fresh (unlike v1_bridge's per-story composed_story cache), so
+    # effects_vf needs no cache fingerprint. getattr keeps duck-typed callers that predate
+    # the field working; the sanitizer in compose fail-softs a bad chain to "no grade".
     _compose.compose(design, placements, out_path, canvas=canvas,
-                     fps=req.fps, duration=req.duration)
+                     fps=req.fps, duration=req.duration,
+                     effects_vf=getattr(req, "effects_vf", "") or "")
 
     # SCROLLING TICKER: composite a marquee strip over the finished still at the ticker slot's
     # rect — efficient ffmpeg overlay (one re-encode pass, NO per-frame screenshots, so it
@@ -365,6 +376,25 @@ def _overlay_carousel_on_rect(out_path: str, *, rect: dict, spec: dict, work_dir
     _dur = (_compose.probe_duration(out_path) or (cap or 6.0))
     tmp = out_path + ".carousel.mp4"
 
+    # Slot-level focal point (offset_x/y_pct from the template editor /
+    # face-aware auto-fill). These fields were already carried into the
+    # slot spec by _load_template_media but never read here — the crop
+    # always centered. None/50 emits the bare legacy `crop=w:h` so every
+    # pre-focal template render keeps a character-identical graph.
+    try:
+        _sox = float(spec.get("offset_x_pct") if spec.get("offset_x_pct") is not None else 50.0)
+        _soy = float(spec.get("offset_y_pct") if spec.get("offset_y_pct") is not None else 50.0)
+    except (TypeError, ValueError):
+        _sox = _soy = 50.0
+    _sox = max(0.0, min(100.0, _sox))
+    _soy = max(0.0, min(100.0, _soy))
+
+    def _crop(w: int, h: int) -> str:
+        if _sox == 50.0 and _soy == 50.0:
+            return f"crop={w}:{h}"
+        return (f"crop={w}:{h}:(in_w-{w})*{_sox / 100.0:.3f}:"
+                f"(in_h-{h})*{_soy / 100.0:.3f}")
+
     def _build_fc(effects_on: bool):
         """filter_complex for the slideshow. effects_on=False -> hard cuts (the fail-soft path).
         \\, escapes commas inside ffmpeg expressions (gte/max/min), same as the ticker overlay."""
@@ -376,13 +406,13 @@ def _overlay_carousel_on_rect(out_path: str, *, rect: dict, spec: dict, work_dir
             if eff == "zoom_in":
                 zf = max(2, int(round((dur_i + 1.0) * fps)))
                 chain = (f"[{i+1}:v]scale={rw*2}:{rh*2}:force_original_aspect_ratio=increase,"
-                         f"crop={rw*2}:{rh*2},zoompan=z='min(zoom+0.0010\\,1.4)':d={zf}:"
+                         f"{_crop(rw*2, rh*2)},zoompan=z='min(zoom+0.0010\\,1.4)':d={zf}:"
                          f"s={rw}x{rh}:fps={fps},setsar=1,format=yuva420p")
                 if ed > 0.05:
                     chain += f",fade=t=in:st={starts[i]:.3f}:d={ed:.3f}:alpha=1"
             else:
                 chain = (f"[{i+1}:v]scale={rw}:{rh}:force_original_aspect_ratio=increase,"
-                         f"crop={rw}:{rh},setsar=1,format=yuva420p")
+                         f"{_crop(rw, rh)},setsar=1,format=yuva420p")
                 if eff == "fade" and ed > 0.05:
                     chain += f",fade=t=in:st={starts[i]:.3f}:d={ed:.3f}:alpha=1"
             _fc.append(chain + f"[c{i}]")
@@ -409,7 +439,7 @@ def _overlay_carousel_on_rect(out_path: str, *, rect: dict, spec: dict, work_dir
         for f in frames:
             _cmd += ["-loop", "1", "-i", str(f["path"])]
         _cmd += ["-filter_complex", ";".join(_fc), "-map", f"[{_prev}]", "-map", "0:a?",
-                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                 *_compose._venc(crf=20, preset_hint="veryfast"), "-pix_fmt", "yuv420p",
                  "-c:a", "copy", "-movflags", "+faststart", "-t", f"{_dur:.3f}", tmp]
         return _sp.run(_cmd, capture_output=True, timeout=1800)
 
@@ -471,7 +501,7 @@ def _overlay_element_entrances(out_path: str, *, elems: list, work_dir: str, fps
         for e in elems:
             _cmd += ["-loop", "1", "-i", str(e["path"])]
         _cmd += ["-filter_complex", ";".join(_fc), "-map", f"[{_prev}]", "-map", "0:a?",
-                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                 *_compose._venc(crf=20, preset_hint="veryfast"), "-pix_fmt", "yuv420p",
                  "-c:a", "copy", "-movflags", "+faststart", "-t", f"{_dur:.3f}", tmp]
         return _sp.run(_cmd, capture_output=True, timeout=1800)
 
@@ -557,7 +587,7 @@ def _overlay_ticker_on_rect(out_path: str, *, rect: dict, text: str, work_dir: s
     )
     cmd = [ff, "-y", "-i", out_path, "-loop", "1", "-i", png,
            "-filter_complex", fc, "-map", "[v]", "-map", "0:a?",
-           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           *_compose._venc(crf=20, preset_hint="veryfast"), "-pix_fmt", "yuv420p",
            "-c:a", "copy", "-movflags", "+faststart", tmp]
     r = _sp.run(cmd, capture_output=True, timeout=1800)
     if r.returncode != 0 or not _os.path.isfile(tmp) or _os.path.getsize(tmp) < 1024:

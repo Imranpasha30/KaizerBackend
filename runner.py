@@ -43,6 +43,69 @@ def _fair_queue_enabled() -> bool:
     return (os.getenv("KAIZER_FAIR_RENDER_QUEUE", "0") or "0").strip() == "1"
 
 
+def _desktop_mode() -> bool:
+    """Desktop build (KAIZER_DESKTOP=1, set by desktop_entry.py serve)."""
+    return (os.environ.get("KAIZER_DESKTOP", "") or "").strip() == "1"
+
+
+def build_v4_spawn_cmd(job_id: int, video_path: str, out_dir, language: str,
+                       default_logo: str = "", frozen: "Optional[bool]" = None) -> list:
+    """Build the argv for the V4 orchestrator subprocess.
+
+    Dev/SaaS: ``<venv python> -m pipeline_v4.orchestrator <flags>``.
+    Frozen desktop build (PyInstaller — sys.frozen): there IS no venv
+    python, so re-invoke THIS executable's ``render`` subcommand
+    (desktop_entry.py), which forwards the flags verbatim to
+    pipeline_v4.orchestrator's CLI. The flag tail is IDENTICAL in both
+    shapes — tests/test_desktop_mode.py string-compares them so the argv
+    contract can't drift.
+
+    ``frozen`` is injectable for tests; None → detect from sys.frozen.
+    """
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    tail = [
+        "--job-id", str(job_id),
+        "--source", str(video_path),
+        "--output-dir", str(out_dir),
+        "--language", language or "te",
+    ]
+    if default_logo:
+        tail += ["--brand-logo", default_logo]
+    if frozen:
+        return [sys.executable, "render"] + tail
+    venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
+    if not Path(venv_python).exists():
+        venv_python = sys.executable
+    return [venv_python, "-m", "pipeline_v4.orchestrator"] + tail
+
+
+def _resolve_trim_planner(v4_trim_planner: str) -> str:
+    """Validate the KEEP/CUT planner pick ("claude" | "gemini").
+
+    Desktop default order: an explicit valid per-job pick wins; otherwise
+    the user's SAVED desktop setting (env KAIZER_V4_TRIM_PLANNER, written
+    by routers/desktop_local.py) is honored; only then the "claude"
+    default. SaaS behavior is untouched (env setting is desktop-only).
+
+    Desktop safety net: an EMPTY Anthropic key hard-fails Stage 1
+    (documented gotcha), and desktop installs routinely have no Anthropic
+    key — so under KAIZER_DESKTOP=1 with no ANTHROPIC_API_KEY, "claude"
+    quietly becomes "gemini" instead of failing the user's render.
+    """
+    planner = (v4_trim_planner or "").strip().lower()
+    if planner not in {"claude", "gemini"}:
+        env_pick = ""
+        if _desktop_mode():
+            env_pick = (os.environ.get("KAIZER_V4_TRIM_PLANNER", "")
+                        or "").strip().lower()
+        planner = env_pick if env_pick in {"claude", "gemini"} else "claude"
+    if (planner == "claude" and _desktop_mode()
+            and not (os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()):
+        planner = "gemini"
+    return planner
+
+
 _STARTUP_LOCK = threading.Lock()
 _STARTUP_DONE = False
 
@@ -317,6 +380,75 @@ def cancel_job(job_id: int) -> dict:
     return {"job_id": job_id, "found_running": True, "killed_pids": killed}
 
 
+def relaunch_job(job_id: int, db_session_factory) -> dict:
+    """Re-run a job from its stored row — the engine behind RESUME and RETRY.
+
+    Rebuilds the ``run_pipeline`` call from the persisted Job columns (source
+    upload + all V4 render params) and re-queues it. Reproduces the render's
+    core inputs; creation-time-only extras that aren't persisted on the row
+    (a custom branding logo / default image, pre-picked bulletin images, a
+    studio bg clip) are NOT re-applied — a retry renders from the saved wizard
+    settings. Idempotent-guarded: refuses if the job is already live. Returns a
+    small status dict the HTTP endpoint can serialise.
+    """
+    from models import Job
+    from datetime import datetime as _dt, timezone as _tz
+    db = db_session_factory()
+    kwargs = None
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return {"job_id": job_id, "relaunched": False, "error": "Job not found"}
+        # Never spawn a second render for a job that's already going.
+        with _ACTIVE_PROCS_LOCK:
+            _live = _ACTIVE_PROCS.get(job_id)
+        if job.status == "running" or (_live is not None and _live.poll() is None):
+            return {"job_id": job_id, "relaunched": False,
+                    "error": "Job is already running"}
+        # Resolve the original source upload (create_job dropped it in
+        # MEDIA_ROOT/uploads/<video_name>; V4 renders don't delete it).
+        src = BASE_DIR / "media" / "uploads" / (job.video_name or "")
+        if not job.video_name or not src.exists():
+            return {"job_id": job_id, "relaunched": False,
+                    "error": "Source video is no longer on disk — please re-upload."}
+        # Fresh lifecycle state so the worker treats it as a clean run.
+        job.status = "pending"
+        job.cancel_requested = False
+        job.error = ""
+        job.started_at = None
+        job.finished_at = None
+        job.log = (job.log or "") + (
+            f"\n[retry] re-queued {_dt.now(_tz.utc).isoformat(timespec='seconds')}")
+        db.commit()
+        kwargs = dict(
+            video_path=str(src),
+            platform=(job.platform or "full_video_shorts_v4"),
+            frame=(job.frame_layout or "torn_card"),
+            db_session_factory=db_session_factory,
+            language=(job.language or "te"),
+            v4_trim_planner=(getattr(job, "v4_trim_planner", None) or "claude"),
+            v4_content_type=(getattr(job, "v4_content_type", None) or "auto"),
+            v4_image_provider=(getattr(job, "v4_image_provider", None) or "auto"),
+            v4_predefined_description=(getattr(job, "v4_predefined_description", None) or ""),
+            v4_output_format=(getattr(job, "v4_output_format", None) or "both"),
+            v4_effects_mode=(getattr(job, "v4_effects_mode", None) or "off"),
+            v4_theme=(getattr(job, "v4_theme", None) or ""),
+            v4_style_directives=(getattr(job, "v4_style_directives", None) or ""),
+            v4_director_engine=(getattr(job, "v4_director_engine", None) or "v4"),
+            v4_defer_render=bool(getattr(job, "v4_defer_render", False)),
+            v4_audio_first=bool(getattr(job, "v4_audio_first", False)),
+            v4_max_shorts=8,
+            fullform_layout=(getattr(job, "fullform_layout", None) or ""),
+        )
+    finally:
+        db.close()
+    if kwargs is None:
+        return {"job_id": job_id, "relaunched": False,
+                "error": "Could not prepare relaunch"}
+    run_pipeline(job_id=job_id, **kwargs)
+    return {"job_id": job_id, "relaunched": True, "status": "pending"}
+
+
 def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  db_session_factory, language: str = "te",
                  default_image: str = "",
@@ -341,6 +473,11 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  # Forwarded via KAIZER_V4_IMAGE_PROVIDER env. Ignored
                  # by non-V4 platforms.
                  v4_image_provider: str = "auto",
+                 # V4 only: content type / edit profile. "auto" = the
+                 # orchestrator classifies the transcript; an explicit
+                 # news/podcast/interview/vlog/generic is the operator's
+                 # wizard answer. Forwarded as KAIZER_V4_CONTENT_TYPE.
+                 v4_content_type: str = "auto",
                  # V4 only: operator-supplied bulletin description.
                  # When non-empty the orchestrator preserves the source
                  # video AS-IS (no Claude KEEP/CUT) and uses this text
@@ -355,6 +492,25 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  # non-V4 platforms. The orchestrator also persists the choice
                  # into canvas.json so editor re-renders honour it.
                  v4_output_format: str = "both",
+                 # V4 only: full-form effects mode ("auto" broadcast polish /
+                 # "rich" content-type pack look / "off"). Forwarded via
+                 # KAIZER_V4_EFFECTS_MODE. Ignored by non-V4 platforms.
+                 v4_effects_mode: str = "off",
+                 # V4 only: THEME PACK key ("" = classic look). Forwarded as
+                 # KAIZER_V4_THEME; the orchestrator stamps it on the canvas.
+                 v4_theme: str = "",
+                 # V4 only: the user's per-category effect picks ("edit using
+                 # THESE") — a JSON object {style_packs,transitions,frame_fx,
+                 # overlays,typography,story_category:[...]}. Empty = leave every
+                 # category to the AI Director. Forwarded via
+                 # KAIZER_V4_STYLE_DIRECTIVES; constrains the Director's vocab
+                 # per category (and forces it on when non-empty).
+                 v4_style_directives: str = "",
+                 # V4 only: which AI Director ENGINE ("v4" ours default |
+                 # "platform" ported 3-layer engine). Forwarded as
+                 # KAIZER_V4_DIRECTOR_ENGINE. Selects WHICH director runs;
+                 # WHETHER one runs stays with v4_effects_mode.
+                 v4_director_engine: str = "v4",
                  # V4 Stage 2: defer the up-front compose (edit-first; export on demand).
                  # Forwarded as KAIZER_V4_DEFER_RENDER. Default off.
                  v4_defer_render: bool = False,
@@ -364,7 +520,21 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                  # "Full form video" (16:9) custom template, e.g. "custom:<id>".
                  # Forwarded via KAIZER_V4_FULLFORM_LAYOUT; the orchestrator renders
                  # the full video through the custom engine instead of the bulletin.
-                 fullform_layout: str = ""):
+                 fullform_layout: str = "",
+                 # V4 audio-first: the narration AUDIO is the master track and
+                 # arrives as video_path (--source); the optional MUTED reference
+                 # b-roll comes via v4_ref_video_path. Forwarded as
+                 # KAIZER_V4_AUDIO_FIRST + KAIZER_V4_REF_VIDEO_PATH. Ignored by
+                 # non-V4 platforms.
+                 v4_audio_first: bool = False,
+                 v4_ref_video_path: Optional[str] = None,
+                 # Subject label per pre-selected bulletin image ("name-tag
+                 # contract"): {absolute_source_path: label}, built by
+                 # create_job from each picked asset's UserAsset.description.
+                 # Forwarded as KAIZER_BULLETIN_IMAGE_LABELS_B64 (b64 JSON)
+                 # so the orchestrator can stamp real subjects onto the pool
+                 # instead of filename stems.
+                 bulletin_image_labels: Optional[dict] = None):
     """Launch pipeline as subprocess, stream stdout into Job.log.
 
     - `default_image` (non-empty absolute path) → the pipeline uses this
@@ -424,18 +594,10 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                 print(f"[runner.v4] swept {swept} old render-output dir(s)", flush=True)
         except Exception as _exc:
             print(f"[runner.v4] render-output sweep skipped: {_exc}", flush=True)
-        venv_python = str(BASE_DIR.parent / "venv" / "Scripts" / "python.exe")
-        if not Path(venv_python).exists():
-            venv_python = sys.executable
-        cmd = [
-            venv_python, "-m", "pipeline_v4.orchestrator",
-            "--job-id", str(job_id),
-            "--source", video_path,
-            "--output-dir", str(out_dir),
-            "--language", language or "te",
-        ]
-        if default_logo:
-            cmd += ["--brand-logo", default_logo]
+        # Dev/SaaS → venv python -m pipeline_v4.orchestrator; frozen desktop
+        # build → this exe's "render" subcommand (identical flag tail).
+        cmd = build_v4_spawn_cmd(job_id, video_path, out_dir,
+                                 language or "te", default_logo or "")
         log_out = open(out_dir / "stdout.log", "w", encoding="utf-8")
         log_err = open(out_dir / "stderr.log", "w", encoding="utf-8")
         # CRITICAL on Windows: the subprocess inherits cp1252 for its
@@ -449,6 +611,15 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         }
         if bulletin_images:
             _env["KAIZER_BULLETIN_IMAGES"] = "|".join(p for p in bulletin_images if p)
+        if bulletin_image_labels:
+            # b64 JSON — Telugu/Hindi labels + Windows paths survive env
+            # passage without escaping issues (same trick as
+            # KAIZER_V4_PREDEFINED_DESCRIPTION).
+            import base64 as _b64
+            import json as _json
+            _env["KAIZER_BULLETIN_IMAGE_LABELS_B64"] = _b64.b64encode(
+                _json.dumps(bulletin_image_labels, ensure_ascii=False).encode("utf-8")
+            ).decode("ascii")
         # Studio background video the user picked in the new-job wizard.
         # The orchestrator reads these env vars and stamps them onto the
         # initial canvas.json so the first render uses them.
@@ -459,10 +630,15 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         # KEEP/CUT planner choice — forwarded to trim_engine._select_planner.
         # Validate here so a stale frontend can't pass garbage and silently
         # downgrade quality (the planner's own fallback covers env typos).
-        _planner = (v4_trim_planner or "claude").strip().lower()
-        if _planner not in {"claude", "gemini"}:
-            _planner = "claude"
-        _env["KAIZER_V4_TRIM_PLANNER"] = _planner
+        # Desktop (KAIZER_DESKTOP=1) with no ANTHROPIC_API_KEY: "claude"
+        # becomes "gemini" — see _resolve_trim_planner.
+        _env["KAIZER_V4_TRIM_PLANNER"] = _resolve_trim_planner(v4_trim_planner)
+        # Content type / edit profile — validate against the known set so a
+        # stale frontend can't smuggle garbage; unknown → "auto" (classify).
+        _ctype = (v4_content_type or "auto").strip().lower()
+        if _ctype not in {"auto", "news", "podcast", "interview", "vlog", "generic"}:
+            _ctype = "auto"
+        _env["KAIZER_V4_CONTENT_TYPE"] = _ctype
         # Image-provider pick. Same validation pattern.
         _imgp = (v4_image_provider or "auto").strip().lower()
         if _imgp not in {"auto", "gemini", "openai"}:
@@ -472,9 +648,42 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         # pattern so a stale frontend can't pass garbage. The orchestrator
         # falls back to canvas.output_format, then "both", if this is absent.
         _ofmt = (v4_output_format or "both").strip().lower()
-        if _ofmt not in {"both", "full-only", "shorts-only"}:
+        if _ofmt not in {"both", "full-only", "shorts-only", "trailer-only"}:
             _ofmt = "both"
         _env["KAIZER_V4_OUTPUT_FORMAT"] = _ofmt
+        # Effects-mode pick. Same validate-here pattern; "off" keeps the
+        # render byte-identical to a legacy job.
+        _efx = (v4_effects_mode or "off").strip().lower()
+        if _efx not in {"auto", "rich", "off"}:
+            _efx = "off"
+        _env["KAIZER_V4_EFFECTS_MODE"] = _efx
+        _thm = (v4_theme or "").strip().lower()
+        if _thm:
+            _env["KAIZER_V4_THEME"] = _thm
+        # END-TO-END WIRING (operator): "Cinematic" in the wizard IS the
+        # AI Director for that job — per-story mood packs, per-joint
+        # transitions, tone listening. No hidden env needed by the user.
+        if _efx == "rich" and "KAIZER_V4_DIRECTOR" not in _env:
+            _env["KAIZER_V4_DIRECTOR"] = "1"
+        # Director ENGINE pick ("v4" ours default | "platform" ported).
+        # Selects WHICH director plans; the wiring above stays untouched.
+        _deng = (v4_director_engine or "v4").strip().lower()
+        if _deng not in {"v4", "platform"}:
+            _deng = "v4"
+        _env["KAIZER_V4_DIRECTOR_ENGINE"] = _deng
+        # User-directed effect picks ("edit using THESE"). Validate that it
+        # parses to a JSON object before forwarding so a stale/garbage value
+        # can't reach the orchestrator; the picks constrain the AI Director's
+        # per-category vocabulary (and force it on) — empty categories stay
+        # AI-decided. Invalid/empty → not forwarded (full AI autonomy).
+        _sdir = (v4_style_directives or "").strip()
+        if _sdir:
+            try:
+                _sd_obj = json.loads(_sdir)
+                if isinstance(_sd_obj, dict) and any(_sd_obj.values()):
+                    _env["KAIZER_V4_STYLE_DIRECTIVES"] = json.dumps(_sd_obj)
+            except Exception:
+                pass
         # V4 Stage 2: per-job defer toggle (a globally-set KAIZER_V4_DEFER_RENDER is already
         # inherited via {**os.environ}). When set, the orchestrator skips the up-front compose.
         if v4_defer_render:
@@ -494,12 +703,29 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
         _ffl = (fullform_layout or "").strip().lower()
         if _ffl.startswith("custom:") and _ffl.split(":", 1)[1].isdigit():
             _env["KAIZER_V4_FULLFORM_LAYOUT"] = _ffl
+        elif _ffl.startswith("lib:"):
+            # Designed layout from the library — validate the key against
+            # the RENDERABLE subset (stale frontends can't pass garbage).
+            try:
+                from pipeline_v4.layout_library import RENDERABLE
+                if _ffl[4:] in RENDERABLE:
+                    _env["KAIZER_V4_FULLFORM_LAYOUT"] = _ffl
+            except Exception:
+                pass
         # Shorts-per-job ceiling (default 8; operator can opt into more).
         try:
             _ms = int(v4_max_shorts or 8)
         except (TypeError, ValueError):
             _ms = 8
         _env["KAIZER_V4_MAX_SHORTS"] = str(max(1, min(50, _ms)))
+
+        # V4 audio-first: the narration is the --source (video_path); forward
+        # the optional muted reference b-roll so the orchestrator muxes it under
+        # the narration. No ref video → the orchestrator uses fullscreen images.
+        if v4_audio_first:
+            _env["KAIZER_V4_AUDIO_FIRST"] = "1"
+            if v4_ref_video_path and str(v4_ref_video_path).strip():
+                _env["KAIZER_V4_REF_VIDEO_PATH"] = str(v4_ref_video_path)
 
         # Predefined description. Encoded as base64-utf8 because env
         # vars on Windows can't reliably carry newlines + non-ASCII
@@ -531,9 +757,69 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
             _startup_once()
             _acquire_render_slot(job_id)
             try:
+                # Pause/cancel gate: a job paused or cancelled WHILE it was
+                # waiting in the queue must NOT spawn a render when its turn
+                # finally comes. Re-read the fresh row post-acquire; if the
+                # user held or stopped it, quietly give up the slot (the
+                # ``finally`` below releases it) so the next job proceeds.
+                try:
+                    _gdb = db_session_factory()
+                    from models import Job as _JobGate
+                    _gj = _gdb.query(_JobGate).filter(_JobGate.id == job_id).first()
+                    _gstatus = (_gj.status or "") if _gj else ""
+                    _gcancel = bool(getattr(_gj, "cancel_requested", False)) if _gj else False
+                    _gdb.close()
+                    if _gstatus in ("paused", "cancelled") or _gcancel:
+                        print(f"[runner.v4] job {job_id} is '{_gstatus or 'cancel_requested'}' "
+                              f"before spawn -- skipping render", flush=True)
+                        log_out.close(); log_err.close()
+                        return
+                except Exception as _gexc:
+                    print(f"[runner.v4] pause/cancel gate soft-failed for job {job_id}: {_gexc}",
+                          flush=True)
                 if not _disk_guard_or_fail(job_id, db_session_factory):
                     log_out.close(); log_err.close()
                     return
+                # Idempotency guard: never spawn a 2nd orchestrator for a job
+                # that's already rendering. Prevents the duplicate-render
+                # collision that hangs jobs (a shared-DB backend, a retry, or a
+                # double-submit). Machine-wide check via psutil.
+                try:
+                    import psutil as _ps
+                    import re as _re
+                    # Word-boundary match: the old substring test
+                    # (f"--job-id {job_id}" in cmdline) made job 1 match a
+                    # job-10/-100 render and silently SKIP a legit spawn.
+                    # (?!\d) stops the id from matching a longer number.
+                    _job_re = _re.compile(
+                        r"--job-id\s+" + _re.escape(str(job_id)) + r"(?!\d)")
+                    for _p in _ps.process_iter(["pid", "cmdline"]):
+                        try:
+                            _argv = list(_p.info.get("cmdline") or [])
+                            _cl = " ".join(_argv)
+                        except Exception:
+                            continue
+                        # Frozen desktop builds spawn "<exe> render --job-id N ..."
+                        # (no "pipeline_v4.orchestrator" in the cmdline) — match
+                        # both shapes or the duplicate guard is blind on desktop.
+                        _is_render_proc = ("pipeline_v4.orchestrator" in _cl
+                                           or " render --job-id" in _cl)
+                        # Exact-token check first (argv is a real list on
+                        # psutil/Windows); regex fallback covers one-string
+                        # cmdlines. Both are word-exact — no 1-vs-10 collision.
+                        _same_job = any(
+                            _tok == "--job-id" and _i + 1 < len(_argv)
+                            and str(_argv[_i + 1]).strip() == str(job_id)
+                            for _i, _tok in enumerate(_argv)
+                        ) or bool(_job_re.search(_cl))
+                        if (_is_render_proc and _same_job
+                                and _p.info["pid"] != os.getpid()):
+                            print(f"[runner.v4] job {job_id} already rendering (pid {_p.info['pid']}) "
+                                  f"-- skipping duplicate spawn", flush=True)
+                            log_out.close(); log_err.close()
+                            return
+                except Exception:
+                    pass
                 proc = subprocess.Popen(
                     cmd, cwd=str(BASE_DIR),
                     stdout=log_out, stderr=log_err,
@@ -550,6 +836,14 @@ def run_pipeline(job_id: int, video_path: str, platform: str, frame: str,
                     log_out.close(); log_err.close()
             finally:
                 _release_render_slot(job_id)
+                # Audio-first: drop the optional reference b-roll upload — a raw
+                # input we no longer need after the render (avoids leaking it in
+                # MEDIA_ROOT/uploads/). The muxed master lives in the output dir.
+                try:
+                    if v4_ref_video_path and os.path.exists(v4_ref_video_path):
+                        os.remove(v4_ref_video_path)
+                except OSError:
+                    pass
         threading.Thread(target=_v4_worker, daemon=True).start()
         return   # V4 worker queued; subprocess runs when semaphore is available
 
