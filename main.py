@@ -194,6 +194,10 @@ def _migrate_schema():
              "ALTER TABLE live_streams ADD COLUMN apply_branding BOOLEAN NOT NULL DEFAULT FALSE"),
             ("live_streams", "branded_path",
              "ALTER TABLE live_streams ADD COLUMN branded_path VARCHAR(512)"),
+            ("onboarding_profiles", "channel_id",
+             "ALTER TABLE onboarding_profiles ADD COLUMN channel_id VARCHAR(64)"),
+            ("onboarding_profiles", "channel_title",
+             "ALTER TABLE onboarding_profiles ADD COLUMN channel_title VARCHAR(200)"),
         ]
         for _tbl, _col, _sql in _adds:
             if _tbl in _inspCI.get_table_names():

@@ -1643,6 +1643,12 @@ class OnboardingProfile(Base):
     website      = Column(String(500), nullable=True)   # the one optional field
     languages    = Column(String(200), nullable=True)   # comma-separated codes
     channel_link = Column(String(500), nullable=True)
+    #: Resolved from YouTube when the channel could be confirmed. NULL means
+    #: "not verified" -- a missing API key, a spent quota or a legacy /c/ URL
+    #: with no cheap resolver -- never "the channel is fake"; a channel proven
+    #: not to exist is refused at the door and no row is written.
+    channel_id    = Column(String(64),  nullable=True)
+    channel_title = Column(String(200), nullable=True)
     # "form"   filled in by the person
     # "legacy" written by the backfill for an account that predates this
     source       = Column(String(12), nullable=False, default="form")

@@ -132,6 +132,79 @@ def normalise_channel_link(raw: str) -> str:
         "https://youtube.com/channel/UC...")
 
 
+
+def verify_channel(canonical: str) -> dict:
+    """Ask YouTube whether this channel exists.
+
+    Returns ``{"ok": bool, "definitely_missing": bool, "id": str, "title": str}``.
+
+    FAILS OPEN BY DESIGN. ``definitely_missing`` is True only when YouTube
+    answered and said there is no such channel. A missing key, a spent quota,
+    a timeout, a network error or a URL shape with no cheap resolver all come
+    back ok=False, definitely_missing=False -- accept the link, record nothing.
+
+    The form cannot be skipped. If an outage at Google could refuse a
+    submission, an outage at Google would stop people signing up.
+
+    Cost: channels.list, 1 quota unit. search.list (100) is never used --
+    after normalise_channel_link we always hold a handle, an id or a
+    username, so the cheap call always applies.
+    """
+    blank = {"ok": False, "definitely_missing": False, "id": "", "title": ""}
+
+    # Kill switch. forHandle tested case-insensitive and reliable, so the
+    # refusal is safe -- but this check sits in front of a form nobody can
+    # skip, so if it ever DID start refusing real channels the fix must be an
+    # env var, not a code change and a deploy.
+    import os as _os
+    if (_os.environ.get("KAIZER_ONBOARDING_VERIFY_CHANNEL", "1").strip().lower()
+            in ("0", "false", "no", "off")):
+        return blank
+    try:
+        from routers.yt_lookup import _fetch_by_handle, _fetch_by_id, _yt_api_key
+    except Exception:                                    # noqa: BLE001
+        return blank
+
+    key = _yt_api_key()
+    if not key:
+        return blank                                     # no key -> cannot ask
+
+    path = canonical.rsplit("youtube.com/", 1)[-1]
+    item = None
+    try:
+        if path.startswith("@"):
+            item = _fetch_by_handle(path, key)
+        elif path.startswith("channel/"):
+            item = _fetch_by_id(path.split("/", 1)[1], key)
+        elif path.startswith("user/"):
+            import requests
+            r = requests.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "snippet", "forUsername": path.split("/", 1)[1],
+                        "key": key},
+                timeout=10,
+            )
+            item = (r.json().get("items") or [None])[0] if r.ok else None
+        else:
+            # /c/Name has no cheap resolver -- only search.list, at 100 units
+            # against a 10,000/day quota. Not worth 100x the cost to check a
+            # legacy URL form, so it is accepted unverified.
+            return blank
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[onboarding] channel check could not run ({exc}) -- accepting")
+        return blank
+
+    if item is None:
+        # YouTube answered, and there is no such channel. This is the ONLY
+        # case that refuses a submission.
+        return {"ok": False, "definitely_missing": True, "id": "", "title": ""}
+
+    snip = item.get("snippet") or {}
+    return {"ok": True, "definitely_missing": False,
+            "id": str(item.get("id") or ""),
+            "title": str(snip.get("title") or "")[:200]}
+
+
 def _clean(payload: OnboardingIn) -> dict:
     """Validate every field, and say precisely which one is wrong.
 
@@ -169,6 +242,15 @@ def _clean(payload: OnboardingIn) -> dict:
     # the messages that name the actual mistake.
     link = normalise_channel_link(payload.channel_link)
 
+    # Shape is not existence: "@kaizernewss" with a typo passes every pattern
+    # and resolves to nothing. Ask YouTube. Refuse ONLY on a definite answer
+    # that the channel is not there -- see verify_channel on why anything
+    # else has to be accepted.
+    _chan = verify_channel(link)
+    if _chan["definitely_missing"]:
+        bad("We could not find that channel on YouTube. Please check the "
+            "address — open your channel and copy it from the address bar.")
+
     site = (payload.website or "").strip()
     if site:                               # optional -- only checked if given
         if not site.lower().startswith(("http://", "https://")):
@@ -180,7 +262,9 @@ def _clean(payload: OnboardingIn) -> dict:
 
     return {"full_name": name, "mobile": mobile, "company_name": company,
             "email": email, "languages": ",".join(langs),
-            "channel_link": link, "website": site}
+            "channel_link": link, "website": site,
+            # Empty when unverified -- never a claim that the channel is fake.
+            "channel_id": _chan["id"], "channel_title": _chan["title"]}
 
 
 def _out(row: Optional[models.OnboardingProfile]) -> dict:
@@ -196,6 +280,8 @@ def _out(row: Optional[models.OnboardingProfile]) -> dict:
             "website":      row.website or "",
             "languages":    [l for l in (row.languages or "").split(",") if l],
             "channel_link": row.channel_link or "",
+            "channel_id":    getattr(row, "channel_id", "") or "",
+            "channel_title": getattr(row, "channel_title", "") or "",
             "source":       row.source or "form",
         },
     }

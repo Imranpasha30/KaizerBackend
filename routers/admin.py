@@ -2978,7 +2978,9 @@ def onboarding_submissions(
             "email":        prof.email or "",
             "website":      prof.website or "",
             "languages":    [c for c in (prof.languages or "").split(",") if c],
-            "channel_link": prof.channel_link or "",
+            "channel_link":  prof.channel_link or "",
+            "channel_id":    getattr(prof, "channel_id", "") or "",
+            "channel_title": getattr(prof, "channel_title", "") or "",
             "submitted_at": (prof.updated_at or prof.created_at).isoformat()
                             if (prof.updated_at or prof.created_at) else None,
         })
