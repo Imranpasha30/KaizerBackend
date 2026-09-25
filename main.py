@@ -1186,9 +1186,17 @@ if _DESKTOP:
             )
         return await call_next(request)
 else:
+    # KAIZER_CORS_ORIGINS: comma-separated explicit allowlist. Falls back to
+    # the production web app only -- narrower than the old "*" so the API
+    # only answers browser-origin requests from domains we control.
+    _cors_env = os.getenv("KAIZER_CORS_ORIGINS", "").strip()
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or [
+        "https://kaizerx.com",
+        "https://www.kaizerx.com",
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
