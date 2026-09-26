@@ -27,9 +27,8 @@ IDS = ["streamer", "url_ingest"]
 
 @pytest.fixture(autouse=True)
 def _no_inherited_override(monkeypatch):
-    """This machine may set either variable; the tests must not read it."""
+    """This machine may set the override; the tests must not read it."""
     monkeypatch.delenv("YTDLP_BIN", raising=False)
-    monkeypatch.delenv("KAIZER_YTDLP_BIN", raising=False)
 
 
 @pytest.mark.parametrize("mod", MODULES, ids=IDS)

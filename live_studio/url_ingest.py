@@ -37,6 +37,9 @@ from live_studio import uploads as live_uploads
 # on 4K/8K sources. 1080p is YouTube's max ingest tier for most
 # accounts anyway.
 # The same ffmpeg the streamer uses. yt-dlp needs it for HLS sources.
+from live_studio.ytdlp_auth import (ytdlp_auth_args as _ytdlp_auth_args,
+                                    describe as _ytdlp_describe)
+
 _FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
                or os.environ.get("KAIZER_FFMPEG_BIN")
                or _shutil.which("ffmpeg")
@@ -48,8 +51,11 @@ _FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
 # it is not, and every URL broadcast died with "[Errno 2] No such file or
 # directory: 'yt-dlp'" after the YouTube broadcast had already been minted.
 def _resolve_ytdlp() -> list:
-    explicit = (os.environ.get("YTDLP_BIN")
-                or os.environ.get("KAIZER_YTDLP_BIN"))
+    # YTDLP_BIN only. KAIZER_YTDLP_BIN was added for symmetry with
+    # KAIZER_FFMPEG_BIN, but that name is read by five existing modules
+    # while this one was read here and written nowhere -- which the repo's
+    # own orphan-env sweep correctly rejected.
+    explicit = os.environ.get("YTDLP_BIN")
     if explicit:
         return [explicit]
     found = _shutil.which("yt-dlp")
@@ -125,6 +131,10 @@ def _ytdlp_download(url: str, out_path: str) -> tuple[bool, str]:
     # for (no auto-numbering of duplicates).
     cmd = [
         *_YTDLP_CMD,
+        # YouTube answers anonymous extraction from datacenter IPs with
+        # "Sign in to confirm you're not a bot", so production fails on a URL
+        # the operator's desktop fetches fine. Empty unless configured.
+        *_ytdlp_auth_args(),
         # HLS sources need ffmpeg; yt-dlp looks on PATH unless told.
         *(["--ffmpeg-location", _FFMPEG_BIN] if os.path.isfile(_FFMPEG_BIN) else []),
         "--no-progress",
@@ -136,6 +146,9 @@ def _ytdlp_download(url: str, out_path: str) -> tuple[bool, str]:
         "-o", out_path,
         url,
     ]
+    # Presence, never content -- so 'I set the cookie' and 'the container
+    # received it' stop being the same sentence.
+    print(f"[live_studio] yt-dlp auth: {_ytdlp_describe()}", flush=True)
     try:
         proc = subprocess.run(
             cmd,
