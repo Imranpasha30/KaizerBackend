@@ -85,6 +85,7 @@ from routers.work_monitor import router as work_monitor_router
 from routers.postiz import router as postiz_router
 from routers.yt_lookup import router as yt_lookup_router
 from routers.onboarding import router as onboarding_router
+from routers.help import router as help_router
 from routers.analytics_ai import router as analytics_ai_router
 from routers.bulletin_images import router as bulletin_images_router
 from routers.express_mode import router as express_mode_router
@@ -1274,6 +1275,7 @@ if not _DESKTOP:
     app.include_router(postiz_router)           # Cross-platform scheduling via Postiz (admin-only)
     app.include_router(yt_lookup_router)
     app.include_router(onboarding_router)        # one-time details form on a new account's first sign-in        # YouTube channel lookup for Style References (auth'd)
+    app.include_router(help_router)        # Help Centre: guides streamed from R2, not bundled
     app.include_router(analytics_ai_router)     # AI-powered Insights — coach reports + any-channel compare (auth'd + rate-limited)
     app.include_router(express_mode_router)     # Express Mode — one-click auto-publish (Whisper+Claude+Postiz)
     app.include_router(heygen_router)           # HeyGen avatar generation for Trending (replaces Veo 3)
