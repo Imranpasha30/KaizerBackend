@@ -25,6 +25,12 @@ asset URL. So the catalogue points assets at the HOSTED api instead
 app. A <video src> and an <a href> are ordinary navigations, so no CORS
 preflight and no IPC bridge is involved.
 
+KEYS ARE UNPREFIXED on purpose. R2Storage normally prepends
+R2_KEY_PREFIX so DEV (`local/`) and production (`prod/`) cannot tread on
+each other. Guides are not per-environment -- there is one walkthrough and
+everyone reads it -- so they live at a bare `help/...` and this router asks
+for that key directly.
+
 ADDING A GUIDE is one entry in GUIDES below plus an upload to the matching key.
 No frontend change, and nothing to rebuild on the desktop.
 """
@@ -211,8 +217,15 @@ def get_asset(asset_id: str, request: Request, download: bool = False):
     if callable(client):
         try:
             extra = {"Range": rng} if rng else {}
+            # NOT provider._k(): that prepends R2_KEY_PREFIX, which is how
+            # environments avoid treading on each other -- DEV writes under
+            # `local/`, production under `prod/`. Right for renders, which
+            # belong to one environment's rows; wrong for guides, of which
+            # there is ONE copy that DEV, production and the desktop all read.
+            # Prefixing them is how the first deploy 404'd: the objects were
+            # at local/help/... and production looked under prod/help/...
             obj = provider._get_client().get_object(
-                Bucket=provider.bucket, Key=provider._k(asset["key"]), **extra)
+                Bucket=provider.bucket, Key=asset["key"], **extra)
         except Exception as exc:                               # noqa: BLE001
             # A key that is missing, or a range past the end.
             raise HTTPException(
