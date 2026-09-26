@@ -131,7 +131,12 @@ def _mark_failed(stream_ids: list[int], reason: str) -> None:
                 continue
             row.status = "failed"
             row.error = reason[:2000]
-            row.message = "URL ingest failed"
+            # The reason, not the category: "URL ingest failed" told the
+            # operator only that the thing that failed was the thing that
+            # failed. yt-dlp's own words are what identify the fault.
+            row.message = ("failed: " + " ".join(str(reason).split()))[:512]
+            print(f"[live_studio] STREAM {sid} -> failed | via url_ingest"
+                  f" | err={' '.join(str(reason).split())[:2000]}", flush=True)
         sess.commit()
     finally:
         sess.close()

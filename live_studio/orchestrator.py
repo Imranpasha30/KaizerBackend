@@ -81,16 +81,55 @@ def request_cancel(stream_id: int) -> bool:
 
 def _update(stream_id: int, **fields) -> None:
     """Patch a LiveStream row. Owns its own session so it doesn't
-    block on whatever else is happening in the request thread."""
+    block on whatever else is happening in the request thread.
+
+    Also does two things for every terminal status, here rather than at the
+    seven call sites so the eighth cannot forget:
+
+    * LOGS the reason. The `error` was only ever written to Postgres, and a
+      hosted deployment's logs come from stdout, so on production the reason
+      for a failure was unreachable.
+
+    * REPLACES A STALE `message`. The UI renders `message`, and a failure that
+      passed only status+error left whatever step ran last still showing --
+      which is how a failed row came to read "queued - waiting for an
+      available broadcast slot" long after it had stopped queueing.
+    """
     sess = SessionLocal()
     try:
         row = sess.query(models.LiveStream).get(stream_id)
         if not row:
             return
+
+        # A failure that carries a reason but no message would otherwise leave
+        # the previous step's message on screen, describing something that is
+        # no longer true.
+        if (fields.get("status") == "failed" and fields.get("error")
+                and not fields.get("message")):
+            fields["message"] = ("failed: "
+                                 + " ".join(str(fields["error"]).split()))[:512]
+
         for k, v in fields.items():
             if hasattr(row, k):
                 setattr(row, k, v)
         sess.commit()
+
+        status = fields.get("status")
+        if status in ("failed", "canceled", "done"):
+            # ONE line per event: log collectors split on newlines, and a
+            # reason spread over five lines is a reason nobody greps out.
+            err = str(fields.get("error") or getattr(row, "error", "") or "")
+            msg = str(fields.get("message") or getattr(row, "message", "") or "")
+            print(
+                f"[live_studio] STREAM {stream_id} -> {status}"
+                f" | channel={getattr(row, 'channel_id', None)}"
+                f" | batch={getattr(row, 'batch_id', None)}"
+                f" | source={getattr(row, 'source_url', None) or 'upload'}"
+                f" | broadcast={getattr(row, 'yt_broadcast_id', None)}"
+                f" | msg={' '.join(msg.split())[:200]}"
+                f" | err={' '.join(err.split())[:2000] or '(none recorded)'}",
+                flush=True,
+            )
     finally:
         sess.close()
 

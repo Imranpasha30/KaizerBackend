@@ -220,7 +220,10 @@ def recover_pending_streams() -> dict:
                 row.error  = ("backend restarted mid-broadcast; no R2 backup "
                               "available — please re-upload and retry")
                 row.finished_at = now
+                row.message = ("failed: " + " ".join(str(row.error).split()))[:512]
                 sess.commit()
+                print(f"[live_studio] STREAM {row.id} -> failed | via r2_backup"
+                      f" | err={' '.join(str(row.error).split())[:2000]}", flush=True)
                 abandoned += 1
                 continue
 
@@ -232,7 +235,10 @@ def recover_pending_streams() -> dict:
                 row.status = "failed"
                 row.error  = "R2 backup present but download failed; please retry"
                 row.finished_at = now
+                row.message = ("failed: " + " ".join(str(row.error).split()))[:512]
                 sess.commit()
+                print(f"[live_studio] STREAM {row.id} -> failed | via r2_backup"
+                      f" | err={' '.join(str(row.error).split())[:2000]}", flush=True)
                 abandoned += 1
                 continue
 
