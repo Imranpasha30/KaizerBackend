@@ -19,6 +19,7 @@ no exception leaks to the request handler.
 from __future__ import annotations
 
 import os
+import sys as _sys
 import shutil as _shutil
 import re
 import subprocess
@@ -40,6 +41,37 @@ _FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
                or os.environ.get("KAIZER_FFMPEG_BIN")
                or _shutil.which("ffmpeg")
                or "ffmpeg")
+
+# ── yt-dlp, RESOLVED rather than hoped for ───────────────────────────
+# A bare "yt-dlp" resolves only if the venv's bin directory is exported on
+# PATH for the CHILD process. On the buildpack deploy that serves production
+# it is not, and every URL broadcast died with "[Errno 2] No such file or
+# directory: 'yt-dlp'" after the YouTube broadcast had already been minted.
+def _resolve_ytdlp() -> list:
+    explicit = (os.environ.get("YTDLP_BIN")
+                or os.environ.get("KAIZER_YTDLP_BIN"))
+    if explicit:
+        return [explicit]
+    found = _shutil.which("yt-dlp")
+    if found:
+        return [found]
+    # The console script is missing, but the PACKAGE may still be importable
+    # -- the normal state of a venv whose bin dir is not on the child's PATH.
+    # `python -m yt_dlp` is the same CLI in the same kind of subprocess; it is
+    # NOT yt-dlp's in-process Python API, which is what _ytdlp_download's
+    # docstring warns against.
+    try:
+        import importlib.util
+        if importlib.util.find_spec("yt_dlp") is not None:
+            return [_sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        pass
+    # Nothing found. Keep the bare name so the failure names itself.
+    return ["yt-dlp"]
+
+
+_YTDLP_CMD = _resolve_ytdlp()
+
 
 _YTDLP_FORMAT = "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1080][vcodec^=avc1]+ba/b[height<=1080][vcodec^=avc1]/bv*[height<=1080]+ba/b"
 
@@ -92,7 +124,7 @@ def _ytdlp_download(url: str, out_path: str) -> tuple[bool, str]:
     # Cap to 1080p and force the merged output to be the path we asked
     # for (no auto-numbering of duplicates).
     cmd = [
-        "yt-dlp",
+        *_YTDLP_CMD,
         # HLS sources need ffmpeg; yt-dlp looks on PATH unless told.
         *(["--ffmpeg-location", _FFMPEG_BIN] if os.path.isfile(_FFMPEG_BIN) else []),
         "--no-progress",

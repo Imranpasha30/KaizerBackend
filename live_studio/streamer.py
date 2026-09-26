@@ -32,6 +32,7 @@ isn't H.264 we'd need to transcode; v1 assumes user uploads MP4/H.264.
 from __future__ import annotations
 
 import os
+import sys as _sys
 import shutil as _shutil
 import re
 import subprocess
@@ -48,6 +49,37 @@ _FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
                or os.environ.get("KAIZER_FFMPEG_BIN")
                or _shutil.which("ffmpeg")
                or "ffmpeg")
+
+# ── yt-dlp, RESOLVED rather than hoped for ───────────────────────────
+# A bare "yt-dlp" resolves only if the venv's bin directory is exported on
+# PATH for the CHILD process. On the buildpack deploy that serves production
+# it is not, and every URL broadcast died with "[Errno 2] No such file or
+# directory: 'yt-dlp'" after the YouTube broadcast had already been minted.
+def _resolve_ytdlp() -> list:
+    explicit = (os.environ.get("YTDLP_BIN")
+                or os.environ.get("KAIZER_YTDLP_BIN"))
+    if explicit:
+        return [explicit]
+    found = _shutil.which("yt-dlp")
+    if found:
+        return [found]
+    # The console script is missing, but the PACKAGE may still be importable
+    # -- the normal state of a venv whose bin dir is not on the child's PATH.
+    # `python -m yt_dlp` is the same CLI in the same kind of subprocess; it is
+    # NOT yt-dlp's in-process Python API, which is what _ytdlp_download's
+    # docstring warns against.
+    try:
+        import importlib.util
+        if importlib.util.find_spec("yt_dlp") is not None:
+            return [_sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        pass
+    # Nothing found. Keep the bare name so the failure names itself.
+    return ["yt-dlp"]
+
+
+_YTDLP_CMD = _resolve_ytdlp()
+
 _TIME_RE    = re.compile(r"time=(-?\d+):(\d+):(\d+\.?\d*)")
 
 # On Windows, ``CTRL_BREAK_EVENT`` (used by ``_terminate`` to stop a broadcast)
@@ -227,7 +259,7 @@ def push_passthrough(
     # best ≤1080p video+audio merged into an fragmented mp4 so ffmpeg
     # can consume it without seeking (pipes aren't seekable).
     ytdlp_args = [
-        "yt-dlp",
+        *_YTDLP_CMD,
         "--no-progress", "--no-colors", "--no-warnings",
         "--no-part",
         "-f", "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1080][vcodec^=avc1]+ba/b[height<=1080][vcodec^=avc1]/bv*[height<=1080]+ba/b",
@@ -266,7 +298,10 @@ def push_passthrough(
             creationflags=_NEW_GROUP_FLAGS,
         )
     except FileNotFoundError as exc:
-        raise StreamerError(f"yt-dlp not on PATH: {exc}")
+        raise StreamerError(
+            f"yt-dlp could not be run as {' '.join(_YTDLP_CMD)!r}: {exc}. "
+            f"Install it on the server (pip install yt-dlp) or set YTDLP_BIN "
+            f"to its full path.")
 
     try:
         ff = subprocess.Popen(

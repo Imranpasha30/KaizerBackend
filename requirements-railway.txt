@@ -120,3 +120,9 @@ boto3==1.42.96
 botocore==1.42.96
 s3transfer==0.16.1
 jmespath==1.1.0
+
+# Live Studio fetches a source URL with the yt-dlp CLI. Present in
+# requirements.txt but NOT here, so every URL broadcast on the deploy
+# that builds from this file failed with "yt-dlp not on PATH" after
+# the YouTube broadcast had already been minted.
+yt-dlp==2026.2.21
