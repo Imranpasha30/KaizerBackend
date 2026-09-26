@@ -305,7 +305,20 @@ def finalize_broadcast(
     # ── 1) Wait briefly for YT to register the stream as "active",
     # otherwise the transition rejects with "errorStreamInactive".
     # We don't block forever — 30 s is plenty after ffmpeg started.
-    _wait_for_stream_active(yt, broadcast_id, timeout_s=30)
+    # THE RESULT IS READ. Discarding it meant a broadcast that was never fed
+    # was still asked to complete, and the operator was shown a 403
+    # invalidTransition about a transition when the encoder is what failed.
+    went_live = _wait_for_stream_active(yt, broadcast_id, timeout_s=30)
+    if not went_live:
+        _safe_delete_broadcast(yt, broadcast_id)
+        raise StreamNeverActive(
+            "Nothing reached YouTube: the broadcast was created and the stream "
+            "key issued, but no video arrived at the ingest within 30s, so it "
+            "never went live. The encoder is what failed - usually the source "
+            "could not be fetched (for a URL source, check the stream's error "
+            "for the yt-dlp reason), ffmpeg exited early, or the RTMP endpoint "
+            "was unreachable from this server."
+        )
 
     # ── 2) Transition to "complete" — closes the live broadcast and
     # locks the recording as a past-stream video on the channel.
@@ -329,7 +342,10 @@ def finalize_broadcast(
         # YT often returns 403 redundantTransition when auto-stop
         # already fired (because the encoder cleanly stopped sending
         # frames). That's success, not a failure.
-        if _is_redundant_transition(e):
+        if _is_redundant_transition(e) or _is_invalid_transition(e):
+            # Reached only having CONFIRMED it went live, so either
+            # reason means auto-stop already closed it: the normal
+            # ending, not a failure.
             print(f"[rtmp-provider] broadcast {broadcast_id} already complete (auto-stop fired)")
         else:
             raise _wrap_http(e, "liveBroadcasts.transition(complete)") from e
@@ -422,6 +438,18 @@ def _wrap_http(e: HttpError, op: str) -> RtmpProviderError:
     if status in _TRANSIENT_STATUS or reason in _TRANSIENT_REASONS:
         return TransientRtmpError(msg)
     return RtmpProviderError(msg)
+
+
+class StreamNeverActive(RuntimeError):
+    """Nothing ever reached YouTube's ingest. Raised instead of letting
+    transition(complete) fail with invalidTransition, which names the symptom:
+    a broadcast that was never fed stays `ready`, and `ready` -> `complete` is
+    not a legal move. The encoder is what failed, not the transition."""
+
+
+def _is_invalid_transition(e: HttpError) -> bool:
+    _, reason = _parse_error(e)
+    return reason == "invalidTransition"
 
 
 def _is_redundant_transition(e: HttpError) -> bool:

@@ -32,6 +32,7 @@ isn't H.264 we'd need to transcode; v1 assumes user uploads MP4/H.264.
 from __future__ import annotations
 
 import os
+import shutil as _shutil
 import re
 import subprocess
 import threading
@@ -40,7 +41,13 @@ from collections import deque
 from typing import Callable, Optional
 
 
-_FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+# Resolved to a REAL PATH, not a bare name: it is handed to yt-dlp with
+# --ffmpeg-location for HLS sources, and a bare "ffmpeg" would fail the
+# isfile() guard and silently omit the flag.
+_FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
+               or os.environ.get("KAIZER_FFMPEG_BIN")
+               or _shutil.which("ffmpeg")
+               or "ffmpeg")
 _TIME_RE    = re.compile(r"time=(-?\d+):(\d+):(\d+\.?\d*)")
 
 # On Windows, ``CTRL_BREAK_EVENT`` (used by ``_terminate`` to stop a broadcast)
@@ -223,7 +230,7 @@ def push_passthrough(
         "yt-dlp",
         "--no-progress", "--no-colors", "--no-warnings",
         "--no-part",
-        "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
+        "-f", "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1080][vcodec^=avc1]+ba/b[height<=1080][vcodec^=avc1]/bv*[height<=1080]+ba/b",
         "--merge-output-format", "mp4",
         "--postprocessor-args", "ffmpeg:-movflags +frag_keyframe+empty_moov+default_base_moof",
         "-o", "-",
@@ -251,7 +258,10 @@ def push_passthrough(
     try:
         ytdlp = subprocess.Popen(
             ytdlp_args,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            # NOT DEVNULL: when yt-dlp cannot fetch the source it says
+            # exactly why here, and discarding it left only
+            # ffmpeg's "Invalid data ... pipe:0".
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0,
             creationflags=_NEW_GROUP_FLAGS,
         )
@@ -281,6 +291,22 @@ def push_passthrough(
     discovered_dur_sec = 0.0
     started_at = time.time()
     stderr_tail: deque = deque(maxlen=80)
+    # yt-dlp's own words, kept for the error message -- AND, just as
+    # importantly, READ AT ALL. stderr is a pipe; a pipe nobody drains fills at
+    # 64 KB and blocks the writer for ever. Turning stderr into a pipe without
+    # this thread is what hung stream 123: three live processes, 0 CPU, and an
+    # ingest reporting noData.
+    _ytdlp_tail: deque = deque(maxlen=20)
+
+    def _ytdlp_pump() -> None:
+        if not ytdlp.stderr:
+            return
+        for raw in iter(ytdlp.stderr.readline, b""):
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                _ytdlp_tail.append(line)
+                if extra_log_cb:
+                    extra_log_cb(("yt-dlp: " + line)[-300:])
 
     _DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)")
 
@@ -317,6 +343,9 @@ def push_passthrough(
     pump = threading.Thread(target=_stderr_pump, name="ffmpeg-stderr-pass",
                             daemon=True)
     pump.start()
+    ytpump = threading.Thread(target=_ytdlp_pump, name="ytdlp-stderr",
+                              daemon=True)
+    ytpump.start()
 
     cancelled_by_user = False
     try:
@@ -349,7 +378,20 @@ def push_passthrough(
 
     # Pump already drained stderr — use the captured ring buffer.
     tail = "\n".join(stderr_tail)[-900:]
-    raise StreamerError(f"ffmpeg exited {code} (passthrough): {tail or '(no stderr captured)'}")
+    # yt-dlp's words are the diagnosis when ffmpeg's complaint is only that
+    # stdin held nothing usable.
+    yt_tail = " | ".join(list(_ytdlp_tail)[-4:])
+    yt_rc = ytdlp.poll()
+    if yt_tail and ("pipe:0" in (tail or "") or "Invalid data" in (tail or "")
+                    or (yt_rc not in (0, None))):
+        raise StreamerError(
+            f"the source could not be fetched (yt-dlp exited {yt_rc}): {yt_tail} "
+            f"- ffmpeg then had nothing to send: {tail or '(no stderr captured)'}"
+        )
+    raise StreamerError(
+        f"ffmpeg exited {code} (passthrough): {tail or '(no stderr captured)'}"
+        + (f" [yt-dlp: {yt_tail}]" if yt_tail else "")
+    )
 
 
 def _terminate(proc: subprocess.Popen) -> None:

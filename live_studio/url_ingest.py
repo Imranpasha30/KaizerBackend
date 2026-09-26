@@ -19,6 +19,7 @@ no exception leaks to the request handler.
 from __future__ import annotations
 
 import os
+import shutil as _shutil
 import re
 import subprocess
 import threading
@@ -34,7 +35,13 @@ from live_studio import uploads as live_uploads
 # Limit downloads to a sane resolution so disk + uplink don't blow up
 # on 4K/8K sources. 1080p is YouTube's max ingest tier for most
 # accounts anyway.
-_YTDLP_FORMAT = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b"
+# The same ffmpeg the streamer uses. yt-dlp needs it for HLS sources.
+_FFMPEG_BIN = (os.environ.get("FFMPEG_BIN")
+               or os.environ.get("KAIZER_FFMPEG_BIN")
+               or _shutil.which("ffmpeg")
+               or "ffmpeg")
+
+_YTDLP_FORMAT = "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1080][vcodec^=avc1]+ba/b[height<=1080][vcodec^=avc1]/bv*[height<=1080]+ba/b"
 
 _YT_URL_RE = re.compile(
     r"^https?://(?:www\.|m\.|music\.)?"
@@ -86,6 +93,8 @@ def _ytdlp_download(url: str, out_path: str) -> tuple[bool, str]:
     # for (no auto-numbering of duplicates).
     cmd = [
         "yt-dlp",
+        # HLS sources need ffmpeg; yt-dlp looks on PATH unless told.
+        *(["--ffmpeg-location", _FFMPEG_BIN] if os.path.isfile(_FFMPEG_BIN) else []),
         "--no-progress",
         "--no-colors",
         "--no-warnings",
