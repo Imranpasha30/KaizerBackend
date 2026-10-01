@@ -287,6 +287,14 @@ def _checker_node(counts: dict) -> dict:
                  detail=detail)
 
 
+#: How long a channel may be pushed to without YouTube confirming the broadcast
+#: live before that counts as a fault rather than a startup. Ours confirm in
+#: about 18 seconds; the one that prompted this took several minutes, and the
+#: panel called it broken the whole time -- a false alarm is the expensive kind,
+#: because it teaches an operator that red means nothing.
+CONFIRM_GRACE_S = 180.0
+
+
 def _youtube_node(live: list[dict]) -> dict:
     """Is YouTube getting what it needs? Not "is a process running".
 
@@ -297,8 +305,9 @@ def _youtube_node(live: list[dict]) -> dict:
     point of drawing one: the whole reason for a map is that live streaming
     fails at the joins, and this is the join between the relay and YouTube.
     """
-    on = confirmed = not_live = starved = 0
+    on = confirmed = not_live = starting = starved = 0
     need = sent = 0.0
+    now = time.time()
     for v in live:
         for c in v.get("channels", []):
             if c.get("state") != "on":
@@ -306,7 +315,19 @@ def _youtube_node(live: list[dict]) -> dict:
             on += 1
             yt = c.get("youtube")
             confirmed += yt == "live"
-            not_live += yt == "not_live"
+            # NOT LIVE YET vs NOT LIVE. A channel seconds into its startup has
+            # the same `not_live` reading as one that has been pushing into a
+            # void for an hour, and only the second is a fault. Ours confirm in
+            # about 18 seconds, but YouTube is entitled to take longer.
+            if yt == "not_live":
+                try:
+                    joined = float(c.get("joined_at") or 0)
+                except (TypeError, ValueError):
+                    joined = 0.0
+                if joined and (now - joined) < CONFIRM_GRACE_S:
+                    starting += 1
+                else:
+                    not_live += 1
             h = c.get("health") or {}
             if h.get("state") == "starved":
                 starved += 1
@@ -319,7 +340,8 @@ def _youtube_node(live: list[dict]) -> dict:
         return _node("idle", "YouTube", "nothing on air",
                      metrics=[_m("on air", 0)])
 
-    state = "bad" if (not_live or starved) else "warn" if confirmed < on else "ok"
+    state = ("bad" if (not_live or starved)
+             else "warn" if (starting or confirmed < on) else "ok")
     detail = ""
     if starved:
         detail = (f"{starved} channel(s) cannot be fed fast enough: about "
@@ -328,13 +350,22 @@ def _youtube_node(live: list[dict]) -> dict:
                   f"viewers buffer. The upload is the limit — re-encode smaller "
                   f"(KAIZER_LIVE_ENCODE_MBPS) or use a faster connection.")
     elif not_live:
-        detail = (f"{not_live} channel(s) are being pushed to but YouTube does not "
-                  f"report them live.")
+        detail = (f"{not_live} channel(s) have been pushed to for over "
+                  f"{int(CONFIRM_GRACE_S // 60)} minute(s) and YouTube still does not "
+                  f"report them live. Check the broadcast exists and is bound to "
+                  f"the stream this is pushing to.")
+    elif starting:
+        detail = (f"{starting} channel(s) are starting: video is being pushed and "
+                  f"YouTube has not flipped the broadcast to live yet. Ours usually "
+                  f"take about 20 seconds; YouTube sometimes takes a few minutes. "
+                  f"This is not a fault until it passes "
+                  f"{int(CONFIRM_GRACE_S // 60)} minute(s).")
     elif confirmed < on:
         detail = "waiting for the single confirmation, a few seconds after ffmpeg starts"
     return _node(state, "YouTube", f"{on} channel{'s' if on != 1 else ''} on air",
                  metrics=[_m("on air", on), _m("confirmed live", confirmed),
-                          _m("not live", not_live), _m("starved", starved)],
+                          _m("starting", starting), _m("not live", not_live),
+                          _m("starved", starved)],
                  detail=detail)
 
 
