@@ -1,13 +1,23 @@
 """A broadcast that is still starting must not be drawn as broken.
 
-The founder went live, saw the Live Map's YouTube node red -- "1 channel(s) are
-being pushed to but YouTube does not report them live" -- and reported the
-stream as failed. It had not failed. YouTube flipped it to `live` a few minutes
-later and it ran healthily at 2965 Kbps.
+The founder went live, saw the YouTube node red -- "1 channel(s) are being
+pushed to but YouTube does not report them live" -- and reported the stream as
+failed. It had not failed. YouTube flipped it to live a few minutes later and it
+ran healthily at 2965 Kbps.
 
-`not_live` only ever meant "our one confirmation check has not come back live".
-A channel one second old read identically to one that had been pushing into a
-void for an hour, and the panel called both broken, in red.
+Two separate defects produced that:
+
+  * the map could not tell "not live YET" from "not live", and
+  * the engine GAVE UP confirming after a few checks inside the first minute,
+    recording the same value YouTube's own "complete" produces -- and never
+    looked again, so the panel kept saying it for the rest of the run.
+
+The engine now records four distinct things, and the map draws them differently:
+
+    live          confirmed                                 -> ok
+    pending       still inside the first checks             -> starting (amber)
+    unconfirmed   we stopped asking; re-asked on a backoff  -> starting (amber)
+    not_live      YouTube itself said complete/revoked      -> fault (red)
 
 A false alarm is the expensive kind of wrong: it teaches an operator that red
 means nothing, so the next red -- a real one -- gets ignored too.
@@ -24,15 +34,23 @@ def _chan(youtube, joined_ago=5.0, health_state="live", **extra):
     return c
 
 
-def _live(*channels):
-    return [{"video_id": "1-0", "channels": list(channels)}]
+def _node(*channels):
+    return _youtube_node([{"video_id": "1-0", "channels": list(channels)}])
 
 
 def test_a_channel_seconds_into_startup_is_not_broken():
     """The exact case: pushing, YouTube has not flipped it live yet."""
-    n = _youtube_node(_live(_chan("not_live", joined_ago=5)))
+    n = _node(_chan("pending", joined_ago=5))
     assert n["state"] != "bad", f"a 5-second-old broadcast was called broken: {n}"
-    assert "starting" in n["detail"].lower()
+    assert "not confirmed live yet" in n["detail"]
+
+
+def test_a_channel_we_gave_up_on_is_not_broken_either():
+    """`unconfirmed` means WE stopped asking. It says nothing about YouTube, and
+    this is what kept 49-0 showing as broken while it was live and healthy."""
+    n = _node(_chan("unconfirmed", joined_ago=CONFIRM_GRACE_S + 600))
+    assert n["state"] != "bad", n
+    assert "re-checking" in n["detail"] or "re-check" in n["detail"]
 
 
 def test_ours_normally_confirm_well_inside_the_grace():
@@ -41,46 +59,57 @@ def test_ours_normally_confirm_well_inside_the_grace():
     assert CONFIRM_GRACE_S > 18 * 3, CONFIRM_GRACE_S
 
 
-def test_a_channel_past_the_grace_IS_broken():
-    """The fault this check exists for must still fire."""
-    n = _youtube_node(_live(_chan("not_live", joined_ago=CONFIRM_GRACE_S + 30)))
+def test_a_pending_channel_past_the_grace_IS_broken():
+    """Still 'pending' long after it started is a genuine fault."""
+    n = _node(_chan("pending", joined_ago=CONFIRM_GRACE_S + 30))
     assert n["state"] == "bad", n
-    assert "still does not" in n["detail"]
+    assert "does not report them live" in n["detail"]
+
+
+def test_youtubes_own_terminal_answer_is_always_a_fault():
+    """`not_live` now only comes from complete/revoked, so it needs no grace."""
+    n = _node(_chan("not_live", joined_ago=2))
+    assert n["state"] == "bad", n
+
+
+def test_the_fault_detail_names_the_audio_cause():
+    """A silent file is the most common way a broadcast never goes live, and the
+    operator should not have to remember that."""
+    n = _node(_chan("not_live"))
+    assert "audio" in n["detail"].lower(), n["detail"]
 
 
 def test_a_confirmed_channel_is_ok():
-    n = _youtube_node(_live(_chan("live")))
-    assert n["state"] == "ok", n
+    assert _node(_chan("live"))["state"] == "ok"
 
 
-def test_starving_is_still_bad_immediately():
-    """Starvation is not a startup condition -- it is measured against a live
-    source, so it never needs a grace period."""
-    n = _youtube_node(_live(_chan("live", health_state="starved",
-                                  joined_ago=5)))
-    n2 = _youtube_node([{"video_id": "1-0", "channels": [
+def test_starving_is_bad_immediately():
+    """Starvation is measured against a live source, so it is never a startup
+    condition and never gets a grace period."""
+    n = _youtube_node([{"video_id": "1-0", "channels": [
         {"state": "on", "youtube": "live", "joined_at": time.time() - 5,
          "health": {"state": "starved", "source_mbps": "4.4", "kbps": "600"}}]}])
-    assert n2["state"] == "bad", n2
-    assert "starved" in n2["detail"] or "cannot be fed" in n2["detail"]
+    assert n["state"] == "bad", n
+    assert "cannot be fed" in n["detail"]
 
 
-def test_a_channel_with_no_joined_at_is_judged_not_excused():
+def test_a_pending_channel_with_no_joined_at_is_judged_not_excused():
     """Missing timing must not become a way to never report a fault."""
-    c = {"state": "on", "youtube": "not_live", "health": {"state": "live"}}
-    n = _youtube_node([{"video_id": "1-0", "channels": [c]}])
+    n = _youtube_node([{"video_id": "1-0", "channels": [
+        {"state": "on", "youtube": "pending", "health": {"state": "live"}}]}])
     assert n["state"] == "bad", "an unknown start time must not excuse a channel"
 
 
 def test_starting_and_broken_are_counted_separately():
     """The operator needs to see which is which, not one merged number."""
-    n = _youtube_node(_live(
-        _chan("not_live", joined_ago=5),                       # starting
-        _chan("not_live", joined_ago=CONFIRM_GRACE_S + 60),    # genuinely stuck
-        _chan("live"),                                         # fine
-    ))
+    n = _node(
+        _chan("pending", joined_ago=5),                      # starting
+        _chan("unconfirmed", joined_ago=900),                # starting (re-checking)
+        _chan("not_live", joined_ago=900),                   # genuinely over
+        _chan("live"),                                       # fine
+    )
     m = {x["label"]: x["value"] for x in n["metrics"]}
-    assert m["starting"] == 1, m
+    assert m["starting"] == 2, m
     assert m["not live"] == 1, m
     assert m["confirmed live"] == 1, m
-    assert n["state"] == "bad", "one genuinely stuck channel still makes it bad"
+    assert n["state"] == "bad", "one genuinely dead channel still makes it bad"

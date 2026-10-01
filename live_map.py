@@ -315,15 +315,27 @@ def _youtube_node(live: list[dict]) -> dict:
             on += 1
             yt = c.get("youtube")
             confirmed += yt == "live"
-            # NOT LIVE YET vs NOT LIVE. A channel seconds into its startup has
-            # the same `not_live` reading as one that has been pushing into a
-            # void for an hour, and only the second is a fault. Ours confirm in
-            # about 18 seconds, but YouTube is entitled to take longer.
+            # THREE DIFFERENT THINGS, not one.
+            #
+            #   pending      still inside the first checks
+            #   unconfirmed  we stopped asking; the engine re-asks on a backoff
+            #   not_live     YouTube itself said complete/revoked
+            #
+            # Only the last is a fault. `unconfirmed` means our check budget ran
+            # out, which says nothing about the broadcast -- reporting "YouTube
+            # does not report them live" about a stream that is live and healthy
+            # is the false alarm this exists to remove.
             if yt == "not_live":
+                not_live += 1
+            elif yt == "unconfirmed":
+                starting += 1
+            elif yt == "pending":
                 try:
                     joined = float(c.get("joined_at") or 0)
                 except (TypeError, ValueError):
                     joined = 0.0
+                # No joined_at is judged, not excused: missing timing must never
+                # become a way to never report a fault.
                 if joined and (now - joined) < CONFIRM_GRACE_S:
                     starting += 1
                 else:
@@ -350,16 +362,15 @@ def _youtube_node(live: list[dict]) -> dict:
                   f"viewers buffer. The upload is the limit — re-encode smaller "
                   f"(KAIZER_LIVE_ENCODE_MBPS) or use a faster connection.")
     elif not_live:
-        detail = (f"{not_live} channel(s) have been pushed to for over "
-                  f"{int(CONFIRM_GRACE_S // 60)} minute(s) and YouTube still does not "
-                  f"report them live. Check the broadcast exists and is bound to "
-                  f"the stream this is pushing to.")
+        detail = (f"{not_live} channel(s) are being pushed to and YouTube does not "
+                  f"report them live. Check the broadcast still exists and is bound "
+                  f"to the stream being pushed to, and that the file has an audio "
+                  f"track — YouTube Live will not start ingest without one.")
     elif starting:
-        detail = (f"{starting} channel(s) are starting: video is being pushed and "
-                  f"YouTube has not flipped the broadcast to live yet. Ours usually "
-                  f"take about 20 seconds; YouTube sometimes takes a few minutes. "
-                  f"This is not a fault until it passes "
-                  f"{int(CONFIRM_GRACE_S // 60)} minute(s).")
+        detail = (f"{starting} channel(s) are not confirmed live yet: video is going "
+                  f"out and YouTube has not flipped the broadcast over. Ours usually "
+                  f"take about 20 seconds; YouTube sometimes takes minutes, and the "
+                  f"engine keeps re-checking. Not a fault on its own.")
     elif confirmed < on:
         detail = "waiting for the single confirmation, a few seconds after ffmpeg starts"
     return _node(state, "YouTube", f"{on} channel{'s' if on != 1 else ''} on air",
