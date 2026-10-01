@@ -104,3 +104,71 @@ def admin_unblock_channel(channel_id: int, db: Session = Depends(get_db),
     svc.unblock_channel(str(channel_id))
     return {"channel_id": channel_id, "channel": ch.name, "blocked": False,
             "was_blocked_because": was or ""}
+
+
+@router.get("/logs")
+def live_logs(limit: int = 300, proc: str = "", level: str = "",
+              _=Depends(auth.admin_required)):
+    """What the live processes have been saying, newest last.
+
+    Read from Redis, not from files: the API and the workers are not necessarily
+    on the same machine, and on the deployment this matters for they are not.
+    Every line was redacted by the process that wrote it, so a stream key cannot
+    reach here even if one is printed.
+
+    `proc` filters to one process (worker:live-worker-1, control, encode:...);
+    `level` to info|warn|error.
+    """
+    from kaizer_live import logbuf
+
+    svc = _service()
+    lines = logbuf.tail(svc.r, svc.s.prefix,
+                        limit=max(1, min(int(limit), 2000)),
+                        proc=proc or None, level=level or None)
+    procs = sorted({l["proc"] for l in lines if l.get("proc")})
+    counts = {"error": 0, "warn": 0, "info": 0}
+    for l in lines:
+        counts[l.get("level", "info")] = counts.get(l.get("level", "info"), 0) + 1
+    return {"lines": lines, "count": len(lines), "processes": procs,
+            "counts": counts, "cap": logbuf.CAP,
+            # Said explicitly so an empty panel is not read as "nothing is
+            # wrong": a process that has not been restarted since this shipped
+            # mirrors nothing at all.
+            "note": ("Mirrored from each live process's own output. A process "
+                     "started before this feature shipped sends nothing until "
+                     "it is restarted."),
+            "relay_logs": _relay_log_tails()}
+
+
+def _relay_log_tails(max_files: int = 4, lines_each: int = 40) -> list:
+    """The relay's own per-stream logs, when they are on this machine.
+
+    The relay is a Go process that writes its own file and never prints through
+    Python, so it is the one part the Redis mirror cannot see. Best effort: an
+    empty list simply means the relays run elsewhere.
+    """
+    import os
+
+    from kaizer_live import logbuf
+
+    out = []
+    try:
+        svc = _service()
+        d = getattr(svc.s, "relay_log_dir", "") or ""
+        if not d or not os.path.isdir(d):
+            return out
+        files = sorted(
+            (os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log")),
+            key=os.path.getmtime, reverse=True)[:max_files]
+        for path in files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    tail = fh.readlines()[-lines_each:]
+            except OSError:
+                continue
+            out.append({"file": os.path.basename(path),
+                        "modified": os.path.getmtime(path),
+                        "lines": [logbuf.redact(x.rstrip()) for x in tail if x.strip()]})
+    except Exception:
+        pass
+    return out
