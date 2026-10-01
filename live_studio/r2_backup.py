@@ -215,6 +215,29 @@ def recover_pending_streams() -> dict:
                 row.backup_url and row.backup_key
                 and row.backup_expires_at and row.backup_expires_at > now
             )
+            # THE ENGINE'S BROADCASTS ARE NOT ORPHANS. Its relays run in
+            # another process, so they went on streaming through this restart --
+            # which is what the split is for. This recovery was written for the
+            # classic path, where the ffmpeg really did die with the backend.
+            #
+            # Touching an engine row here did real damage: two branches below
+            # mark it failed (disarming the customer's Stop button, because
+            # cancel_stream returns early on a terminal status), and the third
+            # re-spawns the CLASSIC worker for it -- which mints a SECOND
+            # YouTube broadcast on a channel that already has one live. The
+            # comment further down claiming the abandoned broadcast "auto-stops
+            # after a few minutes of silence" is exactly wrong: auto-stop is
+            # deliberately off, so transition(complete) is the only thing that
+            # ever ends one.
+            try:
+                from live_integration import engine_is_carrying as _carrying
+            except Exception:
+                _carrying = lambda _r: False
+            if _carrying(row):
+                print(f"[r2-recovery] stream {row.id} is still live on the engine; "
+                      f"leaving it alone")
+                continue
+
             if not has_backup:
                 row.status = "failed"
                 row.error  = ("backend restarted mid-broadcast; no R2 backup "
@@ -242,11 +265,18 @@ def recover_pending_streams() -> dict:
                 abandoned += 1
                 continue
 
-            # Reset to "starting" so the worker re-enters the normal
-            # provision + push flow. The YT broadcast may still be
-            # active — obtain_rtmp_target will mint a fresh one
-            # (the abandoned one auto-stops after a few minutes of
-            # silence).
+            # Reset to "starting" so the CLASSIC worker re-enters the normal
+            # provision + push flow, and mints a fresh YouTube broadcast.
+            #
+            # Only ever reached for a classic row -- engine rows are skipped
+            # above. That matters, because this leaves the previous broadcast
+            # open: it does NOT "auto-stop after a few minutes of silence", as
+            # this comment used to claim. enable_auto_stop is deliberately False
+            # (loop micro-gaps made YouTube close broadcasts hours early), so
+            # transition(complete) is the only thing that ends one. On the
+            # classic path the old broadcast is closed by finalize_broadcast
+            # when its worker unwinds; on the engine path nothing would have,
+            # and the channel would have carried two at once.
             row.status   = "starting"
             row.message  = "recovering after backend restart"
             row.upload_done = True

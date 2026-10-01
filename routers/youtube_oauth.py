@@ -493,6 +493,25 @@ def disconnect(
         # Don't leak whether the channel exists for other users —
         # 404 for both "missing" and "not yours" cases.
         raise HTTPException(status_code=404, detail="Channel not found")
+    # A LIVE BROADCAST NEEDS THESE CREDENTIALS TO BE ENDED. With auto-stop
+    # deliberately off, transition(complete) is the only thing that ever closes
+    # one, and it authenticates as this channel. Revoke now and the broadcast
+    # can never be closed: it holds the channel's reused stream key for ever,
+    # and its 50-unit close reserve comes back every day. Nothing would show it,
+    # because this path writes no row at all.
+    try:
+        from live_integration import live_broadcasts_on_channel
+        _live = live_broadcasts_on_channel(db, channel_id)
+    except Exception:
+        _live = []
+    if _live:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"This channel has {len(_live)} broadcast(s) that have not "
+                    f"finished (stream {', '.join(str(r.id) for r in _live[:5])}). "
+                    f"Stop them in Live Studio first — disconnecting now would "
+                    f"leave them running on YouTube with no way to end them."),
+        )
     try:
         oauth.revoke(db, channel_id)
     except oauth.OAuthError as e:

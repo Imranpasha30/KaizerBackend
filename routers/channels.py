@@ -697,6 +697,25 @@ def delete_channel(channel_id: int, db: Session = Depends(get_db), user: models.
           )
           .count()
     )
+    # The same question for live broadcasts, which this never asked. Today a
+    # LiveStream foreign key happens to make Postgres refuse the delete anyway,
+    # so the customer gets "still referenced by other records (e.g. publish
+    # history)" -- true, unhelpful, and only true by accident: add a cascade to
+    # that column one day and this becomes a delete that leaves a broadcast live
+    # with its credentials gone.
+    try:
+        from live_integration import live_broadcasts_on_channel
+        _live = live_broadcasts_on_channel(db, channel_id)
+    except Exception:
+        _live = []
+    if _live:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Cannot delete — {len(_live)} broadcast(s) have not finished "
+                    f"(stream {', '.join(str(r.id) for r in _live[:5])}). "
+                    f"Stop them in Live Studio first."),
+        )
+
     if queued:
         raise HTTPException(
             status_code=409,

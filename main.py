@@ -176,6 +176,21 @@ def _migrate_schema():
              "ALTER TABLE seo_learning_snapshots ADD COLUMN kind VARCHAR(12) NOT NULL DEFAULT 'own'"),
             ("training_samples", "explored_hook",
              "ALTER TABLE training_samples ADD COLUMN explored_hook VARCHAR(12)"),
+            # The channel's reused YouTube stream. Without this ladder entry the
+            # column exists in the model and NOT in the database -- create_all
+            # only creates missing TABLES, it never ALTERs one that is already
+            # there -- and every broadcast would mint a fresh stream at 50 units
+            # instead of looking this one up for 1.
+            # The audit column rtmp_provider._job_ref writes for a live
+            # broadcast. create_all only creates missing TABLES -- it never
+            # ALTERs one that exists -- so without this entry the column lives
+            # in the model and not in the database, and every live API call is
+            # silently dropped by log_youtube_call instead of reaching the
+            # quota dashboard.
+            ("youtube_api_calls", "live_stream_id",
+             "ALTER TABLE youtube_api_calls ADD COLUMN live_stream_id INTEGER"),
+            ("channels", "yt_stream_id",
+             "ALTER TABLE channels ADD COLUMN yt_stream_id VARCHAR(64)"),
             ("channels", "use_competitor_intel",
              "ALTER TABLE channels ADD COLUMN use_competitor_intel BOOLEAN DEFAULT FALSE"),
             # Template remix: creator opt-in for others to fork+edit a template.
@@ -195,6 +210,8 @@ def _migrate_schema():
              "ALTER TABLE live_streams ADD COLUMN apply_branding BOOLEAN NOT NULL DEFAULT FALSE"),
             ("live_streams", "branded_path",
              "ALTER TABLE live_streams ADD COLUMN branded_path VARCHAR(512)"),
+            ("live_streams", "delivery_json",
+             "ALTER TABLE live_streams ADD COLUMN delivery_json TEXT"),
             ("onboarding_profiles", "channel_id",
              "ALTER TABLE onboarding_profiles ADD COLUMN channel_id VARCHAR(64)"),
             ("onboarding_profiles", "channel_title",
@@ -1306,12 +1323,86 @@ app.include_router(library_router)          # Shared company Library — creativ
 app.include_router(profile_router)          # User profile — avatar + creator rating
 app.include_router(metrics_router)          # Phase 3.G — Prometheus /metrics (NOT auth-gated; scraped over internal network)
 app.include_router(admin_upload_v2_router)  # Phase 3.G — admin observability page at /admin/upload-v2 (admin_required)
+
+# The admin Live Map: every stage of live streaming as it is right now.
+# Mounted whether or not the engine is running -- when it is off the endpoint
+# answers 503 with the reason, which is what lets an admin fix it. A 404 would
+# just look like a broken page.
+from routers.admin_live_map import router as admin_live_map_router  # noqa: E402
+app.include_router(admin_live_map_router)
 # Wave 3 — WebSocket live progress under /api so the Vite dev proxy
 # ("/api": { ws: true }) and the production VITE_API_URL origin both
 # forward the upgrade. Routes: /api/ws/jobs/{id}, /api/ws/uploads.
 app.include_router(ws_progress_router, prefix="/api")
 app.include_router(quick_publish_router)    # Quick Publish — /api/clips/{id}/quick-*
 app.include_router(custom_templates_router) # /api/templates — developer-uploaded HTML/CSS templates
+
+# ─── Live engine v2 (kaizer_live) ────────────────────────────────────
+# OFF unless KAIZER_LIVE_ENGINE=v2. The existing thread-per-broadcast Live
+# Studio path is untouched and still serves every customer; this mounts
+# alongside it so the two can be compared on the same deployment.
+#
+# get_live_service() returns None whenever the engine is disabled or its
+# dependencies (Redis, ffmpeg, a Fernet key) are missing, and says why on
+# stdout. It must never take the API down.
+try:
+    from live_integration import get_live_service as _get_live_service, owns_channel as _owns_channel
+    _live_service = _get_live_service()
+except Exception as _exc:                      # pragma: no cover - defensive
+    print(f"[kaizer_live] not mounted: {type(_exc).__name__}: {_exc}", flush=True)
+    _live_service = None
+
+if _live_service is not None:
+    from kaizer_live.api import make_router as _make_live_router
+    app.include_router(
+        _make_live_router(_live_service,
+                          current_user=auth.current_user,
+                          admin_user=auth.admin_required,
+                          owns_channel=_owns_channel),
+        prefix="/api")
+
+    @app.on_event("startup")
+    def _check_live_sweeper():
+        """The sweeper is its own process now. Say whether it is running.
+
+        The sweep confirms broadcasts, ends finished videos, retries ends that
+        could not happen, starts queued channels and moves videos off dead
+        workers. It used to run here on a daemon thread, which made every API
+        deploy a sweeper outage and let an API crash strand a broadcast open --
+        paying nothing and holding that channel's reused key.
+
+        Nothing breaks visibly when it is missing, which is the danger: videos
+        go live correctly and then never end, and the credit drains into a
+        reserve nothing releases. So this reports what it finds, at startup,
+        where whoever just deployed is still watching. The admin Live Map shows
+        the same thing continuously.
+        """
+        import os
+        import threading
+
+        from kaizer_live.control import run_sweeper, sweeper_status
+
+        if (os.getenv("KAIZER_LIVE_SWEEPER_INPROC") or "").strip() == "1":
+            # A single-box deployment that would rather not run a third
+            # process. Safe because the Redis lock elects one holder whether
+            # the candidates are threads or processes.
+            t = threading.Thread(target=run_sweeper, args=(_live_service,),
+                                 name="kaizer-live-sweeper", daemon=True)
+            t.start()
+            print("[kaizer_live] sweeper running IN THIS PROCESS "
+                  "(KAIZER_LIVE_SWEEPER_INPROC=1)", flush=True)
+            return
+
+        st = sweeper_status(_live_service.r, _live_service.s.prefix)
+        if st.get("alive"):
+            print(f"[kaizer_live] sweeper is running elsewhere: {st.get('holder')}", flush=True)
+        else:
+            print("[kaizer_live] WARNING: no live-control process is sweeping. "
+                  "Broadcasts will start but will never be confirmed or ended, "
+                  "and their close credit will stay reserved. Start it with:\n"
+                  "    python -m kaizer_live.control "
+                  "--service-factory live_integration:get_live_service\n"
+                  f"  ({st.get('detail') or 'no heartbeat'})", flush=True)
 if _DESKTOP:
     # Desktop-ONLY local control surface (API keys + per-feature preflight).
     # No auth — the backend binds 127.0.0.1 for a single local user; the
@@ -1596,33 +1687,61 @@ async def _live_studio_expiry_sweeper():
 
 @app.on_event("startup")
 async def _live_studio_orphan_sweeper():
-    """At backend startup, sweep LiveStream rows that were mid-broadcast
-    when the previous process died (status in
-    starting/provisioning/streaming/queued/downloading) — their ffmpeg
-    subprocess is gone, so they need to be marked failed honestly rather
-    than appearing stuck-on-streaming forever in the UI.
+    """At backend startup, mark rows whose broadcast really did die with us.
 
-    Runs synchronously on boot before serving requests.
+    THE PREMISE IS ONLY TRUE OF THE CLASSIC PATH. There, the ffmpeg is a child
+    of this process, so a restart certainly killed it and a row still reading
+    "streaming" is a lie that must be corrected.
+
+    IT IS FALSE OF THE ENGINE, and this used to mark those rows failed anyway.
+    Engine relays run in their own process precisely so that redeploying the API
+    does not touch a live stream -- surviving this restart is the designed
+    behaviour, not an orphan. Marking them failed left the broadcast streaming
+    to the customer's audience with a row saying it had died; and because
+    `cancel_stream` returns early on a terminal status, it also DISARMED the
+    customer's own Stop button, leaving the admin panel as the only way out.
+
+    So each row is now asked about individually, and anything the engine is
+    still carrying is left exactly as it is.
     """
     if _DESKTOP:
         return  # desktop: no Live Studio broadcasting → no live_streams rows
+    IN_FLIGHT = ('starting', 'provisioning', 'streaming', 'queued',
+                 'downloading', 'uploaded', 'uploading', 'branding', 'preparing')
     try:
-        from sqlalchemy import text as _text
-        with engine.begin() as conn:
-            res = conn.execute(_text(
-                """
-                UPDATE live_streams
-                   SET status      = 'failed',
-                       error       = COALESCE(error, '')
-                                     || ' | backend restarted while broadcast was in flight',
-                       message     = 'backend restarted; broadcast interrupted',
-                       finished_at = CURRENT_TIMESTAMP
-                 WHERE status IN ('starting','provisioning','streaming','queued','downloading','uploaded')
-                """
-            ))
-            n = res.rowcount or 0
-            if n:
-                print(f"[startup] marked {n} orphaned live_streams as failed (backend was restarted mid-broadcast)")
+        import models as _m
+        from datetime import datetime as _dt, timezone as _tz
+
+        from database import SessionLocal as _S
+        try:
+            from live_integration import engine_is_carrying as _carrying
+        except Exception:
+            _carrying = lambda _row: False      # engine unavailable: old behaviour
+
+        db = _S()
+        try:
+            rows = (db.query(_m.LiveStream)
+                      .filter(_m.LiveStream.status.in_(IN_FLIGHT)).all())
+            failed, kept = 0, []
+            for r in rows:
+                if _carrying(r):
+                    kept.append(r.id)
+                    continue
+                r.status = 'failed'
+                r.error = ((r.error or '')
+                           + ' | backend restarted while broadcast was in flight')[:2000]
+                r.message = 'backend restarted; broadcast interrupted'
+                r.finished_at = _dt.now(_tz.utc)
+                failed += 1
+            db.commit()
+        finally:
+            db.close()
+        if failed:
+            print(f"[startup] marked {failed} orphaned live_streams as failed "
+                  f"(backend was restarted mid-broadcast)")
+        if kept:
+            print(f"[startup] left {len(kept)} live engine broadcast(s) running "
+                  f"through the restart: {kept}")
     except Exception as e:
         print(f"[startup] WARN: live studio orphan sweeper failed: {e}")
 

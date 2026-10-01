@@ -74,6 +74,11 @@ class BatchVideoIn(BaseModel):
     seo_source:    str = Field("user", pattern="^(user|ai)$")
     seo:           live_seo.LiveSeoIn
     source_url:    Optional[str] = None     # YouTube URL → server-side fetch
+    # Per-channel override of how each one goes live, as
+    # Channels (⊆ channel_ids) whose stream should pass through the
+    # branding conveyor (logo/watermark stamped before going live).
+    # Ignored for source_url videos (no local file to stamp).
+    brand_channel_ids: list[int] = Field(default_factory=list)
 
     @field_validator("filename")
     @classmethod
@@ -106,6 +111,12 @@ class BatchStreamOut(BaseModel):
     upload_total: Optional[int] = None
     upload_done:  bool = False
     source_url:   Optional[str] = None
+    apply_branding: bool = False
+    # The engine video this row belongs to, when the live engine is
+    # running. Sent by the server rather than derived in the browser:
+    # the id is also a Redis key and an RTMP path, and two
+    # implementations of the same sanitising rule would drift.
+    engine_video_id: Optional[str] = None
 
 
 class BatchOut(BaseModel):
@@ -137,8 +148,25 @@ def _thumb_url(stream_id: int, thumbnail_path: Optional[str]) -> Optional[str]:
     return f"/api/live-studio/streams/{stream_id}/thumbnail"
 
 
+def _engine_vid(s: models.LiveStream) -> Optional[str]:
+    """The engine video id for this row, or None when the engine is off.
+
+    None is meaningful to the UI: it is what tells the per-channel control
+    panel not to render, so the page looks exactly as it does on the classic
+    path instead of showing controls that would 404.
+    """
+    try:
+        from live_integration import get_live_service, engine_video_id
+        if get_live_service() is None:
+            return None
+        return engine_video_id(s.batch_id, s.video_slot)
+    except Exception:
+        return None
+
+
 def _stream_to_out(s: models.LiveStream) -> BatchStreamOut:
     return BatchStreamOut(
+        engine_video_id=_engine_vid(s),
         id=s.id, video_slot=s.video_slot,
         channel_id=s.channel_id or 0,
         status=s.status, progress_pct=s.progress_pct,
@@ -155,6 +183,7 @@ def _stream_to_out(s: models.LiveStream) -> BatchStreamOut:
         upload_total=s.upload_total,
         upload_done=bool(s.upload_done),
         source_url=getattr(s, "source_url", None),
+        apply_branding=bool(getattr(s, "apply_branding", False)),
     )
 
 
@@ -214,6 +243,14 @@ def list_oauth_channels(
     # if the user picked the same Brand row twice in Google's OAuth
     # picker), we get N rows for the same actual YouTube channel.
     # Keep the most-recently-connected token's channel_id.
+    # Branding presence per channel (Quick Live's Brand toggle asks the
+    # user what to do when a channel has nothing configured, BEFORE the
+    # stream launches). Light check — no asset materialization.
+    try:
+        from pipeline_v4 import watermark as _wm
+    except Exception:
+        _wm = None
+
     seen_gcid: set[str] = set()
     out = []
     for tok in tokens:
@@ -227,7 +264,16 @@ def list_oauth_channels(
         if dedupe_key in seen_gcid:
             continue
         seen_gcid.add(dedupe_key)
+        has_branding = True   # optimistic default when the check breaks
+        if _wm is not None:
+            try:
+                ch_row = db.query(models.Channel).get(tok.channel_id)
+                has_branding = _wm.has_branding_configured(
+                    channel=ch_row, user=user, db=db)
+            except Exception:
+                pass
         out.append({
+            "has_branding":  has_branding,
             # Channel.id — what the orchestrator needs internally.
             "id":            tok.channel_id,
             # Real YT channel name (e.g. "Cyber Sphere").
@@ -253,6 +299,9 @@ class SeoGenerateIn(BaseModel):
     channel_id: Optional[int] = None
     language: str = Field("te", min_length=2, max_length=8)
     privacy:  str = Field("unlisted")
+    # Which brain writes the SEO — None keeps the user's seo_engine
+    # choice (then gemini). Claude/ChatGPT failures fall back to Gemini.
+    provider: Optional[str] = Field(None, pattern="^(gemini|claude|openai)$")
 
 
 @router.post("/seo/generate")
@@ -272,8 +321,25 @@ def generate_seo(
     hard caps) before returning, so the result is brand-safe.
     """
     import os
-    if not os.environ.get("GEMINI_API_KEY", "").strip():
-        raise HTTPException(503, "GEMINI_API_KEY not configured — fill SEO manually")
+    # Engine choice: explicit request → user's stored seo_engine → gemini.
+    seo_engine = (payload.provider or "").strip().lower()
+    if seo_engine not in ("gemini", "claude", "openai"):
+        seo_engine = (getattr(user, "seo_engine", "") or "").strip().lower()
+    if seo_engine not in ("gemini", "claude", "openai"):
+        seo_engine = "gemini"
+    # Gemini is the fallback floor for every engine, so its key is only a
+    # HARD requirement when nothing else could possibly serve the request.
+    _has = {
+        "gemini": bool(os.environ.get("GEMINI_API_KEY", "").strip()),
+        "claude": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
+        "openai": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+    }
+    if not _has[seo_engine]:
+        if _has["gemini"]:
+            seo_engine = "gemini"
+        else:
+            raise HTTPException(503, "No AI key configured for SEO — add a "
+                                     "Gemini/Claude/OpenAI key or fill SEO manually")
 
     # Style-source channel = the user's style profile bound to this
     # YT account. Gives Gemini the title-formula + desc-style
@@ -355,17 +421,38 @@ def generate_seo(
     for attempt in range(1, total_rounds + 1):
         user_prompt = _build_user_prompt(retry_feedback if attempt > 1 else None)
         try:
-            raw, model_used = seo_gen._call_gemini(
-                system_prompt, user_prompt,
-                db=db, user_id=user.id, job_id=None, clip_id=None,
-            )
+            # Same engine dispatch as seo.generator.generate_seo_for_clip:
+            # the chosen writer first, Gemini as the safety net so an
+            # engine choice can never break SEO.
+            raw = None
+            if seo_engine == "claude":
+                try:
+                    raw, model_used = seo_gen._call_claude_seo(
+                        system_prompt, user_prompt)
+                except Exception as _ce:
+                    print(f"[live-studio/seo] claude engine failed "
+                          f"({str(_ce)[:100]}) — falling back to gemini")
+                    raw = None
+            elif seo_engine == "openai":
+                try:
+                    raw, model_used = seo_gen._call_openai_seo(
+                        system_prompt, user_prompt)
+                except Exception as _oe:
+                    print(f"[live-studio/seo] openai engine failed "
+                          f"({str(_oe)[:100]}) — falling back to gemini")
+                    raw = None
+            if raw is None:
+                raw, model_used = seo_gen._call_gemini(
+                    system_prompt, user_prompt,
+                    db=db, user_id=user.id, job_id=None, clip_id=None,
+                )
         except seo_gen.SEOGenerationError as exc:
             if best:
                 # All models exhausted but we have a candidate — ship it.
                 print(f"[live-studio/seo] attempt {attempt}: models exhausted; "
                       f"keeping best score={best_score}")
                 break
-            raise HTTPException(502, f"Gemini SEO failed: {exc}")
+            raise HTTPException(502, f"AI SEO failed: {exc}")
 
         if not isinstance(raw, dict):
             print(f"[live-studio/seo] attempt {attempt}: non-dict response, skip")
@@ -545,6 +632,11 @@ def create_batch(
     streams: list[models.LiveStream] = []
     for vi, vid in enumerate(payload.videos):
         cleaned = per_video_seo[vi]
+        # Branding is per (video × channel): only channels the user
+        # ALSO picked count, and URL-passthrough videos can't stamp
+        # (no local file) so their flags are dropped.
+        brand_cids = (set(vid.brand_channel_ids or []) & set(vid.channel_ids)
+                      if not (vid.source_url or "").strip() else set())
         for cid in vid.channel_ids:
             row = models.LiveStream(
                 batch_id=batch.id,
@@ -559,8 +651,10 @@ def create_batch(
                 description=cleaned.description,
                 tags_json=json.dumps(cleaned.tags, ensure_ascii=False),
                 privacy=cleaned.privacy,
+                # NULL unless the operator chose one for THIS broadcast.
                 made_for_kids=cleaned.made_for_kids,
                 source_url=(vid.source_url or "")[:1024] or None,
+                apply_branding=(cid in brand_cids),
             )
             db.add(row); db.commit(); db.refresh(row)
             # The upload path needs the row id so we set it now.
@@ -590,6 +684,214 @@ def create_batch(
         )
 
     return _batch_to_out(batch, streams)
+
+
+class FromVideoChannelIn(BaseModel):
+    """One target channel for a Quick Live, with its brand toggle."""
+    channel_id: int
+    brand:      bool = False    # True → stamp channel logo/watermark first
+
+
+class FromVideoIn(BaseModel):
+    """Quick Live: broadcast an ALREADY-RENDERED video (any finished
+    clip — the long video or a short) straight from the server's disk.
+    No re-upload: the file is hardlinked into the live-studio temp dir
+    (or streamed in place when linking isn't possible)."""
+    clip_id:        int
+    channels:       list[FromVideoChannelIn] = Field(..., min_length=1, max_length=20)
+    duration_hours: float = Field(1.0, gt=0, le=24)
+    seo_source:     str = Field("user", pattern="^(user|ai)$")
+    seo:            live_seo.LiveSeoIn
+
+
+@router.post("/from-video")
+def go_live_from_video(
+    payload: FromVideoIn,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> BatchOut:
+    """Create a LiveBatch from a rendered clip and start every stream
+    immediately — no chunk upload, no /start call needed.
+
+    Channels marked ``brand=true`` pass through the branding conveyor
+    (orchestrator stamps the channel's logo/watermark, then goes live);
+    unbranded channels go live instantly. Each stream is independent,
+    exactly like a normal Live Studio batch.
+    """
+    # Ownership walks Clip → Job.user_id (clips have no user column).
+    clip = (
+        db.query(models.Clip)
+          .join(models.Job, models.Clip.job_id == models.Job.id)
+          .filter(models.Clip.id == payload.clip_id,
+                  models.Job.user_id == user.id)
+          .first()
+    )
+    if not clip:
+        raise HTTPException(404, "video not found")
+    src = (clip.file_path or "").strip()
+    if not src or not os.path.isfile(src):
+        raise HTTPException(
+            409,
+            "the rendered file for this video is no longer on disk — "
+            "re-render it, or download it and use Live Studio's upload path",
+        )
+    src_size = os.path.getsize(src)
+
+    channel_ids = [c.channel_id for c in payload.channels]
+    if len(set(channel_ids)) != len(channel_ids):
+        raise HTTPException(400, "duplicate channels in the selection")
+    owned = {
+        c.id: c for c in db.query(models.Channel).filter(
+            models.Channel.id.in_(channel_ids),
+            models.Channel.user_id == user.id,
+        ).all()
+    }
+    missing = set(channel_ids) - set(owned.keys())
+    if missing:
+        raise HTTPException(403, f"channels not yours: {sorted(missing)}")
+
+    try:
+        if payload.seo_source == "ai":
+            cleaned = live_seo.validate_ai_path(payload.seo)
+        else:
+            cleaned = live_seo.sanitize_for_user_path(payload.seo)
+    except ValueError as exc:
+        raise HTTPException(400, f"SEO invalid: {exc}")
+
+    batch = models.LiveBatch(
+        user_id=user.id,
+        public_id=secrets.token_urlsafe(8),
+        status="queued",
+        total_streams=len(payload.channels),
+    )
+    db.add(batch); db.commit(); db.refresh(batch)
+
+    streams: list[models.LiveStream] = []
+    for ch_in in payload.channels:
+        row = models.LiveStream(
+            batch_id=batch.id,
+            user_id=user.id,
+            channel_id=ch_in.channel_id,
+            video_slot=0,
+            status="queued",
+            target_hours=payload.duration_hours,
+            upload_total=src_size,
+            seo_source=payload.seo_source,
+            title=cleaned.title,
+            description=cleaned.description,
+            tags_json=json.dumps(cleaned.tags, ensure_ascii=False),
+            privacy=cleaned.privacy,
+            made_for_kids=cleaned.made_for_kids,
+            apply_branding=bool(ch_in.brand),
+        )
+        db.add(row); db.commit(); db.refresh(row)
+        # Source wiring: hardlink the rendered file into the live temp
+        # dir (instant, and the post-broadcast temp cleanup then only
+        # removes the link — the render output survives). Cross-volume
+        # hardlinks fail on Windows/NTFS → stream the file in place
+        # (the orchestrator's cleanup never touches non-temp paths).
+        link_path = live_uploads.upload_path_for(row.id)
+        try:
+            if os.path.exists(link_path):
+                os.remove(link_path)
+            os.link(src, link_path)
+            row.upload_path = link_path
+        except OSError:
+            row.upload_path = src
+        row.upload_bytes = src_size
+        row.upload_done = True
+        row.status = "starting"
+        row.message = ("spawning broadcast worker (branding first)…"
+                       if ch_in.brand else "spawning broadcast worker…")
+        row.started_at = datetime.now(timezone.utc)
+        db.commit()
+        streams.append(row)
+        live_orch.kick_off(row.id)
+
+    return _batch_to_out(batch, streams)
+
+
+@router.get("/active")
+def active_streams(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.current_user),
+) -> dict:
+    """Every non-terminal stream for the signed-in user — powers the
+    Workspace live tracker (branding → provisioning → LIVE rails)."""
+    terminal = ("done", "failed", "canceled")
+    rows = (
+        db.query(models.LiveStream)
+          .filter(models.LiveStream.user_id == user.id,
+                  ~models.LiveStream.status.in_(terminal))
+          .order_by(models.LiveStream.created_at.desc())
+          .limit(100)
+          .all()
+    )
+    ch_ids = {r.channel_id for r in rows if r.channel_id}
+    names = {}
+    if ch_ids:
+        names = {
+            c.id: (c.name or f"channel {c.id}")
+            for c in db.query(models.Channel)
+                       .filter(models.Channel.id.in_(ch_ids)).all()
+        }
+    return {
+        "streams": [
+            {
+                "id":            r.id,
+                "batch_id":      r.batch_id,
+                "channel_id":    r.channel_id,
+                "channel_name":  names.get(r.channel_id, ""),
+                "status":        r.status,
+                "progress_pct":  int(r.progress_pct or 0),
+                "message":       r.message,
+                "title":         r.title or "",
+                "apply_branding": bool(getattr(r, "apply_branding", False)),
+                "yt_watch_url":  _watch_url(r.yt_video_id),
+                "started_at":    r.started_at,
+                "target_hours":  float(r.target_hours or 0),
+                "finished_at":   r.finished_at,
+                # HOW MUCH OF IT ACTUALLY REACHED YOUTUBE. None for every
+                # broadcast that ran before this was recorded -- absent is
+                # "unknown", never "nothing got through".
+                "delivery":      _delivery(r),
+            } for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+
+def _delivery(row) -> dict | None:
+    """The kept delivery counters, plus a sentence a person can act on.
+
+    A broadcast can run its full two hours and still be barely watchable if the
+    uplink could not carry it -- YouTube calls that `videoIngestionStarved` and
+    tells viewers they will buffer. The duration and the delivery are different
+    facts and both belong on the row.
+    """
+    import json as _json
+
+    raw = getattr(row, "delivery_json", None)
+    if not raw:
+        return None
+    try:
+        rec = _json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    pct = rec.get("delivered_pct")
+    if pct is None:
+        rec["summary"] = "delivery to YouTube was not measured"
+    elif pct >= 97:
+        rec["summary"] = "everything reached YouTube"
+    elif pct >= 85:
+        rec["summary"] = (f"{pct:.0f}% reached YouTube — a little was lost to "
+                          f"upload speed")
+    else:
+        rec["summary"] = (f"only {pct:.0f}% reached YouTube — the upload could "
+                          f"not carry this bitrate, so viewers saw buffering "
+                          f"and the recording is rougher than the source")
+    return rec
 
 
 @router.post("/streams/{stream_id}/chunk")
@@ -658,19 +960,73 @@ def start_stream(
     ffmpeg launch is wired up next phase.
     """
     row = _owned_stream(db, stream_id, user.id)
-    if not row.upload_done and row.upload_bytes < live_uploads.CHUNK_THRESHOLD_BYTES:
+
+    # Is the live engine running? It decides how much of the file we need.
+    try:
+        from live_integration import get_live_service, start_through_engine
+        _engine = get_live_service()
+    except Exception:
+        _engine = None
+
+    if _engine is not None:
+        # The engine probes the file before spending any credit, and ffprobe on
+        # a half-written MP4 whose index is at the end tells us nothing. The
+        # classic pusher can start at 5 MB because it just reads forward; this
+        # one cannot.
+        if not row.upload_done and not (row.source_url or "").strip():
+            raise HTTPException(
+                409,
+                f"the upload is still running "
+                f"({row.upload_bytes}/{row.upload_total or 0} bytes). The live "
+                f"engine checks the file before it starts, so it needs the whole "
+                f"thing.",
+            )
+    elif not row.upload_done and row.upload_bytes < live_uploads.CHUNK_THRESHOLD_BYTES:
         raise HTTPException(
             409,
             f"not enough video buffered yet "
             f"({row.upload_bytes}/{live_uploads.CHUNK_THRESHOLD_BYTES} bytes)",
         )
-    if row.status in ("streaming", "done", "starting", "provisioning"):
+
+    # `preparing` and `canceled` belong here as much as the rest.
+    #
+    # `preparing` is set eleven lines below for every engine start, and the
+    # repair it covers takes MINUTES -- by far the widest window this endpoint
+    # has. Without it a second click spawned a second prepare thread: the first
+    # called go_live, the second's add_channel raised "already on this video",
+    # and the row was written `failed` while the broadcast ran. `canceled`
+    # without it meant a cancelled broadcast could be started again.
+    if row.status in ("streaming", "done", "starting", "provisioning",
+                      "preparing", "canceled"):
         return {"ok": True, "status": row.status, "note": "already started"}
 
     row.status = "starting"
     row.message = "spawning broadcast worker…"
     row.started_at = datetime.now(timezone.utc)
     db.commit()
+
+    if _engine is not None:
+        # One engine video per (batch, slot); the first channel opens it and the
+        # rest join. NO SILENT FALLBACK to the classic path: that path always
+        # spends quota, and falling back would spend it on a channel the
+        # operator had deliberately set to use its own stream key.
+        #
+        # The file is prepared first WHERE IT NEEDS TO BE. Keyframe spacing
+        # cannot be fixed by copying, and most encoders place keyframes on
+        # scene changes rather than a two-second grid -- so refusing outright
+        # would reject almost every real upload. A re-encode takes minutes,
+        # far longer than an HTTP request should live, so it runs on a thread
+        # and the row's status carries the progress the UI already polls.
+        import threading
+        from live_integration import prepare_and_start
+
+        row.status = "preparing"
+        row.message = "checking the file before going live…"
+        db.commit()
+        threading.Thread(target=prepare_and_start, args=(row.id,),
+                         name=f"live-prepare-{row.id}", daemon=True).start()
+        return {"ok": True, "status": row.status,
+                "note": "checking the file; the broadcast starts by itself once it is ready"}
 
     # Spawn the daemon worker. It owns its own DB session — we don't
     # block the request thread.
@@ -687,8 +1043,56 @@ def cancel_stream(
     row = _owned_stream(db, stream_id, user.id)
     if row.status in ("done", "failed", "canceled"):
         return {"ok": True, "status": row.status, "note": "terminal state"}
+
+    # ── STOP THE THING THAT IS ACTUALLY RUNNING, BEFORE TOUCHING THE ROW ──
+    #
+    # Two quite different things can own a live broadcast: the classic path
+    # (a thread in THIS process, signalled by request_cancel below) and the
+    # engine (relays in a SEPARATE process, which can only be stopped by
+    # asking the service). This endpoint used to do the second half only.
+    #
+    # The result was a Stop button that reported success and left the stream on
+    # air: the row went terminal so nothing would retry the end, the engine kept
+    # the channel marked busy so its next broadcast was refused with "already
+    # live on another video", the broadcast stayed open on YouTube holding that
+    # channel's reused key, and the 50 units reserved to close it were never
+    # released. The admin panel's Stop worked all along because it calls the
+    # engine directly -- which is how the difference was noticed.
+    #
+    # Order matters twice over: the row is marked AFTER, because ending a
+    # broadcast writes the row too and skips one that is already terminal.
+    engine_note = ""
+    try:
+        from live_integration import engine_video_id, get_live_service
+        _svc = get_live_service()
+    except Exception:
+        _svc = None
+    if _svc is not None and row.channel_id:
+        from kaizer_live.service import LiveError
+        vid = engine_video_id(row.batch_id, row.video_slot)
+        try:
+            out = _svc.stop_channel(vid, str(row.channel_id), reason="canceled by user")
+            engine_note = f"engine stopped {vid}/{row.channel_id} ({out.get('state')})"
+        except LiveError:
+            # Not on the engine at all: a classic broadcast, or one that never
+            # started. Nothing to stop there, and the classic signal below is
+            # the right and only mechanism.
+            pass
+        except Exception as exc:
+            # The engine is running and could not be told. Refusing is the
+            # point: answering "cancelled" while the video is still going out
+            # to the customer's audience is the failure this whole change is
+            # about. The row is deliberately left non-terminal so the sweeper
+            # and a retry can still act on it.
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Could not stop the live broadcast: {exc}. It is still "
+                        f"streaming. Nothing has been cancelled — try again, or "
+                        f"stop it from the admin Live Map."),
+            ) from exc
+
     row.status = "canceled"
-    row.message = "canceled by user"
+    row.message = ("canceled by user" + (f"; {engine_note}" if engine_note else ""))[:512]
     row.finished_at = datetime.now(timezone.utc)
     db.commit()
     # Signal the running ffmpeg (if any) to exit cleanly. The worker
@@ -697,7 +1101,7 @@ def cancel_stream(
     # ourselves so the disk doesn't leak.
     if not live_orch.request_cancel(stream_id):
         live_uploads.delete_upload(stream_id)
-    return {"ok": True, "status": row.status}
+    return {"ok": True, "status": row.status, "engine": engine_note or None}
 
 
 @router.get("/batches")

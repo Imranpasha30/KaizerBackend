@@ -2913,6 +2913,7 @@ def v2_admin_stats(
         "cancellation_rate_pct":     cancel_rate,
     }
 
+
 # ─── Onboarding: what people told us on their first sign-in ──────────
 #
 # The form is mandatory for new accounts and cannot be skipped, so this is
@@ -2979,6 +2980,8 @@ def onboarding_submissions(
             "website":      prof.website or "",
             "languages":    [c for c in (prof.languages or "").split(",") if c],
             "channel_link":  prof.channel_link or "",
+            # Filled only when YouTube confirmed the channel; empty means
+            # unverified, never "fake".
             "channel_id":    getattr(prof, "channel_id", "") or "",
             "channel_title": getattr(prof, "channel_title", "") or "",
             "submitted_at": (prof.updated_at or prof.created_at).isoformat()
@@ -2997,4 +3000,288 @@ def onboarding_submissions(
         "matched": matched,
         "limit":   limit,
         "offset":  offset,
+    }
+
+
+# ─── Live Studio activity (admin-wide) ───────────────────────────────
+
+# The eight non-terminal statuses a broadcast can sit in. Derived from what
+# the orchestrator and the router actually write, NOT from the LiveStream
+# docstring, which lists five and is stale. Getting this wrong silently
+# under-counts what is live.
+_LIVE_STATUSES = (
+    "queued", "uploading", "uploaded", "downloading",
+    "branding", "preparing", "starting", "provisioning", "streaming",
+)
+_TERMINAL_STATUSES = ("done", "failed", "canceled")
+
+
+def _live_row(st: "models.LiveStream", email: str, channel_name: str) -> dict:
+    """One broadcast, for admin eyes.
+
+    Fields are NAMED rather than serialised off the row on purpose:
+    live_streams also carries yt_stream_key (plaintext), yt_ingest_url and a
+    signed backup_url, none of which may ever reach a browser.
+    """
+    started, finished = st.started_at, st.finished_at
+    dur = None
+    if started and finished:
+        dur = max(0.0, (finished - started).total_seconds())
+    vid = (st.yt_video_id or "").strip()
+    return {
+        "id":            st.id,
+        "batch_id":      st.batch_id,
+        "status":        st.status,
+        "user_id":       st.user_id,
+        "user_email":    email,
+        "channel_id":    st.channel_id,
+        "channel_name":  channel_name,
+        "title":         st.title,
+        # A URL source means the video was fetched with yt-dlp rather than
+        # uploaded; the two paths fail in completely different ways, so the
+        # operator needs to tell them apart at a glance.
+        "source":        "url" if (st.source_url or "").strip() else "upload",
+        "watch_url":     f"https://www.youtube.com/watch?v={vid}" if vid else None,
+        "progress_pct":  st.progress_pct,
+        "target_hours":  st.target_hours,
+        "message":       st.message,
+        "error":         st.error,
+        "started_at":    _iso(started),
+        "finished_at":   _iso(finished),
+        "created_at":    _iso(st.created_at),
+        "duration_s":    dur,
+    }
+
+
+@router.get("/live-broadcasts")
+def live_broadcasts(
+    days:  int = Query(7, ge=1, le=365),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _:  models.User = Depends(auth.admin_required),
+) -> dict:
+    """Everything happening on Live Studio, across every user.
+
+    Returns:
+      * ``totals``     — counts over the window, plus how many are live NOW
+                         (live_now is deliberately NOT windowed: a broadcast
+                         started before the cutoff can still be running)
+      * ``live_now``   — the rows actually in flight
+      * ``recent``     — most recent broadcasts, successes and failures alike
+      * ``by_user``    — who is using it
+      * ``by_channel`` — which channels it runs on
+    """
+    cutoff = _utcnow() - timedelta(days=int(days))
+
+    # ── rows in the window, plus anything still running from before it ──
+    windowed = (
+        db.query(models.LiveStream)
+          .filter(models.LiveStream.created_at >= cutoff)
+          .order_by(desc(models.LiveStream.created_at))
+          .limit(int(limit))
+          .all()
+    )
+    running = (
+        db.query(models.LiveStream)
+          .filter(models.LiveStream.status.in_(_LIVE_STATUSES))
+          .order_by(desc(models.LiveStream.created_at))
+          .all()
+    )
+
+    # ── one lookup for every name, rather than one per row ─────────────
+    ids_u = {r.user_id for r in windowed + running if r.user_id}
+    ids_c = {r.channel_id for r in windowed + running if r.channel_id}
+    emails = dict(
+        db.query(models.User.id, models.User.email)
+          .filter(models.User.id.in_(ids_u)).all()
+    ) if ids_u else {}
+    names = dict(
+        db.query(models.Channel.id, models.Channel.name)
+          .filter(models.Channel.id.in_(ids_c)).all()
+    ) if ids_c else {}
+
+    def _row(st):
+        return _live_row(st,
+                         emails.get(st.user_id) or "",
+                         names.get(st.channel_id) or "")
+
+    # ── totals over the window ─────────────────────────────────────────
+    counts = dict(
+        db.query(models.LiveStream.status, func.count(models.LiveStream.id))
+          .filter(models.LiveStream.created_at >= cutoff)
+          .group_by(models.LiveStream.status).all()
+    )
+    total = sum(counts.values())
+    done = counts.get("done", 0)
+    failed = counts.get("failed", 0)
+    finished = done + failed
+
+    # ── per user and per channel, in one pass each ─────────────────────
+    by_user = []
+    rows_u = (
+        db.query(models.LiveStream.user_id,
+                 models.LiveStream.status,
+                 func.count(models.LiveStream.id))
+          .filter(models.LiveStream.created_at >= cutoff)
+          .group_by(models.LiveStream.user_id, models.LiveStream.status).all()
+    )
+    agg_u: dict = {}
+    for uid, stt, n in rows_u:
+        e = agg_u.setdefault(uid, {"user_id": uid, "email": "",
+                                   "total": 0, "done": 0, "failed": 0})
+        e["total"] += n
+        if stt in ("done", "failed"):
+            e[stt] += n
+    if agg_u:
+        more = dict(
+            db.query(models.User.id, models.User.email)
+              .filter(models.User.id.in_([k for k in agg_u if k])).all()
+        )
+        for uid, e in agg_u.items():
+            e["email"] = more.get(uid) or emails.get(uid) or ""
+        by_user = sorted(agg_u.values(), key=lambda e: -e["total"])
+
+    rows_c = (
+        db.query(models.LiveStream.channel_id,
+                 models.LiveStream.status,
+                 func.count(models.LiveStream.id))
+          .filter(models.LiveStream.created_at >= cutoff)
+          .group_by(models.LiveStream.channel_id, models.LiveStream.status).all()
+    )
+    agg_c: dict = {}
+    for cid, stt, n in rows_c:
+        e = agg_c.setdefault(cid, {"channel_id": cid, "name": "",
+                                   "total": 0, "done": 0, "failed": 0})
+        e["total"] += n
+        if stt in ("done", "failed"):
+            e[stt] += n
+    if agg_c:
+        more_c = dict(
+            db.query(models.Channel.id, models.Channel.name)
+              .filter(models.Channel.id.in_([k for k in agg_c if k])).all()
+        )
+        for cid, e in agg_c.items():
+            e["name"] = more_c.get(cid) or names.get(cid) or ""
+    by_channel = sorted(agg_c.values(), key=lambda e: -e["total"])
+
+    return {
+        "window": {"days": int(days), "since": _iso(cutoff)},
+        "totals": {
+            "total":     total,
+            "live_now":  len(running),
+            "done":      done,
+            "failed":    failed,
+            "canceled":  counts.get("canceled", 0),
+            # Share of FINISHED broadcasts that succeeded. Counting the ones
+            # still running as failures would make a busy day look broken.
+            "success_rate": round(done / finished, 3) if finished else None,
+            "by_status": counts,
+        },
+        "live_now":   [_row(r) for r in running],
+        "recent":     [_row(r) for r in windowed],
+        "by_user":    by_user,
+        "by_channel": by_channel,
+    }
+
+
+@router.get("/live/credit-proof")
+def live_credit_proof(
+    hours: int = Query(24, ge=1, le=720),
+    db: Session = Depends(get_db),
+    _:  models.User = Depends(auth.admin_required),
+) -> dict:
+    """Did manual mode really cost nothing? Measured, not asserted.
+
+    Every YouTube API call this backend makes is recorded in youtube_api_calls
+    with its published unit cost, so the spend is a fact rather than an
+    estimate. Manual broadcasts should appear with zero calls and zero units;
+    anything else means bytes are being pushed to a Studio key while the API is
+    still being called somewhere, which would defeat the entire point.
+    """
+    since = _utcnow() - timedelta(hours=int(hours))
+
+    # ── what was actually spent, by operation ────────────────────────
+    rows = (
+        db.query(models.YouTubeApiCall.operation,
+                 func.count(models.YouTubeApiCall.id),
+                 func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0))
+          .filter(models.YouTubeApiCall.created_at >= since)
+          .group_by(models.YouTubeApiCall.operation)
+          .all()
+    )
+    by_operation = sorted(
+        ({"operation": op, "calls": int(n), "units": int(u)} for op, n, u in rows),
+        key=lambda r: -r["units"])
+    total_units = sum(r["units"] for r in by_operation)
+
+    # ── spend attributed to live broadcasts specifically ─────────────
+    # This only works because live_stream_id exists. Before it, Live Studio
+    # calls were written into upload_job_id — an FK to a different table — and
+    # every insert was rejected and swallowed, so none of this was visible.
+    live_rows = (
+        db.query(models.YouTubeApiCall.live_stream_id,
+                 func.count(models.YouTubeApiCall.id),
+                 func.coalesce(func.sum(models.YouTubeApiCall.quota_cost), 0))
+          .filter(models.YouTubeApiCall.created_at >= since)
+          .filter(models.YouTubeApiCall.live_stream_id.isnot(None))
+          .group_by(models.YouTubeApiCall.live_stream_id)
+          .all()
+    )
+    connected_broadcasts = len(live_rows)
+    connected_units = sum(int(u) for _, _, u in live_rows)
+    per_broadcast = round(connected_units / connected_broadcasts, 1) if connected_broadcasts else None
+
+    # ── what the engine says it did ──────────────────────────────────
+    started = {"connected": 0, "manual": 0}
+    engine_seen = False
+    try:
+        from live_integration import get_live_service
+        svc = get_live_service()
+        if svc is not None:
+            engine_seen = True
+            cutoff_ms = since.timestamp()
+            for _id, d in svc.r.xrevrange(svc.k.events(), count=5000):
+                if float(d.get("ts", 0) or 0) < cutoff_ms:
+                    break
+                if d.get("type") == "channel_started":
+                    mode = d.get("mode") or ""
+                    if mode in started:
+                        started[mode] += 1
+    except Exception:
+        engine_seen = False
+
+    # ── the answer, in words ─────────────────────────────────────────
+    if not engine_seen:
+        verdict = ("The live engine is not running here, so only total API spend "
+                   "is shown. Manual mode cannot be measured without it.")
+    elif started["manual"] == 0:
+        verdict = ("No manual broadcasts in this window, so there is nothing to "
+                   "measure yet. Run one on a channel with a saved stream key.")
+    elif connected_broadcasts == 0 and started["connected"] == 0:
+        verdict = (f"{started['manual']} manual broadcast(s) and no API calls "
+                   f"attributed to any live broadcast. Manual mode spent nothing, "
+                   f"as intended.")
+    else:
+        verdict = (f"{started['manual']} manual and {started['connected']} connected "
+                   f"broadcast(s). {connected_units} units were attributed to "
+                   f"{connected_broadcasts} broadcast(s) — "
+                   f"{per_broadcast} each. Manual broadcasts have no rows of their "
+                   f"own, which is what costing nothing looks like.")
+
+    return {
+        "window_hours": int(hours),
+        "since": _iso(since),
+        "total_units_all_operations": total_units,
+        "by_operation": by_operation,
+        "connected": {
+            "broadcasts_with_api_calls": connected_broadcasts,
+            "units": connected_units,
+            "units_per_broadcast": per_broadcast,
+            # What it SHOULD be now that the stream key is reused: insert 50 +
+            # list 1 + bind 50 + ~15 polls + transition 50.
+            "expected_per_broadcast": 166,
+        },
+        "engine_started": started,
+        "engine_available": engine_seen,
+        "verdict": verdict,
     }

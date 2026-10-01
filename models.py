@@ -354,6 +354,30 @@ class Channel(Base):
     # OPT-IN (operator requirement): when True, SEO generation for this
     # channel receives the tracked competitors' topic-matched intelligence
     # (their winning titles to differentiate from + tags to harvest).
+    # THE CHANNEL'S REUSED YOUTUBE STREAM. Set the first time a broadcast is
+    # made on this channel and reused by every one after: liveStreams.list
+    # costs 1 unit to look it up, against 50 to mint a new one. That single
+    # column is the difference between 202 units for a channel's first
+    # broadcast and 153 for every one after -- 65 broadcasts a day instead of
+    # 49 on a 10,000-unit project.
+    yt_stream_id       = Column(String(64),  nullable=True, index=True)
+
+    # ── Manual (Studio) stream key ───────────────────────────────────
+    # The customer pastes the key from YouTube Studio -> Go live -> Stream.
+    # Pushing to it costs ZERO API quota, because Studio owns the broadcast;
+    # we only move bytes. Fernet ciphertext, like refresh_token_enc -- Text,
+    # never String(n), since ciphertext is roughly twice the plaintext and a
+    # truncating column would corrupt it without complaining.
+    # ── Retired: the manual (Studio) stream-key path ─────────────────
+    # Nothing reads these three. They are kept because dropping a column is
+    # irreversible and these hold keys customers pasted by hand.
+    #
+    # Pushing to a persistent Studio key costs no quota, which is why this was
+    # built. It was then tested on a real channel: 90 seconds of video, stream
+    # `active` throughout, and no broadcast ever appeared. YouTube stopped
+    # auto-creating a broadcast for a persistent key on 1 September 2020, so a
+    # key carries video nobody can watch unless a broadcast exists -- and making
+    # one is insert (50) + bind (50). 100 units is the floor either way.
     use_competitor_intel = Column(Boolean, default=False)
     title_formula      = Column(Text, default="")
     desc_style         = Column(String(50), default="hook_first")
@@ -1458,6 +1482,14 @@ class YouTubeApiCall(Base):
     job_id        = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"),  nullable=True, index=True)
     clip_id       = Column(Integer, ForeignKey("clips.id", ondelete="SET NULL"), nullable=True, index=True)
     upload_job_id = Column(Integer, ForeignKey("upload_jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    # WHICH KIND OF JOB THIS CALL BELONGS TO. obtain_rtmp_target serves two
+    # callers with two row types: the upload agent passes an UploadJob, Live
+    # Studio passes a LiveStream. Writing a LiveStream id into upload_job_id
+    # violated that column's foreign key -- and log_youtube_call swallows the
+    # failure, so the call vanished from the quota dashboard instead of being
+    # recorded against the wrong job. rtmp_provider._job_ref picks the column;
+    # this is the other half, and without it the calls disappear again.
+    live_stream_id = Column(Integer, ForeignKey("live_streams.id", ondelete="SET NULL"), nullable=True, index=True)
     channel_id    = Column(Integer, ForeignKey("channels.id", ondelete="SET NULL"), nullable=True, index=True)
     # The actual YouTube channel id (UCxxxxx) that the call targeted.
     # Stored alongside the local FK so we can group by destination even
@@ -1812,6 +1844,19 @@ class LiveStream(Base):
     # orchestrator hands this to youtube.uploader.set_thumbnail() once
     # the broadcast is minted. NULL = let YouTube auto-pick a frame.
     thumbnail_path    = Column(String(512), nullable=True)
+
+    # HOW MUCH OF THE BROADCAST ACTUALLY REACHED YOUTUBE.
+    #
+    # JSON, written once when the broadcast ends: the bytes ffmpeg produced, the
+    # bytes the relay managed to write to YouTube, that ratio, and the relay's
+    # dropped/reconnect counters. All of it already existed -- in a Redis hash
+    # the sweep deletes seconds later -- so the question "did the frames arrive?"
+    # could only be answered by polling DURING a broadcast, and became
+    # unanswerable the moment it ended.
+    #
+    # NULL for every broadcast that ran before this column existed, and for any
+    # that ends without the engine's counters readable. Absent is not zero.
+    delivery_json = Column(Text, nullable=True)
 
     # When the stream's source is a YouTube URL (yt-dlp ingested) rather
     # than a user-uploaded file, we record the original URL here for

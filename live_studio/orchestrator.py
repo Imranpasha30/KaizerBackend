@@ -50,6 +50,46 @@ from live_studio import concurrency, streamer, uploads as live_uploads
 _CANCEL_EVENTS: dict[int, threading.Event] = {}
 _EV_LOCK = threading.Lock()
 
+# Shared branding cache (Quick Live conveyor): channels with the SAME
+# effective branding (watermark.brand_signature) broadcasting the SAME
+# source share ONE stamped file instead of rendering N identical copies.
+# Keyed by the shared file path; per-key locks serialize the first stamp,
+# refcounts delay deletion until the last sharer's finally block.
+_BRAND_STATE_LOCK = threading.Lock()
+_BRAND_LOCKS: dict[str, threading.Lock] = {}
+_BRAND_REFS: dict[str, int] = {}
+
+
+def _brand_lock_for(path: str) -> threading.Lock:
+    with _BRAND_STATE_LOCK:
+        lk = _BRAND_LOCKS.get(path)
+        if lk is None:
+            lk = threading.Lock()
+            _BRAND_LOCKS[path] = lk
+        return lk
+
+
+def _brand_ref(path: str) -> None:
+    with _BRAND_STATE_LOCK:
+        _BRAND_REFS[path] = _BRAND_REFS.get(path, 0) + 1
+
+
+def _brand_unref_and_maybe_delete(path: str) -> None:
+    """Drop one reference; delete the shared file when the last sharer
+    leaves. A Windows delete of a file another ffmpeg still has open
+    fails harmlessly (caught) — the next stamp regenerates it."""
+    with _BRAND_STATE_LOCK:
+        n = _BRAND_REFS.get(path, 1) - 1
+        if n > 0:
+            _BRAND_REFS[path] = n
+            return
+        _BRAND_REFS.pop(path, None)
+        _BRAND_LOCKS.pop(path, None)
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 def cancel_event_for(stream_id: int) -> threading.Event:
     """Return (or create) the cancel event for ``stream_id``."""
@@ -153,6 +193,9 @@ def run_stream(stream_id: int) -> None:
     """
     sess = SessionLocal()
     cancel_ev = cancel_event_for(stream_id)
+    # Stamped branding temp file (Quick Live conveyor) — tracked out here
+    # so the finally block can clean it up on ANY exit path.
+    branded_tmp: Optional[str] = None
 
     try:
         row = sess.query(models.LiveStream).get(stream_id)
@@ -198,6 +241,83 @@ def run_stream(stream_id: int) -> None:
                         error=f"YouTube OAuth failed: {exc}")
                 return
 
+            # 2b) Quick Live branding conveyor — stamp the channel's
+            # logo/watermark onto the source BEFORE minting the broadcast
+            # (so YouTube never sees a moment of unbranded footage).
+            # Soft-fails: an unbranded live beats no live, and the reason
+            # is surfaced in the row message. Skipped for passthrough URL
+            # streams (no local file to stamp). The stamped temp file is
+            # recorded on the row and deleted in the finally block.
+            stream_input_path = row.upload_path
+            if (getattr(row, "apply_branding", False)
+                    and not (getattr(row, "source_url", "") or "").strip()):
+                _update(stream_id, status="branding",
+                        message="adding channel branding (logo/watermark)…")
+                try:
+                    import hashlib
+                    from pipeline_v4 import watermark as _wm
+                    _owner = sess.query(models.User).get(row.user_id)
+                    _sig = _wm.brand_signature(
+                        channel=channel, user=_owner, db=sess)
+                    if _sig is None:
+                        # Honest no-op: nothing configured to stamp. The
+                        # UI asks BEFORE launch (has_branding on /channels);
+                        # this covers settings changed mid-flight.
+                        _append_message(
+                            stream_id,
+                            "branding not configured on this channel — "
+                            "streaming the original (unbranded)")
+                    else:
+                        # Channels with identical effective branding AND the
+                        # same source content share ONE stamped file.
+                        # Hardlinked from-video sources share size+mtime, so
+                        # (size, mtime_ns, signature) identifies the output.
+                        _st = os.stat(row.upload_path)
+                        _key = hashlib.sha1(
+                            f"{_st.st_size}|{_st.st_mtime_ns}|{_sig}"
+                            .encode("utf-8")).hexdigest()[:16]
+                        _tmp_dir = os.path.dirname(
+                            live_uploads.upload_path_for(row.id))
+                        _shared = os.path.join(
+                            _tmp_dir, f"brandshare-{_key}.mp4")
+                        with _brand_lock_for(_shared):
+                            if not os.path.isfile(_shared):
+                                _stamped = _wm.stamp_for_channel(
+                                    source_path=row.upload_path,
+                                    channel=channel,
+                                    user=_owner,
+                                    db=sess,
+                                    # NEVER the source's own dir — from-video
+                                    # streams can point at a render-output
+                                    # file; keep temp artifacts in the
+                                    # live-studio upload dir.
+                                    work_dir=_tmp_dir,
+                                )
+                                if (_stamped and _stamped != row.upload_path
+                                        and os.path.isfile(_stamped)):
+                                    os.replace(_stamped, _shared)
+                            if os.path.isfile(_shared):
+                                _brand_ref(_shared)
+                                branded_tmp = _shared
+                                stream_input_path = _shared
+                                _update(stream_id, branded_path=_shared,
+                                        message="channel branding applied")
+                            else:
+                                _append_message(
+                                    stream_id,
+                                    "branding produced no change — "
+                                    "streaming the original")
+                except Exception as exc:
+                    _append_message(
+                        stream_id,
+                        f"branding failed — streaming the original "
+                        f"({str(exc)[:200]})")
+                if cancel_ev.is_set():
+                    _update(stream_id, status="canceled",
+                            message="canceled during branding",
+                            finished_at=datetime.now(timezone.utc))
+                    return
+
             # 3) Mint the YouTube broadcast — re-use rtmp_provider.
             _update(stream_id, status="provisioning",
                     message="creating YouTube broadcast…")
@@ -211,6 +331,13 @@ def run_stream(stream_id: int) -> None:
                     title=(row.title or "Live broadcast")[:100],
                     description=(row.description or "")[:5000],
                     privacy_status=row.privacy or "unlisted",
+                    # Looping a copy-stream (-stream_loop -1 -c:v copy) produces
+                    # a micro-gap at each loop boundary. With YouTube's default
+                    # enableAutoStop=True those gaps make YouTube END the
+                    # broadcast early (operator: "set 9h, closed before time").
+                    # We own the duration via ffmpeg -t and finalize_broadcast
+                    # at the end, so tell YouTube NOT to auto-stop.
+                    enable_auto_stop=False,
                     db=sess,
                 )
             except Exception as exc:
@@ -230,6 +357,23 @@ def run_stream(stream_id: int) -> None:
                 message="broadcast minted; ffmpeg starting",
                 started_at=datetime.now(timezone.utc),
             )
+
+            # Remember the channel's stream so the NEXT broadcast reuses it
+            # (liveStreams.list, 1 unit) instead of minting another (50) and
+            # abandoning the old one on the customer's channel. Without this
+            # the reuse path above never has an id to find and the whole
+            # feature is inert.
+            _sid = target.get("stream_id") or ""
+            if _sid and channel is not None and getattr(channel, "yt_stream_id", None) != _sid:
+                try:
+                    channel.yt_stream_id = _sid
+                    sess.commit()
+                    print(f"[live_studio] channel {channel.id} stream id saved: {_sid}",
+                          flush=True)
+                except Exception as _exc:
+                    sess.rollback()
+                    print(f"[live_studio] could not save stream id for channel "
+                          f"{getattr(channel, 'id', '?')}: {_exc}", flush=True)
 
             # 3b) Apply the user-uploaded thumbnail, if any. Soft-fail —
             # YouTube will fall back to an auto-picked frame, and the
@@ -276,7 +420,7 @@ def run_stream(stream_id: int) -> None:
                     )
                 else:
                     streamer.push_loop(
-                        input_path=row.upload_path,
+                        input_path=stream_input_path,
                         ingest_url=target["ingest_url"],
                         stream_key=target["stream_key"],
                         duration_hours=float(row.target_hours or 1.0),
@@ -313,7 +457,12 @@ def run_stream(stream_id: int) -> None:
 
             # 5) Finalize broadcast (transition=complete) regardless of
             # how it ended — if YouTube has already transitioned us
-            # automatically (enableAutoStop=True is the default), this
+            # NOT the default here: obtain_rtmp_target is called with
+            # enable_auto_stop=False, because loop micro-gaps make
+            # YouTube's auto-stop end the broadcast early. This
+            # transition is therefore the ONLY closer for a Live Studio
+            # broadcast -- and with a reusable per-channel stream, an
+            # un-closed broadcast blocks the channel's next one.
             # is a no-op.
             try:
                 yt_rtmp.finalize_broadcast(
@@ -369,8 +518,14 @@ def run_stream(stream_id: int) -> None:
                 error=str(exc)[:2000],
                 finished_at=datetime.now(timezone.utc))
     finally:
-        # Clean up temp upload + cancel event.
+        # Clean up temp upload + branding artifact + cancel event. The
+        # delete only ever touches the live-studio temp dir — from-video
+        # streams' original render files are never at these paths.
+        # Shared branded files (brandshare-*) are refcounted: the file
+        # survives until the LAST channel sharing it finishes.
         live_uploads.delete_upload(stream_id)
+        if branded_tmp:
+            _brand_unref_and_maybe_delete(branded_tmp)
         _release_cancel_event(stream_id)
         sess.close()
 
