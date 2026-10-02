@@ -821,7 +821,10 @@ def start_through_engine(db, row) -> dict:
         raise RuntimeError("live engine is not running")
 
     vid = engine_video_id(row.batch_id, row.video_slot)
-    src = (row.source_url or "").strip() or (row.upload_path or "").strip()
+    # THE FILE, NOT THE LINK. For a link, prepare_and_start has already fetched
+    # it and recorded the local copy in upload_path; the page URL itself is not
+    # something a relay can read.
+    src = (row.upload_path or "").strip() or (row.source_url or "").strip()
     if not src:
         raise RuntimeError("nothing to stream: neither an upload nor a source url")
 
@@ -847,12 +850,24 @@ def start_through_engine(db, row) -> dict:
         {"reuse_key": _reuse},
     )
 
-    try:
-        svc.status(vid)                      # already running: join it
-        out = svc.add_channel(vid, req)
-    except LiveError:
-        out = svc.go_live(vid, str(row.user_id or ""), src, [req],
-                          duration_s=hours * 3600.0, loop=True)
+    # OPEN OR JOIN, DECIDED ONCE. This used to try add_channel and fall back to
+    # go_live on ANY engine refusal. So when joining was refused for a real
+    # reason, the fallback then failed with "already live; add channels to it
+    # instead", and that -- not the reason -- is what the customer was shown.
+    # And two channels of one batch that finished preparing together could both
+    # find no video and both call go_live. The lock makes the decision atomic
+    # in this process (the only one that starts broadcasts); the video's state,
+    # not an exception, decides between opening and joining.
+    with _video_lock(vid):
+        try:
+            _state = (svc.status(vid) or {}).get("state")
+        except LiveError:
+            _state = None                    # the engine has never seen this video
+        if _state == "live":
+            out = svc.add_channel(vid, req)  # its refusal IS the reason: do not mask it
+        else:
+            out = svc.go_live(vid, str(row.user_id or ""), src, [req],
+                              duration_s=hours * 3600.0, loop=True)
     if note:
         out = dict(out)
         out["note"] = note
@@ -952,6 +967,114 @@ def prepare_source(src: str, on_progress=None, *, stream_id: int = 0) -> tuple:
         f"Check that an encode worker is running: python -m kaizer_live.encode --id <name>")
 
 
+# ─── A source that is a link rather than a file ──────────────────────
+#
+# The engine streams FILES: the checker runs ffprobe on what it is given and the
+# relay loops it. A YouTube page link is neither, so handing row.source_url to
+# them failed every channel of a batch at the first ffprobe ("could not prepare
+# the file: Command '[ffprobe ... https://youtu.be/...]' returned non-zero").
+#
+# So a link is fetched ONCE per engine video (batch, slot) into the upload
+# directory, and every channel of that video shares the one file: one download
+# and one repair for seven channels, not seven of each.
+
+import threading as _threading
+
+_VIDEO_LOCKS: dict = {}
+_VIDEO_LOCKS_GUARD = _threading.Lock()
+
+#: The whole fetch, including a slow link. A two-hour 1080p video is a few GB.
+FETCH_TIMEOUT_S = 2 * 3600
+
+#: Same preference order the classic path asks yt-dlp for: H.264 + AAC up to
+#: 1080p, falling back to whatever exists. The checker decides what needs repair.
+_FETCH_FORMAT = ("bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/"
+                 "bv*[height<=1080][vcodec^=avc1]+ba/"
+                 "b[height<=1080][vcodec^=avc1]/bv*[height<=1080]+ba/b")
+
+
+def _video_lock(vid: str):
+    """One lock per engine video, shared by every prepare thread in this process."""
+    with _VIDEO_LOCKS_GUARD:
+        lk = _VIDEO_LOCKS.get(vid)
+        if lk is None:
+            lk = _VIDEO_LOCKS[vid] = _threading.Lock()
+        return lk
+
+
+def fetched_path_for(batch_id, video_slot) -> str:
+    """Where the one fetched copy of a link lives for this engine video.
+
+    Deterministic, so a retry -- or the next channel of the same batch -- finds
+    the copy already made instead of downloading it again.
+    """
+    import os
+    from live_studio import uploads as _uploads
+    return os.path.join(_uploads._UPLOAD_DIR,
+                        f"url-{engine_video_id(batch_id, video_slot)}.mp4")
+
+
+def fetch_source_url(url: str, dest: str, on_progress=None) -> str:
+    """Download a link to `dest` with yt-dlp. Returns `dest`.
+
+    Raises NotStreamReady with a reason a customer can act on. A link that is
+    STILL LIVE is refused rather than attempted: it has no end to download to,
+    and the engine loops a finished file.
+    """
+    import os
+    import subprocess
+
+    from live_studio.streamer import _resolve_ytdlp
+    from live_studio.ytdlp_auth import ytdlp_auth_args
+
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = os.path.splitext(dest)[0] + ".fetching.mp4"
+    if on_progress:
+        on_progress("fetching the video from the link…")
+    cmd = [
+        *_resolve_ytdlp(),
+        *ytdlp_auth_args(),
+        "--no-playlist", "--no-progress", "--no-colors", "--no-warnings", "--no-part",
+        "--match-filter", "!is_live",
+        "-f", _FETCH_FORMAT,
+        "--merge-output-format", "mp4",
+        "-o", tmp,
+        url,
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=FETCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise NotStreamReady(
+            f"the link was still downloading after {FETCH_TIMEOUT_S // 3600} hours; "
+            f"upload the file instead") from None
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stderr or "").strip().splitlines()[-3:])
+        raise NotStreamReady(
+            f"the link could not be fetched (yt-dlp exited {proc.returncode}): {tail}"[:1500])
+    if not (os.path.isfile(tmp) and os.path.getsize(tmp) > 0):
+        raise NotStreamReady(
+            "the link produced no video. If it is a broadcast that is still LIVE, "
+            "wait for it to end or upload the file: the engine streams finished videos.")
+    os.replace(tmp, dest)
+    return dest
+
+
+def local_source_for(db, row, on_progress=None) -> str:
+    """The file this row streams. A link is fetched first, once per engine video."""
+    url = (row.source_url or "").strip()
+    if not url:
+        return (row.upload_path or "").strip()
+    dest = fetched_path_for(row.batch_id, row.video_slot)
+    fetch_source_url(url, dest, on_progress=on_progress)
+    if (row.upload_path or "").strip() != dest:
+        row.upload_path = dest
+        db.commit()
+    return dest
+
+
 def prepare_and_start(stream_id: int) -> None:
     """Prepare the file if needed, then start the broadcast. Runs on a thread.
 
@@ -971,9 +1094,20 @@ def prepare_and_start(stream_id: int) -> None:
             row.message = msg
             db.commit()
 
-        src = (row.source_url or "").strip() or (row.upload_path or "").strip()
+        # A LINK IS FETCHED FIRST, AND ONCE. Every channel of a batch is its own
+        # row and its own thread, all pointing at the same link. The per-video
+        # lock makes the first one fetch and repair while the rest wait and then
+        # reuse that file -- instead of seven downloads racing seven repairs
+        # onto one output path. An upload is one file per row and needs no lock.
+        is_link = bool((row.source_url or "").strip())
+        src = (row.upload_path or "").strip()
         try:
-            ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
+            if is_link:
+                with _video_lock(engine_video_id(row.batch_id, row.video_slot)):
+                    src = local_source_for(db, row, on_progress=_note)
+                    ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
+            else:
+                ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
         except Exception as exc:
             row.status = "failed"
             row.error = f"could not prepare the file: {exc}"[:2000]
@@ -997,7 +1131,7 @@ def prepare_and_start(stream_id: int) -> None:
             return
 
         # Stream the prepared copy, not the original.
-        if ready != src and not (row.source_url or "").strip():
+        if ready != src:
             row.upload_path = ready
             db.commit()
 
