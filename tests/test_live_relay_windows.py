@@ -268,3 +268,163 @@ def test_shutdown_retires_the_relay_cleanly(rig):
             break
         time.sleep(0.25)
     assert rig["relay"].poll() is not None, "the relay ignored POST /shutdown"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# The crash that reached production, and the reason no test saw it.
+#
+# A relay carrying a real broadcast died with:
+#
+#     panic: runtime error: index out of range [1] with length 1
+#     joy4/format/rtmp.(*Conn).WritePacket   rtmp.go:860
+#
+# joy4 does `self.streams[pkt.Idx]` with no bounds check. A Go panic ends
+# every goroutine, so one destination took every channel on that video off
+# air at once.
+#
+# HOW A PACKET GETS AN INDEX THE CONNECTION NEVER HEARD OF. The relay reads
+# FLV from ffmpeg, which is invoked `-map 0:v:0 -map 0:a:0?` -- the audio
+# mapping is OPTIONAL. A source with no audio therefore produces an FLV whose
+# file-header flags say video only (byte 4 == 1 rather than 5), joy4's prober
+# stops at one stream, and the relay FREEZES that list:
+#
+#     if r.streams == nil { r.streams = streams }
+#     else if !sameCodec(...) { r.readerErr.Store("source codec changed...") }
+#
+# Every RTMP connection then publishes a one-stream header. When ffmpeg is
+# restarted -- on a crash, or at the end of a file that was still uploading --
+# and the source now carries audio, the demuxer hands out packets with Idx 1.
+# sameCodec DETECTS exactly this (it compares len) and only records a string;
+# the packets keep flowing, and the next one panics the process.
+#
+# WHY THE SUITE MISSED IT. Every relay fixture in both repos is built
+# `testsrc + sine -> libx264 + aac`: two streams, always, from frame zero. No
+# test ever gave the relay a video-only source, and none ever changed the
+# source's stream count across a restart. The ffmpeg-restart tests that do
+# exist are Linux-only (SIGKILL, `ps --ppid`), so on Windows -- which is what
+# runs this in production -- the restart path was never exercised at all.
+#
+# This test creates precisely that state and asserts the relay SURVIVES it.
+# ─────────────────────────────────────────────────────────────────────
+
+def _mk(ffmpeg, path, *, audio: bool, seconds: int = 4):
+    """A tiny clip, with or without an audio track."""
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "lavfi", "-i", f"testsrc=size=320x180:rate=30:duration={seconds}"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}"]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-g", "30", "-keyint_min", "30", "-sc_threshold", "0"]
+    if audio:
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+    cmd += ["-movflags", "+faststart", str(path)]
+    subprocess.run(cmd, check=True)
+    return path
+
+
+def test_a_video_only_source_declares_one_stream_in_its_flv_header(ff, tmp_path):
+    """The precondition, isolated: this is what makes the frozen list wrong.
+
+    byte 4 of an FLV header is the flags: bit0 video, bit2 audio. 1 means the
+    demuxer will stop probing at a single stream.
+    """
+    ffmpeg, _ = ff
+    for audio, want in ((False, 1), (True, 5)):
+        src = _mk(ffmpeg, tmp_path / f"src_{audio}.mp4", audio=audio)
+        out = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(src),
+             "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "flv", "-"],
+            capture_output=True).stdout
+        assert len(out) > 9, "ffmpeg produced no FLV"
+        assert out[4] == want, (
+            f"audio={audio}: FLV flags byte is {out[4]}, expected {want}. The "
+            f"relay's stream list is derived from this.")
+
+
+def test_the_relay_survives_a_source_whose_stream_count_changes(ff, tmp_path):
+    """The production crash, reproduced end to end.
+
+    Start on a video-only source so the relay freezes a one-stream header, then
+    put a file WITH audio at the same path and restart ffmpeg. The demuxer then
+    emits Idx 1 packets against a header that declared one stream -- which used
+    to panic joy4 and kill every channel.
+
+    Asserts both halves: that the bad packets really arrive (`mismatched` > 0,
+    otherwise this test would pass without reproducing anything), and that the
+    relay is still alive and still publishing afterwards.
+    """
+    ffmpeg, ffprobe = ff
+    a = _mk(ffmpeg, tmp_path / "a_videoonly.mp4", audio=False)
+    b = _mk(ffmpeg, tmp_path / "b_withaudio.mp4", audio=True)
+    live = tmp_path / "live_source.mp4"
+    shutil.copy(a, live)
+
+    port = _free_port()
+    sink_f = tmp_path / "sink.flv"
+    sink_e = open(tmp_path / "sink.err", "wb")
+    sink = subprocess.Popen(
+        [ffmpeg, "-hide_banner", "-loglevel", "warning", "-listen", "1",
+         "-i", f"rtmp://127.0.0.1:{port}/live/k", "-c", "copy", "-y", str(sink_f)],
+        stdout=subprocess.DEVNULL, stderr=sink_e)
+    time.sleep(2.0)
+    if sink.poll() is not None:
+        sink_e.close()
+        pytest.skip("the RTMP sink could not listen (port in use?)")
+
+    log = tmp_path / "relay.log"
+    fh = open(log, "wb", buffering=0)
+    relay = subprocess.Popen(
+        [str(RELAY), "--listen", "127.0.0.1:0", "--source", str(live), "--loop=true",
+         "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--instance", "streamswap",
+         "--orphan-timeout", "120s"],
+        stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+        creationflags=0x00000008 | 0x00000200)
+    try:
+        addr = ""
+        for _ in range(200):
+            if relay.poll() is not None:
+                break
+            for line in log.read_text(errors="replace").splitlines():
+                if line.startswith("LISTEN "):
+                    addr = line.split(None, 1)[1].strip()
+            if addr:
+                break
+            time.sleep(0.1)
+        assert addr, f"relay never listened:\n{log.read_text(errors='replace')[-400:]}"
+
+        _api(addr, "PUT", "/outputs/ch0",
+             {"url": f"rtmp://127.0.0.1:{port}/live/k", "gen": 1})
+        time.sleep(5)
+        first = _api(addr, "GET", "/stats")
+        assert list(first["outputs"].values())[0].get("packets", 0) > 0, \
+            "nothing was published before the swap; the test proves nothing"
+
+        # The swap: same path, now with an audio track, and force the restart.
+        shutil.copy(b, live)
+        pid = (first.get("reader") or {}).get("pid")
+        if pid:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        time.sleep(12)
+
+        after = _api(addr, "GET", "/stats")
+        out = list(after["outputs"].values())[0]
+
+        # Did we actually reproduce it? Without this the test could pass by
+        # simply never creating the condition.
+        assert out.get("mismatched", 0) > 0, (
+            "no out-of-range packets arrived, so the panic was never provoked "
+            f"-- this test is not testing anything. stats={after}")
+
+        # And the point: it did not die.
+        assert relay.poll() is None, (
+            "the relay exited when the source's stream count changed:\n"
+            + log.read_text(errors="replace")[-900:])
+        assert "panic" not in log.read_text(errors="replace").lower(), \
+            "the relay panicked"
+        assert out.get("state") in ("live", "reconnecting"), out
+    finally:
+        for p in (relay, sink):
+            if p.poll() is None:
+                p.kill()
+        fh.close()
+        sink_e.close()
