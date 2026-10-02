@@ -910,6 +910,13 @@ async def upload_chunk(
           fast and removes a memory copy).
     """
     row = _owned_stream(db, stream_id, user.id)
+    # A STOPPED STREAM TAKES NO MORE BYTES. Cancelling (or failing) a row left
+    # this endpoint accepting its chunks, so an abandoned browser tab went on
+    # uploading a multi-GB file for a broadcast that would never start: the
+    # cancel deleted the temp file and the next chunk simply recreated it. On
+    # production that refilled the disk with three 2.3 GB files nobody wanted.
+    if row.status in ("canceled", "failed", "done"):
+        raise HTTPException(409, f"this stream is {row.status}; start a new one")
     if row.upload_done:
         raise HTTPException(409, "upload already complete")
 
