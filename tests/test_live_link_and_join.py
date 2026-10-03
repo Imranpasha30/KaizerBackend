@@ -238,6 +238,58 @@ def test_the_address_is_minted_once_for_a_batch():
         li._LIVE_LINKS.pop("77-5", None)
 
 
+# ─── a channel YouTube refused must not be reported as streaming ────────────────
+REASON = "YouTube broadcast start failed: Failed to refresh token for channel 5 (reconnect from the Channels page)"
+
+
+def test_a_refused_first_channel_is_reported_not_swallowed():
+    class Refusing(FakeSvc):
+        def go_live(self, vid, user_id, source, channels, **kw):
+            super().go_live(vid, user_id, source, channels, **kw)
+            return {"state": "live", "channels": [{"channel_id": str(channels[0].channel_id),
+                                                   "state": "failed", "error": REASON}]}
+
+    svc = Refusing()
+    _with_svc(svc)
+    try:
+        try:
+            li.start_through_engine(FakeDb(), _row(5))
+        except RuntimeError as exc:
+            assert "reconnect from the Channels page" in str(exc), str(exc)
+        else:
+            raise AssertionError("a refused channel must raise, or the row says 'streaming'")
+    finally:
+        _restore()
+
+
+def test_a_refused_joining_channel_is_reported():
+    class Refusing(FakeSvc):
+        def add_channel(self, vid, req):
+            return {"channel_id": req.channel_id, "state": "failed", "error": REASON}
+
+    svc = Refusing()
+    svc.state = "live"
+    _with_svc(svc)
+    try:
+        try:
+            li.start_through_engine(FakeDb(), _row(6))
+        except RuntimeError as exc:
+            assert "Failed to refresh token" in str(exc)
+        else:
+            raise AssertionError("a refused join must raise")
+    finally:
+        _restore()
+
+
+def test_only_the_failed_channel_is_blamed():
+    out = {"state": "live", "channels": [{"channel_id": "1", "state": "on"},
+                                         {"channel_id": "2", "state": "failed", "error": "e2"}]}
+    assert li.engine_refusal(out, 1) == ""
+    assert li.engine_refusal(out, 2) == "e2"
+    assert li.engine_refusal({"state": "queued"}, 1) == ""
+    assert li.engine_refusal(None, 1) == ""
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

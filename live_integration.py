@@ -807,6 +807,22 @@ def stop_row_on_engine(row, *, reason: str = "stopped") -> str:
     return f"engine stopped {vid}/{row.channel_id} ({out.get('state')})"
 
 
+def engine_refusal(out, channel_id) -> str:
+    """The engine's reason, when it replied normally about a channel it had failed.
+
+    Two shapes: add_channel returns the channel's own record, go_live returns the
+    whole video's status with a list of channels.
+    """
+    if not isinstance(out, dict):
+        return ""
+    if out.get("state") == "failed":
+        return str(out.get("error") or "YouTube refused this channel")
+    for c in out.get("channels") or []:
+        if str(c.get("channel_id")) == str(channel_id) and c.get("state") == "failed":
+            return str(c.get("error") or "YouTube refused this channel")
+    return ""
+
+
 def start_through_engine(db, row) -> dict:
     """Start (or join) an engine broadcast for one LiveStream row.
 
@@ -877,6 +893,15 @@ def start_through_engine(db, row) -> dict:
         else:
             out = svc.go_live(vid, str(row.user_id or ""), src, [req],
                               duration_s=hours * 3600.0, loop=not live)
+    # THE ENGINE ANSWERS EVEN WHEN YOUTUBE SAID NO. A channel whose sign-in has
+    # expired, whose live streaming is off, or that is blocked, comes back as a
+    # normal reply with state "failed" and the reason -- it is not an exception.
+    # So this function returned success, prepare_and_start wrote `streaming`, and
+    # Live Studio showed a row streaming with nothing on air while the real
+    # reason ("reconnect the channel") sat in Redis. Raise it, so the row says so.
+    refused = engine_refusal(out, row.channel_id)
+    if refused:
+        raise RuntimeError(refused)
     if note:
         out = dict(out)
         out["note"] = note
