@@ -505,7 +505,11 @@ def get_live_service():
         _inner_go_live = _SERVICE.go_live
 
         def _checked_go_live(video_id, user_id, source, channels, **kw):
-            assert_stream_ready(source)
+            # A live relay's source is a stream address, not a file: there is
+            # nothing to ffprobe-then-repair, and the keyframe scan would read a
+            # minute of the live feed to reach a verdict that cannot be acted on.
+            if not is_live_manifest(source):
+                assert_stream_ready(source)
             return _inner_go_live(video_id, user_id, source, channels, **kw)
 
         _SERVICE.go_live = _checked_go_live
@@ -824,11 +828,16 @@ def start_through_engine(db, row) -> dict:
     # THE FILE, NOT THE LINK. For a link, prepare_and_start has already fetched
     # it and recorded the local copy in upload_path; the page URL itself is not
     # something a relay can read.
-    src = (row.upload_path or "").strip() or (row.source_url or "").strip()
+    live = live_link_for(vid)
+    src = (live["manifest"] if live
+           else (row.upload_path or "").strip() or (row.source_url or "").strip())
     if not src:
         raise RuntimeError("nothing to stream: neither an upload nor a source url")
 
     hours, note = clamp_live_hours(row.target_hours)
+    if live:
+        hours, lnote = fit_live_hours(hours, live)
+        note = "; ".join(x for x in (note, lnote) if x)
     # HAS THIS CHANNEL GOT A STREAM TO REUSE? The engine cannot know -- it has
     # no database -- and the answer is worth 49 units: liveStreams.list costs 1,
     # liveStreams.insert costs 50. Measured on the first production broadcast,
@@ -867,7 +876,7 @@ def start_through_engine(db, row) -> dict:
             out = svc.add_channel(vid, req)  # its refusal IS the reason: do not mask it
         else:
             out = svc.go_live(vid, str(row.user_id or ""), src, [req],
-                              duration_s=hours * 3600.0, loop=True)
+                              duration_s=hours * 3600.0, loop=not live)
     if note:
         out = dict(out)
         out["note"] = note
@@ -965,6 +974,149 @@ def prepare_source(src: str, on_progress=None, *, stream_id: int = 0) -> tuple:
     raise NotStreamReady(
         f"the file was still being repaired after {ENCODE_WAIT_S // 3600} hours. "
         f"Check that an encode worker is running: python -m kaizer_live.encode --id <name>")
+
+
+# ─── A link that is LIVE right now ───────────────────────────────────
+#
+# A finished video is downloaded once and looped (below). A broadcast that is
+# still going out has no finished file, so it is relayed instead: yt-dlp
+# resolves the address of its live HLS feed, the engine's relay reads that
+# address with -c copy and no loop, and when the source broadcast ends ffmpeg
+# exits cleanly, the relay reports the video finished, and the sweeper ends
+# every channel's YouTube broadcast by itself.
+#
+# TWO FACTS SHAPE THIS. The address YouTube hands out is bound to the IP that
+# asked for it, and expires six hours later. So (1) it is resolved through the
+# WARP route and the engine's ffmpeg must read it through the same route -- the
+# kaizer-ffmpeg wrapper does that for googlevideo.com addresses only -- and
+# (2) a relay is held inside that window; fit_live_hours() says so out loud.
+
+import json as _json
+import re as _re
+import threading as _threading
+import time as _time
+
+#: Seconds kept back from the address's life: a relay that starts with 90 s left
+#: would die before the first viewer arrived.
+LIVE_LINK_MARGIN_S = 120
+
+_LIVE_LINKS: dict = {}
+_LIVE_LINKS_GUARD = _threading.Lock()
+
+
+def is_live_manifest(source: str) -> bool:
+    """Is this source a live address from YouTube, rather than a file or a page?"""
+    s = (source or "").strip()
+    return s.startswith("https://") and "googlevideo.com" in s.split("/", 3)[2]
+
+
+def live_link_for(vid: str):
+    """The live record for this engine video, or None (finished video, upload, expired)."""
+    with _LIVE_LINKS_GUARD:
+        rec = _LIVE_LINKS.get(vid)
+        if rec and rec["expires_at"] - LIVE_LINK_MARGIN_S <= _time.time():
+            _LIVE_LINKS.pop(vid, None)
+            return None
+        return dict(rec) if rec else None
+
+
+def fit_live_hours(hours: float, rec: dict) -> tuple:
+    """Hold a live relay inside its address's life. Returns (hours, note)."""
+    window_h = (rec["expires_at"] - LIVE_LINK_MARGIN_S - _time.time()) / 3600.0
+    if window_h < 0.05:
+        raise NotStreamReady("the live address expired before the relay could start; "
+                             "paste the link again")
+    if hours > window_h:
+        return window_h, (f"limited to {window_h:.1f}h: YouTube's live address "
+                          f"expires after 6 hours")
+    return hours, ""
+
+
+def pick_hls(formats: list):
+    """The combined audio+video HLS format to relay, or None.
+
+    Combined, because the relay maps one input; at most 720p, because every
+    channel of the batch carries it out and the first thing to run short on a
+    shared uplink is bandwidth. Falls back to the smallest above 720p.
+    """
+    muxed = [f for f in formats or []
+             if str(f.get("protocol") or "").startswith("m3u8")
+             and f.get("vcodec") not in (None, "none")
+             and f.get("acodec") not in (None, "none")
+             and f.get("url")]
+    if not muxed:
+        return None
+    within = [f for f in muxed if int(f.get("height") or 0) <= 720]
+    if within:
+        return max(within, key=lambda f: (int(f.get("height") or 0), float(f.get("tbr") or 0)))
+    return min(muxed, key=lambda f: int(f.get("height") or 0))
+
+
+def info_to_link(info: dict):
+    """Classify yt-dlp's description of a link. None = a finished video (fetch it).
+
+    Returns a live record for a broadcast that is on air now. Raises
+    NotStreamReady, with a reason a person can act on, for one that cannot be used yet.
+    """
+    status = info.get("live_status") or ("is_live" if info.get("is_live") else "not_live")
+    title = (info.get("title") or "live broadcast").strip()
+    if status == "is_upcoming":
+        raise NotStreamReady(f"\"{title}\" has not started yet. Paste the link again once it is live.")
+    if status == "post_live":
+        raise NotStreamReady(f"\"{title}\" has just ended and YouTube is still processing the "
+                             f"recording. Try again in a few minutes.")
+    if status != "is_live":
+        return None
+    fmt = pick_hls(info.get("formats") or [])
+    if fmt is None:
+        raise NotStreamReady(f"\"{title}\" is live but offers no combined audio+video stream "
+                             f"that can be relayed. Upload the file instead.")
+    url = fmt["url"]
+    m = _re.search(r"/expire/(\d+)", url)
+    expires = float(m.group(1)) if m else _time.time() + 6 * 3600
+    return {"manifest": url, "title": title[:120], "expires_at": expires,
+            "height": int(fmt.get("height") or 0), "format_id": str(fmt.get("format_id") or "")}
+
+
+def probe_link(url: str):
+    """Ask yt-dlp what a link is. Same route and credentials as the download path."""
+    import subprocess
+
+    from live_studio.streamer import _resolve_ytdlp
+    from live_studio.ytdlp_auth import ytdlp_auth_args
+
+    cmd = [*_resolve_ytdlp(), *ytdlp_auth_args(),
+           "--no-playlist", "--no-warnings", "--no-colors", "--dump-single-json", url]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        raise NotStreamReady("YouTube took too long to describe the link; try again") from None
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stderr or "").strip().splitlines()[-2:])
+        raise NotStreamReady(f"the link could not be read (yt-dlp exited {proc.returncode}): {tail}"[:1500])
+    try:
+        return info_to_link(_json.loads(proc.stdout))
+    except ValueError:
+        raise NotStreamReady("the link could not be read: unexpected answer from yt-dlp") from None
+
+
+def resolve_live_link(url: str, vid: str, on_progress=None):
+    """The live record for this link, or None if it is a finished video.
+
+    Called under the per-video lock, so the first channel asks YouTube and the
+    other six reuse the answer: the address is minted once per engine video.
+    """
+    rec = live_link_for(vid)
+    if rec:
+        return rec
+    if on_progress:
+        on_progress("checking whether the link is live…")
+    rec = probe_link(url)
+    if rec:
+        with _LIVE_LINKS_GUARD:
+            _LIVE_LINKS[vid] = rec
+    return rec
 
 
 # ─── A source that is a link rather than a file ──────────────────────
@@ -1103,9 +1255,17 @@ def prepare_and_start(stream_id: int) -> None:
         src = (row.upload_path or "").strip()
         try:
             if is_link:
-                with _video_lock(engine_video_id(row.batch_id, row.video_slot)):
-                    src = local_source_for(db, row, on_progress=_note)
-                    ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
+                _vid = engine_video_id(row.batch_id, row.video_slot)
+                with _video_lock(_vid):
+                    live = resolve_live_link(row.source_url, _vid, on_progress=_note)
+                    if live:
+                        # Streamed as it is: no download, no repair. The relay
+                        # pulls it through the same route that resolved it.
+                        src = ready = live["manifest"]
+                        note = f"live relay of \"{live['title']}\""[:480]
+                    else:
+                        src = local_source_for(db, row, on_progress=_note)
+                        ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
             else:
                 ready, note = prepare_source(src, on_progress=_note, stream_id=row.id)
         except Exception as exc:
@@ -1131,8 +1291,8 @@ def prepare_and_start(stream_id: int) -> None:
             return
 
         # Stream the prepared copy, not the original.
-        if ready != src:
-            row.upload_path = ready
+        if ready != src and not is_live_manifest(ready):
+            row.upload_path = ready          # a 1,200-character live address never belongs here
             db.commit()
 
         try:

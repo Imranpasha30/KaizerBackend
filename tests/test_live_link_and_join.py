@@ -127,6 +127,117 @@ def test_one_fetched_file_per_engine_video():
     assert a.endswith("url-77-0.mp4")
 
 
+# ─── a link that is LIVE right now ────────────────────────────────────────────
+import time as _t
+
+MANIFEST = ("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/{exp}/ip/2a09:bac1::1/"
+            "id/abc.1/itag/95/file/index.m3u8")
+
+
+def _fmt(fid, height, **kw):
+    base = dict(format_id=str(fid), protocol="m3u8_native", vcodec="avc1", acodec="mp4a",
+                height=height, tbr=height, url=MANIFEST.format(exp=int(_t.time()) + 21600) + f"#{fid}")
+    base.update(kw)
+    return base
+
+
+def test_pick_hls_prefers_combined_up_to_720p():
+    fmts = [_fmt(93, 360), _fmt(94, 480), _fmt(95, 720), _fmt(96, 1080),
+            _fmt(301, 720, acodec="none"), _fmt(140, 0, vcodec="none")]
+    assert li.pick_hls(fmts)["format_id"] == "95"
+    assert li.pick_hls([_fmt(96, 1080)])["format_id"] == "96"          # nothing smaller exists
+    assert li.pick_hls([_fmt(301, 720, acodec="none")]) is None        # no combined stream at all
+
+
+def test_classifying_a_link():
+    live = li.info_to_link({"live_status": "is_live", "title": "Press meet", "formats": [_fmt(95, 720)]})
+    assert live["manifest"].startswith("https://manifest.googlevideo.com/")
+    assert 21000 < live["expires_at"] - _t.time() <= 21600
+    assert li.info_to_link({"live_status": "not_live", "formats": [_fmt(95, 720)]}) is None
+    assert li.info_to_link({"live_status": "was_live"}) is None
+    for status, word in (("is_upcoming", "not started"), ("post_live", "processing")):
+        try:
+            li.info_to_link({"live_status": status, "title": "t"})
+        except li.NotStreamReady as exc:
+            assert word in str(exc), str(exc)
+        else:
+            raise AssertionError(status)
+
+
+def test_a_live_manifest_is_recognised_and_a_file_or_page_is_not():
+    assert li.is_live_manifest(MANIFEST.format(exp=1))
+    assert not li.is_live_manifest("/tmp/kaizer-live-studio/stream-1.mp4")
+    assert not li.is_live_manifest("https://youtu.be/abc")
+    assert not li.is_live_manifest("https://evil.example/googlevideo.com/x")   # host, not substring
+
+
+def test_a_live_relay_is_held_inside_the_addresses_life():
+    rec = {"expires_at": _t.time() + 3 * 3600, "manifest": "m", "title": "t"}
+    h, note = li.fit_live_hours(1.0, rec)
+    assert h == 1.0 and note == ""
+    h, note = li.fit_live_hours(24.0, rec)
+    assert 2.9 < h < 3.0 and "limited" in note
+    try:
+        li.fit_live_hours(1.0, {"expires_at": _t.time() + 60, "manifest": "m", "title": "t"})
+    except li.NotStreamReady:
+        pass
+    else:
+        raise AssertionError("an address about to expire must be refused")
+
+
+def test_a_live_link_is_relayed_not_looped_and_every_channel_joins():
+    class Svc(FakeSvc):
+        def go_live(self, vid, user_id, source, channels, **kw):
+            self.kw = kw
+            return super().go_live(vid, user_id, source, channels, **kw)
+
+    svc = Svc()
+    rec = {"expires_at": _t.time() + 21600, "manifest": MANIFEST.format(exp=1), "title": "Press meet"}
+    saved = li.live_link_for
+    li.live_link_for = lambda vid: dict(rec)
+    _with_svc(svc)
+    try:
+        errors = []
+
+        def start(cid):
+            try:
+                li.start_through_engine(FakeDb(), _row(cid, upload_path="", target_hours=2.0))
+            except Exception as exc:                      # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=start, args=(c,)) for c in range(1, 8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert not errors, errors
+        assert len(svc.opened) == 1 and len(svc.joined) == 6
+        assert svc.opened[0][1] == rec["manifest"], "the engine must be given the live address"
+        assert svc.kw["loop"] is False, "a live source must not be looped"
+        assert svc.kw["duration_s"] == 7200.0
+    finally:
+        li.live_link_for = saved
+        _restore()
+
+
+def test_the_address_is_minted_once_for_a_batch():
+    calls = []
+    saved = li.probe_link
+
+    def fake_probe(url):
+        calls.append(url)
+        return {"manifest": MANIFEST.format(exp=int(_t.time()) + 21600), "title": "t",
+                "expires_at": _t.time() + 21600}
+
+    li.probe_link = fake_probe
+    li._LIVE_LINKS.pop("77-5", None)
+    try:
+        a = li.resolve_live_link("https://youtu.be/x", "77-5")
+        b = li.resolve_live_link("https://youtu.be/x", "77-5")
+        assert a["manifest"] == b["manifest"] and len(calls) == 1
+    finally:
+        li.probe_link = saved
+        li._LIVE_LINKS.pop("77-5", None)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
