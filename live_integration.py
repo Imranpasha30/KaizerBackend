@@ -852,8 +852,7 @@ def start_through_engine(db, row) -> dict:
 
     hours, note = clamp_live_hours(row.target_hours)
     if live:
-        hours, lnote = fit_live_hours(hours, live)
-        note = "; ".join(x for x in (note, lnote) if x)
+        hours, note = live_relay_hours(live)
     # HAS THIS CHANNEL GOT A STREAM TO REUSE? The engine cannot know -- it has
     # no database -- and the answer is worth 49 units: liveStreams.list costs 1,
     # liveStreams.insert costs 50. Measured on the first production broadcast,
@@ -1045,16 +1044,26 @@ def live_link_for(vid: str):
         return dict(rec) if rec else None
 
 
-def fit_live_hours(hours: float, rec: dict) -> tuple:
-    """Hold a live relay inside its address's life. Returns (hours, note)."""
-    window_h = (rec["expires_at"] - LIVE_LINK_MARGIN_S - _time.time()) / 3600.0
-    if window_h < 0.05:
+def live_relay_hours(rec: dict) -> tuple:
+    """How long a live relay may run. Returns (hours, note).
+
+    NOT the row's "live hours". That setting means "fill this many hours with a
+    looping file", and a relay of a broadcast has no file to loop: it must run
+    for as long as the SOURCE does. When the source ends, ffmpeg exits cleanly,
+    the relay reports the video finished and the sweeper closes every channel's
+    broadcast by itself, so this is only a ceiling, and it is the engine's
+    maximum.
+
+    Nor is it held inside YouTube's 6-hour address. The address is renewed by the
+    kaizer-ffmpeg wrapper each time ffmpeg is (re)started, and the relay restarts
+    ffmpeg without dropping its connection to YouTube. Only an address that is
+    already about to expire is refused, because the first start would fail.
+    """
+    if rec["expires_at"] - LIVE_LINK_MARGIN_S <= _time.time():
         raise NotStreamReady("the live address expired before the relay could start; "
                              "paste the link again")
-    if hours > window_h:
-        return window_h, (f"limited to {window_h:.1f}h: YouTube's live address "
-                          f"expires after 6 hours")
-    return hours, ""
+    return float(MAX_LIVE_HOURS), (f"runs until the source broadcast ends "
+                                   f"(at most {MAX_LIVE_HOURS}h)")
 
 
 def pick_hls(formats: list):

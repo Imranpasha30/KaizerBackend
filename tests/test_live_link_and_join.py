@@ -171,18 +171,18 @@ def test_a_live_manifest_is_recognised_and_a_file_or_page_is_not():
     assert not li.is_live_manifest("https://evil.example/googlevideo.com/x")   # host, not substring
 
 
-def test_a_live_relay_is_held_inside_the_addresses_life():
+def test_a_live_relay_runs_until_the_source_ends_not_for_live_hours():
     rec = {"expires_at": _t.time() + 3 * 3600, "manifest": "m", "title": "t"}
-    h, note = li.fit_live_hours(1.0, rec)
-    assert h == 1.0 and note == ""
-    h, note = li.fit_live_hours(24.0, rec)
-    assert 2.9 < h < 3.0 and "limited" in note
+    h, note = li.live_relay_hours(rec)
+    assert h == float(li.MAX_LIVE_HOURS) and "until the source broadcast ends" in note
+    # an address with 3 hours left is NOT a reason to stop at 3 hours: the wrapper renews it
+    assert h > 100
     try:
-        li.fit_live_hours(1.0, {"expires_at": _t.time() + 60, "manifest": "m", "title": "t"})
+        li.live_relay_hours({"expires_at": _t.time() + 60, "manifest": "m", "title": "t"})
     except li.NotStreamReady:
         pass
     else:
-        raise AssertionError("an address about to expire must be refused")
+        raise AssertionError("an address about to expire must be refused at start")
 
 
 def test_a_live_link_is_relayed_not_looped_and_every_channel_joins():
@@ -201,7 +201,7 @@ def test_a_live_link_is_relayed_not_looped_and_every_channel_joins():
 
         def start(cid):
             try:
-                li.start_through_engine(FakeDb(), _row(cid, upload_path="", target_hours=2.0))
+                li.start_through_engine(FakeDb(), _row(cid, upload_path="", target_hours=1.0))
             except Exception as exc:                      # pragma: no cover
                 errors.append(exc)
 
@@ -212,7 +212,7 @@ def test_a_live_link_is_relayed_not_looped_and_every_channel_joins():
         assert len(svc.opened) == 1 and len(svc.joined) == 6
         assert svc.opened[0][1] == rec["manifest"], "the engine must be given the live address"
         assert svc.kw["loop"] is False, "a live source must not be looped"
-        assert svc.kw["duration_s"] == 7200.0
+        assert svc.kw["duration_s"] == float(li.MAX_LIVE_HOURS) * 3600.0, "live hours must not cap a live relay"
     finally:
         li.live_link_for = saved
         _restore()
